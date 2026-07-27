@@ -1,0 +1,220 @@
+# EtcFS Development Environment
+#
+# Simulates a 3-node EtcFS cluster on a single machine:
+#   - 3 etcd nodes (colocated pattern — one per EtcFS node)
+#   - 1 loopback block device shared via Docker volumes
+#   - 3 etcfuse-meta (Go) + 3 etcfuse (C) daemon pairs
+#
+# Usage:
+#   docker compose up -d                  # start the cluster
+#   docker compose logs -f                # tail logs
+#   docker compose down -v                # tear down
+#
+# The FUSE mount is accessible inside each container at /mnt/etcfuse.
+# For host-level access, mount the FUSE filesystem inside the container
+# and bind-mount it to the host (requires privileged mode for FUSE).
+
+version: "3.9"
+
+services:
+  # ---- 3-node etcd cluster ----
+
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: etcfs-etcd1
+    command:
+      - etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-token=etcfuse-dev
+      - --initial-cluster-state=new
+    volumes:
+      - etcd1_data:/etcd-data
+    networks:
+      - etcfuse-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://localhost:2379"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: etcfs-etcd2
+    command:
+      - etcd
+      - --name=etcd2
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-token=etcfuse-dev
+      - --initial-cluster-state=new
+    volumes:
+      - etcd2_data:/etcd-data
+    networks:
+      - etcfuse-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://localhost:2379"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: etcfs-etcd3
+    command:
+      - etcd
+      - --name=etcd3
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd3:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd3:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-token=etcfuse-dev
+      - --initial-cluster-state=new
+    volumes:
+      - etcd3_data:/etcd-data
+    networks:
+      - etcfuse-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://localhost:2379"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---- Block device simulator (loopback file) ----
+  # Creates a file-backed block device shared across all EtcFS nodes.
+  # In production this is an io2 Multi-Attach EBS volume.
+  block-init:
+    image: alpine:3.20
+    container_name: etcfs-block-init
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache e2fsprogs-extra
+        dd if=/dev/zero of=/block-device/etcfuse.img bs=1M count=1024 2>/dev/null
+        chmod 666 /block-device/etcfuse.img
+        echo "Block device initialised: 1 GB file at /block-device/etcfuse.img"
+    volumes:
+      - block_data:/block-device
+    networks:
+      - etcfuse-net
+
+  # ---- EtcFS Meta nodes (Go — metadata backend) ----
+  # These will connect to their respective etcd instance and expose a
+  # Unix socket for the C FUSE daemon.
+  #
+  # Uncomment when the Go binary is built:
+  #   docker compose build etcfuse-meta1
+
+  # etcfuse-meta1:
+  #   build:
+  #     context: ../..
+  #     dockerfile: deploy/docker/Dockerfile.etcfuse-meta
+  #   container_name: etcfs-meta1
+  #   command:
+  #     - /usr/local/bin/etcfuse-meta
+  #     - --listen=/var/run/etcfuse.sock
+  #     - --etcd-endpoints=http://etcd1:2379
+  #     - --node-id=etcfuse-node-1
+  #     - --lease-ttl=10s
+  #   volumes:
+  #     - meta1_sock:/var/run
+  #   networks:
+  #     - etcfuse-net
+  #   depends_on:
+  #     etcd1:
+  #       condition: service_healthy
+  #     block-init:
+  #       condition: service_completed_successfully
+
+  # etcfuse-meta2:
+  #   build:
+  #     context: ../..
+  #     dockerfile: deploy/docker/Dockerfile.etcfuse-meta
+  #   container_name: etcfs-meta2
+  #   command:
+  #     - /usr/local/bin/etcfuse-meta
+  #     - --listen=/var/run/etcfuse.sock
+  #     - --etcd-endpoints=http://etcd2:2379
+  #     - --node-id=etcfuse-node-2
+  #     - --lease-ttl=10s
+  #   volumes:
+  #     - meta2_sock:/var/run
+  #   networks:
+  #     - etcfuse-net
+  #   depends_on:
+  #     etcd2:
+  #       condition: service_healthy
+
+  # etcfuse-meta3:
+  #   build:
+  #     context: ../..
+  #     dockerfile: deploy/docker/Dockerfile.etcfuse-meta
+  #   container_name: etcfs-meta3
+  #   command:
+  #     - /usr/local/bin/etcfuse-meta
+  #     - --listen=/var/run/etcfuse.sock
+  #     - --etcd-endpoints=http://etcd3:2379
+  #     - --node-id=etcfuse-node-3
+  #     - --lease-ttl=10s
+  #   volumes:
+  #     - meta3_sock:/var/run
+  #   networks:
+  #     - etcfuse-net
+  #   depends_on:
+  #     etcd3:
+  #       condition: service_healthy
+
+  # ---- EtcFS FUSE nodes (C — FUSE daemon) ----
+  # These mount the actual FUSE filesystem.  Privileged mode is required
+  # for FUSE.  In development, you can also test without FUSE by running
+  # the C daemon directly on the host.
+  #
+  # Uncomment when the C binary is built:
+  #   docker compose build etcfuse1
+
+  # etcfuse1:
+  #   build:
+  #     context: ../..
+  #     dockerfile: deploy/docker/Dockerfile.etcfuse
+  #   container_name: etcfs-fuse1
+  #   privileged: true
+  #   devices:
+  #     - /dev/fuse
+  #   command:
+  #     - /usr/local/bin/etcfuse
+  #     - --socket=/var/run/etcfuse.sock
+  #     - --volume-id=/block-device/etcfuse.img
+  #     - --node-id=etcfuse-node-1
+  #     - --log-level=2
+  #     - /mnt/etcfuse
+  #   volumes:
+  #     - meta1_sock:/var/run
+  #     - block_data:/block-device:shared
+  #   networks:
+  #     - etcfuse-net
+  #   depends_on:
+  #     - etcfuse-meta1
+
+volumes:
+  etcd1_data:
+  etcd2_data:
+  etcd3_data:
+  block_data:
+  meta1_sock:
+  meta2_sock:
+  meta3_sock:
+
+networks:
+  etcfuse-net:
+    driver: bridge

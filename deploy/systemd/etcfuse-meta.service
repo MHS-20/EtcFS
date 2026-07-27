@@ -1,0 +1,18 @@
+[Unit]
+Description=EtcFS Metadata Backend
+After=network-online.target etcd.service
+Wants=network-online.target etcd.service
+Documentation=https://github.com/anomalyco/etcfuse
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/etcfuse-meta \
+  --listen=/var/run/etcfuse.sock \
+  --node-id=%H \
+  --lease-ttl=10s
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

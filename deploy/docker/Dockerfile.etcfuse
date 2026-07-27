@@ -1,0 +1,25 @@
+# EtcFS FUSE daemon (C component)
+#
+# Build:
+#   docker build -f deploy/docker/Dockerfile.etcfuse -t etcfuse .
+#
+# Uses a multi-stage build: compile in a builder image, then copy
+# the static binary into a minimal runtime image.
+
+FROM amazonlinux:2023 AS builder
+
+RUN dnf install -y gcc make fuse3-devel fuse3-libs && dnf clean all
+
+WORKDIR /build
+COPY cmd/etcfuse/ cmd/etcfuse/
+COPY pkg/ pkg/
+
+RUN make -C cmd/etcfuse
+
+FROM amazonlinux:2023
+
+RUN dnf install -y fuse3-libs && dnf clean all
+
+COPY --from=builder /build/bin/etcfuse /usr/local/bin/etcfuse
+
+ENTRYPOINT ["/usr/local/bin/etcfuse"]
