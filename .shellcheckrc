@@ -1,0 +1,28 @@
+# SSH_OPTS must be unquoted for word splitting ("-o Opt=val -o Other=val")
+disable=SC2086
+
+# source via relative path isn't followed from the runner's CWD
+disable=SC1091
+
+# Config variables defined in state.sh for sourcing scripts — they look
+# unused when checked in isolation but are consumed by other scripts
+disable=SC2034
+
+# grep | wc -l vs grep -c — style preference, not a bug
+disable=SC2126
+
+# Functions that look unreachable are invoked via run_scenario()
+disable=SC2317
+
+# Functions invoked indirectly via run_scenario()
+disable=SC2329
+
+# Declare-and-assign-separately warnings for local tag=$(...)
+disable=SC2155
+
+# Individual redirects vs { ... } — fine for short sequences
+disable=SC2129
+
+# SSH variable expansion on remote side — intentional; $svc is a local var
+# that expands into the remote command string
+disable=SC2029

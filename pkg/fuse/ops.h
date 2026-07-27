@@ -18,7 +18,7 @@ struct fuse_lowlevel_ops *etcfs_fuse_ops(void);
 /* IPC layer — serialises requests, deserialises responses. */
 struct etcfs_ipc;
 struct etcfs_ipc *etcfs_ipc_init(int fd);
-void              etcfs_ipc_destroy(struct etcfs_ipc *ipc);
+void etcfs_ipc_destroy(struct etcfs_ipc *ipc);
 
 /* Shutdown notification — the Go side tells us to stop. */
 int etcfs_ipc_recv_shutdown(struct etcfs_ipc *ipc);

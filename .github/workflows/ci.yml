@@ -1,10 +1,16 @@
-name: CI
+name: CI / Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+  pull-requests: write
 
 jobs:
   lint-go:
@@ -64,8 +70,7 @@ jobs:
       - name: Install deps
         run: sudo apt-get install -y libfuse3-dev
       - name: Build
-        run: |
-          make -C cmd/etcfuse
+        run: make -C cmd/etcfuse
 
   test-go:
     name: Test (Go)
@@ -85,7 +90,50 @@ jobs:
     needs: [build-go, build-c]
     steps:
       - uses: actions/checkout@v4
-      - name: Integration smoke test
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Start etcd
         run: |
-          # Start etcd + build both binaries, verify they connect
-          echo "Integration tests will be added in subsequent phases"
+          curl -sL https://github.com/etcd-io/etcd/releases/download/v3.5.18/etcd-v3.5.18-linux-amd64.tar.gz | tar xz
+          sudo mv etcd-v3.5.18-linux-amd64/etcd etcd-v3.5.18-linux-amd64/etcdctl /usr/local/bin/
+          mkdir -p /tmp/etcd-data
+          etcd --data-dir=/tmp/etcd-data --listen-client-urls=http://127.0.0.1:2379 --advertise-client-urls=http://127.0.0.1:2379 &
+          sleep 3
+          etcdctl endpoint health
+      - name: Run integration tests
+        env:
+          ETCD_ENDPOINTS: http://127.0.0.1:2379
+        run: go test -tags=integration -count=1 -timeout 120s ./pkg/metadata/ -run Integration
+
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    needs: [lint-go, lint-c, lint-sh, build-go, build-c, test-go, test-integration]
+    if: github.event_name == 'push'
+    outputs:
+      released: ${{ steps.semrel.outputs.new_release_published }}
+      version: ${{ steps.semrel.outputs.new_release_version }}
+      version_major: ${{ steps.semrel.outputs.new_release_major_version }}
+      version_minor: ${{ steps.semrel.outputs.new_release_minor_version }}
+      version_patch: ${{ steps.semrel.outputs.new_release_patch_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Run semantic-release
+        id: semrel
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            @semantic-release/github
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

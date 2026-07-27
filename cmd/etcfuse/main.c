@@ -26,60 +26,66 @@
 #include "pkg/fuse/fuse.h"
 #include "pkg/fuse/ops.h"
 
-static void
-print_usage(const char *prog)
+static void print_usage(const char *prog)
 {
     fprintf(stderr,
-        "EtcFS FUSE daemon v" ETCFS_VERSION "\n"
-        "\n"
-        "Usage: %s [options] <mountpoint>\n"
-        "\n"
-        "Options:\n"
-        "  --socket=PATH      Unix socket path for Go metadata backend\n"
-        "                     (default: /tmp/etcfuse.sock)\n"
-        "  --volume-id=ID     EBS volume ID or block device path\n"
-        "                     (example: vol-0abcdef1234567890 or /dev/nvme1n1)\n"
-        "  --node-id=NAME     Node identifier (default: hostname)\n"
-        "  --log-level=N      Log level: 0=error, 1=warn, 2=info, 3=debug\n"
-        "                     (default: 2)\n"
-        "  -h, --help         Show this help\n"
-        "\n"
-        "The Go metadata backend (etcfuse-meta) must be running before\n"
-        "this daemon is started.\n",
-        prog);
+            "EtcFS FUSE daemon v" ETCFS_VERSION "\n"
+            "\n"
+            "Usage: %s [options] <mountpoint>\n"
+            "\n"
+            "Options:\n"
+            "  --socket=PATH      Unix socket path for Go metadata backend\n"
+            "                     (default: /tmp/etcfuse.sock)\n"
+            "  --volume-id=ID     EBS volume ID or block device path\n"
+            "                     (example: vol-0abcdef1234567890 or /dev/nvme1n1)\n"
+            "  --node-id=NAME     Node identifier (default: hostname)\n"
+            "  --log-level=N      Log level: 0=error, 1=warn, 2=info, 3=debug\n"
+            "                     (default: 2)\n"
+            "  -h, --help         Show this help\n"
+            "\n"
+            "The Go metadata backend (etcfuse-meta) must be running before\n"
+            "this daemon is started.\n",
+            prog);
 }
 
-int
-main(int argc, char *argv[])
+int main(int argc, char *argv[])
 {
     struct etcfs_context ctx;
     const char *socket_path = "/tmp/etcfuse.sock";
     const char *volume_id = NULL;
     const char *node_id = NULL;
     const char *mountpoint = NULL;
-    int         log_level = ETCFS_LOG_INFO;
+    int log_level = ETCFS_LOG_INFO;
 
     memset(&ctx, 0, sizeof(ctx));
 
     /* parse arguments */
     static struct option long_opts[] = {
-        {"socket",    required_argument, 0, 's'},
-        {"volume-id", required_argument, 0, 'v'},
-        {"node-id",   required_argument, 0, 'n'},
-        {"log-level", required_argument, 0, 'l'},
-        {"help",      no_argument,       0, 'h'},
-        {0, 0, 0, 0}
-    };
+        {"socket", required_argument, 0, 's'},  {"volume-id", required_argument, 0, 'v'},
+        {"node-id", required_argument, 0, 'n'}, {"log-level", required_argument, 0, 'l'},
+        {"help", no_argument, 0, 'h'},          {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "s:v:n:l:h", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 's': socket_path = optarg; break;
-        case 'v': volume_id = optarg;   break;
-        case 'n': node_id = optarg;     break;
-        case 'l': log_level = atoi(optarg); break;
-        case 'h': print_usage(argv[0]); return 0;
-        default:  print_usage(argv[0]); return 1;
+        case 's':
+            socket_path = optarg;
+            break;
+        case 'v':
+            volume_id = optarg;
+            break;
+        case 'n':
+            node_id = optarg;
+            break;
+        case 'l':
+            log_level = atoi(optarg);
+            break;
+        case 'h':
+            print_usage(argv[0]);
+            return 0;
+        default:
+            print_usage(argv[0]);
+            return 1;
         }
     }
 
@@ -110,9 +116,9 @@ main(int argc, char *argv[])
     setenv("ETCFS_IPC_SOCKET", socket_path, 1);
 
     /* populate context */
-    ctx.mountpoint = (char *)mountpoint;
-    ctx.volume_id  = (char *)volume_id;
-    ctx.node_id    = (char *)node_id;
+    ctx.mountpoint = (char *) mountpoint;
+    ctx.volume_id = (char *) volume_id;
+    ctx.node_id = (char *) node_id;
 
     /* run the FUSE daemon */
     int ret = etcfs_run(&ctx);

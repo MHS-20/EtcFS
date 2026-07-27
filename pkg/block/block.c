@@ -24,14 +24,13 @@
 #include <unistd.h>
 
 struct etcfs_block_dev {
-    int      fd;
-    int      sector_size;
-    size_t   total_sectors;
-    char     path[256];
+    int fd;
+    int sector_size;
+    size_t total_sectors;
+    char path[256];
 };
 
-struct etcfs_block_dev *
-etcfs_block_open(const char *volume_id)
+struct etcfs_block_dev *etcfs_block_open(const char *volume_id)
 {
     struct etcfs_block_dev *dev;
     unsigned long long bytes;
@@ -41,7 +40,8 @@ etcfs_block_open(const char *volume_id)
         return NULL;
 
     dev = calloc(1, sizeof(*dev));
-    if (!dev) return NULL;
+    if (!dev)
+        return NULL;
 
     dev->fd = -1;
 
@@ -71,39 +71,33 @@ etcfs_block_open(const char *volume_id)
     }
 
     if (dev->fd < 0) {
-        etcfs_log(ETCFS_LOG_WARN, "block_open: cannot open %s: %s",
-                  volume_id, strerror(errno));
+        etcfs_log(ETCFS_LOG_WARN, "block_open: cannot open %s: %s", volume_id, strerror(errno));
         free(dev);
         return NULL;
     }
 
     /* query geometry */
     if (ioctl(dev->fd, BLKSSZGET, &sector) < 0) {
-        etcfs_log(ETCFS_LOG_WARN, "block_open: BLKSSZGET failed: %s",
-                  strerror(errno));
-        dev->sector_size = 512;  /* safe default */
+        etcfs_log(ETCFS_LOG_WARN, "block_open: BLKSSZGET failed: %s", strerror(errno));
+        dev->sector_size = 512; /* safe default */
     } else {
         dev->sector_size = sector;
     }
 
     if (ioctl(dev->fd, BLKGETSIZE64, &bytes) < 0) {
-        etcfs_log(ETCFS_LOG_WARN, "block_open: BLKGETSIZE64 failed: %s",
-                  strerror(errno));
+        etcfs_log(ETCFS_LOG_WARN, "block_open: BLKGETSIZE64 failed: %s", strerror(errno));
         dev->total_sectors = 0;
     } else {
-        dev->total_sectors = (size_t)(bytes / dev->sector_size);
+        dev->total_sectors = (size_t) (bytes / dev->sector_size);
     }
 
-    etcfs_log(ETCFS_LOG_INFO,
-              "block_open: %s sector=%d total_sectors=%zu (%.1f GB)",
-              dev->path, dev->sector_size, dev->total_sectors,
-              (double)bytes / 1e9);
+    etcfs_log(ETCFS_LOG_INFO, "block_open: %s sector=%d total_sectors=%zu (%.1f GB)", dev->path,
+              dev->sector_size, dev->total_sectors, (double) bytes / 1e9);
 
     return dev;
 }
 
-void
-etcfs_block_close(struct etcfs_block_dev *dev)
+void etcfs_block_close(struct etcfs_block_dev *dev)
 {
     if (dev) {
         if (dev->fd >= 0)
@@ -112,20 +106,17 @@ etcfs_block_close(struct etcfs_block_dev *dev)
     }
 }
 
-int
-etcfs_block_get_sector_size(const struct etcfs_block_dev *dev)
+int etcfs_block_get_sector_size(const struct etcfs_block_dev *dev)
 {
     return dev ? dev->sector_size : 512;
 }
 
-size_t
-etcfs_block_get_total_sectors(const struct etcfs_block_dev *dev)
+size_t etcfs_block_get_total_sectors(const struct etcfs_block_dev *dev)
 {
     return dev ? dev->total_sectors : 0;
 }
 
-void *
-etcfs_block_alloc_buffer(const struct etcfs_block_dev *dev, size_t size)
+void *etcfs_block_alloc_buffer(const struct etcfs_block_dev *dev, size_t size)
 {
     int align = dev ? dev->sector_size : 4096;
     void *buf = NULL;
@@ -135,49 +126,51 @@ etcfs_block_alloc_buffer(const struct etcfs_block_dev *dev, size_t size)
 }
 
 /* Validate alignment: offset, length, and buffer must be sector-aligned. */
-static int
-check_alignment(const struct etcfs_block_dev *dev, const void *buf,
-                size_t count, uint64_t offset)
+static int check_alignment(const struct etcfs_block_dev *dev, const void *buf, size_t count,
+                           uint64_t offset)
 {
     int align = dev->sector_size;
-    if (offset % (uint64_t)align != 0) return -EINVAL;
-    if (count % (size_t)align != 0)      return -EINVAL;
-    if (((uintptr_t)buf) % (uintptr_t)align != 0) return -EINVAL;
+    if (offset % (uint64_t) align != 0)
+        return -EINVAL;
+    if (count % (size_t) align != 0)
+        return -EINVAL;
+    if (((uintptr_t) buf) % (uintptr_t) align != 0)
+        return -EINVAL;
     return 0;
 }
 
-ssize_t
-etcfs_block_read(struct etcfs_block_dev *dev, void *buf,
-                 size_t count, uint64_t byte_offset)
+ssize_t etcfs_block_read(struct etcfs_block_dev *dev, void *buf, size_t count, uint64_t byte_offset)
 {
-    if (!dev || dev->fd < 0) return -EBADF;
+    if (!dev || dev->fd < 0)
+        return -EBADF;
 
     int ret = check_alignment(dev, buf, count, byte_offset);
-    if (ret < 0) return ret;
+    if (ret < 0)
+        return ret;
 
-    return pread(dev->fd, buf, count, (off_t)byte_offset);
+    return pread(dev->fd, buf, count, (off_t) byte_offset);
 }
 
-ssize_t
-etcfs_block_write(struct etcfs_block_dev *dev, const void *buf,
-                  size_t count, uint64_t byte_offset)
+ssize_t etcfs_block_write(struct etcfs_block_dev *dev, const void *buf, size_t count,
+                          uint64_t byte_offset)
 {
-    if (!dev || dev->fd < 0) return -EBADF;
+    if (!dev || dev->fd < 0)
+        return -EBADF;
 
     int ret = check_alignment(dev, buf, count, byte_offset);
-    if (ret < 0) return ret;
+    if (ret < 0)
+        return ret;
 
-    return pwrite(dev->fd, buf, count, (off_t)byte_offset);
+    return pwrite(dev->fd, buf, count, (off_t) byte_offset);
 }
 
-int
-etcfs_block_sync(struct etcfs_block_dev *dev, uint64_t byte_offset,
-                 size_t count)
+int etcfs_block_sync(struct etcfs_block_dev *dev, uint64_t byte_offset, size_t count)
 {
-    if (!dev || dev->fd < 0) return -EBADF;
+    if (!dev || dev->fd < 0)
+        return -EBADF;
 
-    off_t off_aligned = (off_t)(byte_offset & ~(off_t)(dev->sector_size - 1));
-    size_t len_aligned = count + (size_t)(byte_offset - (uint64_t)off_aligned);
+    off_t off_aligned = (off_t) (byte_offset & ~(off_t) (dev->sector_size - 1));
+    size_t len_aligned = count + (size_t) (byte_offset - (uint64_t) off_aligned);
 
     return sync_file_range(dev->fd, off_aligned, len_aligned,
                            SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);

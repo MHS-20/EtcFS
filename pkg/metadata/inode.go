@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Inode operations: create, get, update, delete.
@@ -170,18 +170,29 @@ func encodeInode(rec *InodeRecord) []byte {
 	buf := make([]byte, 72)
 	pos := 0
 
-	binary.BigEndian.PutUint64(buf[pos:], rec.Ino); pos += 8
-	binary.BigEndian.PutUint64(buf[pos:], rec.Size); pos += 8
-	binary.BigEndian.PutUint64(buf[pos:], rec.Blocks); pos += 8
-	binary.BigEndian.PutUint32(buf[pos:], rec.Mode); pos += 4
-	binary.BigEndian.PutUint32(buf[pos:], rec.Nlink); pos += 4
-	binary.BigEndian.PutUint32(buf[pos:], rec.UID); pos += 4
-	binary.BigEndian.PutUint32(buf[pos:], rec.GID); pos += 4
-	binary.BigEndian.PutUint32(buf[pos:], rec.Rdev); pos += 4
-	binary.BigEndian.PutUint32(buf[pos:], rec.Blksize); pos += 4
-	binary.BigEndian.PutUint64(buf[pos:], uint64(rec.Atime.Unix())); pos += 8
-	binary.BigEndian.PutUint64(buf[pos:], uint64(rec.Mtime.Unix())); pos += 8
-	binary.BigEndian.PutUint64(buf[pos:], uint64(rec.Ctime.Unix())); pos += 8
+	binary.BigEndian.PutUint64(buf[pos:], rec.Ino)
+	pos += 8
+	binary.BigEndian.PutUint64(buf[pos:], rec.Size)
+	pos += 8
+	binary.BigEndian.PutUint64(buf[pos:], rec.Blocks)
+	pos += 8
+	binary.BigEndian.PutUint32(buf[pos:], rec.Mode)
+	pos += 4
+	binary.BigEndian.PutUint32(buf[pos:], rec.Nlink)
+	pos += 4
+	binary.BigEndian.PutUint32(buf[pos:], rec.UID)
+	pos += 4
+	binary.BigEndian.PutUint32(buf[pos:], rec.GID)
+	pos += 4
+	binary.BigEndian.PutUint32(buf[pos:], rec.Rdev)
+	pos += 4
+	binary.BigEndian.PutUint32(buf[pos:], rec.Blksize)
+	pos += 4
+	binary.BigEndian.PutUint64(buf[pos:], uint64(rec.Atime.Unix()))
+	pos += 8
+	binary.BigEndian.PutUint64(buf[pos:], uint64(rec.Mtime.Unix()))
+	pos += 8
+	binary.BigEndian.PutUint64(buf[pos:], uint64(rec.Ctime.Unix()))
 
 	return buf
 }
@@ -194,27 +205,31 @@ func decodeInode(data []byte) *InodeRecord {
 	rec := &InodeRecord{}
 	pos := 0
 
-	rec.Ino = binary.BigEndian.Uint64(data[pos:]); pos += 8
-	rec.Size = binary.BigEndian.Uint64(data[pos:]); pos += 8
-	rec.Blocks = binary.BigEndian.Uint64(data[pos:]); pos += 8
-	rec.Mode = binary.BigEndian.Uint32(data[pos:]); pos += 4
-	rec.Nlink = binary.BigEndian.Uint32(data[pos:]); pos += 4
-	rec.UID = binary.BigEndian.Uint32(data[pos:]); pos += 4
-	rec.GID = binary.BigEndian.Uint32(data[pos:]); pos += 4
-	rec.Rdev = binary.BigEndian.Uint32(data[pos:]); pos += 4
-	rec.Blksize = binary.BigEndian.Uint32(data[pos:]); pos += 4
-	rec.Atime = time.Unix(int64(binary.BigEndian.Uint64(data[pos:])), 0); pos += 8
-	rec.Mtime = time.Unix(int64(binary.BigEndian.Uint64(data[pos:])), 0); pos += 8
-	rec.Ctime = time.Unix(int64(binary.BigEndian.Uint64(data[pos:])), 0); pos += 8
+	rec.Ino = binary.BigEndian.Uint64(data[pos:])
+	pos += 8
+	rec.Size = binary.BigEndian.Uint64(data[pos:])
+	pos += 8
+	rec.Blocks = binary.BigEndian.Uint64(data[pos:])
+	pos += 8
+	rec.Mode = binary.BigEndian.Uint32(data[pos:])
+	pos += 4
+	rec.Nlink = binary.BigEndian.Uint32(data[pos:])
+	pos += 4
+	rec.UID = binary.BigEndian.Uint32(data[pos:])
+	pos += 4
+	rec.GID = binary.BigEndian.Uint32(data[pos:])
+	pos += 4
+	rec.Rdev = binary.BigEndian.Uint32(data[pos:])
+	pos += 4
+	rec.Blksize = binary.BigEndian.Uint32(data[pos:])
+	pos += 4
+	rec.Atime = time.Unix(int64(binary.BigEndian.Uint64(data[pos:])), 0)
+	pos += 8
+	rec.Mtime = time.Unix(int64(binary.BigEndian.Uint64(data[pos:])), 0)
+	pos += 8
+	rec.Ctime = time.Unix(int64(binary.BigEndian.Uint64(data[pos:])), 0)
 
 	return rec
-}
-
-// encodeInodeJSON serialises as JSON (used in membership keys).
-func encodeInodeJSON(rec *InodeRecord) []byte {
-	return []byte(fmt.Sprintf(
-		`{"ino":%d,"size":%d,"mode":%d,"nlink":%d,"uid":%d,"gid":%d}`,
-		rec.Ino, rec.Size, rec.Mode, rec.Nlink, rec.UID, rec.GID))
 }
 
 // ---- extent helpers ----

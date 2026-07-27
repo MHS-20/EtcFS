@@ -22,12 +22,12 @@
 /* A single WAL entry: an extent that was written to disk. */
 struct wal_entry {
     uint64_t ino;          /* owning inode */
-    uint64_t logical_off;   /* file offset */
-    uint64_t disk_off;      /* block device offset */
-    uint64_t length;        /* extent length */
-    uint64_t generation;    /* fencing generation at write time */
-    uint64_t timestamp_ns;  /* wall-clock time of write */
-    uint64_t committed;     /* 0 = uncommitted, 1 = etcd confirmed */
+    uint64_t logical_off;  /* file offset */
+    uint64_t disk_off;     /* block device offset */
+    uint64_t length;       /* extent length */
+    uint64_t generation;   /* fencing generation at write time */
+    uint64_t timestamp_ns; /* wall-clock time of write */
+    uint64_t committed;    /* 0 = uncommitted, 1 = etcd confirmed */
 };
 
 /* WAL handle (opaque). */
@@ -43,8 +43,7 @@ void etcfs_wal_close(struct etcfs_wal *wal);
 int etcfs_wal_append(struct etcfs_wal *wal, const struct wal_entry *entry);
 
 /* Mark an entry as committed (etcd confirmed the extent list update). */
-int etcfs_wal_mark_committed(struct etcfs_wal *wal, uint64_t ino,
-                             uint64_t logical_off);
+int etcfs_wal_mark_committed(struct etcfs_wal *wal, uint64_t ino, uint64_t logical_off);
 
 /*
  * Replay the WAL on restart.

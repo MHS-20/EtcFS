@@ -32,19 +32,28 @@ void etcfs_set_log_level(int level)
     etcfs_log_level = level;
 }
 
-void
-etcfs_log(int level, const char *fmt, ...)
+void etcfs_log(int level, const char *fmt, ...)
 {
     if (level > etcfs_log_level)
         return;
 
     const char *prefix;
     switch (level) {
-    case ETCFS_LOG_ERROR: prefix = "ERROR"; break;
-    case ETCFS_LOG_WARN:  prefix = "WARN";  break;
-    case ETCFS_LOG_INFO:  prefix = "INFO";  break;
-    case ETCFS_LOG_DEBUG: prefix = "DEBUG"; break;
-    default:              prefix = "???";   break;
+    case ETCFS_LOG_ERROR:
+        prefix = "ERROR";
+        break;
+    case ETCFS_LOG_WARN:
+        prefix = "WARN";
+        break;
+    case ETCFS_LOG_INFO:
+        prefix = "INFO";
+        break;
+    case ETCFS_LOG_DEBUG:
+        prefix = "DEBUG";
+        break;
+    default:
+        prefix = "???";
+        break;
     }
 
     fprintf(stderr, "[etcfuse] %s: ", prefix);
@@ -57,8 +66,7 @@ etcfs_log(int level, const char *fmt, ...)
 
 /* ---- IPC connection to Go backend ---- */
 
-static int
-connect_to_meta(const char *socket_path)
+static int connect_to_meta(const char *socket_path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -71,7 +79,7 @@ connect_to_meta(const char *socket_path)
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         etcfs_log(ETCFS_LOG_ERROR, "connect to %s: %s", socket_path, strerror(errno));
         close(fd);
         return -1;
@@ -85,16 +93,14 @@ connect_to_meta(const char *socket_path)
 
 static struct fuse_session *g_session;
 
-static void
-handle_signal(int sig)
+static void handle_signal(int sig)
 {
-    (void)sig;
+    (void) sig;
     if (g_session)
         fuse_session_exit(g_session);
 }
 
-static void
-setup_signals(void)
+static void setup_signals(void)
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -106,8 +112,7 @@ setup_signals(void)
 
 /* ---- main entry ---- */
 
-int
-etcfs_run(struct etcfs_context *ctx)
+int etcfs_run(struct etcfs_context *ctx)
 {
     struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
     struct fuse_session *se;
@@ -144,13 +149,12 @@ etcfs_run(struct etcfs_context *ctx)
     if (ctx->volume_id) {
         ctx->block_fd = -1;
         struct etcfs_block_dev *block_dev = etcfs_block_open(ctx->volume_id);
-        (void)block_dev; /* Phase 0: access through ctx->block_fd when I/O is implemented */
+        (void) block_dev; /* Phase 0: access through ctx->block_fd when I/O is implemented */
         etcfs_log(ETCFS_LOG_WARN, "block device not available (read-only mode)");
     }
 
     /* build FUSE args */
-    if (fuse_opt_add_arg(&args, "etcfuse") < 0 ||
-        fuse_opt_add_arg(&args, "-o") < 0 ||
+    if (fuse_opt_add_arg(&args, "etcfuse") < 0 || fuse_opt_add_arg(&args, "-o") < 0 ||
         fuse_opt_add_arg(&args, "default_permissions,allow_other,auto_unmount") < 0 ||
         fuse_opt_add_arg(&args, mountpoint) < 0)
         return -1;

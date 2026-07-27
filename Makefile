@@ -108,6 +108,12 @@ clean:
 
 check: lint test
 
+# ---- Git hooks ----
+
+hooks:
+	ln -sf ../../scripts/dev/pre-push.sh .git/hooks/pre-push
+	@echo "Git hooks installed"
+
 # ---- Help ----
 
 help:
@@ -117,6 +123,7 @@ help:
 	@echo "  make test             run unit tests"
 	@echo "  make lint             run all linters"
 	@echo "  make fmt              auto-format code"
+	@echo "  make hooks            install git pre-push hook"
 	@echo "  make dev              start dev environment"
 	@echo "  make clean            remove artifacts"
 	@echo "  make check            CI pipeline (lint + test)"

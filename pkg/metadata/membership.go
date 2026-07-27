@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Membership manages this node's presence in the EtcFS cluster.
@@ -96,7 +96,7 @@ func (m *Membership) grantAndRegister(ctx context.Context) (clientv3.LeaseID, er
 
 	_, err = m.client.Put(ctx, MembershipKey(m.nodeID), value, clientv3.WithLease(resp.ID))
 	if err != nil {
-		m.client.Revoke(ctx, resp.ID)
+		_, _ = m.client.Revoke(ctx, resp.ID)
 		return 0, fmt.Errorf("membership: put key: %w", err)
 	}
 
@@ -113,7 +113,7 @@ func (m *Membership) revokeLease(ctx context.Context) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.leaseID != 0 {
-		m.client.Revoke(ctx, m.leaseID)
+		_, _ = m.client.Revoke(ctx, m.leaseID)
 		m.leaseID = 0
 	}
 	m.alive = false

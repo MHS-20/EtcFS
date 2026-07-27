@@ -11,6 +11,7 @@ The binary also runs:
   - The etcd watch multiplexer (fan-out directory watches to the C side)
 
 Usage:
+
 	etcfuse-meta \
 	  --listen=unix:///tmp/etcfuse.sock \
 	  --etcd-endpoints=https://10.0.0.1:2379,https://10.0.0.2:2379,https://10.0.0.3:2379 \
@@ -31,12 +32,13 @@ import (
 	"syscall"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
+
 	"github.com/anomalyco/etcfuse/internal/config"
 	"github.com/anomalyco/etcfuse/internal/ipc"
 	"github.com/anomalyco/etcfuse/pkg/fencing"
 	"github.com/anomalyco/etcfuse/pkg/metadata"
-	"go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc"
 )
 
 func main() {
@@ -64,7 +66,7 @@ func main() {
 	if err != nil {
 		log.Fatal("cannot connect to etcd", "error", err)
 	}
-	defer etcdCli.Close()
+	defer func() { _ = etcdCli.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -98,7 +100,7 @@ func main() {
 	if err != nil {
 		log.Fatal("cannot listen", "addr", cfg.ListenAddr, "error", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	// Restrict socket permissions
 	if err := os.Chmod(cfg.ListenAddr, 0600); err != nil {

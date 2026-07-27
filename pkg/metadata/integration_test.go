@@ -25,7 +25,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // testStore connects to etcd and returns a Store for testing.
@@ -466,10 +466,10 @@ func TestIntegration_LargeExtentMap(t *testing.T) {
 	const totalExtents = 200
 	for i := 0; i < totalExtents; i++ {
 		err := store.AppendExtent(ctx, ino,
-			uint64(i)*4096,          // logical offset
-			uint64(i)*4096+1000000,  // disk offset
-			4096,                    // length
-			1)                       // generation
+			uint64(i)*4096,         // logical offset
+			uint64(i)*4096+1000000, // disk offset
+			4096,                   // length
+			1)                      // generation
 		require.NoError(t, err, "append extent %d", i)
 	}
 
@@ -479,8 +479,8 @@ func TestIntegration_LargeExtentMap(t *testing.T) {
 	assert.GreaterOrEqual(t, len(extents), totalExtents, "should have at least %d extents", totalExtents)
 
 	// Verify first and last
-	assert.Equal(t, uint64(0), extents[0][0])                       // logical_off
-	assert.Equal(t, uint64(1000000), extents[0][1])                 // disk_off
+	assert.Equal(t, uint64(0), extents[0][0])       // logical_off
+	assert.Equal(t, uint64(1000000), extents[0][1]) // disk_off
 	assert.Equal(t, uint64((totalExtents-1)*4096), extents[totalExtents-1][0])
 }
 

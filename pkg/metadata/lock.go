@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Lock operations: acquire shared/exclusive file locks backed by etcd leases.
@@ -64,17 +64,17 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 
 	ok, err := s.Txn(ctx, cmps, []clientv3.Op{op}, nil)
 	if err != nil {
-		s.RevokeLease(ctx, leaseID)
+		_ = s.RevokeLease(ctx, leaseID)
 		return 0, nil, fmt.Errorf("acquire lock ino %d: %w", ino, err)
 	}
 	if !ok {
-		s.RevokeLease(ctx, leaseID)
+		_ = s.RevokeLease(ctx, leaseID)
 		return 0, nil, fmt.Errorf("acquire lock ino %d: %w", ino, ErrConflict)
 	}
 
 	keepCh, err := s.KeepAlive(ctx, leaseID)
 	if err != nil {
-		s.ReleaseLock(ctx, ino, leaseID)
+		_ = s.ReleaseLock(ctx, ino, leaseID)
 		return 0, nil, fmt.Errorf("acquire lock ino %d: keepalive: %w", ino, err)
 	}
 
@@ -102,7 +102,7 @@ func (s *Store) GetLockInfo(ctx context.Context, ino uint64) (*LockRecord, error
 
 	// Simple JSON parsing — full struct in Phase 3.
 	var rec LockRecord
-	fmt.Sscanf(string(value), `{"mode":"%s","holders":["%s"]}`, &rec.Mode, nil)
+	_, _ = fmt.Sscanf(string(value), `{"mode":"%s"}`, &rec.Mode)
 	if rec.Mode == "" {
 		rec.Mode = "unknown"
 	}

@@ -5,17 +5,19 @@
 // those requests into etcd operations and returns protobuf responses.
 //
 // Phase 0: stub implementation — returns minimal responses so the C daemon
-//          can mount and serve a filesystem.  Full implementation follows
-//          in Phase 1 (etcd schema) and Phase 2 (FUSE read ops).
+//
+//	can mount and serve a filesystem.  Full implementation follows
+//	in Phase 1 (etcd schema) and Phase 2 (FUSE read ops).
 package ipc
 
 import (
 	"context"
 
+	"google.golang.org/grpc"
+
 	"github.com/anomalyco/etcfuse/internal/config"
 	"github.com/anomalyco/etcfuse/pkg/fencing"
 	"github.com/anomalyco/etcfuse/pkg/metadata"
-	"google.golang.org/grpc"
 )
 
 // Service handles FUSE operation requests from the C daemon.

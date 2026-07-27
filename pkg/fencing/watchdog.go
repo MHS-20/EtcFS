@@ -5,10 +5,10 @@
 // each EtcFS daemon monitors its own etcd lease health.  If the lease
 // keepalive stream is disconnected and reconnection fails within
 // 2× the TTL margin, the watchdog declares the node fenced and:
-//   1. Stops accepting new FUSE write requests
-//   2. Closes the block device file descriptor
-//   3. Optionally remounts the FUSE filesystem read-only
-//   4. Exits the process
+//  1. Stops accepting new FUSE write requests
+//  2. Closes the block device file descriptor
+//  3. Optionally remounts the FUSE filesystem read-only
+//  4. Exits the process
 //
 // This closes the most dangerous window — a node partitioned from etcd
 // but still connected to the shared block device.

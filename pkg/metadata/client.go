@@ -3,11 +3,10 @@ package metadata
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Store is the primary metadata facade.  It wraps the etcd client and
@@ -16,8 +15,6 @@ import (
 type Store struct {
 	client *clientv3.Client
 	nodeID string
-
-	mu sync.RWMutex
 }
 
 // NewStore creates a Store backed by the given etcd client.

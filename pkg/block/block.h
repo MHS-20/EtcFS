@@ -30,7 +30,7 @@ struct etcfs_block_dev *etcfs_block_open(const char *volume_id);
 void etcfs_block_close(struct etcfs_block_dev *dev);
 
 /* Get device geometry. */
-int    etcfs_block_get_sector_size(const struct etcfs_block_dev *dev);
+int etcfs_block_get_sector_size(const struct etcfs_block_dev *dev);
 size_t etcfs_block_get_total_sectors(const struct etcfs_block_dev *dev);
 
 /*
@@ -47,15 +47,14 @@ void *etcfs_block_alloc_buffer(const struct etcfs_block_dev *dev, size_t size);
  */
 
 /* Read from a raw byte offset on the block device. */
-ssize_t etcfs_block_read(struct etcfs_block_dev *dev, void *buf,
-                         size_t count, uint64_t byte_offset);
+ssize_t etcfs_block_read(struct etcfs_block_dev *dev, void *buf, size_t count,
+                         uint64_t byte_offset);
 
 /* Write to a raw byte offset on the block device. */
-ssize_t etcfs_block_write(struct etcfs_block_dev *dev, const void *buf,
-                          size_t count, uint64_t byte_offset);
+ssize_t etcfs_block_write(struct etcfs_block_dev *dev, const void *buf, size_t count,
+                          uint64_t byte_offset);
 
 /* Flush any in-flight I/O to stable storage. */
-int etcfs_block_sync(struct etcfs_block_dev *dev, uint64_t byte_offset,
-                     size_t count);
+int etcfs_block_sync(struct etcfs_block_dev *dev, uint64_t byte_offset, size_t count);
 
 #endif /* ETCFS_BLOCK_H */

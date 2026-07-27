@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Inode number allocation via per-node range reservation.

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Dirent operations: lookup, create, unlink, rename.
@@ -66,7 +66,7 @@ func (s *Store) ListDirents(ctx context.Context, parent uint64) ([]DirentEntry, 
 		return nil, fmt.Errorf("list dirents %d: %w", parent, err)
 	}
 
-	var entries []DirentEntry
+	entries := make([]DirentEntry, 0, len(kvs))
 	for _, kv := range kvs {
 		entries = append(entries, DirentEntry{
 			Name: extractNameFromKey(string(kv.Key), parent),
@@ -98,7 +98,7 @@ func (s *Store) ListDirentsPaginated(ctx context.Context, parent uint64, cursor 
 		return nil, "", 0, fmt.Errorf("list dirents %d paginated: %w", parent, err)
 	}
 
-	var entries []DirentEntry
+	entries := make([]DirentEntry, 0, len(kvs))
 	var lastKey string
 	for _, kv := range kvs {
 		name := extractNameFromKey(string(kv.Key), parent)
@@ -154,7 +154,7 @@ func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string
 
 	cmps := []clientv3.Cmp{
 		clientv3.Compare(clientv3.CreateRevision(DirentKey(parent, name)), "=", 0), // entry doesn't exist
-		clientv3.Compare(clientv3.CreateRevision(InodeKey(ino)), "=", 0),             // inode doesn't exist
+		clientv3.Compare(clientv3.CreateRevision(InodeKey(ino)), "=", 0),           // inode doesn't exist
 	}
 
 	ops := []clientv3.Op{

@@ -101,10 +101,10 @@ log "=== Results ==="
 for i in "${!PUB_IPS[@]}"; do
     RESULT_FILE="$RESULTS_DIR/node${i}.txt"
     if [[ -f "$RESULT_FILE" ]]; then
-        echo -n "  node${i} ($PUB_IPS[$i]): "
+        echo -n "  node${i} (${PUB_IPS[$i]}): "
         cat "$RESULT_FILE"
     else
-        echo "  node${i} ($PUB_IPS[$i]): no results (FUSE mount may not be available — expected in design phase)"
+        echo "  node${i} (${PUB_IPS[$i]}): no results (FUSE mount may not be available — expected in design phase)"
     fi
 done
 
