@@ -216,6 +216,7 @@ static uint32_t wb_u32(uint8_t *buf, uint32_t v)
 static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
     struct etcfs_context *ctx = GET_CTX(req);
+    size_t nlen = strlen(name);
 
     /* Root directory or self-references: handle locally */
     if (parent == FUSE_ROOT_ID && (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || strcmp(name, "/") == 0)) {

@@ -179,8 +179,11 @@ int etcfs_run(struct etcfs_context *ctx)
 
     etcfs_log(ETCFS_LOG_INFO, "EtcFS mounted at %s", mountpoint);
 
-    /* enter event loop (single-threaded for Phase 2 debugging) */
-    ret = fuse_session_loop(se);
+    /* enter event loop (multi-threaded) */
+    struct fuse_loop_config loop_cfg;
+    memset(&loop_cfg, 0, sizeof(loop_cfg));
+    loop_cfg.max_idle_threads = ETCFS_MAX_THREADS;
+    ret = fuse_session_loop_mt(se, &loop_cfg);
 
     /* cleanup */
     fuse_session_unmount(se);

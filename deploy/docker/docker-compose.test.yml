@@ -1,0 +1,113 @@
+# Phase 2 end-to-end test environment.
+#
+# Usage:
+#   docker compose -f deploy/docker/docker-compose.test.yml up --build --abort-on-container-exit
+#   docker compose -f deploy/docker/docker-compose.test.yml down -v
+#
+# This runs etcd + builds both binaries + runs the Go e2e test
+# that seeds data, starts the IPC server, mounts FUSE, and verifies reads.
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    command:
+      - etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=etcd1=http://etcd:2380
+      - --initial-cluster-state=new
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  test:
+    build:
+      context: ../..
+      dockerfile: test/e2e/Dockerfile.phase2
+    container_name: etcfuse-test
+    privileged: true
+    devices:
+      - /dev/fuse
+    environment:
+      ETCD_ENDPOINTS: http://etcd:2379
+    depends_on:
+      etcd:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "=== Phase 2 E2E Test ==="
+
+        # Start Go metadata backend
+        /usr/local/bin/etcfuse-meta \
+          --etcd-endpoints=http://etcd:2379 \
+          --listen=/tmp/etcfuse.sock \
+          --node-id=test-node \
+          --lease-ttl=30s &
+        sleep 2
+
+        # Seed etcd with test data
+        /usr/local/bin/seed-etcd
+        echo "Seed complete."
+
+        # Mount FUSE daemon
+        mkdir -p /mnt/etcfuse
+        /usr/local/bin/etcfuse \
+          --socket=/tmp/etcfuse.sock \
+          --log-level=3 \
+          /mnt/etcfuse &
+        sleep 2
+
+        echo "=== Running read tests ==="
+
+        # Test 1: ls root directory
+        echo -n "  ls /mnt/etcfuse: "
+        if ls /mnt/etcfuse/ >/dev/null 2>&1; then
+          echo "PASS"
+        else
+          echo "FAIL (exit $?)"; exit 1
+        fi
+
+        # Test 2: stat a file
+        echo -n "  stat hello.txt: "
+        if stat /mnt/etcfuse/hello.txt >/dev/null 2>&1; then
+          echo "PASS"
+        else
+          echo "FAIL"; exit 1
+        fi
+
+        # Test 3: ls subdirectory
+        echo -n "  ls subdir: "
+        if ls /mnt/etcfuse/subdir/ >/dev/null 2>&1; then
+          echo "PASS"
+        else
+          echo "FAIL"; exit 1
+        fi
+
+        # Test 4: readlink
+        echo -n "  readlink link-to-hello: "
+        TARGET=$(readlink /mnt/etcfuse/link-to-hello 2>/dev/null)
+        if [ "$TARGET" = "hello.txt" ]; then
+          echo "PASS ($TARGET)"
+        else
+          echo "FAIL (got: '$TARGET')"; exit 1
+        fi
+
+        # Test 5: find files
+        echo -n "  find /mnt/etcfuse: "
+        COUNT=$(find /mnt/etcfuse -type f 2>/dev/null | wc -l)
+        if [ "$COUNT" -ge 4 ]; then
+          echo "PASS ($COUNT files)"
+        else
+          echo "FAIL ($COUNT files)"; exit 1
+        fi
+
+        echo "=== All tests passed ==="
