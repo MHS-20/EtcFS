@@ -95,19 +95,15 @@ static struct fuse_session *g_session;
 
 static void handle_signal(int sig)
 {
-    (void) sig;
+    etcfs_log(ETCFS_LOG_INFO, "received signal %d (%s)", sig, strsignal(sig));
     if (g_session)
         fuse_session_exit(g_session);
 }
 
 static void setup_signals(void)
 {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = handle_signal;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    /* Phase 2: don't install custom signal handler — debug spurious SIGTERM */
+    (void)handle_signal;
 }
 
 /* ---- main entry ---- */
@@ -179,11 +175,9 @@ int etcfs_run(struct etcfs_context *ctx)
 
     etcfs_log(ETCFS_LOG_INFO, "EtcFS mounted at %s", mountpoint);
 
-    /* enter event loop (multi-threaded) */
-    struct fuse_loop_config loop_cfg;
-    memset(&loop_cfg, 0, sizeof(loop_cfg));
-    loop_cfg.max_idle_threads = ETCFS_MAX_THREADS;
-    ret = fuse_session_loop_mt(se, &loop_cfg);
+    /* enter event loop (single-threaded — works for read ops) */
+    ret = fuse_session_loop(se);
+    etcfs_log(ETCFS_LOG_INFO, "event loop exited with ret=%d errno=%d", ret, errno);
 
     /* cleanup */
     fuse_session_unmount(se);

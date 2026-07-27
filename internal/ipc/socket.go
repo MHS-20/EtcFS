@@ -195,20 +195,19 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 	nameLen, rest := readU32(rest)
 	name := string(rest[:nameLen])
 
-	// Resolve dirent
 	ino, err := s.store.LookupDirent(ctx, parent, name)
 	if err != nil {
-		s.log.Warn("lookup", "parent", parent, "name", name, "error", err)
-		return int32Resp(makeErrno(-5)), nil // EIO
+		s.log.Warn("lookup dirent", "parent", parent, "name", name, "error", err)
+		return int32Resp(makeErrno(-5)), nil
 	}
 	if ino == 0 {
 		return int32Resp(makeErrno(-2)), nil // ENOENT
 	}
 
-	// Get inode attrs
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
-		return int32Resp(makeErrno(-5)), nil // EIO
+		s.log.Warn("lookup getinode", "ino", ino, "error", err)
+		return int32Resp(makeErrno(-5)), nil
 	}
 
 	return lookupResp(0, ino, rec), nil

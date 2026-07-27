@@ -82,8 +82,8 @@ type MembershipRecord struct {
 
 // Inode mode constants matching Linux stat.h
 const (
-	ModeDir     = uint32(1 << 31) // S_IFDIR = 0040000
-	ModeSymlink = uint32(1 << 27) // S_IFLNK = 0120000
+	ModeDir     = uint32(0040000) // S_IFDIR
+	ModeSymlink = uint32(0120000) // S_IFLNK
 
 	DirentTypeDir     = 4  // DT_DIR
 	DirentTypeFile    = 8  // DT_REG

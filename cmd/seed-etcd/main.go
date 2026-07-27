@@ -74,17 +74,17 @@ func main() {
 		{parent: 1, name: ".", ino: 1, mode: metadata.ModeDir | 0755, uid: 0, gid: 0},
 
 		// Top-level files
-		{parent: 1, name: "hello.txt", ino: 10, mode: 0644, uid: 1000, gid: 1000},
-		{parent: 1, name: "notes.md", ino: 11, mode: 0644, uid: 1000, gid: 1000},
-		{parent: 1, name: "empty", ino: 12, mode: 0644, uid: 1000, gid: 1000},
+		{parent: 1, name: "hello.txt", ino: 10, mode: 0100644, uid: 1000, gid: 1000},
+		{parent: 1, name: "notes.md",  ino: 11, mode: 0100644, uid: 1000, gid: 1000},
+		{parent: 1, name: "empty",     ino: 12, mode: 0100644, uid: 1000, gid: 1000},
 
 		// Sub-directory
 		{parent: 1, name: "subdir", ino: 20, mode: metadata.ModeDir | 0755, uid: 1000, gid: 1000},
 		{parent: 20, name: ".", ino: 20, mode: metadata.ModeDir | 0755, uid: 1000, gid: 1000},
-		{parent: 20, name: "nested.txt", ino: 21, mode: 0644, uid: 1000, gid: 1000},
+		{parent: 20, name: "nested.txt", ino: 21, mode: 0100644, uid: 1000, gid: 1000},
 		{parent: 20, name: "deep", ino: 22, mode: metadata.ModeDir | 0755, uid: 1000, gid: 1000},
 		{parent: 22, name: ".", ino: 22, mode: metadata.ModeDir | 0755, uid: 1000, gid: 1000},
-		{parent: 22, name: "bottom.txt", ino: 23, mode: 0644, uid: 1000, gid: 1000},
+		{parent: 22, name: "bottom.txt", ino: 23, mode: 0100644, uid: 1000, gid: 1000},
 
 		// Symlink
 		{parent: 1, name: "link-to-hello", ino: 30, mode: metadata.ModeSymlink | 0777, uid: 1000, gid: 1000, target: "hello.txt"},

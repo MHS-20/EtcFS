@@ -215,9 +215,6 @@ static uint32_t wb_u32(uint8_t *buf, uint32_t v)
 
 static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
-    struct etcfs_context *ctx = GET_CTX(req);
-    size_t nlen = strlen(name);
-
     /* Root directory or self-references: handle locally */
     if (parent == FUSE_ROOT_ID && (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || strcmp(name, "/") == 0)) {
         struct fuse_entry_param e;
@@ -234,7 +231,10 @@ static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
         return;
     }
 
-    /* build request: u64 parent, u32 name_len, name bytes */
+    /* Use IPC for all other lookups */
+    struct etcfs_context *ctx = GET_CTX(req);
+    size_t nlen = strlen(name);
+
     uint8_t req_payload[12 + 256];
     uint32_t off = 0;
     off += wb_u64(req_payload + off, parent);
@@ -242,7 +242,9 @@ static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
     memcpy(req_payload + off, name, nlen); off += (uint32_t)nlen;
 
     uint8_t *resp; uint32_t rlen;
-    if (ipc_call(ctx->ipc, IPC_OP_LOOKUP, req_payload, off, &resp, &rlen) < 0) {
+    int ipc_ret = ipc_call(ctx->ipc, IPC_OP_LOOKUP, req_payload, off, &resp, &rlen);
+    if (ipc_ret < 0) {
+        etcfs_log(ETCFS_LOG_DEBUG, "lookup ipc fail");
         fuse_reply_err(req, EIO); return;
     }
     if (rlen < 4) { free(resp); fuse_reply_err(req, EIO); return; }
@@ -256,8 +258,8 @@ static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
     e.ino = rb_u64(resp, &pos);
     struct etcfs_attr a;
     rb_attr(resp, &pos, &a);
-    e.attr_timeout  = (double)rb_u32(resp, &pos);
     e.entry_timeout = (double)rb_u32(resp, &pos);
+    e.attr_timeout  = (double)rb_u32(resp, &pos);
     fill_stat(&e.attr, &a);
     free(resp);
 
@@ -268,7 +270,7 @@ static void ec_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 {
     (void)fi;
 
-    /* Root inode: return locally */
+    /* Root: return locally */
     if (ino == FUSE_ROOT_ID || ino == 0) {
         struct stat st;
         memset(&st, 0, sizeof(st));
@@ -306,6 +308,14 @@ static void ec_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
     struct stat st;
     fill_stat(&st, &a);
     fuse_reply_attr(req, &st, (double)to);
+}
+
+/* statx: modern stat syscall — delegates to getattr */
+static void ec_statx(fuse_req_t req, fuse_ino_t ino, int flags,
+                     int mask, struct fuse_file_info *fi)
+{
+    (void)flags; (void)mask;
+    ec_getattr(req, ino, fi);
 }
 
 static void ec_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
@@ -521,6 +531,7 @@ struct fuse_lowlevel_ops *etcfs_fuse_ops(void)
 
     ops.lookup     = ec_lookup;
     ops.getattr    = ec_getattr;
+    ops.statx      = ec_statx;
     ops.readdir    = ec_readdir;
     ops.readlink   = ec_readlink;
     ops.statfs     = ec_statfs;
