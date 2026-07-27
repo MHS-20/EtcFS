@@ -9,3 +9,8 @@ build.log
 infra-state.json
 __pycache__/
 test-results/
+chaos-report-*/
+light-test-results/
+vendor/
+*.exe
+.DS_Store
