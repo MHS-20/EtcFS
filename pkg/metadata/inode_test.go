@@ -25,7 +25,7 @@ func TestEncodeDecodeInode(t *testing.T) {
 		Ctime:   now,
 	}
 
-	encoded := encodeInode(rec)
+	encoded := EncodeInode(rec)
 	assert.Len(t, encoded, 72, "encoded inode should be 72 bytes")
 
 	decoded := decodeInode(encoded)
@@ -59,7 +59,7 @@ func TestEncodeInodeRoundTrip(t *testing.T) {
 		GID:     65534,
 		Blksize: 4096,
 	}
-	encoded := encodeInode(original)
+	encoded := EncodeInode(original)
 	decoded := decodeInode(encoded)
 	assert.NotNil(t, decoded)
 	assert.Equal(t, original.Ino, decoded.Ino)

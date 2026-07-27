@@ -80,10 +80,24 @@ type MembershipRecord struct {
 	Address     string
 }
 
+// Inode mode constants matching Linux stat.h
+const (
+	ModeDir     = uint32(1 << 31) // S_IFDIR = 0040000
+	ModeSymlink = uint32(1 << 27) // S_IFLNK = 0120000
+
+	DirentTypeDir     = 4  // DT_DIR
+	DirentTypeFile    = 8  // DT_REG
+	DirentTypeSymlink = 10 // DT_LNK
+)
+
 // Key helpers — build etcd keys from components.
 
 func InodeKey(ino uint64) string {
 	return fmt.Sprintf("%s%d", PrefixInode, ino)
+}
+
+func InodeSymlinkKey(ino uint64) string {
+	return fmt.Sprintf("symlink:%d", ino)
 }
 
 func DirentKey(parent uint64, name string) string {

@@ -37,7 +37,7 @@ func (s *Store) CreateInode(ctx context.Context, ino uint64, mode uint32, uid, g
 		Ctime:   now,
 	}
 
-	value := encodeInode(rec)
+	value := EncodeInode(rec)
 	op := clientv3.OpPut(InodeKey(ino), string(value))
 
 	// Condition: inode key must not exist (CreateRevision == 0)
@@ -71,7 +71,7 @@ func (s *Store) GetInode(ctx context.Context, ino uint64) (*InodeRecord, error) 
 // The update is conditioned on the inode's current ModRevision to avoid
 // lost updates.  Returns the new revision and updated record.
 func (s *Store) UpdateInode(ctx context.Context, rec *InodeRecord) (*InodeRecord, error) {
-	value := encodeInode(rec)
+	value := EncodeInode(rec)
 	key := InodeKey(rec.Ino)
 
 	// CAS: update only if the inode hasn't been modified since we read it
@@ -150,7 +150,7 @@ func (s *Store) DecrementNlink(ctx context.Context, ino uint64) (bool, error) {
 
 func (s *Store) putInodeWithCAS(ctx context.Context, rec *InodeRecord) error {
 	key := InodeKey(rec.Ino)
-	value := encodeInode(rec)
+	value := EncodeInode(rec)
 	cmp := clientv3.Compare(clientv3.CreateRevision(key), ">", 0) // must exist
 	ok, err := s.Txn(ctx, []clientv3.Cmp{cmp}, []clientv3.Op{clientv3.OpPut(key, string(value))}, nil)
 	if err != nil {
@@ -164,9 +164,9 @@ func (s *Store) putInodeWithCAS(ctx context.Context, rec *InodeRecord) error {
 
 // ---- serialisation ----
 
-// encodeInode serialises an InodeRecord to a binary format.
+// EncodeInode serialises an InodeRecord to a binary format.
 // Format: fixed-length fields in big-endian byte order, 72 bytes total.
-func encodeInode(rec *InodeRecord) []byte {
+func EncodeInode(rec *InodeRecord) []byte {
 	buf := make([]byte, 72)
 	pos := 0
 

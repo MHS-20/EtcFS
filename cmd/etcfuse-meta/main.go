@@ -26,19 +26,16 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc"
-
 	"github.com/anomalyco/etcfuse/internal/config"
 	"github.com/anomalyco/etcfuse/internal/ipc"
 	"github.com/anomalyco/etcfuse/pkg/fencing"
 	"github.com/anomalyco/etcfuse/pkg/metadata"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 func main() {
@@ -80,32 +77,14 @@ func main() {
 	// Self-fencing watchdog
 	watchdog := fencing.NewWatchdog(membership, cfg.LeaseTTL)
 
-	// gRPC server
-	grpcServer := grpc.NewServer()
-
 	// IPC service: handles FUSE op requests from the C daemon
 	svc := ipc.NewService(store, membership, watchdog, log)
-	svc.Register(grpcServer)
 
 	// Start membership heartbeat
 	go membership.Run(ctx)
 
 	// Start self-fencing watchdog
 	go watchdog.Run(ctx)
-
-	// Remove stale socket file if present
-	_ = os.Remove(cfg.ListenAddr)
-
-	listener, err := net.Listen("unix", cfg.ListenAddr)
-	if err != nil {
-		log.Fatal("cannot listen", "addr", cfg.ListenAddr, "error", err)
-	}
-	defer func() { _ = listener.Close() }()
-
-	// Restrict socket permissions
-	if err := os.Chmod(cfg.ListenAddr, 0600); err != nil {
-		log.Warn("cannot chmod socket", "error", err)
-	}
 
 	// Signal handling: graceful shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -115,12 +94,11 @@ func main() {
 		sig := <-sigCh
 		log.Info("received signal, shutting down", "signal", sig)
 		cancel()
-		grpcServer.GracefulStop()
 	}()
 
-	log.Info("gRPC server starting")
-	if err := grpcServer.Serve(listener); err != nil {
-		log.Fatal("gRPC server failed", "error", err)
+	log.Info("binary IPC server starting")
+	if err := ipc.StartSocketServer(svc, cfg.ListenAddr, log); err != nil {
+		log.Fatal("IPC server failed", "error", err)
 	}
 
 	log.Info("etcfuse-meta stopped")

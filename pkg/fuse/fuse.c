@@ -153,10 +153,8 @@ int etcfs_run(struct etcfs_context *ctx)
         etcfs_log(ETCFS_LOG_WARN, "block device not available (read-only mode)");
     }
 
-    /* build FUSE args */
-    if (fuse_opt_add_arg(&args, "etcfuse") < 0 || fuse_opt_add_arg(&args, "-o") < 0 ||
-        fuse_opt_add_arg(&args, "default_permissions,allow_other,auto_unmount") < 0 ||
-        fuse_opt_add_arg(&args, mountpoint) < 0)
+    /* build FUSE args — mountpoint passed to fuse_session_mount, not in args */
+    if (fuse_opt_add_arg(&args, "etcfuse") < 0)
         return -1;
 
     /* create session */
@@ -181,11 +179,8 @@ int etcfs_run(struct etcfs_context *ctx)
 
     etcfs_log(ETCFS_LOG_INFO, "EtcFS mounted at %s", mountpoint);
 
-    /* enter event loop (multi-threaded) */
-    struct fuse_loop_config loop_cfg;
-    memset(&loop_cfg, 0, sizeof(loop_cfg));
-    loop_cfg.max_idle_threads = ETCFS_MAX_THREADS;
-    ret = fuse_session_loop_mt(se, &loop_cfg);
+    /* enter event loop (single-threaded for Phase 2 debugging) */
+    ret = fuse_session_loop(se);
 
     /* cleanup */
     fuse_session_unmount(se);

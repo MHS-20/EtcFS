@@ -159,7 +159,7 @@ func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string
 
 	ops := []clientv3.Op{
 		PutDirent(parent, name, ino),
-		clientv3.OpPut(InodeKey(ino), string(encodeInode(rec))),
+		clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec))),
 	}
 
 	ok, err := s.Txn(ctx, cmps, ops, nil)
@@ -208,7 +208,7 @@ func (s *Store) AtomicCreateDir(ctx context.Context, parent uint64, name string,
 
 	ops := []clientv3.Op{
 		PutDirent(parent, name, ino),
-		clientv3.OpPut(InodeKey(ino), string(encodeInode(rec))),
+		clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec))),
 	}
 
 	ok, err := s.Txn(ctx, cmps, ops, nil)
@@ -249,7 +249,7 @@ func (s *Store) AtomicUnlink(ctx context.Context, parent uint64, name string) er
 
 	rec.Nlink--
 	if rec.Nlink > 0 {
-		thenOps = append(thenOps, clientv3.OpPut(InodeKey(ino), string(encodeInode(rec))))
+		thenOps = append(thenOps, clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec))))
 	} else {
 		thenOps = append(thenOps, clientv3.OpDelete(InodeKey(ino)))
 	}
