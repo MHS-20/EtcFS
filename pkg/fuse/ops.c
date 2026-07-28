@@ -523,7 +523,8 @@ static void ec_statfs(fuse_req_t req, fuse_ino_t ino)
     submit_req(req, IPC_OP_STATFS, NULL, 0, cb_statfs, NULL);
 }
 
-static void ec_statx(fuse_req_t req, fuse_ino_t ino, int flags, int mask, struct fuse_file_info *fi)
+static void __attribute__((unused)) ec_statx(fuse_req_t req, fuse_ino_t ino, int flags, int mask,
+                     struct fuse_file_info *fi)
 {
     (void) flags;
     (void) mask;
