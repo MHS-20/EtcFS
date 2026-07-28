@@ -150,10 +150,19 @@ func (s *MockStore) evalCmps(cmps []clientv3.Cmp) bool {
 }
 
 // cmpMatches checks if the given comparison holds for a key-value pair.
-// The mock store's comparison is simplified: it checks key existence for
-// CreateRevision comparisons, and always passes for Value comparisons.
-// Full value-accurate comparison is tested against real etcd in integration tests.
 func cmpMatches(cmp clientv3.Cmp, key string, val []byte) bool {
+	target := int32(cmp.Target)
+	// 1 = Compare_CREATE (CreateRevision).  "= 0" means key absent.
+	if target == 1 {
+		return val == nil
+	}
+	// 3 = Compare_VALUE.  Compare the serialised bytes.
+	if target == 3 {
+		if val == nil {
+			return false
+		}
+		return string(val) == string(cmp.ValueBytes())
+	}
 	return val != nil
 }
 

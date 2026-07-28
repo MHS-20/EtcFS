@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
@@ -74,4 +75,62 @@ func (c *Cluster) checkAllInvariants() int {
 		total += n.checkInvariants()
 	}
 	return total
+}
+
+const arenaBlockSize = 4096
+const arenaSizeBytes = 1 << 30
+
+func (c *Cluster) AddNode() {
+	seed := int64(9000 + len(c.Nodes))
+	sim := NewSimulatorWithStore(seed, c.Store)
+	c.Nodes = append(c.Nodes, sim)
+}
+
+func (c *Cluster) RemoveNode(idx int) {
+	if idx < 0 || idx >= len(c.Nodes) {
+		return
+	}
+	c.Nodes = append(c.Nodes[:idx], c.Nodes[idx+1:]...)
+}
+
+func (c *Cluster) PopulateExtents(ctx context.Context, inoStart, fileCount uint64, arenaID uint64) {
+	diskStart := arenaID * arenaSizeBytes
+	for i := uint64(0); i < fileCount; i++ {
+		ino := inoStart + i
+		diskOff := diskStart + i*arenaBlockSize
+		extKey := fmt.Sprintf("extent:%d/0", ino)
+		extVal := fmt.Sprintf("0,%d,%d,1", diskOff, arenaBlockSize)
+		_, _ = c.Store.Put(ctx, extKey, []byte(extVal))
+
+		rec := &metadata.InodeRecord{
+			Ino: ino, Mode: 0100644, Nlink: 1,
+			Size: arenaBlockSize, Blksize: arenaBlockSize,
+			Atime: time.Now(), Mtime: time.Now(), Ctime: time.Now(),
+		}
+		_, _ = c.Store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+	}
+}
+
+func (c *Cluster) ArenaDiskStart(arenaID uint64) uint64 {
+	return arenaID * arenaSizeBytes
+}
+
+func (c *Cluster) ArenaDiskEnd(arenaID uint64) uint64 {
+	return (arenaID + 1) * arenaSizeBytes
+}
+
+func (c *Cluster) CountExtentsInArena(ctx context.Context, arenaID uint64) int {
+	diskStart := c.ArenaDiskStart(arenaID)
+	diskEnd := c.ArenaDiskEnd(arenaID)
+	count := 0
+	kvs, _ := c.Store.GetPrefix(ctx, "extent:")
+	for _, kv := range kvs {
+		var logOff, diskOff, length, gen uint64
+		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
+		if diskOff >= diskStart && diskOff+length <= diskEnd {
+			count++
+		}
+	}
+	_ = diskEnd
+	return count
 }
