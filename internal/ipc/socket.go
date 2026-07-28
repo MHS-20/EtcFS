@@ -530,7 +530,6 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 
 // WRITE payload: [u64:ino][u64:offset][u32:data_len][data]
 // Response: [i32:error][u32:written]
-// Phase 3: data is cached in Go daemon memory (no block device yet)
 func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 20 {
 		return int32Resp(makeErrno(-22)), nil
@@ -538,14 +537,18 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 	ino, rest := readU64(payload)
 	offset, rest := readU64(rest)
 	dataLen, rest := readU32(rest)
-	_ = rest // data payload (cached in Go for now, no block device)
+	data := rest[:dataLen]
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
 		return int32Resp(makeErrno(-2)), nil
 	}
 
-	// Update size if write extends beyond current EOF
+	if s.dev != nil {
+		return s.handleWriteBlock(ctx, ino, offset, data, rec)
+	}
+
+	// No block device — update size only (metadata-only mode)
 	newEnd := offset + uint64(dataLen)
 	if newEnd > rec.Size {
 		rec.Size = newEnd
@@ -553,8 +556,59 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 	}
 
 	var b buf
-	b.w32(0)       // error = success
-	b.w32(dataLen) // written
+	b.w32(0)
+	b.w32(dataLen)
+	return b.b, nil
+}
+
+func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint64,
+	data []byte, rec *metadata.InodeRecord) ([]byte, error) {
+
+	dataLen := len(data)
+	if dataLen == 0 {
+		var b buf
+		b.w32(0)
+		b.w32(0)
+		return b.b, nil
+	}
+
+	if s.alloc.ArenaCount() == 0 {
+		if _, err := s.alloc.AcquireArena(ctx); err != nil {
+			s.log.Warn("write: cannot acquire arena", "error", err)
+			return int32Resp(makeErrno(-28)), nil
+		}
+	}
+
+	diskOff, err := s.alloc.Allocate(uint64(dataLen))
+	if err != nil {
+		s.log.Warn("write: cannot allocate blocks", "error", err)
+		return int32Resp(makeErrno(-28)), nil
+	}
+
+	n, werr := s.dev.WriteAt(data, int64(diskOff))
+	if werr != nil {
+		s.alloc.Free(diskOff, uint64(dataLen))
+		s.log.Warn("write: block device write failed", "error", werr)
+		return int32Resp(makeErrno(-5)), nil
+	}
+
+	if err := s.dev.SyncRange(int64(diskOff), int64(n)); err != nil {
+		s.log.Warn("write: sync failed", "error", err)
+	}
+
+	extKey := fmt.Sprintf("extent:%d/0", ino)
+	extVal := fmt.Sprintf("%d,%d,%d,1", offset, diskOff, uint64(dataLen))
+	_, _ = s.store.Put(ctx, extKey, []byte(extVal))
+
+	newEnd := offset + uint64(dataLen)
+	if newEnd > rec.Size {
+		rec.Size = newEnd
+		_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+	}
+
+	var b buf
+	b.w32(0)
+	b.w32(uint32(n))
 	return b.b, nil
 }
 

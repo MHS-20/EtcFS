@@ -22,7 +22,7 @@ type Device struct {
 }
 
 func Open(path string) (*Device, error) {
-	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_DIRECT, 0)
+	fd, err := syscall.Open(path, syscall.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
@@ -68,18 +68,10 @@ func (d *Device) TotalSize() int64 { return d.totalSize }
 func (d *Device) Path() string     { return d.path }
 
 func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
-	if offset%int64(d.sectorSize) != 0 || len(buf)%d.sectorSize != 0 {
-		return 0, fmt.Errorf("misaligned read: offset=%d len=%d sector=%d",
-			offset, len(buf), d.sectorSize)
-	}
 	return unix.Pread(d.fd, buf, offset)
 }
 
 func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
-	if offset%int64(d.sectorSize) != 0 || len(buf)%d.sectorSize != 0 {
-		return 0, fmt.Errorf("misaligned write: offset=%d len=%d sector=%d",
-			offset, len(buf), d.sectorSize)
-	}
 	return unix.Pwrite(d.fd, buf, offset)
 }
 
