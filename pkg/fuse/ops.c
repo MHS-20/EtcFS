@@ -437,50 +437,332 @@ static void ec_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
     fuse_reply_open(req, fi);
 }
 
-/* ---- stub handlers for write ops (return EROFS) ---- */
+/* ---- write op handlers (Phase 3 — IPC-based) ---- */
 
+// CREATE payload:  [u64:parent][u32:name_len][name][u32:mode][u32:flags][u32:umask]
+// Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
 static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name,
                       mode_t mode, struct fuse_file_info *fi)
-{ (void)parent; (void)name; (void)mode; (void)fi; fuse_reply_err(req, EROFS); }
+{
+    struct etcfs_context *ctx = GET_CTX(req);
+    size_t nlen = strlen(name);
+    uint32_t um = 022;
 
+    uint8_t req_payload[20 + 256];
+    uint32_t off = 0;
+    off += wb_u64(req_payload + off, parent);
+    off += wb_u32(req_payload + off, (uint32_t)nlen);
+    memcpy(req_payload + off, name, nlen); off += (uint32_t)nlen;
+    off += wb_u32(req_payload + off, (uint32_t)mode);
+    off += wb_u32(req_payload + off, (uint32_t)(fi ? fi->flags : 0));
+    off += wb_u32(req_payload + off, um);
+
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_CREATE, req_payload, off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
+
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    if (err != 0) { free(resp); fuse_reply_err(req, -err); return; }
+
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = rb_u64(resp, &pos);
+    struct etcfs_attr a;
+    rb_attr(resp, &pos, &a);
+    e.entry_timeout = (double)rb_u32(resp, &pos);
+    e.attr_timeout  = (double)rb_u32(resp, &pos);
+    fill_stat(&e.attr, &a);
+    free(resp);
+
+    fuse_reply_create(req, &e, fi);
+}
+
+// MKDIR payload:  [u64:parent][u32:name_len][name][u32:mode][u32:umask]
+// Response: same as CREATE
 static void ec_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
                      mode_t mode)
-{ (void)parent; (void)name; (void)mode; fuse_reply_err(req, EROFS); }
+{
+    struct etcfs_context *ctx = GET_CTX(req);
+    size_t nlen = strlen(name);
 
+    uint8_t req_payload[20 + 256];
+    uint32_t off = 0;
+    off += wb_u64(req_payload + off, parent);
+    off += wb_u32(req_payload + off, (uint32_t)nlen);
+    memcpy(req_payload + off, name, nlen); off += (uint32_t)nlen;
+    off += wb_u32(req_payload + off, (uint32_t)mode);
+    off += wb_u32(req_payload + off, 022);
+
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_MKDIR, req_payload, off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
+
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    if (err != 0) { free(resp); fuse_reply_err(req, -err); return; }
+
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = rb_u64(resp, &pos);
+    struct etcfs_attr a;
+    rb_attr(resp, &pos, &a);
+    e.entry_timeout = (double)rb_u32(resp, &pos);
+    e.attr_timeout  = (double)rb_u32(resp, &pos);
+    fill_stat(&e.attr, &a);
+    free(resp);
+
+    fuse_reply_entry(req, &e);
+}
+
+// UNLINK payload: [u64:parent][u32:name_len][name]
+// Response: [i32:error]
 static void ec_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
-{ (void)parent; (void)name; fuse_reply_err(req, EROFS); }
+{
+    struct etcfs_context *ctx = GET_CTX(req);
+    size_t nlen = strlen(name);
 
+    uint8_t req_payload[12 + 256];
+    uint32_t off = 0;
+    off += wb_u64(req_payload + off, parent);
+    off += wb_u32(req_payload + off, (uint32_t)nlen);
+    memcpy(req_payload + off, name, nlen); off += (uint32_t)nlen;
+
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_UNLINK, req_payload, off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
+
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    free(resp);
+    fuse_reply_err(req, err != 0 ? -err : 0);
+}
+
+// RMDIR payload: same format as UNLINK
 static void ec_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
-{ (void)parent; (void)name; fuse_reply_err(req, EROFS); }
+{
+    struct etcfs_context *ctx = GET_CTX(req);
+    size_t nlen = strlen(name);
 
-static void ec_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
-                      fuse_ino_t newparent, const char *newname, unsigned int flags)
-{ (void)parent; (void)name; (void)newparent; (void)newname; (void)flags; fuse_reply_err(req, EROFS); }
+    uint8_t req_payload[12 + 256];
+    uint32_t off = 0;
+    off += wb_u64(req_payload + off, parent);
+    off += wb_u32(req_payload + off, (uint32_t)nlen);
+    memcpy(req_payload + off, name, nlen); off += (uint32_t)nlen;
 
-static void ec_symlink(fuse_req_t req, const char *link, fuse_ino_t parent,
-                       const char *name)
-{ (void)link; (void)parent; (void)name; fuse_reply_err(req, EROFS); }
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_RMDIR, req_payload, off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
 
-static void ec_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent,
-                    const char *newname)
-{ (void)ino; (void)newparent; (void)newname; fuse_reply_err(req, EROFS); }
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    free(resp);
+    fuse_reply_err(req, err != 0 ? -err : 0);
+}
 
-static void ec_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
-                       int to_set, struct fuse_file_info *fi)
-{ (void)ino; (void)attr; (void)to_set; (void)fi; fuse_reply_err(req, EROFS); }
+// RENAME payload: [u64:old_parent][u32:old_name_len][old_name][u64:new_parent][u32:new_name_len][new_name][u32:flags]
+// Response: [i32:error]
+static void ec_rename(fuse_req_t req, fuse_ino_t old_parent, const char *old_name,
+                      fuse_ino_t new_parent, const char *new_name, unsigned int flags)
+{
+    struct etcfs_context *ctx = GET_CTX(req);
+    size_t olen = strlen(old_name);
+    size_t nlen = strlen(new_name);
 
+    uint8_t req_payload[40 + 512];
+    uint32_t off = 0;
+    off += wb_u64(req_payload + off, old_parent);
+    off += wb_u32(req_payload + off, (uint32_t)olen);
+    memcpy(req_payload + off, old_name, olen); off += (uint32_t)olen;
+    off += wb_u64(req_payload + off, new_parent);
+    off += wb_u32(req_payload + off, (uint32_t)nlen);
+    memcpy(req_payload + off, new_name, nlen); off += (uint32_t)nlen;
+    off += wb_u32(req_payload + off, flags);
+
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_RENAME, req_payload, off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
+
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    free(resp);
+    fuse_reply_err(req, err != 0 ? -err : 0);
+}
+
+// WRITE payload: [u64:ino][u64:offset][u32:data_len][data]
+// Response: [i32:error][u32:written]
 static void ec_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
                      size_t size, off_t off, struct fuse_file_info *fi)
-{ (void)ino; (void)buf; (void)size; (void)off; (void)fi; fuse_reply_err(req, EROFS); }
+{
+    (void)fi;
+    struct etcfs_context *ctx = GET_CTX(req);
+
+    uint8_t req_payload[20 + 128 * 1024];
+    uint32_t payload_off = 0;
+    payload_off += wb_u64(req_payload + payload_off, ino);
+    payload_off += wb_u64(req_payload + payload_off, (uint64_t)off);
+    payload_off += wb_u32(req_payload + payload_off, (uint32_t)size);
+    memcpy(req_payload + payload_off, buf, size); payload_off += (uint32_t)size;
+
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_WRITE, req_payload, payload_off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
+
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    uint32_t written = rb_u32(resp, &pos);
+    free(resp);
+
+    if (err != 0) { fuse_reply_err(req, -err); return; }
+    fuse_reply_write(req, (size_t)written);
+}
 
 static void ec_write_buf(fuse_req_t req, fuse_ino_t ino,
                          struct fuse_bufvec *bufv, off_t off,
                          struct fuse_file_info *fi)
-{ (void)req; (void)ino; (void)bufv; (void)off; (void)fi; fuse_reply_err(req, EROFS); }
+{
+    (void)ino; (void)bufv; (void)off; (void)fi;
+    fuse_reply_err(req, ENOSYS);
+}
 
+// SYMLINK payload: [u64:parent][u32:name_len][name][u32:target_len][target]
+static void ec_symlink(fuse_req_t req, const char *target, fuse_ino_t parent,
+                       const char *name)
+{
+    struct etcfs_context *ctx = GET_CTX(req);
+    size_t nlen = strlen(name);
+    size_t tlen = strlen(target);
+
+    uint8_t req_payload[20 + 512];
+    uint32_t off = 0;
+    off += wb_u64(req_payload + off, parent);
+    off += wb_u32(req_payload + off, (uint32_t)nlen);
+    memcpy(req_payload + off, name, nlen); off += (uint32_t)nlen;
+    off += wb_u32(req_payload + off, (uint32_t)tlen);
+    memcpy(req_payload + off, target, tlen); off += (uint32_t)tlen;
+
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_SYMLINK, req_payload, off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
+
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    if (err != 0) { free(resp); fuse_reply_err(req, -err); return; }
+
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = rb_u64(resp, &pos);
+    struct etcfs_attr a;
+    rb_attr(resp, &pos, &a);
+    e.entry_timeout = (double)rb_u32(resp, &pos);
+    e.attr_timeout  = (double)rb_u32(resp, &pos);
+    fill_stat(&e.attr, &a);
+    free(resp);
+
+    fuse_reply_entry(req, &e);
+}
+
+// LINK payload: [u64:ino][u64:new_parent][u32:new_name_len][new_name]
+static void ec_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t new_parent,
+                    const char *new_name)
+{
+    struct etcfs_context *ctx = GET_CTX(req);
+    size_t nlen = strlen(new_name);
+
+    uint8_t req_payload[24 + 256];
+    uint32_t off = 0;
+    off += wb_u64(req_payload + off, ino);
+    off += wb_u64(req_payload + off, new_parent);
+    off += wb_u32(req_payload + off, (uint32_t)nlen);
+    memcpy(req_payload + off, new_name, nlen); off += (uint32_t)nlen;
+
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_LINK, req_payload, off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
+
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    if (err != 0) { free(resp); fuse_reply_err(req, -err); return; }
+
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = rb_u64(resp, &pos);
+    struct etcfs_attr a;
+    rb_attr(resp, &pos, &a);
+    e.entry_timeout = (double)rb_u32(resp, &pos);
+    e.attr_timeout  = (double)rb_u32(resp, &pos);
+    fill_stat(&e.attr, &a);
+    free(resp);
+
+    fuse_reply_entry(req, &e);
+}
+
+// SETATTR payload: [u64:ino][u64:fh][u32:valid][attr:84]
+static void ec_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
+                       int to_set, struct fuse_file_info *fi)
+{
+    (void)attr; (void)to_set;
+    struct etcfs_context *ctx = GET_CTX(req);
+
+    uint8_t req_payload[20 + 84];
+    uint32_t off = 0;
+    off += wb_u64(req_payload + off, ino);
+    off += wb_u64(req_payload + off, (fi ? fi->fh : 0));
+    off += wb_u32(req_payload + off, (uint32_t)to_set);
+
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_SETATTR, req_payload, off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
+
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    if (err != 0) { free(resp); fuse_reply_err(req, -err); return; }
+
+    struct etcfs_attr a;
+    rb_attr(resp, &pos, &a);
+    uint32_t to = rb_u32(resp, &pos);
+    free(resp);
+
+    struct stat st;
+    fill_stat(&st, &a);
+    fuse_reply_attr(req, &st, (double)to);
+}
+
+// MKNOD payload: [u64:parent][u32:name_len][name][u32:mode][u32:rdev]
 static void ec_mknod(fuse_req_t req, fuse_ino_t parent, const char *name,
                      mode_t mode, dev_t rdev)
-{ (void)parent; (void)name; (void)mode; (void)rdev; fuse_reply_err(req, EROFS); }
+{
+    struct etcfs_context *ctx = GET_CTX(req);
+    size_t nlen = strlen(name);
+
+    uint8_t req_payload[24 + 256];
+    uint32_t off = 0;
+    off += wb_u64(req_payload + off, parent);
+    off += wb_u32(req_payload + off, (uint32_t)nlen);
+    memcpy(req_payload + off, name, nlen); off += (uint32_t)nlen;
+    off += wb_u32(req_payload + off, (uint32_t)mode);
+    off += wb_u32(req_payload + off, (uint32_t)rdev);
+
+    uint8_t *resp; uint32_t rlen;
+    if (ipc_call(ctx->ipc, IPC_OP_MKNOD, req_payload, off, &resp, &rlen) < 0)
+    { fuse_reply_err(req, EIO); return; }
+
+    uint32_t pos = 0;
+    int32_t err = rb_i32(resp, &pos);
+    if (err != 0) { free(resp); fuse_reply_err(req, -err); return; }
+
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    e.ino = rb_u64(resp, &pos);
+    struct etcfs_attr a;
+    rb_attr(resp, &pos, &a);
+    e.entry_timeout = (double)rb_u32(resp, &pos);
+    e.attr_timeout  = (double)rb_u32(resp, &pos);
+    fill_stat(&e.attr, &a);
+    free(resp);
+
+    fuse_reply_entry(req, &e);
+}
 
 static void ec_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
                          off_t offset, off_t length, struct fuse_file_info *fi)
