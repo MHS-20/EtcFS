@@ -73,10 +73,10 @@ struct etcfs_dirent {
     uint64_t off;  /* offset cookie */
 };
 
-/* IPC connection state. */
-struct etcfs_ipc;
+/* IPC worker (async, dedicated thread) */
+struct ipc_worker;
 struct etcfs_context {
-    struct etcfs_ipc *ipc;
+    struct ipc_worker *ipc;
     int block_fd;    /* raw block device FD, opened with O_DIRECT */
     int self_fenced; /* set to 1 when lease expiry detected */
     char *mountpoint;

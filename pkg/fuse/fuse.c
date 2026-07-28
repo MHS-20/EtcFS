@@ -8,6 +8,7 @@
 
 #include "fuse.h"
 #include "ops.h"
+#include "pool.h"
 #include "../block/block.h"
 
 #include <errno.h>
@@ -119,7 +120,7 @@ int etcfs_run(struct etcfs_context *ctx)
     if (ipc_fd < 0)
         return -1;
 
-    ctx->ipc = etcfs_ipc_init(ipc_fd);
+    ctx->ipc = ipc_worker_new(ipc_fd);
     if (!ctx->ipc) {
         etcfs_log(ETCFS_LOG_ERROR, "failed to initialise IPC");
         close(ipc_fd);
@@ -186,6 +187,7 @@ int etcfs_run(struct etcfs_context *ctx)
     fuse_session_unmount(se);
     fuse_remove_signal_handlers(se);
     fuse_session_destroy(se);
+    ipc_worker_destroy(ctx->ipc);
     close(ipc_fd);
     etcfs_log(ETCFS_LOG_INFO, "EtcFS unmounted");
     return ret;

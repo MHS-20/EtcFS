@@ -14,6 +14,7 @@ ROOT := $(CURDIR)/../..
 SRCS := $(ROOT)/cmd/etcfuse/main.c \
         $(ROOT)/pkg/fuse/fuse.c \
         $(ROOT)/pkg/fuse/ops.c \
+        $(ROOT)/pkg/fuse/pool.c \
         $(ROOT)/pkg/block/block.c \
         $(ROOT)/pkg/wal/wal.c
 
