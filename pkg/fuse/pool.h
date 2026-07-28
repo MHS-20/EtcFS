@@ -1,7 +1,7 @@
 #ifndef ETCFS_FUSE_POOL_H
 #define ETCFS_FUSE_POOL_H
 
-#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 12)
+#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 10)
 
 /*
  * pool.h — async IPC worker for EtcFS FUSE daemon.
