@@ -58,6 +58,8 @@ func (s *Service) RunSocket(listener net.Listener) error {
 func (s *Service) handleConn(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
+	s.log.Info("ipc connection accepted", "remote", conn.RemoteAddr())
+
 	for {
 		op, payload, err := recvReq(conn)
 		if err != nil {
