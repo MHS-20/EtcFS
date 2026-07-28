@@ -720,10 +720,19 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64, rec 
 	for _, kv := range kvs {
 		var logOff, diskOff, length, gen uint64
 		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
-		if logOff+length > newSize {
+		eEnd := logOff + length
+		if logOff >= newSize {
 			_ = s.store.Delete(ctx, string(kv.Key))
 			if s.dev != nil {
 				s.alloc.Free(diskOff, length)
+			}
+		} else if eEnd > newSize {
+			keepLen := newSize - logOff
+			freeLen := length - keepLen
+			newVal := fmt.Sprintf("%d,%d,%d,%d", logOff, diskOff, keepLen, gen)
+			_, _ = s.store.Put(ctx, string(kv.Key), []byte(newVal))
+			if s.dev != nil {
+				s.alloc.Free(diskOff+keepLen, freeLen)
 			}
 		}
 	}
