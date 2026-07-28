@@ -553,7 +553,7 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 	}
 
 	var b buf
-	b.w32(0)               // error = success
+	b.w32(0)       // error = success
 	b.w32(dataLen) // written
 	return b.b, nil
 }

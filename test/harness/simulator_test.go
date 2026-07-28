@@ -131,7 +131,7 @@ func TestCrashDuringBulkDelete(t *testing.T) {
 
 		// Create 20 files
 		for i := 0; i < 20; i++ {
-			s.createFile(t.Context(), 1, fmt.Sprintf("bulk-%d", i), uint64(7000+i), 0100644)
+			_, _ = s.createFile(t.Context(), 1, fmt.Sprintf("bulk-%d", i), uint64(7000+i), 0100644)
 		}
 
 		// Unlink all

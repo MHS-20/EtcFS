@@ -33,7 +33,7 @@ type Simulator struct {
 
 	inodes  map[uint64]*metadata.InodeRecord
 	dirents map[string]uint64
-	locks map[uint64]*metadata.LockRecord
+	locks   map[uint64]*metadata.LockRecord
 
 	faultSchedule map[int64]FaultType
 	crashPoints   map[int64]bool
