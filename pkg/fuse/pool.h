@@ -27,8 +27,8 @@ struct ipc_worker;
  *   rlen  — response data length
  *   data  — user data passed when submitting the request
  */
-typedef void (*ipc_resp_cb)(fuse_req_t req, int32_t error,
-                            uint8_t *resp, uint32_t rlen, void *data);
+typedef void (*ipc_resp_cb)(fuse_req_t req, int32_t error, uint8_t *resp, uint32_t rlen,
+                            void *data);
 
 /*
  * Create an IPC worker thread connected to the given socket.
@@ -42,9 +42,8 @@ struct ipc_worker *ipc_worker_new(int fd);
  * response arrives.  Ownership of payload is transferred to the worker
  * (it will be freed).  The callback takes ownership of resp.
  */
-int ipc_worker_submit(struct ipc_worker *w, fuse_req_t req,
-                      uint16_t opcode, uint8_t *payload, uint32_t plen,
-                      ipc_resp_cb cb, void *cb_data);
+int ipc_worker_submit(struct ipc_worker *w, fuse_req_t req, uint16_t opcode, uint8_t *payload,
+                      uint32_t plen, ipc_resp_cb cb, void *cb_data);
 
 /*
  * Shut down the IPC worker.  Blocks until pending requests are drained
