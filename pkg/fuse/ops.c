@@ -136,6 +136,7 @@ static void submit_req(fuse_req_t req, uint16_t op,
                        ipc_resp_cb cb, void *cb_data)
 {
     struct etcfs_context *ctx = fuse_req_userdata(req);
+    if (!ctx || !ctx->ipc) { fuse_reply_err(req, EIO); return; }
     uint8_t *copy = malloc(plen);
     if (!copy) { fuse_reply_err(req, ENOMEM); return; }
     memcpy(copy, payload, plen);

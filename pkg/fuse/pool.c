@@ -98,6 +98,7 @@ static int do_ipc_exchange(int fd, uint16_t opcode,
 static void *ipc_worker_thread(void *arg)
 {
     struct ipc_worker *w = (struct ipc_worker *)arg;
+    etcfs_log(ETCFS_LOG_INFO, "IPC worker thread started");
 
     for (;;) {
         pthread_mutex_lock(&w->mu);
@@ -116,6 +117,8 @@ static void *ipc_worker_thread(void *arg)
         w->head = req->next;
         if (!w->head) w->tail = NULL;
         pthread_mutex_unlock(&w->mu);
+
+        etcfs_log(ETCFS_LOG_DEBUG, "IPC worker processing op=%u plen=%u", req->opcode, req->plen);
 
         /* do IPC */
         uint8_t  *resp = NULL;

@@ -158,13 +158,6 @@ int etcfs_run(struct etcfs_context *ctx)
 
     fuse_opt_free_args(&args);
 
-    /* set up signal handlers BEFORE mount (matches libfuse reference) */
-    if (fuse_set_signal_handlers(se) != 0) {
-        etcfs_log(ETCFS_LOG_ERROR, "fuse_set_signal_handlers failed");
-        fuse_session_destroy(se);
-        return -1;
-    }
-
     /* mount */
     if (fuse_session_mount(se, mountpoint) != 0) {
         etcfs_log(ETCFS_LOG_ERROR, "fuse_session_mount failed");
@@ -185,7 +178,6 @@ int etcfs_run(struct etcfs_context *ctx)
 
     /* cleanup */
     fuse_session_unmount(se);
-    fuse_remove_signal_handlers(se);
     fuse_session_destroy(se);
     ipc_worker_destroy(ctx->ipc);
     close(ipc_fd);
