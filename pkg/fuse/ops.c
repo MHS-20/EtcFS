@@ -524,7 +524,7 @@ static void ec_statfs(fuse_req_t req, fuse_ino_t ino)
 }
 
 static void __attribute__((unused)) ec_statx(fuse_req_t req, fuse_ino_t ino, int flags, int mask,
-                     struct fuse_file_info *fi)
+                                             struct fuse_file_info *fi)
 {
     (void) flags;
     (void) mask;
@@ -787,9 +787,9 @@ struct fuse_lowlevel_ops *etcfs_fuse_ops(void)
     static struct fuse_lowlevel_ops ops;
     memset(&ops, 0, sizeof(ops));
 
-    ops.lookup     = ec_lookup;
-    ops.getattr    = ec_getattr;
-    ops.readdir    = ec_readdir;
+    ops.lookup = ec_lookup;
+    ops.getattr = ec_getattr;
+    ops.readdir = ec_readdir;
     ops.readlink = ec_readlink;
     ops.statfs = ec_statfs;
     ops.open = ec_open;
