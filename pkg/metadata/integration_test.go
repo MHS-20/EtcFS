@@ -132,10 +132,10 @@ func TestIntegration_AtomicRename(t *testing.T) {
 	store := testStore(t, "test-node")
 	ctx := context.Background()
 
-	parent := uint64(1)
+	parent := uint64(10001)
 	ino := uint64(42)
 
-	_, err := store.CreateInode(ctx, parent, 0755|uint32(1<<31), 0, 0)
+	_, err := store.CreateInode(ctx, parent, ModeDir|0755, 0, 0)
 	require.NoError(t, err)
 
 	// Create source file
@@ -609,4 +609,250 @@ func TestIntegration_ConcurrentCreatesNoCollision(t *testing.T) {
 	entries, err := store.ListDirents(ctx, parent)
 	require.NoError(t, err)
 	assert.Len(t, entries, workers*filesPerWorker)
+}
+
+// ---- Phase 3: Write operations ----
+
+func TestIntegration_CreateFile(t *testing.T) {
+	store := testStore(t, "phase3-create")
+	ctx := context.Background()
+	parent := uint64(3001)
+
+	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
+	require.NoError(t, err)
+
+	// Create a file via AtomicCreateFile (Go handler path)
+	rec, err := store.AtomicCreateFile(ctx, parent, "newfile.txt", 3010, 0100644, 1000, 1000)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3010), rec.Ino)
+	assert.Equal(t, uint32(0100644), rec.Mode)
+	assert.Equal(t, uint32(1), rec.Nlink)
+
+	// Verify dirent exists
+	ino, err := store.LookupDirent(ctx, parent, "newfile.txt")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3010), ino)
+}
+
+func TestIntegration_Mkdir(t *testing.T) {
+	store := testStore(t, "phase3-mkdir")
+	ctx := context.Background()
+	parent := uint64(3020)
+
+	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
+	require.NoError(t, err)
+
+	rec, err := store.AtomicCreateDir(ctx, parent, "newdir", 3030, ModeDir|0755, 1000, 1000)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3030), rec.Ino)
+	assert.Equal(t, uint32(2), rec.Nlink) // . and ..
+
+	ino, err := store.LookupDirent(ctx, parent, "newdir")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3030), ino)
+}
+
+func TestIntegration_Unlink(t *testing.T) {
+	store := testStore(t, "phase3-unlink")
+	ctx := context.Background()
+	parent := uint64(3100)
+
+	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
+	require.NoError(t, err)
+	_, err = store.AtomicCreateFile(ctx, parent, "todelete.txt", 3101, 0100644, 1000, 1000)
+	require.NoError(t, err)
+
+	err = store.AtomicUnlink(ctx, parent, "todelete.txt")
+	require.NoError(t, err)
+
+	ino, err := store.LookupDirent(ctx, parent, "todelete.txt")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), ino)
+
+	rec, err := store.GetInode(ctx, 3101)
+	require.NoError(t, err)
+	assert.Nil(t, rec, "inode deleted when nlink reaches 0")
+}
+
+func TestIntegration_Rmdir(t *testing.T) {
+	store := testStore(t, "phase3-rmdir")
+	ctx := context.Background()
+	parent := uint64(3120)
+
+	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
+	require.NoError(t, err)
+	_, err = store.AtomicCreateDir(ctx, parent, "emptydir", 3121, ModeDir|0755, 1000, 1000)
+	require.NoError(t, err)
+
+	err = store.AtomicUnlink(ctx, parent, "emptydir")
+	require.NoError(t, err)
+
+	ino, err := store.LookupDirent(ctx, parent, "emptydir")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), ino)
+}
+
+func TestIntegration_Rename(t *testing.T) {
+	store := testStore(t, "phase3-rename")
+	ctx := context.Background()
+	parent := uint64(3130)
+
+	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
+	require.NoError(t, err)
+	_, err = store.AtomicCreateFile(ctx, parent, "oldname.txt", 3131, 0100644, 1000, 1000)
+	require.NoError(t, err)
+
+	err = store.AtomicRename(ctx, parent, "oldname.txt", parent, "newname.txt", 3131, 0)
+	require.NoError(t, err)
+
+	oldIno, err := store.LookupDirent(ctx, parent, "oldname.txt")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), oldIno)
+
+	newIno, err := store.LookupDirent(ctx, parent, "newname.txt")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3131), newIno)
+}
+
+func TestIntegration_WriteInodeSize(t *testing.T) {
+	store := testStore(t, "phase3-write")
+	ctx := context.Background()
+
+	// Create inode
+	_, err := store.CreateInode(ctx, 3201, 0100644, 1000, 1000)
+	require.NoError(t, err)
+
+	// Simulate write: update size
+	rec, err := store.GetInode(ctx, 3201)
+	require.NoError(t, err)
+	rec.Size = 4096
+	_, err = store.Put(ctx, InodeKey(3201), EncodeInode(rec))
+	require.NoError(t, err)
+
+	rec, err = store.GetInode(ctx, 3201)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(4096), rec.Size)
+}
+
+func TestIntegration_Symlink(t *testing.T) {
+	store := testStore(t, "phase3-symlink")
+	ctx := context.Background()
+	parent := uint64(3300)
+
+	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
+	require.NoError(t, err)
+
+	// Create symlink inode
+	_, err = store.CreateInode(ctx, 3301, ModeSymlink|0777, 1000, 1000)
+	require.NoError(t, err)
+
+	// Store target
+	_, err = store.Put(ctx, InodeSymlinkKey(3301), []byte("target.txt"))
+	require.NoError(t, err)
+
+	// Create dirent
+	err = store.CreateDirent(ctx, parent, "mylink", 3301)
+	require.NoError(t, err)
+
+	// Verify
+	ino, err := store.LookupDirent(ctx, parent, "mylink")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3301), ino)
+
+	target, err := store.Get(ctx, InodeSymlinkKey(3301))
+	require.NoError(t, err)
+	assert.Equal(t, "target.txt", string(target))
+}
+
+func TestIntegration_Link(t *testing.T) {
+	store := testStore(t, "phase3-link")
+	ctx := context.Background()
+	parent := uint64(3400)
+
+	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
+	require.NoError(t, err)
+	_, err = store.AtomicCreateFile(ctx, parent, "original.txt", 3401, 0100644, 1000, 1000)
+	require.NoError(t, err)
+
+	// Hard link
+	err = store.IncrementNlink(ctx, 3401)
+	require.NoError(t, err)
+	err = store.CreateDirent(ctx, parent, "hardlink.txt", 3401)
+	require.NoError(t, err)
+
+	rec, err := store.GetInode(ctx, 3401)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), rec.Nlink)
+
+	// Both dirents point to same inode
+	ino1, _ := store.LookupDirent(ctx, parent, "original.txt")
+	ino2, _ := store.LookupDirent(ctx, parent, "hardlink.txt")
+	assert.Equal(t, uint64(3401), ino1)
+	assert.Equal(t, uint64(3401), ino2)
+}
+
+func TestIntegration_FsyncDurability(t *testing.T) {
+	store := testStore(t, "phase3-fsync")
+	ctx := context.Background()
+
+	_, err := store.CreateInode(ctx, 3501, 0100644, 1000, 1000)
+	require.NoError(t, err)
+
+	// Simulate write + fsync: update then verify
+	rec, err := store.GetInode(ctx, 3501)
+	require.NoError(t, err)
+	rec.Size = 8192
+	_, err = store.Put(ctx, InodeKey(3501), EncodeInode(rec))
+	require.NoError(t, err)
+
+	// Verify data persists (simulating fsync durability)
+	rec2, err := store.GetInode(ctx, 3501)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(8192), rec2.Size)
+}
+
+func TestIntegration_TruncateToZero(t *testing.T) {
+	store := testStore(t, "phase3-truncate")
+	ctx := context.Background()
+
+	_, err := store.CreateInode(ctx, 3601, 0100644, 1000, 1000)
+	require.NoError(t, err)
+
+	// Write some data
+	rec, err := store.GetInode(ctx, 3601)
+	require.NoError(t, err)
+	rec.Size = 4096
+	_, err = store.Put(ctx, InodeKey(3601), EncodeInode(rec))
+	require.NoError(t, err)
+
+	// Truncate to 0
+	rec.Size = 0
+	_, err = store.Put(ctx, InodeKey(3601), EncodeInode(rec))
+	require.NoError(t, err)
+
+	rec, err = store.GetInode(ctx, 3601)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), rec.Size)
+}
+
+func TestIntegration_DeepMkdir(t *testing.T) {
+	store := testStore(t, "phase3-deepdir")
+	ctx := context.Background()
+	parent := uint64(3700)
+
+	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
+	require.NoError(t, err)
+
+	current := parent
+	nextIno := uint64(3710)
+	for depth := 0; depth < 5; depth++ {
+		rec, err := store.AtomicCreateDir(ctx, current, fmt.Sprintf("d%d", depth),
+			nextIno, ModeDir|0755, 1000, 1000)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(2), rec.Nlink)
+		current = nextIno
+		nextIno++
+	}
+
+	assert.Equal(t, uint64(3715), nextIno)
 }

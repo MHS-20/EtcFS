@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anomalyco/etcfuse/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metadata"
 	"go.etcd.io/etcd/client/v3"
 )
 
@@ -120,7 +120,7 @@ func main() {
 			_, err = store.AtomicCreateFile(ctx, e.parent, e.name, e.ino, e.mode, e.uid, e.gid)
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error creating %s/%s (ino %d): %v\n", e.parent, e.name, e.ino, err)
+			fmt.Fprintf(os.Stderr, "error creating %d/%s (ino %d): %v\n", e.parent, e.name, e.ino, err)
 			// Continue — might be a duplicate
 			continue
 		}

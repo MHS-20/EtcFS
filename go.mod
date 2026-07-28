@@ -1,4 +1,4 @@
-module github.com/anomalyco/etcfuse
+module github.com/MHS-20/EtcFS
 
 go 1.24.0
 
