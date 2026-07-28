@@ -40,8 +40,12 @@ type Simulator struct {
 }
 
 func NewSimulator(seed int64) *Simulator {
+	return NewSimulatorWithStore(seed, NewMockStore())
+}
+
+func NewSimulatorWithStore(seed int64, store *MockStore) *Simulator {
 	return &Simulator{
-		store:         NewMockStore(),
+		store:         store,
 		rng:           rand.New(rand.NewPCG(uint64(seed), 0)),
 		seed:          seed,
 		inodes:        make(map[uint64]*metadata.InodeRecord),
