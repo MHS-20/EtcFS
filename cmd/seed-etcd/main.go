@@ -22,6 +22,7 @@ func main() {
 	if endpoints == "" {
 		endpoints = "http://localhost:2379"
 	}
+	fmt.Fprintf(os.Stderr, "seed-etcd: using endpoints=%s\n", endpoints)
 
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   strings.Split(endpoints, ","),
@@ -108,9 +109,9 @@ func main() {
 		}
 
 		// Use AtomicCreateFile for regular files
-		if e.mode&metadata.ModeDir != 0 {
+		if (e.mode & metadata.S_IFMT) == metadata.ModeDir {
 			_, err = store.AtomicCreateDir(ctx, e.parent, e.name, e.ino, e.mode, e.uid, e.gid)
-		} else if e.mode&metadata.ModeSymlink != 0 {
+		} else if (e.mode & metadata.S_IFMT) == metadata.ModeSymlink {
 			_, err = store.CreateInode(ctx, e.ino, e.mode, e.uid, e.gid)
 			if err == nil {
 				// Store symlink target in inode record

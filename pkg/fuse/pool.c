@@ -45,7 +45,7 @@ static int send_full(int fd, const void *buf, size_t len)
     const char *p = buf;
     while (len > 0) {
         ssize_t n = write(fd, p, len);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n < 0) { if (errno == EINTR) continue; etcfs_log(ETCFS_LOG_ERROR, "send_full write error fd=%d errno=%d", fd, errno); return -1; }
         len -= (size_t)n; p += n;
     }
     return 0;
@@ -120,10 +120,13 @@ static void *ipc_worker_thread(void *arg)
 
         etcfs_log(ETCFS_LOG_DEBUG, "IPC worker processing op=%u plen=%u", req->opcode, req->plen);
 
-        /* do IPC */
-        uint8_t  *resp = NULL;
-        uint32_t  rlen = 0;
-        int ret = do_ipc_exchange(w->fd, req->opcode, req->payload, req->plen, &resp, &rlen);
+    /* do IPC */
+    uint8_t  *resp = NULL;
+    uint32_t  rlen = 0;
+    etcfs_log(ETCFS_LOG_INFO, "IPC worker exchange start op=%u fd=%d plen=%u",
+              req->opcode, w->fd, req->plen);
+    int ret = do_ipc_exchange(w->fd, req->opcode, req->payload, req->plen, &resp, &rlen);
+    etcfs_log(ETCFS_LOG_INFO, "IPC worker exchange done ret=%d rlen=%u", ret, rlen);
 
         /* invoke callback */
         int32_t err = 0;

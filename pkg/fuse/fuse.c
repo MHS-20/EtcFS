@@ -86,7 +86,7 @@ static int connect_to_meta(const char *socket_path)
         return -1;
     }
 
-    etcfs_log(ETCFS_LOG_INFO, "connected to metadata backend at %s", socket_path);
+    etcfs_log(ETCFS_LOG_INFO, "connected to metadata backend at %s fd=%d", socket_path, fd);
     return fd;
 }
 

@@ -152,6 +152,7 @@ static void submit_req(fuse_req_t req, uint16_t op,
 static void cb_lookup(fuse_req_t req, int32_t err, uint8_t *resp, uint32_t rlen, void *data)
 {
     (void)data;
+    etcfs_log(ETCFS_LOG_INFO, "cb_lookup err=%d rlen=%u", err, rlen);
     if (err != 0) { fuse_reply_err(req, -err); return; }
     if (rlen < 4)  { fuse_reply_err(req, EIO); return; }
 

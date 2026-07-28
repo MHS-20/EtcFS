@@ -295,9 +295,9 @@ func (s *Service) handleReaddir(ctx context.Context, payload []byte) ([]byte, er
 		rec, _ := s.store.GetInode(ctx, e.Ino)
 		dtype := uint32(metadata.DirentTypeFile)
 		if rec != nil {
-			if rec.Mode&metadata.ModeDir != 0 {
+			if (rec.Mode & metadata.S_IFMT) == metadata.ModeDir {
 				dtype = metadata.DirentTypeDir
-			} else if rec.Mode&metadata.ModeSymlink != 0 {
+			} else if (rec.Mode & metadata.S_IFMT) == metadata.ModeSymlink {
 				dtype = metadata.DirentTypeSymlink
 			}
 		}
