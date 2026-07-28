@@ -26,6 +26,7 @@ type Config struct {
 	LeaseTTL      time.Duration
 	LogLevel      int
 	ShowVersion   bool
+	BlockDevice   string
 }
 
 // Parse reads CLI flags and returns a Config.
@@ -54,6 +55,8 @@ func Parse() *Config {
 	flag.IntVar(&cfg.LogLevel, "log-level", 1,
 		"Log level: 0=error, 1=info, 2=debug")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
+	flag.StringVar(&cfg.BlockDevice, "block-device", "",
+		"Block device path for data I/O (e.g., /dev/nvme1n1)")
 
 	flag.Parse()
 
