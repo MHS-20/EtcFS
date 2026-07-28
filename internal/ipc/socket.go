@@ -596,8 +596,14 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		s.log.Warn("write: sync failed", "error", err)
 	}
 
-	extKey := fmt.Sprintf("extent:%d/0", ino)
-	extVal := fmt.Sprintf("%d,%d,%d,1", offset, diskOff, uint64(dataLen))
+	gen, _ := s.store.GetMyGeneration(ctx)
+	if gen < 1 {
+		gen = 1
+	}
+
+	chunk := s.nextExtentChunk(ctx, ino)
+	extKey := fmt.Sprintf("extent:%d/%d", ino, chunk)
+	extVal := fmt.Sprintf("%d,%d,%d,%d", offset, diskOff, uint64(dataLen), gen)
 	_, _ = s.store.Put(ctx, extKey, []byte(extVal))
 
 	newEnd := offset + uint64(dataLen)
@@ -610,6 +616,12 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	b.w32(0)
 	b.w32(uint32(n))
 	return b.b, nil
+}
+
+func (s *Service) nextExtentChunk(ctx context.Context, ino uint64) uint64 {
+	prefix := fmt.Sprintf("extent:%d/", ino)
+	kvs, _ := s.store.GetPrefix(ctx, prefix)
+	return uint64(len(kvs))
 }
 
 // READ payload: [u64:ino][u64:offset][u32:size]
