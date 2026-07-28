@@ -619,8 +619,12 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		return int32Resp(makeErrno(-22)), nil
 	}
 	ino, rest := readU64(payload)
-	offset, _ := readU64(rest)
-	size, _ := readU32(rest)
+	offset, rest := readU64(rest)
+	size, rest := readU32(rest)
+	_ = rest
+
+	s.log.Info("READ", "ino", ino, "offset", offset, "size", size,
+		"data", fmt.Sprintf("%x", payload))
 
 	if s.dev == nil {
 		return int32Resp(makeErrno(-5)), nil
@@ -628,6 +632,7 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 
 	prefix := fmt.Sprintf("extent:%d/", ino)
 	kvs, _ := s.store.GetPrefix(ctx, prefix)
+	s.log.Info("READ extents", "ino", ino, "count", len(kvs))
 	if len(kvs) == 0 {
 		var b buf
 		b.w32(0)
@@ -642,6 +647,8 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	for _, kv := range kvs {
 		var logOff, diskOff, length, gen uint64
 		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
+
+		s.log.Info("READ ext", "key", string(kv.Key), "log", logOff, "disk", diskOff, "len", length)
 
 		eStart := logOff
 		eEnd := logOff + length
