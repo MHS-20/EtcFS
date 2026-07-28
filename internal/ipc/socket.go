@@ -687,24 +687,47 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 }
 
 // TRUNCATE (= setattr with size change) — handled by setattr
-// SETATTR payload: [u64:ino][u64:fh][u32:valid][attr:84]
+// SETATTR payload: [u64:ino][u64:fh][u32:valid][u64:size]
 // Response: [i32:error][attr:84][u32:attr_timeout]
+const fattrSize = 1 << 3
+
 func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 20 {
+	if len(payload) < 28 {
 		return int32Resp(makeErrno(-22)), nil
 	}
 	ino, rest := readU64(payload)
-	_, rest = readU64(rest) // fh
-	valid, _ := readU32(rest)
-	_ = valid
-	_ = ino
+	_, rest = readU64(rest)
+	valid, rest := readU32(rest)
+	newSize, _ := readU64(rest)
 
-	// Phase 3: simplified — just return current attrs
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
 		return int32Resp(makeErrno(-2)), nil
 	}
+
+	if valid&fattrSize != 0 && newSize < rec.Size {
+		s.truncate(ctx, ino, newSize, rec)
+		rec.Size = newSize
+		_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+	}
+
 	return attrResp(rec), nil
+}
+
+func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64, rec *metadata.InodeRecord) {
+	prefix := fmt.Sprintf("extent:%d/", ino)
+	kvs, _ := s.store.GetPrefix(ctx, prefix)
+	for _, kv := range kvs {
+		var logOff, diskOff, length, gen uint64
+		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
+		if logOff+length > newSize {
+			_ = s.store.Delete(ctx, string(kv.Key))
+			if s.dev != nil {
+				s.alloc.Free(diskOff, length)
+			}
+		}
+	}
+	_ = rec
 }
 
 // SYMLINK payload: [u64:parent][u32:name_len][name][u32:target_len][target]

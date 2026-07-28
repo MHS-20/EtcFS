@@ -607,6 +607,7 @@ static void ec_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
     off += wb_u64(payload + off, ino);
     off += wb_u64(payload + off, (fi ? fi->fh : 0));
     off += wb_u32(payload + off, (uint32_t) to_set);
+    off += wb_u64(payload + off, (uint64_t) attr->st_size);
     (void) attr;
 
     uint8_t *resp;
