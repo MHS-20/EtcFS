@@ -64,7 +64,7 @@ func (s *Store) GetInode(ctx context.Context, ino uint64) (*InodeRecord, error) 
 	if value == nil {
 		return nil, nil
 	}
-	return decodeInode(value), nil
+	return DecodeInode(value), nil
 }
 
 // UpdateInode atomically updates an inode record in etcd.
@@ -197,7 +197,8 @@ func EncodeInode(rec *InodeRecord) []byte {
 	return buf
 }
 
-func decodeInode(data []byte) *InodeRecord {
+// DecodeInode deserialises binary data back to an InodeRecord.
+func DecodeInode(data []byte) *InodeRecord {
 	if len(data) < 72 {
 		return nil
 	}

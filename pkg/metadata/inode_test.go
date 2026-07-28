@@ -28,7 +28,7 @@ func TestEncodeDecodeInode(t *testing.T) {
 	encoded := EncodeInode(rec)
 	assert.Len(t, encoded, 72, "encoded inode should be 72 bytes")
 
-	decoded := decodeInode(encoded)
+	decoded := DecodeInode(encoded)
 	assert.NotNil(t, decoded)
 	assert.Equal(t, rec.Ino, decoded.Ino)
 	assert.Equal(t, rec.Size, decoded.Size)
@@ -45,8 +45,8 @@ func TestEncodeDecodeInode(t *testing.T) {
 }
 
 func TestDecodeInodeTooShort(t *testing.T) {
-	assert.Nil(t, decodeInode([]byte{1, 2, 3}))
-	assert.Nil(t, decodeInode(nil))
+	assert.Nil(t, DecodeInode([]byte{1, 2, 3}))
+	assert.Nil(t, DecodeInode(nil))
 }
 
 func TestEncodeInodeRoundTrip(t *testing.T) {
@@ -60,7 +60,7 @@ func TestEncodeInodeRoundTrip(t *testing.T) {
 		Blksize: 4096,
 	}
 	encoded := EncodeInode(original)
-	decoded := decodeInode(encoded)
+	decoded := DecodeInode(encoded)
 	assert.NotNil(t, decoded)
 	assert.Equal(t, original.Ino, decoded.Ino)
 	assert.Equal(t, original.Mode, decoded.Mode)
