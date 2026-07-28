@@ -100,10 +100,18 @@ static void handle_signal(int sig)
         fuse_session_exit(g_session);
 }
 
-static void setup_signals(void)
+static void __attribute__((unused)) setup_signals(void)
 {
     /* Phase 2: don't install custom signal handler — debug spurious SIGTERM */
     (void)handle_signal;
+}
+
+/* ---- FUSE init callback ---- */
+
+static void etcfs_init(void *userdata, struct fuse_conn_info *conn)
+{
+    (void)userdata;
+    (void)conn;
 }
 
 /* ---- main entry ---- */
@@ -153,6 +161,9 @@ int etcfs_run(struct etcfs_context *ctx)
     if (fuse_opt_add_arg(&args, "etcfuse") < 0)
         return -1;
 
+    /* register init callback */
+    ops->init = etcfs_init;
+
     /* create session */
     se = fuse_session_new(&args, ops, sizeof(*ops), ctx);
     if (!se) {
@@ -171,19 +182,18 @@ int etcfs_run(struct etcfs_context *ctx)
         return -1;
     }
 
-    setup_signals();
-
     etcfs_log(ETCFS_LOG_INFO, "EtcFS mounted at %s", mountpoint);
 
-    /* enter event loop (single-threaded — works for read ops) */
-    ret = fuse_session_loop(se);
-    etcfs_log(ETCFS_LOG_INFO, "event loop exited with ret=%d errno=%d", ret, errno);
+    /* enter event loop (multi-threaded) */
+    struct fuse_loop_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.max_idle_threads = 4;
+    ret = fuse_session_loop_mt(se, &cfg);
 
     /* cleanup */
     fuse_session_unmount(se);
     fuse_session_destroy(se);
     close(ipc_fd);
-
     etcfs_log(ETCFS_LOG_INFO, "EtcFS unmounted");
     return ret;
 }
