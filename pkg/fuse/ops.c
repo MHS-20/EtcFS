@@ -779,11 +779,29 @@ static void ec_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fus
 static void ec_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                     struct fuse_file_info *fi)
 {
-    (void) ino;
-    (void) size;
-    (void) off;
     (void) fi;
-    fuse_reply_buf(req, NULL, 0);
+    uint8_t payload[24];
+    uint32_t p = 0;
+    p += wb_u64(payload + p, ino);
+    p += wb_u64(payload + p, (uint64_t) off);
+    p += wb_u32(payload + p, (uint32_t) size);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_READ, payload, p, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    uint32_t pos = 0;
+    int32_t e = rb_i32(resp, &pos);
+    if (e != 0) {
+        fuse_reply_err(req, -e);
+        free(resp);
+        return;
+    }
+    uint32_t dataLen = rb_u32(resp, &pos);
+    fuse_reply_buf(req, (const char *) (resp + pos), dataLen);
+    free(resp);
 }
 static void ec_getlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct flock *lock)
 {

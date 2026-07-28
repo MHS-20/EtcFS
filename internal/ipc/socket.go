@@ -188,7 +188,7 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 	case ipcOpFsync:
 		return okResp(), nil
 	case ipcOpRead:
-		return int32Resp(0), nil
+		return s.handleRead(ctx, payload)
 	case ipcOpGetlk:
 		return s.handleGetlk(ctx, payload)
 	case ipcOpSetlk:
@@ -609,6 +609,73 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	var b buf
 	b.w32(0)
 	b.w32(uint32(n))
+	return b.b, nil
+}
+
+// READ payload: [u64:ino][u64:offset][u32:size]
+// Response: [i32:error][u32:data_len][data_bytes]
+func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 20 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	ino, rest := readU64(payload)
+	offset, _ := readU64(rest)
+	size, _ := readU32(rest)
+
+	if s.dev == nil {
+		return int32Resp(makeErrno(-5)), nil
+	}
+
+	prefix := fmt.Sprintf("extent:%d/", ino)
+	kvs, _ := s.store.GetPrefix(ctx, prefix)
+	if len(kvs) == 0 {
+		var b buf
+		b.w32(0)
+		b.w32(0)
+		return b.b, nil
+	}
+
+	data := make([]byte, size)
+	bytesRead := uint32(0)
+	rem := size
+
+	for _, kv := range kvs {
+		var logOff, diskOff, length, gen uint64
+		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
+
+		eStart := logOff
+		eEnd := logOff + length
+
+		if offset >= eEnd || offset+uint64(rem) <= eStart {
+			continue
+		}
+
+		readStart := uint64(0)
+		if offset > eStart {
+			readStart = offset - eStart
+		}
+		readLen := length - readStart
+		if readLen > uint64(rem) {
+			readLen = uint64(rem)
+		}
+
+		n, err := s.dev.ReadAt(data[bytesRead:bytesRead+uint32(readLen)],
+			int64(diskOff+readStart))
+		if err != nil {
+			break
+		}
+		bytesRead += uint32(n)
+		rem -= uint32(readLen)
+		if rem == 0 {
+			break
+		}
+		offset += uint64(bytesRead)
+	}
+
+	var b buf
+	b.w32(0)
+	b.w32(bytesRead)
+	b.b = append(b.b, data[:bytesRead]...)
 	return b.b, nil
 }
 
