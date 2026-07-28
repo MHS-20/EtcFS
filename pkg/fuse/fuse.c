@@ -121,7 +121,7 @@ int etcfs_run(struct etcfs_context *ctx)
         return -1;
 
     ctx->ipc_fd = ipc_fd;
-    ctx->ipc_sync = 1;  /* synchronous IPC mode */
+    ctx->ipc_sync = 1; /* synchronous IPC mode */
 
     mountpoint = ctx->mountpoint;
     if (!mountpoint) {
