@@ -2,8 +2,6 @@ package harness
 
 import (
 	"context"
-	"fmt"
-	"math/rand/v2"
 	"time"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
@@ -42,7 +40,7 @@ func (c *Cluster) FreshLookup(ctx context.Context, parent uint64, name string) u
 func (c *Cluster) FreshListDir(ctx context.Context, parent uint64) []string {
 	prefix := metadata.DirentPrefix(parent)
 	kvs, _ := c.Store.GetPrefix(ctx, prefix)
-	var names []string
+	names := make([]string, 0, len(kvs))
 	for _, kv := range kvs {
 		names = append(names, string(kv.Key[len(prefix):]))
 	}
@@ -68,17 +66,6 @@ func (c *Cluster) createDirIfMissing(ctx context.Context, parent uint64, name st
 	}
 	_, _ = c.Store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
 	_, _ = c.Store.Put(ctx, metadata.DirentKey(parent, name), metadata.EncodeUint64(ino))
-}
-
-func (c *Cluster) concurrentCreateFiles(ctx context.Context, dir uint64, nodeIdx, count int, baseIno uint64) {
-	n := c.Nodes[nodeIdx]
-	rng := rand.New(rand.NewPCG(uint64(baseIno), 0))
-	for i := 0; i < count; i++ {
-		ino := baseIno + uint64(i)
-		name := fmt.Sprintf("n%d-f%06d", nodeIdx, rng.IntN(999999))
-		n.createFile(ctx, dir, name, ino, 0100644)
-		n.writeInode(ctx, ino, 4096)
-	}
 }
 
 func (c *Cluster) checkAllInvariants() int {
