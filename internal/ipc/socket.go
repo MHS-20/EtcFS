@@ -10,6 +10,7 @@ import (
 
 	"github.com/anomalyco/etcfuse/internal/config"
 	"github.com/anomalyco/etcfuse/pkg/metadata"
+	"go.etcd.io/etcd/client/v3"
 )
 
 // opcodes matching pkg/fuse/ops.c
@@ -18,17 +19,28 @@ const (
 	ipcOpGetattr   = 2
 	ipcOpReaddir   = 3
 	ipcOpReadlink  = 4
-	ipcOpStatfs    = 17
+	ipcOpCreate    = 5
+	ipcOpMkdir     = 6
+	ipcOpUnlink    = 7
+	ipcOpRmdir     = 8
+	ipcOpRename    = 9
+	ipcOpSymlink   = 10
+	ipcOpLink      = 11
+	ipcOpSetattr   = 12
 	ipcOpOpen      = 13
 	ipcOpRelease   = 14
 	ipcOpOpendir   = 15
 	ipcOpReleasedir = 16
-	ipcOpRead      = 22
-	ipcOpWrite     = 23
-	ipcOpFlush     = 25 // FLUSH has no opcode currently defined
-	ipcOpFsync     = 24
+	ipcOpStatfs    = 17
+	ipcOpAlloc     = 18
+	ipcOpCommit    = 19
 	ipcOpGetlk     = 20
 	ipcOpSetlk     = 21
+	ipcOpRead      = 22
+	ipcOpWrite     = 23
+	ipcOpFsync     = 24
+	ipcOpMknod     = 25
+	ipcOpFlush     = 26
 )
 
 // RunSocket starts a raw binary IPC server on the given listener.
@@ -166,17 +178,42 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 		return s.handleReadlink(ctx, payload)
 	case ipcOpStatfs:
 		return s.handleStatfs(ctx, payload)
-	case ipcOpOpen, ipcOpOpendir, ipcOpRelease, ipcOpReleasedir, ipcOpFlush, ipcOpFsync:
-		// No-op for read-only phase — return success
+	case ipcOpOpen, ipcOpOpendir, ipcOpRelease, ipcOpReleasedir:
+		return okResp(), nil
+	case ipcOpFlush:
+		return okResp(), nil
+	case ipcOpFsync:
 		return okResp(), nil
 	case ipcOpRead:
-		// Read returns empty data — no block device yet
 		return int32Resp(0), nil
 	case ipcOpGetlk:
-		return okResp(), nil
-	case ipcOpSetlk, ipcOpWrite:
-		// Write operations — return EROFS during Phase 2
-		return int32Resp(makeErrno(-30)), nil // EROFS
+		return s.handleGetlk(ctx, payload)
+	case ipcOpSetlk:
+		return s.handleSetlk(ctx, payload)
+	// Write operations (Phase 3)
+	case ipcOpCreate:
+		return s.handleCreate(ctx, payload)
+	case ipcOpMkdir:
+		return s.handleMkdir(ctx, payload)
+	case ipcOpUnlink:
+		return s.handleUnlink(ctx, payload)
+	case ipcOpRmdir:
+		return s.handleRmdir(ctx, payload)
+	case ipcOpRename:
+		return s.handleRename(ctx, payload)
+	case ipcOpWrite:
+		return s.handleWrite(ctx, payload)
+	case ipcOpSetattr:
+		return s.handleSetattr(ctx, payload)
+	case ipcOpSymlink:
+		return s.handleSymlink(ctx, payload)
+	case ipcOpLink:
+		return s.handleLink(ctx, payload)
+	case ipcOpMknod:
+		return s.handleMknod(ctx, payload)
+	case ipcOpAlloc, ipcOpCommit:
+		// Block allocation — Phase 6
+		return int32Resp(makeErrno(-38)), nil // ENOSYS
 	default:
 		return int32Resp(makeErrno(-38)), nil // ENOSYS
 	}
@@ -340,6 +377,395 @@ func attrResp(rec *metadata.InodeRecord) []byte {
 	b.wAttr(rec)
 	b.w32(1) // attr_timeout
 	return b.b
+}
+
+// ---- write operation handlers (Phase 3) ----
+
+// CREATE payload:  [u64:parent][u32:name_len][name][u32:mode][u32:flags][u32:umask]
+// Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout]
+func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 20 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	parent, rest := readU64(payload)
+	nameLen, rest := readU32(rest)
+	name := string(rest[:nameLen])
+	rest = rest[nameLen:]
+	mode, rest := readU32(rest)
+	_, rest = readU32(rest) // flags
+	umask, _ := readU32(rest)
+	_ = umask
+
+	// Reserve inode number
+	ino, err := s.allocInode(ctx)
+	if err != nil {
+		return int32Resp(makeErrno(-28)), nil // ENOSPC
+	}
+
+	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, mode, 1000, 1000)
+	if err != nil {
+		return int32Resp(makeErrno(-17)), nil // EEXIST
+	}
+
+	var b buf
+	b.w32(0) // success
+	b.w64(rec.Ino)
+	b.wAttr(rec)
+	b.w32(1) // entry_timeout
+	b.w32(1) // attr_timeout
+	return b.b, nil
+}
+
+// MKDIR payload:  [u64:parent][u32:name_len][name][u32:mode][u32:umask]
+// Response: same as CREATE
+func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 20 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	parent, rest := readU64(payload)
+	nameLen, rest := readU32(rest)
+	name := string(rest[:nameLen])
+	rest = rest[nameLen:]
+	mode, rest := readU32(rest)
+	_, _ = readU32(rest) // umask
+
+	ino, err := s.allocInode(ctx)
+	if err != nil {
+		return int32Resp(makeErrno(-28)), nil
+	}
+
+	rec, err := s.store.AtomicCreateDir(ctx, parent, name, ino, mode, 1000, 1000)
+	if err != nil {
+		return int32Resp(makeErrno(-17)), nil
+	}
+
+	var b buf
+	b.w32(0)
+	b.w64(rec.Ino)
+	b.wAttr(rec)
+	b.w32(1)
+	b.w32(1)
+	return b.b, nil
+}
+
+// UNLINK payload: [u64:parent][u32:name_len][name]
+// Response: [i32:error]
+func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 12 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	parent, rest := readU64(payload)
+	nameLen, _ := readU32(rest)
+	name := string(rest[4 : 4+nameLen])
+
+	err := s.store.AtomicUnlink(ctx, parent, name)
+	if err != nil {
+		return int32Resp(makeErrno(-2)), nil // ENOENT
+	}
+	return okResp(), nil
+}
+
+// RMDIR payload: [u64:parent][u32:name_len][name]
+// Response: [i32:error]
+func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 12 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	parent, rest := readU64(payload)
+	nameLen, _ := readU32(rest)
+	name := string(rest[4 : 4+nameLen])
+
+	ino, err := s.store.LookupDirent(ctx, parent, name)
+	if err != nil || ino == 0 {
+		return int32Resp(makeErrno(-2)), nil
+	}
+	rec, err := s.store.GetInode(ctx, ino)
+	if err != nil || rec == nil || rec.Mode&metadata.ModeDir == 0 {
+		return int32Resp(makeErrno(-20)), nil // ENOTDIR
+	}
+	// Check directory is empty
+	entries, _ := s.store.ListDirents(ctx, ino)
+	if len(entries) > 0 {
+		return int32Resp(makeErrno(-39)), nil // ENOTEMPTY
+	}
+
+	err = s.store.AtomicUnlink(ctx, parent, name)
+	if err != nil {
+		return int32Resp(makeErrno(-2)), nil
+	}
+	return okResp(), nil
+}
+
+// RENAME payload: [u64:old_parent][u32:old_name_len][old_name][u64:new_parent][u32:new_name_len][new_name][u32:flags]
+// Response: [i32:error]
+func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 28 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	oldParent, rest := readU64(payload)
+	oldNameLen, rest := readU32(rest)
+	oldName := string(rest[:oldNameLen])
+	rest = rest[oldNameLen:]
+	newParent, rest := readU64(rest)
+	newNameLen, rest := readU32(rest)
+	newName := string(rest[:newNameLen])
+	rest = rest[newNameLen:]
+	flags, _ := readU32(rest)
+
+	// Resolve old inode
+	ino, err := s.store.LookupDirent(ctx, oldParent, oldName)
+	if err != nil || ino == 0 {
+		return int32Resp(makeErrno(-2)), nil
+	}
+
+	err = s.store.AtomicRename(ctx, oldParent, oldName, newParent, newName, ino, flags)
+	if err != nil {
+		return int32Resp(makeErrno(-17)), nil // EEXIST or other
+	}
+	return okResp(), nil
+}
+
+// WRITE payload: [u64:ino][u64:offset][u32:data_len][data]
+// Response: [i32:error][u32:written]
+// Phase 3: data is cached in Go daemon memory (no block device yet)
+func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 20 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	ino, rest := readU64(payload)
+	offset, rest := readU64(rest)
+	dataLen, rest := readU32(rest)
+	_ = rest // data payload (cached in Go for now, no block device)
+
+	rec, err := s.store.GetInode(ctx, ino)
+	if err != nil || rec == nil {
+		return int32Resp(makeErrno(-2)), nil
+	}
+
+	// Update size if write extends beyond current EOF
+	newEnd := offset + uint64(dataLen)
+	if newEnd > rec.Size {
+		rec.Size = newEnd
+		_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+	}
+
+	var b buf
+	b.w32(0)           // error = success
+	b.w32(uint32(dataLen)) // written
+	return b.b, nil
+}
+
+// TRUNCATE (= setattr with size change) — handled by setattr
+// SETATTR payload: [u64:ino][u64:fh][u32:valid][attr:84]
+// Response: [i32:error][attr:84][u32:attr_timeout]
+func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 20 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	ino, rest := readU64(payload)
+	_, rest = readU64(rest) // fh
+	valid, _ := readU32(rest)
+	_ = valid
+	_ = ino
+
+	// Phase 3: simplified — just return current attrs
+	rec, err := s.store.GetInode(ctx, ino)
+	if err != nil || rec == nil {
+		return int32Resp(makeErrno(-2)), nil
+	}
+	return attrResp(rec), nil
+}
+
+// SYMLINK payload: [u64:parent][u32:name_len][name][u32:target_len][target]
+// Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
+func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 20 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	parent, rest := readU64(payload)
+	nameLen, rest := readU32(rest)
+	name := string(rest[:nameLen])
+	rest = rest[nameLen:]
+	targetLen, _ := readU32(rest)
+	target := string(rest[4 : 4+targetLen])
+
+	ino, err := s.allocInode(ctx)
+	if err != nil {
+		return int32Resp(makeErrno(-28)), nil
+	}
+
+	// Create inode with symlink mode
+	_, err = s.store.CreateInode(ctx, ino, metadata.ModeSymlink|0777, 1000, 1000)
+	if err != nil {
+		return int32Resp(makeErrno(-17)), nil
+	}
+
+	// Store target
+	_, _ = s.store.Put(ctx, metadata.InodeSymlinkKey(ino), []byte(target))
+
+	// Create directory entry
+	err = s.store.CreateDirent(ctx, parent, name, ino)
+	if err != nil {
+		return int32Resp(makeErrno(-17)), nil
+	}
+
+	var b buf
+	b.w32(0)
+	b.w64(ino)
+	b.wAttr(&metadata.InodeRecord{
+		Ino: ino, Mode: metadata.ModeSymlink | 0777, Nlink: 1, Size: uint64(len(target)),
+	})
+	b.w32(1) // entry_timeout
+	b.w32(1) // attr_timeout
+	return b.b, nil
+}
+
+// LINK payload: [u64:ino][u64:new_parent][u32:new_name_len][new_name]
+// Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
+func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 24 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	ino, rest := readU64(payload)
+	newParent, rest := readU64(rest)
+	nameLen, rest := readU32(rest)
+	name := string(rest[:nameLen])
+
+	// Increment nlink
+	err := s.store.IncrementNlink(ctx, ino)
+	if err != nil {
+		return int32Resp(makeErrno(-2)), nil
+	}
+
+	// Create new directory entry
+	err = s.store.CreateDirent(ctx, newParent, name, ino)
+	if err != nil {
+		return int32Resp(makeErrno(-17)), nil
+	}
+
+	rec, _ := s.store.GetInode(ctx, ino)
+	var b buf
+	b.w32(0)
+	b.w64(ino)
+	if rec != nil {
+		b.wAttr(rec)
+	}
+	b.w32(1)
+	b.w32(1)
+	return b.b, nil
+}
+
+// MKNOD payload: [u64:parent][u32:name_len][name][u32:mode][u32:rdev]
+// Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
+func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 24 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	parent, rest := readU64(payload)
+	nameLen, rest := readU32(rest)
+	name := string(rest[:nameLen])
+	rest = rest[nameLen:]
+	mode, rest := readU32(rest)
+	rdev, _ := readU32(rest)
+
+	ino, err := s.allocInode(ctx)
+	if err != nil {
+		return int32Resp(makeErrno(-28)), nil
+	}
+
+	rec, err := s.store.CreateInode(ctx, ino, mode, 1000, 1000)
+	if err != nil {
+		return int32Resp(makeErrno(-17)), nil
+	}
+	rec.Rdev = rdev
+	_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+
+	err = s.store.CreateDirent(ctx, parent, name, ino)
+	if err != nil {
+		return int32Resp(makeErrno(-17)), nil
+	}
+
+	var b buf
+	b.w32(0)
+	b.w64(ino)
+	b.wAttr(rec)
+	b.w32(1)
+	b.w32(1)
+	return b.b, nil
+}
+
+// ---- lock handlers ----
+
+// GETLK payload: [u64:ino][u64:fh][u64:start][u64:len][u32:type][u32:pid]
+// Response: [i32:error][u64:start][u64:len][u32:type][u32:pid]
+func (s *Service) handleGetlk(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 40 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	ino, rest := readU64(payload)
+	_ = ino
+	_, rest = readU64(rest) // fh
+	start, rest := readU64(rest)
+	length, rest := readU64(rest)
+	ltype, rest := readU32(rest)
+	pid, _ := readU32(rest)
+
+	// Phase 3: no actual locking — report no conflict
+	var b buf
+	b.w32(0)       // error = success
+	b.w64(start)
+	b.w64(length)
+	b.w32(ltype)   // F_UNLCK means no conflict
+	b.w32(pid)
+	return b.b, nil
+}
+
+// SETLK payload: [u64:ino][u64:fh][u64:start][u64:len][u32:type][u32:pid]
+// Response: [i32:error]
+func (s *Service) handleSetlk(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 40 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	ino, rest := readU64(payload)
+	_ = ino
+	_, rest = readU64(rest) // fh
+	_, rest = readU64(rest) // start
+	_, rest = readU64(rest) // len
+	_, rest = readU32(rest) // type
+	_ = rest // pid
+
+	// Phase 3: always grant lock (no conflict resolution yet)
+	return okResp(), nil
+}
+
+// allocInode reserves an inode number from etcd.
+// Simple sequential allocation for Phase 3.
+func (s *Service) allocInode(ctx context.Context) (uint64, error) {
+	for attempt := 0; attempt < 5; attempt++ {
+		v, err := s.store.Get(ctx, metadata.KeyInodeAllocCounter)
+		if err != nil {
+			return 0, err
+		}
+		current := uint64(0)
+		if v != nil {
+			current = metadata.DecodeUint64(v)
+		}
+		next := current + 1
+
+		ok, err := s.store.Txn(ctx,
+			[]clientv3.Cmp{clientv3.Compare(clientv3.Value(metadata.KeyInodeAllocCounter), "=",
+				string(metadata.EncodeUint64(current)))},
+			[]clientv3.Op{clientv3.OpPut(metadata.KeyInodeAllocCounter,
+				string(metadata.EncodeUint64(next)))},
+			nil)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return current, nil
+		}
+	}
+	return 0, fmt.Errorf("inode alloc exhausted")
 }
 
 // StartSocketServer is the public entry point: listens on the Unix socket path
