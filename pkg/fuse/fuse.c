@@ -93,8 +93,8 @@ static int connect_to_meta(const char *socket_path)
 
 static void etcfs_init(void *userdata, struct fuse_conn_info *conn)
 {
-    (void)userdata;
-    (void)conn;
+    (void) userdata;
+    (void) conn;
 }
 
 /* ---- main entry ---- */
