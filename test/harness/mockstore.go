@@ -86,6 +86,17 @@ func (s *MockStore) Put(ctx context.Context, key string, value []byte) (int64, e
 	return s.rev, nil
 }
 
+func (s *MockStore) CASPut(ctx context.Context, key string, value []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.kv[key]; exists {
+		return false
+	}
+	s.kv[key] = value
+	s.rev++
+	return true
+}
+
 func (s *MockStore) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
