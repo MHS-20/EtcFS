@@ -1,7 +1,7 @@
 #ifndef ETCFS_FUSE_H
 #define ETCFS_FUSE_H
 
-#define FUSE_USE_VERSION 34
+#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 12)
 
 /*
  * fuse.h — EtcFS FUSE daemon types and helpers.
