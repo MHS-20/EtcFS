@@ -35,6 +35,7 @@ import (
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/internal/ipc"
+	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -80,6 +81,17 @@ func main() {
 
 	// IPC service: handles FUSE op requests from the C daemon
 	svc := ipc.NewService(store, membership, watchdog, log)
+
+	if cfg.BlockDevice != "" {
+		dev, err := blockio.Open(cfg.BlockDevice)
+		if err != nil {
+			log.Fatal("cannot open block device", "path", cfg.BlockDevice, "error", err)
+		}
+		defer func() { _ = dev.Close() }()
+		svc.SetBlockDevice(dev)
+		log.Info("block device opened", "path", cfg.BlockDevice,
+			"sector_size", dev.SectorSize(), "total_size", dev.TotalSize())
+	}
 
 	// Start membership heartbeat
 	go membership.Run(ctx)

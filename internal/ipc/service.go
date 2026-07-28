@@ -10,6 +10,7 @@ package ipc
 import (
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/arena"
+	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -21,6 +22,7 @@ type Service struct {
 	watchdog   *fencing.Watchdog
 	alloc      *arena.Allocator
 	log        *config.Logger
+	dev        *blockio.Device
 }
 
 // NewService creates a Service.
@@ -33,6 +35,11 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		alloc:      arena.NewAllocator(membership.NodeID(), store),
 		log:        log,
 	}
+}
+
+// SetBlockDevice attaches a block device for data I/O.
+func (s *Service) SetBlockDevice(dev *blockio.Device) {
+	s.dev = dev
 }
 
 // Store returns the underlying metadata store.

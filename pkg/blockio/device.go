@@ -30,7 +30,7 @@ func Open(path string) (*Device, error) {
 	d := &Device{fd: fd, path: path}
 
 	if err := d.queryGeometry(); err != nil {
-		syscall.Close(fd)
+		_ = syscall.Close(fd)
 		return nil, err
 	}
 
@@ -63,7 +63,7 @@ func (d *Device) queryGeometry() error {
 	return nil
 }
 
-func (d *Device) SectorSize() int { return d.sectorSize }
+func (d *Device) SectorSize() int  { return d.sectorSize }
 func (d *Device) TotalSize() int64 { return d.totalSize }
 func (d *Device) Path() string     { return d.path }
 
@@ -89,7 +89,7 @@ func (d *Device) SyncRange(offset int64, length int64) error {
 	lenAligned := length + (offset - offAligned)
 	_, _, errno := syscall.Syscall6(syscall.SYS_SYNC_FILE_RANGE, uintptr(d.fd),
 		uintptr(offAligned), uintptr(lenAligned),
-		uintptr(syncFileRangeWrite|syncFileRangeWaitAfter), 0, 0)
+		syncFileRangeWrite|syncFileRangeWaitAfter, 0, 0)
 	if errno != 0 {
 		return errno
 	}

@@ -1,3 +1,4 @@
+// nolint: errcheck
 package blockio
 
 import (
@@ -6,17 +7,18 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sys/unix"
 )
 
 func TestOpen(t *testing.T) {
 	f, err := os.CreateTemp("", "blockio-test-*")
 	require.NoError(t, err)
-	defer os.Remove(f.Name())
-	require.NoError(t, f.Truncate(4096))
+	name := f.Name()
 	f.Close()
+	defer os.Remove(name)
 
-	dev, err := Open(f.Name())
+	require.NoError(t, os.Truncate(name, 4096))
+
+	dev, err := Open(name)
 	require.NoError(t, err)
 	defer dev.Close()
 
@@ -27,11 +29,13 @@ func TestOpen(t *testing.T) {
 func TestReadWriteAligned(t *testing.T) {
 	f, err := os.CreateTemp("", "blockio-test-*")
 	require.NoError(t, err)
-	defer os.Remove(f.Name())
-	require.NoError(t, f.Truncate(4096*10))
+	name := f.Name()
 	f.Close()
+	defer os.Remove(name)
 
-	dev, err := Open(f.Name())
+	require.NoError(t, os.Truncate(name, 4096*10))
+
+	dev, err := Open(name)
 	require.NoError(t, err)
 	defer dev.Close()
 
@@ -64,11 +68,13 @@ func TestReadWriteAligned(t *testing.T) {
 func TestSyncRange(t *testing.T) {
 	f, err := os.CreateTemp("", "blockio-test-*")
 	require.NoError(t, err)
-	defer os.Remove(f.Name())
-	require.NoError(t, f.Truncate(4096*10))
+	name := f.Name()
 	f.Close()
+	defer os.Remove(name)
 
-	dev, err := Open(f.Name())
+	require.NoError(t, os.Truncate(name, 4096*10))
+
+	dev, err := Open(name)
 	require.NoError(t, err)
 	defer dev.Close()
 
@@ -79,9 +85,7 @@ func TestSyncRange(t *testing.T) {
 
 	_, err = dev.WriteAt(buf[:ss], 0)
 	require.NoError(t, err)
-
-	err = dev.SyncRange(0, int64(ss))
-	assert.NoError(t, err)
+	assert.NoError(t, dev.SyncRange(0, int64(ss)))
 }
 
 func TestAlignedBuffer(t *testing.T) {
@@ -89,7 +93,6 @@ func TestAlignedBuffer(t *testing.T) {
 	buf, err := AlignedBuffer(ss, ss)
 	require.NoError(t, err)
 	defer FreeBuffer(buf)
-
 	assert.GreaterOrEqual(t, len(buf), ss)
 	assert.Equal(t, 0, len(buf)%ss)
 }
@@ -97,8 +100,7 @@ func TestAlignedBuffer(t *testing.T) {
 func TestUnmapFreesBuffer(t *testing.T) {
 	buf, err := AlignedBuffer(4096, 4096)
 	require.NoError(t, err)
-	err = FreeBuffer(buf)
-	assert.NoError(t, err)
+	assert.NoError(t, FreeBuffer(buf))
 }
 
 func TestSectorSizeNonZero(t *testing.T) {
@@ -109,5 +111,3 @@ func TestSectorSizeNonZero(t *testing.T) {
 	defer dev.Close()
 	assert.Greater(t, dev.SectorSize(), 0)
 }
-
-func init() { _ = unix.MAP_ANONYMOUS }
