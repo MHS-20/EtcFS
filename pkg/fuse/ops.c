@@ -786,10 +786,9 @@ struct fuse_lowlevel_ops *etcfs_fuse_ops(void)
     static struct fuse_lowlevel_ops ops;
     memset(&ops, 0, sizeof(ops));
 
-    ops.lookup = ec_lookup;
-    ops.getattr = ec_getattr;
-    ops.statx = ec_statx;
-    ops.readdir = ec_readdir;
+    ops.lookup     = ec_lookup;
+    ops.getattr    = ec_getattr;
+    ops.readdir    = ec_readdir;
     ops.readlink = ec_readlink;
     ops.statfs = ec_statfs;
     ops.open = ec_open;

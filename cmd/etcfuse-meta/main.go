@@ -31,11 +31,12 @@ import (
 	"syscall"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/internal/ipc"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 func main() {

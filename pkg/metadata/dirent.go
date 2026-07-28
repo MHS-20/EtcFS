@@ -196,7 +196,7 @@ func (s *Store) AtomicCreateDir(ctx context.Context, parent uint64, name string,
 		Size:    4096,
 		Blocks:  0,
 		Mode:    mode | ModeDir,
-		Nlink:   2,                    // . and ..
+		Nlink:   2, // . and ..
 		UID:     uid,
 		GID:     gid,
 		Blksize: 4096,

@@ -13,8 +13,9 @@ import (
 	"strings"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/MHS-20/EtcFS/pkg/metadata"
-	"go.etcd.io/etcd/client/v3"
 )
 
 func main() {
@@ -64,7 +65,6 @@ func main() {
 		name   string
 		ino    uint64
 		mode   uint32
-		size   uint64
 		uid    uint32
 		gid    uint32
 		target string // for symlinks
@@ -76,8 +76,8 @@ func main() {
 
 		// Top-level files
 		{parent: 1, name: "hello.txt", ino: 10, mode: 0100644, uid: 1000, gid: 1000},
-		{parent: 1, name: "notes.md",  ino: 11, mode: 0100644, uid: 1000, gid: 1000},
-		{parent: 1, name: "empty",     ino: 12, mode: 0100644, uid: 1000, gid: 1000},
+		{parent: 1, name: "notes.md", ino: 11, mode: 0100644, uid: 1000, gid: 1000},
+		{parent: 1, name: "empty", ino: 12, mode: 0100644, uid: 1000, gid: 1000},
 
 		// Sub-directory
 		{parent: 1, name: "subdir", ino: 20, mode: metadata.ModeDir | 0755, uid: 1000, gid: 1000},

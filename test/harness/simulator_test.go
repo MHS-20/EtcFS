@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/MHS-20/EtcFS/pkg/metadata"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
 func TestDeterministicReplay(t *testing.T) {
@@ -36,9 +37,9 @@ func TestCrashRecovery(t *testing.T) {
 	s := NewSimulator(456)
 
 	// Create some state
-	s.createFile(t.Context(), 1, "test.txt", 100, 0100644)
-	s.createFile(t.Context(), 1, "other.txt", 101, 0100644)
-	s.createDir(t.Context(), 1, "mydir", 200)
+	_, _ = s.createFile(t.Context(), 1, "test.txt", 100, 0100644)
+	_, _ = s.createFile(t.Context(), 1, "other.txt", 101, 0100644)
+	_, _ = s.createDir(t.Context(), 1, "mydir", 200)
 
 	// Crash and restore
 	s.simulateCrash()
@@ -60,9 +61,9 @@ func TestCrashRecovery(t *testing.T) {
 func TestNlinkConsistencyAfterUnlink(t *testing.T) {
 	s := NewSimulator(789)
 
-	s.createFile(t.Context(), 1, "f1", 301, 0100644)
-	s.createFile(t.Context(), 1, "f2", 302, 0100644)
-	s.createFile(t.Context(), 1, "f3", 303, 0100644)
+	_, _ = s.createFile(t.Context(), 1, "f1", 301, 0100644)
+	_, _ = s.createFile(t.Context(), 1, "f2", 302, 0100644)
+	_, _ = s.createFile(t.Context(), 1, "f3", 303, 0100644)
 
 	// Unlink f2
 	s.unlinkFile(t.Context(), 1, "f2")
@@ -78,7 +79,7 @@ func TestNlinkConsistencyAfterUnlink(t *testing.T) {
 func TestRenamePreservesInode(t *testing.T) {
 	s := NewSimulator(111)
 
-	s.createFile(t.Context(), 1, "old", 401, 0100644)
+	_, _ = s.createFile(t.Context(), 1, "old", 401, 0100644)
 	s.renameFile(t.Context(), 1, "old", 1, "new", 401)
 
 	assert.Zero(t, s.lookup(1, "old"))
@@ -97,7 +98,7 @@ func TestSeedZeroViolations(t *testing.T) {
 func TestCrashDuringCreate(t *testing.T) {
 	for seed := 1; seed <= 100; seed++ {
 		s := NewSimulator(int64(seed))
-		s.createFile(t.Context(), 1, "victim.txt", 5000, 0100644)
+		_, _ = s.createFile(t.Context(), 1, "victim.txt", 5000, 0100644)
 		s.simulateCrash()
 		v := s.checkInvariants()
 		if !assert.Zero(t, v, "seed %d: crash during create should not violate invariants", seed) {
@@ -111,7 +112,7 @@ func TestCrashDuringCreate(t *testing.T) {
 func TestCrashDuringRename(t *testing.T) {
 	for seed := 1; seed <= 100; seed++ {
 		s := NewSimulator(int64(seed))
-		s.createFile(t.Context(), 1, "src.txt", 6000, 0100644)
+		_, _ = s.createFile(t.Context(), 1, "src.txt", 6000, 0100644)
 		s.renameFile(t.Context(), 1, "src.txt", 1, "dst.txt", 6000)
 		s.simulateCrash()
 		v := s.checkInvariants()
@@ -177,7 +178,7 @@ func TestConflictStorm(t *testing.T) {
 	for i := 0; i < clients; i++ {
 		ino := uint64(8000 + i)
 		name := fmt.Sprintf("storm-%d", i)
-		s.createFile(ctx, 1, name, ino, 0100644)
+		_, _ = s.createFile(ctx, 1, name, ino, 0100644)
 	}
 
 	// All files should exist with unique inodes
@@ -197,7 +198,7 @@ func TestIntentionalBug_NlinkNotDecremented(t *testing.T) {
 	s := NewSimulator(4001)
 
 	// Create a file normally
-	s.createFile(t.Context(), 1, "buggy.txt", 9001, 0100644)
+	_, _ = s.createFile(t.Context(), 1, "buggy.txt", 9001, 0100644)
 
 	// Simulate bug: delete dirent but forget to decrement nlink
 	key := metadata.DirentKey(1, "buggy.txt")
@@ -223,7 +224,7 @@ func TestIntentionalBug_DuplicateInode(t *testing.T) {
 	s := NewSimulator(4003)
 
 	// Create two dirents with different names pointing to the same inode
-	s.createFile(t.Context(), 1, "file-a.txt", 9100, 0100644)
+	_, _ = s.createFile(t.Context(), 1, "file-a.txt", 9100, 0100644)
 	// Bug: overwrite the inode entirely with a second create
 	s.inodes[9100] = &metadata.InodeRecord{
 		Ino: 9100, Mode: 0100644, Nlink: 1, Size: 999,
@@ -255,7 +256,7 @@ func TestLinearizability_BasicCreateDelete(t *testing.T) {
 	var history []historyEntry
 
 	// Create
-	s.createFile(ctx, 1, "linear", 9200, 0100644)
+	_, _ = s.createFile(ctx, 1, "linear", 9200, 0100644)
 	history = append(history, historyEntry{"create", 9200, "linear"})
 
 	// Verify it exists
@@ -278,7 +279,7 @@ func TestLinearizability_BasicCreateDelete(t *testing.T) {
 
 	// Replay history deterministically
 	s2 := NewSimulator(5001)
-	s2.createFile(ctx, 1, "linear", 9200, 0100644)
+	_, _ = s2.createFile(ctx, 1, "linear", 9200, 0100644)
 	s2.lookup(1, "linear")
 	s2.unlinkFile(ctx, 1, "linear")
 	s2.lookup(1, "linear")

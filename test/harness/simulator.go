@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
-	"sync"
 	"time"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
@@ -14,7 +13,7 @@ import (
 type FaultType int
 
 const (
-	FaultNone          FaultType = iota
+	FaultNone FaultType = iota
 	FaultEtcdPartition
 	FaultLeaderElection
 	FaultMajorityLoss
@@ -24,19 +23,18 @@ const (
 
 // Simulator runs deterministic metadata operations with fault injection.
 type Simulator struct {
-	store  *MockStore
-	rng    *rand.Rand
-	seed   int64
-	tick   int64
-	ops    int
-	faults int
+	store      *MockStore
+	rng        *rand.Rand
+	seed       int64
+	tick       int64
+	ops        int
+	faults     int
 	inoCounter uint64
 
 	inodes  map[uint64]*metadata.InodeRecord
 	dirents map[string]uint64
-	locks   map[uint64]*metadata.LockRecord
+	locks map[uint64]*metadata.LockRecord
 
-	mu            sync.Mutex
 	faultSchedule map[int64]FaultType
 	crashPoints   map[int64]bool
 }
@@ -300,8 +298,6 @@ func (s *Simulator) Seed() int64 { return s.seed }
 func decodeInode(data []byte) *metadata.InodeRecord {
 	return metadata.DecodeInode(data)
 }
-
-var staticIno uint64 = 100
 
 func (s *Simulator) nextIno() uint64 {
 	s.inoCounter++

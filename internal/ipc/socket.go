@@ -8,39 +8,40 @@ import (
 	"net"
 	"os"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
-	"go.etcd.io/etcd/client/v3"
 )
 
 // opcodes matching pkg/fuse/ops.c
 const (
-	ipcOpLookup    = 1
-	ipcOpGetattr   = 2
-	ipcOpReaddir   = 3
-	ipcOpReadlink  = 4
-	ipcOpCreate    = 5
-	ipcOpMkdir     = 6
-	ipcOpUnlink    = 7
-	ipcOpRmdir     = 8
-	ipcOpRename    = 9
-	ipcOpSymlink   = 10
-	ipcOpLink      = 11
-	ipcOpSetattr   = 12
-	ipcOpOpen      = 13
-	ipcOpRelease   = 14
-	ipcOpOpendir   = 15
+	ipcOpLookup     = 1
+	ipcOpGetattr    = 2
+	ipcOpReaddir    = 3
+	ipcOpReadlink   = 4
+	ipcOpCreate     = 5
+	ipcOpMkdir      = 6
+	ipcOpUnlink     = 7
+	ipcOpRmdir      = 8
+	ipcOpRename     = 9
+	ipcOpSymlink    = 10
+	ipcOpLink       = 11
+	ipcOpSetattr    = 12
+	ipcOpOpen       = 13
+	ipcOpRelease    = 14
+	ipcOpOpendir    = 15
 	ipcOpReleasedir = 16
-	ipcOpStatfs    = 17
-	ipcOpAlloc     = 18
-	ipcOpCommit    = 19
-	ipcOpGetlk     = 20
-	ipcOpSetlk     = 21
-	ipcOpRead      = 22
-	ipcOpWrite     = 23
-	ipcOpFsync     = 24
-	ipcOpMknod     = 25
-	ipcOpFlush     = 26
+	ipcOpStatfs     = 17
+	ipcOpAlloc      = 18
+	ipcOpCommit     = 19
+	ipcOpGetlk      = 20
+	ipcOpSetlk      = 21
+	ipcOpRead       = 22
+	ipcOpWrite      = 23
+	ipcOpFsync      = 24
+	ipcOpMknod      = 25
+	ipcOpFlush      = 26
 )
 
 // RunSocket starts a raw binary IPC server on the given listener.
@@ -337,15 +338,15 @@ func (s *Service) handleReadlink(ctx context.Context, payload []byte) ([]byte, e
 // Response: [i32:error][u64:blocks][u64:bfree][u64:bavail][u64:files][u64:ffree][u32:bsize][u32:namelen][u32:frsize]
 func (s *Service) handleStatfs(ctx context.Context, _ []byte) ([]byte, error) {
 	var b buf
-	b.w32(0)         // error = success
-	b.w64(1 << 30)   // blocks
-	b.w64(1 << 29)   // bfree
-	b.w64(1 << 29)   // bavail
-	b.w64(1000000)   // files
-	b.w64(900000)    // ffree
-	b.w32(4096)      // bsize
-	b.w32(255)       // namelen
-	b.w32(4096)      // frsize
+	b.w32(0)       // error = success
+	b.w64(1 << 30) // blocks
+	b.w64(1 << 29) // bfree
+	b.w64(1 << 29) // bavail
+	b.w64(1000000) // files
+	b.w64(900000)  // ffree
+	b.w32(4096)    // bsize
+	b.w32(255)     // namelen
+	b.w32(4096)    // frsize
 	return b.b, nil
 }
 
@@ -552,8 +553,8 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 	}
 
 	var b buf
-	b.w32(0)           // error = success
-	b.w32(uint32(dataLen)) // written
+	b.w32(0)               // error = success
+	b.w32(dataLen) // written
 	return b.b, nil
 }
 
@@ -714,10 +715,10 @@ func (s *Service) handleGetlk(ctx context.Context, payload []byte) ([]byte, erro
 
 	// Phase 3: no actual locking — report no conflict
 	var b buf
-	b.w32(0)       // error = success
+	b.w32(0) // error = success
 	b.w64(start)
 	b.w64(length)
-	b.w32(ltype)   // F_UNLCK means no conflict
+	b.w32(ltype) // F_UNLCK means no conflict
 	b.w32(pid)
 	return b.b, nil
 }
@@ -734,7 +735,7 @@ func (s *Service) handleSetlk(ctx context.Context, payload []byte) ([]byte, erro
 	_, rest = readU64(rest) // start
 	_, rest = readU64(rest) // len
 	_, rest = readU32(rest) // type
-	_ = rest // pid
+	_ = rest                // pid
 
 	// Phase 3: always grant lock (no conflict resolution yet)
 	return okResp(), nil

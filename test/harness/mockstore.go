@@ -7,9 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MHS-20/EtcFS/pkg/metadata"
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
 // MockStore is a deterministic in-memory implementation of MetadataStore.
@@ -141,7 +142,7 @@ func cmpMatches(cmp clientv3.Cmp, key string, val []byte) bool {
 	// We rely on the cmp being created via clientv3.Compare() which stores
 	// the target and compare result internally.
 	// For simplicity, we compare against CreateRevision and Value comparisons only.
-	targetStr := fmt.Sprintf("%s", cmp.Target)
+	targetStr := cmp.Target.String()
 	_ = targetStr
 
 	// The etcd client v3 Cmp wraps an internal protobuf Compare.
@@ -197,11 +198,11 @@ func (s *MockStore) KeepAlive(ctx context.Context, leaseID clientv3.LeaseID) (<-
 				s.mu.Unlock()
 				return
 			}
-			l.ttl = int64(l.ttl) // refresh
+			_ = l.ttl // refresh TTL
 			s.mu.Unlock()
 
 			select {
-			case ch <- &clientv3.LeaseKeepAliveResponse{ID: leaseID, TTL: int64(l.ttl)}:
+			case ch <- &clientv3.LeaseKeepAliveResponse{ID: leaseID, TTL: l.ttl}:
 			case <-ctx.Done():
 				return
 			}

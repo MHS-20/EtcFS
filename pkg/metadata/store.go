@@ -5,7 +5,7 @@ import (
 	"time"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
-	"go.etcd.io/etcd/client/v3"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // MetadataStore is the interface for metadata operations.
