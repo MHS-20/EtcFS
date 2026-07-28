@@ -9,6 +9,7 @@ package ipc
 
 import (
 	"github.com/MHS-20/EtcFS/internal/config"
+	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -18,6 +19,7 @@ type Service struct {
 	store      *metadata.Store
 	membership *metadata.Membership
 	watchdog   *fencing.Watchdog
+	alloc      *arena.Allocator
 	log        *config.Logger
 }
 
@@ -28,6 +30,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		store:      store,
 		membership: membership,
 		watchdog:   watchdog,
+		alloc:      arena.NewAllocator(membership.NodeID(), store),
 		log:        log,
 	}
 }
