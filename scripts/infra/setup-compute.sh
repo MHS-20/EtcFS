@@ -343,7 +343,7 @@ sudo tee /etc/etcd/etcd.args > /dev/null <<'ARGS'
 --advertise-client-urls https://${priv_ip}:2379
 --listen-peer-urls https://0.0.0.0:2380
 --initial-advertise-peer-urls https://${priv_ip}:2380
---initial-cluster ${INITIAL_CLUSTER}
+--initial-cluster ${etcd_name}=https://${priv_ip}:2380
 --initial-cluster-state new
 --initial-cluster-token ${CLUSTER}
 --client-cert-auth

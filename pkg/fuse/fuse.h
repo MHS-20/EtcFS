@@ -1,7 +1,7 @@
 #ifndef ETCFS_FUSE_H
 #define ETCFS_FUSE_H
 
-#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 12)
+#define FUSE_USE_VERSION FUSE_MAKE_VERSION(3, 10)
 
 /*
  * fuse.h — EtcFS FUSE daemon types and helpers.
@@ -78,6 +78,8 @@ struct ipc_worker;
 struct etcfs_context {
     struct ipc_worker *ipc;
     int block_fd;    /* raw block device FD, opened with O_DIRECT */
+    int ipc_fd;      /* Unix socket fd to Go backend */
+    int ipc_sync;    /* 1 = synchronous IPC mode (no worker thread) */
     int self_fenced; /* set to 1 when lease expiry detected */
     char *mountpoint;
     char *volume_id;

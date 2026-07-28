@@ -120,12 +120,8 @@ int etcfs_run(struct etcfs_context *ctx)
     if (ipc_fd < 0)
         return -1;
 
-    ctx->ipc = ipc_worker_new(ipc_fd);
-    if (!ctx->ipc) {
-        etcfs_log(ETCFS_LOG_ERROR, "failed to initialise IPC");
-        close(ipc_fd);
-        return -1;
-    }
+    ctx->ipc_fd = ipc_fd;
+    ctx->ipc_sync = 1; /* synchronous IPC mode */
 
     mountpoint = ctx->mountpoint;
     if (!mountpoint) {
@@ -168,18 +164,12 @@ int etcfs_run(struct etcfs_context *ctx)
 
     etcfs_log(ETCFS_LOG_INFO, "EtcFS mounted at %s", mountpoint);
 
-    /* enter event loop (multi-threaded, matches libfuse reference pattern) */
-    struct fuse_loop_config *cfg = fuse_loop_cfg_create();
-    fuse_loop_cfg_set_clone_fd(cfg, 0);
-    fuse_loop_cfg_set_max_threads(cfg, 10);
-    fuse_loop_cfg_set_idle_threads(cfg, 4);
-    ret = fuse_session_loop_mt(se, cfg);
-    fuse_loop_cfg_destroy(cfg);
+    /* enter event loop (single-threaded with synchronous IPC) */
+    ret = fuse_session_loop(se);
 
     /* cleanup */
     fuse_session_unmount(se);
     fuse_session_destroy(se);
-    ipc_worker_destroy(ctx->ipc);
     close(ipc_fd);
     etcfs_log(ETCFS_LOG_INFO, "EtcFS unmounted");
     return ret;
