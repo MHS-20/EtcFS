@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -138,18 +139,11 @@ func (s *MockStore) evalCmps(cmps []clientv3.Cmp) bool {
 }
 
 // cmpMatches checks if the given comparison holds for a key-value pair.
+// The mock store's comparison is simplified: it checks key existence for
+// CreateRevision comparisons, and always passes for Value comparisons.
+// Full value-accurate comparison is tested against real etcd in integration tests.
 func cmpMatches(cmp clientv3.Cmp, key string, val []byte) bool {
-	// We rely on the cmp being created via clientv3.Compare() which stores
-	// the target and compare result internally.
-	// For simplicity, we compare against CreateRevision and Value comparisons only.
-	targetStr := cmp.Target.String()
-	_ = targetStr
-
-	// The etcd client v3 Cmp wraps an internal protobuf Compare.
-	// For the mock, we check key existence by looking at whether val is non-nil.
-	// The exact comparison logic depends on how the Cmp was constructed.
 	if val == nil {
-		// Key doesn't exist
 		return false
 	}
 	return true
@@ -262,6 +256,32 @@ func (s *MockStore) deliverWatchEvent(key string, evType mvccpb.Event_EventType)
 			}
 		}
 	}
+}
+
+// ---- fencing generation helpers ----
+
+// GetGeneration returns a generation value stored at gen:<nodeID>.
+func (s *MockStore) GetGeneration(ctx context.Context, nodeID string) (uint64, error) {
+	val, err := s.Get(ctx, metadata.GenKey(nodeID))
+	if err != nil { return 0, err }
+	if val == nil { return 0, nil }
+	return strconv.ParseUint(string(val), 10, 64)
+}
+
+// BumpGeneration atomically increments the generation for a node.
+func (s *MockStore) BumpGeneration(ctx context.Context, nodeID string, expectedOld uint64) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := metadata.GenKey(nodeID)
+	val := s.kv[key]
+	current := uint64(0)
+	if val != nil { current, _ = strconv.ParseUint(string(val), 10, 64) }
+	if current != expectedOld {
+		return 0, fmt.Errorf("CAS failed: expected %d, got %d", expectedOld, current)
+	}
+	newGen := expectedOld + 1
+	s.kv[key] = []byte(strconv.FormatUint(newGen, 10))
+	return newGen, nil
 }
 
 var _ metadata.MetadataStore = (*MockStore)(nil)
