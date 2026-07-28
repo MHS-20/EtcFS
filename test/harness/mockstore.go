@@ -143,10 +143,7 @@ func (s *MockStore) evalCmps(cmps []clientv3.Cmp) bool {
 // CreateRevision comparisons, and always passes for Value comparisons.
 // Full value-accurate comparison is tested against real etcd in integration tests.
 func cmpMatches(cmp clientv3.Cmp, key string, val []byte) bool {
-	if val == nil {
-		return false
-	}
-	return true
+	return val != nil
 }
 
 func (s *MockStore) applyOps(ops []clientv3.Op) {
@@ -263,8 +260,12 @@ func (s *MockStore) deliverWatchEvent(key string, evType mvccpb.Event_EventType)
 // GetGeneration returns a generation value stored at gen:<nodeID>.
 func (s *MockStore) GetGeneration(ctx context.Context, nodeID string) (uint64, error) {
 	val, err := s.Get(ctx, metadata.GenKey(nodeID))
-	if err != nil { return 0, err }
-	if val == nil { return 0, nil }
+	if err != nil {
+		return 0, err
+	}
+	if val == nil {
+		return 0, nil
+	}
 	return strconv.ParseUint(string(val), 10, 64)
 }
 
@@ -275,7 +276,9 @@ func (s *MockStore) BumpGeneration(ctx context.Context, nodeID string, expectedO
 	key := metadata.GenKey(nodeID)
 	val := s.kv[key]
 	current := uint64(0)
-	if val != nil { current, _ = strconv.ParseUint(string(val), 10, 64) }
+	if val != nil {
+		current, _ = strconv.ParseUint(string(val), 10, 64)
+	}
 	if current != expectedOld {
 		return 0, fmt.Errorf("CAS failed: expected %d, got %d", expectedOld, current)
 	}

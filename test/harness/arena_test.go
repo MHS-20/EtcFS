@@ -167,7 +167,7 @@ func allocateArenaID(ctx context.Context, s *MockStore) (uint64, error) {
 	for attempt := 0; attempt < 5; attempt++ {
 		v, _ := s.Get(ctx, key)
 		current := uint64(0)
-		if v != nil && len(v) >= 8 {
+		if len(v) >= 8 {
 			current = uint64(v[0])<<56 | uint64(v[1])<<48 | uint64(v[2])<<40 | uint64(v[3])<<32 |
 				uint64(v[4])<<24 | uint64(v[5])<<16 | uint64(v[6])<<8 | uint64(v[7])
 		}

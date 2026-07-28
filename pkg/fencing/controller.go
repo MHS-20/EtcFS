@@ -6,9 +6,10 @@ import (
 	"sync"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
-	"go.etcd.io/etcd/client/v3"
 )
 
 // Controller watches etcd membership keys and performs external fencing

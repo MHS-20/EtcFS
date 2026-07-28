@@ -17,8 +17,8 @@ func TestBlock_DeviceDiscovery(t *testing.T) {
 	// Test with a regular file simulating a block device
 	f, err := os.CreateTemp("", "etcfuse-block-*")
 	require.NoError(t, err)
-	defer os.Remove(f.Name())
-	defer f.Close()
+	defer func() { _ = os.Remove(f.Name()) }()
+	defer func() { _ = f.Close() }()
 
 	// Write enough data to simulate a block device
 	_, err = f.Write(make([]byte, 4096*100))

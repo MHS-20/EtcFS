@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/MHS-20/EtcFS/pkg/metadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
 // ---- C5.1: Self-fence — node stops accepting writes after lease expiry ----

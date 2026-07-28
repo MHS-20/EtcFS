@@ -14,8 +14,9 @@ import (
 	"fmt"
 	"sync"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/MHS-20/EtcFS/pkg/metadata"
-	"go.etcd.io/etcd/client/v3"
 )
 
 // ArenaSizeBytes is the default arena size (1 GiB).
@@ -33,8 +34,6 @@ type Allocator struct {
 	nodeID string
 	store  *metadata.Store
 	arenas []*Arena
-
-	inoCounter uint64
 }
 
 // Arena represents a single contiguous range on the block device.
