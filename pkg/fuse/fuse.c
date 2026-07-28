@@ -89,23 +89,6 @@ static int connect_to_meta(const char *socket_path)
     return fd;
 }
 
-/* ---- signal handling ---- */
-
-static struct fuse_session *g_session;
-
-static void handle_signal(int sig)
-{
-    etcfs_log(ETCFS_LOG_INFO, "received signal %d (%s)", sig, strsignal(sig));
-    if (g_session)
-        fuse_session_exit(g_session);
-}
-
-static void __attribute__((unused)) setup_signals(void)
-{
-    /* Phase 2: don't install custom signal handler — debug spurious SIGTERM */
-    (void)handle_signal;
-}
-
 /* ---- FUSE init callback ---- */
 
 static void etcfs_init(void *userdata, struct fuse_conn_info *conn)
@@ -171,7 +154,6 @@ int etcfs_run(struct etcfs_context *ctx)
         fuse_opt_free_args(&args);
         return -1;
     }
-    g_session = se;
 
     fuse_opt_free_args(&args);
 
