@@ -82,6 +82,7 @@ struct etcfs_context {
     int ipc_sync;     /* 1 = synchronous IPC mode (no worker thread) */
     int self_fenced;  /* set to 1 when lease expiry detected */
     uint64_t next_fh; /* next file handle to assign */
+    void *notify_se;  /* fuse_session for notification thread */
     char *mountpoint;
     char *volume_id;
     char *node_id;

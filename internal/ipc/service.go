@@ -20,13 +20,14 @@ import (
 
 // Service handles FUSE operation requests from the C daemon.
 type Service struct {
-	store      *metadata.Store
-	membership *metadata.Membership
-	watchdog   *fencing.Watchdog
-	alloc      *arena.Allocator
-	log        *config.Logger
-	dev        *blockio.Device
-	wal        *wal.WAL
+	store        *metadata.Store
+	membership   *metadata.Membership
+	watchdog     *fencing.Watchdog
+	alloc        *arena.Allocator
+	log          *config.Logger
+	dev          *blockio.Device
+	wal          *wal.WAL
+	notifyServer *notifyServer
 }
 
 // NewService creates a Service.

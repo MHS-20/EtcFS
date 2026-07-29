@@ -20,8 +20,47 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <fuse3/fuse_lowlevel.h>
+
+static void *notify_thread(void *arg)
+{
+    struct etcfs_context *ctx = (struct etcfs_context *) arg;
+    const char *path = "/tmp/etcfuse-notify.sock";
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return NULL;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        close(fd);
+        return NULL;
+    }
+
+    uint8_t hdr[12];
+    while (read(fd, hdr, 12) == 12) {
+        uint32_t typ = ((uint32_t) hdr[0] << 24) | ((uint32_t) hdr[1] << 16) |
+                       ((uint32_t) hdr[2] << 8) | (uint32_t) hdr[3];
+        uint64_t parent = ((uint64_t) hdr[4] << 56) | ((uint64_t) hdr[5] << 48) |
+                          ((uint64_t) hdr[6] << 40) | ((uint64_t) hdr[7] << 32) |
+                          ((uint64_t) hdr[8] << 24) | ((uint64_t) hdr[9] << 16) |
+                          ((uint64_t) hdr[10] << 8) | (uint64_t) hdr[11];
+        if (typ == 1) {
+            char name[256];
+            ssize_t n = read(fd, name, sizeof(name) - 1);
+            if (n > 0) {
+                name[n] = '\0';
+                fuse_lowlevel_notify_inval_entry(ctx->notify_se, parent, name, strlen(name));
+            }
+        }
+    }
+    close(fd);
+    return NULL;
+}
 
 /* ---- logging ---- */
 
@@ -164,6 +203,10 @@ int etcfs_run(struct etcfs_context *ctx)
     }
 
     etcfs_log(ETCFS_LOG_INFO, "EtcFS mounted at %s", mountpoint);
+
+    ctx->notify_se = se;
+    pthread_t ntid;
+    pthread_create(&ntid, NULL, notify_thread, ctx);
 
     /* enter event loop (single-threaded with synchronous IPC) */
     ret = fuse_session_loop(se);
