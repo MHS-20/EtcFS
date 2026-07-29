@@ -104,6 +104,13 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	s.totalChecked++
 	s.mu.Unlock()
 
+	for _, r := range orphans {
+		if r.AutoFix {
+			s.log.Info("scrub auto-fix: reclaiming orphan extent", "detail", r.Detail)
+			_ = s.store.Delete(ctx, fmt.Sprintf("extent:%d/0", r.Ino))
+		}
+	}
+
 	total := len(collisions) + len(orphans) + len(rangeV) + len(genM) + len(nlinkV)
 	if total > 0 {
 		s.log.Warn("scrub found anomalies", "count", total, "collisions", len(collisions),

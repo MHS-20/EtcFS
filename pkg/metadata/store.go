@@ -13,7 +13,7 @@ import (
 type MetadataStore interface {
 	// Key-value
 	Get(ctx context.Context, key string) ([]byte, error)
-	Put(ctx context.Context, key string, value []byte) (int64, error)
+	Put(ctx context.Context, key string, value []byte, opts ...clientv3.OpOption) (int64, error)
 	Delete(ctx context.Context, key string) error
 	GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.KeyValue, error)
 

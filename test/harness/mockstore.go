@@ -77,7 +77,7 @@ func (s *MockStore) Get(ctx context.Context, key string) ([]byte, error) {
 	return s.kv[key], nil
 }
 
-func (s *MockStore) Put(ctx context.Context, key string, value []byte) (int64, error) {
+func (s *MockStore) Put(ctx context.Context, key string, value []byte, opts ...clientv3.OpOption) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.kv[key] = value

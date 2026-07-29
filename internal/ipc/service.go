@@ -8,6 +8,8 @@
 package ipc
 
 import (
+	"context"
+
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
@@ -40,6 +42,11 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 // SetBlockDevice attaches a block device for data I/O.
 func (s *Service) SetBlockDevice(dev *blockio.Device) {
 	s.dev = dev
+}
+
+// ReconstructArenas rebuilds the arena free-list from existing extents in etcd.
+func (s *Service) ReconstructArenas(ctx context.Context) error {
+	return s.alloc.Reconstruct(ctx)
 }
 
 // Store returns the underlying metadata store.

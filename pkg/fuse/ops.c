@@ -44,6 +44,8 @@
 #define IPC_OP_FSYNC      24
 #define IPC_OP_MKNOD      25
 #define IPC_OP_FLUSH      26
+#define IPC_OP_GETLK      27
+#define IPC_OP_SETLK      28
 
 static int send_full(int fd, const void *buf, size_t len)
 {
@@ -806,20 +808,70 @@ static void ec_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 }
 static void ec_getlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct flock *lock)
 {
-    (void) ino;
     (void) fi;
-    struct flock lk = *lock;
-    lk.l_type = F_UNLCK;
+    uint8_t payload[48];
+    uint32_t off = 0;
+    off += wb_u64(payload + off, ino);
+    off += wb_u64(payload + off, (uint64_t) lock->l_start);
+    off += wb_u64(payload + off, (uint64_t) lock->l_len);
+    off += wb_u32(payload + off, (uint32_t) lock->l_type);
+    off += wb_u32(payload + off, (uint32_t) lock->l_pid);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_GETLK, payload, off, &resp, &rlen) < 0) {
+        struct flock lk = *lock;
+        lk.l_type = F_UNLCK;
+        fuse_reply_lock(req, &lk);
+        return;
+    }
+    uint32_t pos = 0;
+    int32_t e = rb_i32(resp, &pos);
+    if (e != 0) {
+        struct flock lk = *lock;
+        lk.l_type = F_UNLCK;
+        fuse_reply_lock(req, &lk);
+        free(resp);
+        return;
+    }
+    uint64_t lstart = rb_u64(resp, &pos);
+    uint64_t llen = rb_u64(resp, &pos);
+    uint32_t ltype = rb_u32(resp, &pos);
+    uint32_t lpid = rb_u32(resp, &pos);
+    free(resp);
+    struct flock lk;
+    lk.l_type = (short) ltype;
+    lk.l_whence = SEEK_SET;
+    lk.l_start = (off_t) lstart;
+    lk.l_len = (off_t) llen;
+    lk.l_pid = (pid_t) lpid;
     fuse_reply_lock(req, &lk);
 }
 static void ec_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct flock *lock,
                      int sleep)
 {
-    (void) ino;
     (void) fi;
-    (void) lock;
-    (void) sleep;
-    fuse_reply_err(req, 0);
+    uint8_t payload[48];
+    uint32_t off = 0;
+    off += wb_u64(payload + off, ino);
+    off += wb_u64(payload + off, (uint64_t) lock->l_start);
+    off += wb_u64(payload + off, (uint64_t) lock->l_len);
+    off += wb_u32(payload + off, (uint32_t) lock->l_type);
+    off += wb_u32(payload + off, (uint32_t) lock->l_pid);
+    off += wb_u32(payload + off, (uint32_t) sleep);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_SETLK, payload, off, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    int32_t e = 0;
+    if (rlen >= 4)
+        e = (int32_t) ((uint32_t) resp[0] << 24 | (uint32_t) resp[1] << 16 |
+                       (uint32_t) resp[2] << 8 | (uint32_t) resp[3]);
+    free(resp);
+    fuse_reply_err(req, e != 0 ? -e : 0);
 }
 static void ec_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t length,
                          struct fuse_file_info *fi)

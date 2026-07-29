@@ -172,6 +172,62 @@ func (a *Allocator) LiveRatio() float64 {
 // NodeID returns the owning node.
 func (a *Allocator) NodeID() string { return a.nodeID }
 
+// Reconstruct rebuilds the arena free-list from existing extents in etcd.
+// Called at startup after reconnecting to etcd.
+func (a *Allocator) Reconstruct(ctx context.Context) error {
+	arenaIDs, err := a.existingArenaIDs(ctx)
+	if err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	a.arenas = nil
+	a.mu.Unlock()
+
+	for _, id := range arenaIDs {
+		free := &Arena{
+			ID:        id,
+			DiskStart: id * ArenaSizeBytes,
+			DiskEnd:   (id + 1) * ArenaSizeBytes,
+			bitmap:    make([]uint64, BlocksPerArena/64),
+		}
+		a.mu.Lock()
+		a.arenas = append(a.arenas, free)
+		a.mu.Unlock()
+	}
+
+	extKvs, _ := a.store.GetPrefix(ctx, "extent:")
+	for _, kv := range extKvs {
+		var logOff, diskOff, length, gen uint64
+		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
+		for _, free := range a.arenas {
+			if diskOff >= free.DiskStart && diskOff+length <= free.DiskEnd {
+				start := (diskOff - free.DiskStart) / BlockSize
+				blocks := (length + BlockSize - 1) / BlockSize
+				for i := uint64(0); i < blocks && start+i < BlocksPerArena; i++ {
+					free.markAllocated(start + i)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (a *Allocator) existingArenaIDs(ctx context.Context) ([]uint64, error) {
+	kvs, err := a.store.GetPrefix(ctx, metadata.PrefixArena)
+	if err != nil {
+		return nil, err
+	}
+	var ids []uint64
+	for _, kv := range kvs {
+		id := metadata.DecodeUint64(kv.Value)
+		if id > 0 {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
 // ArenaCount returns the number of arenas managed by this allocator.
 func (a *Allocator) ArenaCount() int {
 	a.mu.Lock()

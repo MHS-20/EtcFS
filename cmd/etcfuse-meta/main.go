@@ -36,8 +36,10 @@ import (
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/internal/ipc"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
+	"github.com/MHS-20/EtcFS/pkg/compaction"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/scrub"
 )
 
 func main() {
@@ -89,6 +91,7 @@ func main() {
 		}
 		defer func() { _ = dev.Close() }()
 		svc.SetBlockDevice(dev)
+		_ = svc.ReconstructArenas(ctx)
 		log.Info("block device opened", "path", cfg.BlockDevice,
 			"sector_size", dev.SectorSize(), "total_size", dev.TotalSize())
 	}
@@ -102,6 +105,14 @@ func main() {
 	// Start external fencing controller
 	controller := fencing.NewController(store, membership, log)
 	go controller.Run(ctx)
+
+	// Start background scrubber (checks every 30s)
+	scrubber := scrub.New(store, cfg.NodeID, 30*time.Second, log)
+	go scrubber.Run(ctx)
+
+	// Start background compactor (checks hourly)
+	comp := compaction.New(store, cfg.NodeID)
+	go comp.Run(ctx, time.Hour)
 
 	// Signal handling: graceful shutdown
 	sigCh := make(chan os.Signal, 1)

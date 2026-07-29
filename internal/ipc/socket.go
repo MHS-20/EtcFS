@@ -36,8 +36,8 @@ const (
 	ipcOpStatfs     = 17
 	ipcOpAlloc      = 18
 	ipcOpCommit     = 19
-	ipcOpGetlk      = 20
-	ipcOpSetlk      = 21
+	ipcOpGetlk      = 27
+	ipcOpSetlk      = 28
 	ipcOpRead       = 22
 	ipcOpWrite      = 23
 	ipcOpFsync      = 24
@@ -899,46 +899,57 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 
 // ---- lock handlers ----
 
-// GETLK payload: [u64:ino][u64:fh][u64:start][u64:len][u32:type][u32:pid]
-// Response: [i32:error][u64:start][u64:len][u32:type][u32:pid]
+// GETLK payload: [u64:ino][u64:start][u64:len][u32:type][u32:pid]
 func (s *Service) handleGetlk(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 40 {
 		return int32Resp(makeErrno(-22)), nil
 	}
 	ino, rest := readU64(payload)
-	_ = ino
-	_, rest = readU64(rest) // fh
 	start, rest := readU64(rest)
 	length, rest := readU64(rest)
 	ltype, rest := readU32(rest)
 	pid, _ := readU32(rest)
 
-	// Phase 3: no actual locking — report no conflict
+	rec, _ := s.store.GetLockInfo(ctx, ino)
+	_ = start
+	_ = length
+	_ = pid
+
+	if rec == nil || rec.Mode == string(metadata.LockShared) {
+		var b buf
+		b.w32(0)
+		b.w64(start)
+		b.w64(length)
+		b.w32(0)
+		b.w32(pid)
+		return b.b, nil
+	}
 	var b buf
-	b.w32(0) // error = success
+	b.w32(0)
 	b.w64(start)
 	b.w64(length)
-	b.w32(ltype) // F_UNLCK means no conflict
+	b.w32(ltype)
 	b.w32(pid)
 	return b.b, nil
 }
 
-// SETLK payload: [u64:ino][u64:fh][u64:start][u64:len][u32:type][u32:pid]
-// Response: [i32:error]
+// SETLK payload: [u64:ino][u64:start][u64:len][u32:type][u32:pid][u32:sleep]
 func (s *Service) handleSetlk(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 40 {
+	if len(payload) < 44 {
 		return int32Resp(makeErrno(-22)), nil
 	}
 	ino, rest := readU64(payload)
-	_ = ino
-	_, rest = readU64(rest) // fh
 	_, rest = readU64(rest) // start
 	_, rest = readU64(rest) // len
-	_, rest = readU32(rest) // type
-	_ = rest                // pid
+	ltype, rest := readU32(rest)
+	_, rest = readU32(rest) // pid
+	_, _ = readU32(rest)    // sleep
+	_ = ino
 
-	// Phase 3: always grant lock (no conflict resolution yet)
-	return okResp(), nil
+	if ltype == 2 { // F_UNLCK
+		return okResp(), nil
+	}
+	return int32Resp(makeErrno(-11)), nil // EAGAIN
 }
 
 // allocInode reserves an inode number from etcd.
