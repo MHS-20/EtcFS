@@ -779,6 +779,8 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		}()
 	}
 
+	_ = s.dev.FlushDevice()
+
 	prefix := fmt.Sprintf("extent:%d/", ino)
 	kvs, _ := s.store.GetPrefix(ctx, prefix)
 	s.log.Info("READ extents", "ino", ino, "count", len(kvs))
