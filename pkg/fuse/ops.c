@@ -520,6 +520,10 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
     ep.attr_timeout = (double) rb_u32(resp, &pos);
     fill_stat(&ep.attr, &a);
     free(resp);
+    struct etcfs_context *ctx = fuse_req_userdata(req);
+    fi->fh = ++ctx->next_fh;
+    fi->direct_io = 1;
+    fi->keep_cache = 0;
     fuse_reply_create(req, &ep, fi);
 }
 

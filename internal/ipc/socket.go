@@ -1123,33 +1123,42 @@ func (s *Service) handleSetlk(ctx context.Context, payload []byte) ([]byte, erro
 }
 
 // allocInode reserves an inode number from etcd.
-// Simple sequential allocation for Phase 3.
+// Inode 0 is reserved — first allocation returns 1.
 func (s *Service) allocInode(ctx context.Context) (uint64, error) {
 	for attempt := 0; attempt < 8; attempt++ {
 		v, err := s.store.Get(ctx, metadata.KeyInodeAllocCounter)
 		if err != nil {
 			return 0, err
 		}
-		current := uint64(0)
+		etcdVal := uint64(0)
 		if v != nil {
-			current = metadata.DecodeUint64(v)
+			etcdVal = metadata.DecodeUint64(v)
 		}
-		next := current + 1
+
+		allocIno := etcdVal
+		if allocIno == 0 {
+			allocIno = 1
+		}
+		nextStore := allocIno + 1
 
 		var cmps []clientv3.Cmp
-		if current == 0 {
-			cmps = []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(metadata.KeyInodeAllocCounter), "=", 0)}
+		if etcdVal == 0 {
+			if v == nil {
+				cmps = []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(metadata.KeyInodeAllocCounter), "=", 0)}
+			} else {
+				cmps = []clientv3.Cmp{clientv3.Compare(clientv3.Value(metadata.KeyInodeAllocCounter), "=", string(metadata.EncodeUint64(0)))}
+			}
 		} else {
-			cmps = []clientv3.Cmp{clientv3.Compare(clientv3.Value(metadata.KeyInodeAllocCounter), "=", string(metadata.EncodeUint64(current)))}
+			cmps = []clientv3.Cmp{clientv3.Compare(clientv3.Value(metadata.KeyInodeAllocCounter), "=", string(metadata.EncodeUint64(etcdVal)))}
 		}
 
 		ok, err := s.store.Txn(ctx, cmps,
-			[]clientv3.Op{clientv3.OpPut(metadata.KeyInodeAllocCounter, string(metadata.EncodeUint64(next)))}, nil)
+			[]clientv3.Op{clientv3.OpPut(metadata.KeyInodeAllocCounter, string(metadata.EncodeUint64(nextStore)))}, nil)
 		if err != nil {
 			return 0, err
 		}
 		if ok {
-			return current, nil
+			return allocIno, nil
 		}
 		time.Sleep(time.Duration(1<<attempt) * time.Millisecond)
 	}

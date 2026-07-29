@@ -214,9 +214,15 @@ int etcfs_run(struct etcfs_context *ctx)
                         /* force-unmount the stale mount */
                         char cmd[512];
                         snprintf(cmd, sizeof(cmd), "fusermount -uz %s 2>/dev/null", mountpoint);
-                        system(cmd);
+                        {
+                            int rc = system(cmd);
+                            (void) rc;
+                        }
                         snprintf(cmd, sizeof(cmd), "umount -l %s 2>/dev/null", mountpoint);
-                        system(cmd);
+                        {
+                            int rc = system(cmd);
+                            (void) rc;
+                        }
                         goto after_cleanup;
                     }
                 }

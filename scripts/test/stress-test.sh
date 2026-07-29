@@ -11,8 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/../infra/state.sh"
 
-PUB_IPS=($(state_get compute_public_ips | jq -r '.[]'))
-PRIV_IPS=($(state_get compute_ips | jq -r '.[]'))
+mapfile -t PUB_IPS < <(state_get compute_public_ips | jq -r '.[]')
+mapfile -t PRIV_IPS < <(state_get compute_ips | jq -r '.[]')
 COUNT=${#PUB_IPS[@]}
 [[ "$COUNT" -ge 3 ]] || die "Need at least 3 nodes, got $COUNT"
 
@@ -177,7 +177,7 @@ WORKER
 
 # ---- Push worker to all nodes ----
 log "Deploying worker to $COUNT nodes"
-for i in ${!PUB_IPS[@]}; do
+for i in "${!PUB_IPS[@]}"; do
     ip="${PUB_IPS[$i]}"
     scp -o StrictHostKeyChecking=no /tmp/etcfuse-stress-worker.sh ec2-user@$ip:/tmp/stress.sh 2>/dev/null
     chmod +x /tmp/stress.sh 2>/dev/null
@@ -188,7 +188,7 @@ log "Starting $DUR second stress test on $COUNT nodes"
 RESULTS=""
 PIDS=""
 
-for i in ${!PUB_IPS[@]}; do
+for i in "${!PUB_IPS[@]}"; do
     ip="${PUB_IPS[$i]}"
     SEED=$(( $(date +%s) + i * 1000 ))
     ssh -o StrictHostKeyChecking=no -f ec2-user@$ip "nohup bash /tmp/stress.sh n$((i+1)) $SEED $DUR $TEST_DIR > /tmp/stress-result-$i.json 2>/dev/null &"
@@ -200,7 +200,7 @@ sleep $((DUR + 10))
 
 # ---- Collect results ----
 log "Collecting results"
-for i in ${!PUB_IPS[@]}; do
+for i in "${!PUB_IPS[@]}"; do
     ip="${PUB_IPS[$i]}"
     scp -o StrictHostKeyChecking=no ec2-user@$ip:/tmp/stress-result-$i.json "$REPORT_DIR/node-$i.json" 2>/dev/null || true
 done
@@ -210,7 +210,7 @@ log "Generating report"
 TOTAL_OK=0; TOTAL_ERR=0; TOTAL_CONT=0
 TOTAL_BYTES_W=0; TOTAL_LAT_COUNT=0; TOTAL_LAT_SUM=0
 
-for i in ${!PUB_IPS[@]}; do
+for i in "${!PUB_IPS[@]}"; do
     f="$REPORT_DIR/node-$i.json"
     [[ ! -f "$f" ]] && { fail "no results from node $i"; continue; }
     OK=$(jq '[.operations[].ok] | add' "$f" 2>/dev/null || echo 0)
@@ -247,7 +247,7 @@ AVG_LAT_MS=0
   echo "Avg latency:       ${AVG_LAT_MS}ms"
   echo ""
 
-  for i in ${!PUB_IPS[@]}; do
+  for i in "${!PUB_IPS[@]}"; do
     f="$REPORT_DIR/node-$i.json"
     [[ ! -f "$f" ]] && continue
     echo "--- Node $i ---"
