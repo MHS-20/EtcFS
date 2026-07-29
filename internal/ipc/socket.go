@@ -388,16 +388,30 @@ func (s *Service) handleReadlink(ctx context.Context, payload []byte) ([]byte, e
 // STATFS payload: empty
 // Response: [i32:error][u64:blocks][u64:bfree][u64:bavail][u64:files][u64:ffree][u32:bsize][u32:namelen][u32:frsize]
 func (s *Service) handleStatfs(ctx context.Context, _ []byte) ([]byte, error) {
+	blocks := uint64(1 << 30)
+	bfree := uint64(1 << 29)
+	if s.dev != nil {
+		blocks = uint64(s.dev.TotalSize()) / 512
+		ratio := s.alloc.LiveRatio()
+		bfree = uint64(float64(blocks) * (1 - ratio))
+	}
+	inodeKvs, _ := s.store.GetPrefix(ctx, "inode:")
+	files := uint64(len(inodeKvs))
+	ffree := uint64(1000000 - len(inodeKvs))
+	if ffree > 1000000 {
+		ffree = 900000
+	}
+
 	var b buf
-	b.w32(0)       // error = success
-	b.w64(1 << 30) // blocks
-	b.w64(1 << 29) // bfree
-	b.w64(1 << 29) // bavail
-	b.w64(1000000) // files
-	b.w64(900000)  // ffree
-	b.w32(4096)    // bsize
-	b.w32(255)     // namelen
-	b.w32(4096)    // frsize
+	b.w32(0)
+	b.w64(blocks)
+	b.w64(bfree)
+	b.w64(bfree)
+	b.w64(files)
+	b.w64(ffree)
+	b.w32(4096)
+	b.w32(255)
+	b.w32(4096)
 	return b.b, nil
 }
 
@@ -762,6 +776,15 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		eEnd := logOff + length
 
 		if offset >= eEnd || offset+uint64(rem) <= eStart {
+			if offset < eStart && offset+uint64(rem) > eStart {
+				gapLen := eStart - offset
+				if gapLen > uint64(rem) {
+					gapLen = uint64(rem)
+				}
+				bytesRead += uint32(gapLen)
+				rem -= uint32(gapLen)
+				offset += gapLen
+			}
 			continue
 		}
 
@@ -784,7 +807,7 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		if rem == 0 {
 			break
 		}
-		offset += uint64(bytesRead)
+		offset = eStart + readLen
 	}
 
 	var b buf

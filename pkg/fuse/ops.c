@@ -48,6 +48,8 @@
 #define IPC_OP_SETLK       28
 #define IPC_OP_READDIRPLUS 29
 
+#define MAX_NAME_LEN 255
+
 static int send_full(int fd, const void *buf, size_t len)
 {
     const char *p = buf;
