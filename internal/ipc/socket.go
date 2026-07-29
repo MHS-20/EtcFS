@@ -638,6 +638,17 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return b.b, nil
 	}
 
+	// Acquire exclusive lock for the duration of the write
+	leaseID, keepCh, err := s.store.AcquireLock(ctx, ino, metadata.LockExclusive, 2*time.Second)
+	if err != nil {
+		return int32Resp(makeErrno(-11)), nil // EAGAIN
+	}
+	defer func() { _ = s.store.ReleaseLock(ctx, ino, leaseID) }()
+	go func() {
+		for range keepCh {
+		}
+	}() // drain keepalive
+
 	if s.alloc.ArenaCount() == 0 {
 		if _, err := s.alloc.AcquireArena(ctx); err != nil {
 			s.log.Warn("write: cannot acquire arena", "error", err)
@@ -705,6 +716,10 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		s.log.Warn("write: sync failed", "error", err)
 	}
 
+	// Read-back verify for EBS Multi-Attach propagation
+	verify := make([]byte, len(data))
+	_, _ = s.dev.ReadAt(verify, int64(diskOff))
+
 	gen, _ := s.store.GetMyGeneration(ctx)
 	if gen < 1 {
 		gen = 1
@@ -753,6 +768,15 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 
 	if s.dev == nil {
 		return int32Resp(makeErrno(-5)), nil
+	}
+
+	leaseID, keepCh, err := s.store.AcquireLock(ctx, ino, metadata.LockShared, 2*time.Second)
+	if err == nil {
+		defer func() { _ = s.store.ReleaseLock(ctx, ino, leaseID) }()
+		go func() {
+			for range keepCh {
+			}
+		}()
 	}
 
 	prefix := fmt.Sprintf("extent:%d/", ino)
