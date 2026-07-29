@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
@@ -52,6 +53,25 @@ func (c *Compactor) NeedsCompaction(ctx context.Context) (bool, []uint64) {
 		}
 	}
 	return len(compactable) > 0, compactable
+}
+
+func (c *Compactor) Run(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			needs, candidates := c.NeedsCompaction(ctx)
+			if !needs {
+				continue
+			}
+			dstID := candidates[0] + 1024
+			_, _ = c.CompactArena(ctx, candidates[0], dstID)
+		}
+	}
 }
 
 func (c *Compactor) arenaUsage(ctx context.Context, arenaID uint64) float64 {

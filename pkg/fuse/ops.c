@@ -829,7 +829,7 @@ static void ec_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
     (void) offset;
     (void) length;
     (void) fi;
-    fuse_reply_err(req, EROFS);
+    fuse_reply_err(req, ENOSYS);
 }
 
 /* ---- op table ---- */

@@ -99,6 +99,10 @@ func main() {
 	// Start self-fencing watchdog
 	go watchdog.Run(ctx)
 
+	// Start external fencing controller
+	controller := fencing.NewController(store, membership, log)
+	go controller.Run(ctx)
+
 	// Signal handling: graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

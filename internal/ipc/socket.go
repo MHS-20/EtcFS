@@ -582,8 +582,15 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 
 	diskOff, err := s.alloc.Allocate(uint64(dataLen))
 	if err != nil {
-		s.log.Warn("write: cannot allocate blocks", "error", err)
-		return int32Resp(makeErrno(-28)), nil
+		if _, aerr := s.alloc.AcquireArena(ctx); aerr != nil {
+			s.log.Warn("write: cannot allocate blocks or acquire arena", "error", err)
+			return int32Resp(makeErrno(-28)), nil
+		}
+		diskOff, err = s.alloc.Allocate(uint64(dataLen))
+		if err != nil {
+			s.log.Warn("write: cannot allocate blocks even after arena expansion", "error", err)
+			return int32Resp(makeErrno(-28)), nil
+		}
 	}
 
 	writeData := data
