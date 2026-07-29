@@ -62,11 +62,15 @@ func main() {
 	log.Info("node", "id", cfg.NodeID)
 	log.Info("lease", "ttl", cfg.LeaseTTL)
 
-	// Connect to etcd
+	// Connect to etcd with aggressive failover
 	etcdCli, err := clientv3.New(clientv3.Config{
-		Endpoints:   cfg.EtcdEndpoints,
-		DialTimeout: 5 * time.Second,
-		TLS:         cfg.EtcdTLSConfig(),
+		Endpoints:            cfg.EtcdEndpoints,
+		DialTimeout:          3 * time.Second,
+		DialKeepAliveTime:    1 * time.Second,
+		DialKeepAliveTimeout: 1 * time.Second,
+		PermitWithoutStream:  true,
+		AutoSyncInterval:     30 * time.Second,
+		TLS:                  cfg.EtcdTLSConfig(),
 	})
 	if err != nil {
 		log.Fatal("cannot connect to etcd", "error", err)

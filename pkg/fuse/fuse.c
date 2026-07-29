@@ -194,6 +194,38 @@ int etcfs_run(struct etcfs_context *ctx)
 
     fuse_opt_free_args(&args);
 
+    /* check for a stale FUSE mount from a previous daemon instance.
+     * if the mountpoint is already occupied by a dead FUSE mount,
+     * the kernel will reject or corrupt the new session.
+     * scan /proc/mounts to detect this and force-unmount if needed. */
+    {
+        FILE *fp = fopen("/proc/mounts", "r");
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                char dev[256], mp[256], fst[256];
+                if (sscanf(line, "%255s %255s %255s", dev, mp, fst) == 3) {
+                    if (strcmp(mp, mountpoint) == 0 &&
+                        (strcmp(fst, "fuse") == 0 || strcmp(fst, "fuseblk") == 0)) {
+                        etcfs_log(ETCFS_LOG_WARN,
+                                  "stale FUSE mount at %s (previous daemon crash?), cleaning up",
+                                  mountpoint);
+                        fclose(fp);
+                        /* force-unmount the stale mount */
+                        char cmd[512];
+                        snprintf(cmd, sizeof(cmd), "fusermount -uz %s 2>/dev/null", mountpoint);
+                        system(cmd);
+                        snprintf(cmd, sizeof(cmd), "umount -l %s 2>/dev/null", mountpoint);
+                        system(cmd);
+                        goto after_cleanup;
+                    }
+                }
+            }
+            fclose(fp);
+        }
+    }
+after_cleanup:
+
     /* mount */
     if (fuse_session_mount(se, mountpoint) != 0) {
         etcfs_log(ETCFS_LOG_ERROR, "fuse_session_mount failed");

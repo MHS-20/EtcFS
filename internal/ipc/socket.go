@@ -639,10 +639,19 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return b.b, nil
 	}
 
-	// Acquire exclusive lock for the duration of the write
-	leaseID, keepCh, err := s.store.AcquireLock(ctx, ino, metadata.LockExclusive, 2*time.Second)
-	if err != nil {
-		return int32Resp(makeErrno(-11)), nil // EAGAIN
+	// Acquire exclusive lock for the duration of the write (with retry for failover)
+	var leaseID clientv3.LeaseID
+	var keepCh <-chan *clientv3.LeaseKeepAliveResponse
+	var lerr error
+	for attempt := 0; attempt < 3; attempt++ {
+		leaseID, keepCh, lerr = s.store.AcquireLock(ctx, ino, metadata.LockExclusive, 2*time.Second)
+		if lerr == nil {
+			break
+		}
+		time.Sleep(time.Duration(10+attempt*40) * time.Millisecond)
+	}
+	if lerr != nil {
+		return int32Resp(makeErrno(-11)), nil // EAGAIN after retries
 	}
 	defer func() { _ = s.store.ReleaseLock(ctx, ino, leaseID) }()
 	go func() {
@@ -743,7 +752,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 
 	var b buf
 	b.w32(0)
-	b.w32(uint32(n))
+	b.w32(uint32(dataLen))
 	return b.b, nil
 }
 
