@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"time"
+	"unsafe"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
@@ -791,7 +792,26 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		return b.b, nil
 	}
 
-	data := make([]byte, size)
+	var data []byte
+	var alignedBuf []byte
+	if s.dev.IsDirect() {
+		ss := s.dev.SectorSize()
+		alignedLen := (int(size) + ss - 1) / ss * ss
+		buf, aerr := blockio.AlignedBuffer(alignedLen, ss)
+		if aerr == nil {
+			alignedBuf = buf
+			data = buf[:size]
+		} else {
+			data = make([]byte, size)
+		}
+	} else {
+		data = make([]byte, size)
+	}
+	defer func() {
+		if alignedBuf != nil {
+			_ = blockio.FreeBuffer(alignedBuf)
+		}
+	}()
 	bytesRead := uint32(0)
 	rem := size
 
@@ -826,10 +846,31 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 			readLen = uint64(rem)
 		}
 
-		n, err := s.dev.ReadAt(data[bytesRead:bytesRead+uint32(readLen)],
-			int64(diskOff+readStart))
+		effectiveBuf := data[bytesRead : bytesRead+uint32(readLen)]
+		var tmpBuf []byte
+		if s.dev.IsDirect() {
+			ss := uint64(s.dev.SectorSize())
+			alignedReadLen := (readLen + ss - 1) / ss * ss
+			if alignedReadLen != readLen || uintptr(unsafe.Pointer(&effectiveBuf[0]))%uintptr(ss) != 0 {
+				b, aerr := blockio.AlignedBuffer(int(alignedReadLen), int(ss))
+				if aerr == nil {
+					tmpBuf = b
+					effectiveBuf = b[:alignedReadLen]
+				}
+			}
+		}
+
+		n, err := s.dev.ReadAt(effectiveBuf, int64(diskOff+readStart))
 		if err != nil {
+			if tmpBuf != nil {
+				_ = blockio.FreeBuffer(tmpBuf)
+			}
 			break
+		}
+		if tmpBuf != nil {
+			copy(data[bytesRead:bytesRead+uint32(readLen)], tmpBuf[:readLen])
+			_ = blockio.FreeBuffer(tmpBuf)
+			n = int(readLen)
 		}
 		bytesRead += uint32(n)
 		rem -= uint32(readLen)
