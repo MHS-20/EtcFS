@@ -28,6 +28,8 @@ type Config struct {
 	ShowVersion   bool
 	BlockDevice   string
 	MetricsAddr   string
+	RunFsck       bool
+	RunInfo       bool
 }
 
 // Parse reads CLI flags and returns a Config.
@@ -60,6 +62,10 @@ func Parse() *Config {
 		"Block device path for data I/O (e.g., /dev/nvme1n1)")
 	flag.StringVar(&cfg.MetricsAddr, "metrics-addr", "",
 		"Prometheus metrics HTTP listen address (e.g., :9090)")
+	flag.BoolVar(&cfg.RunFsck, "fsck", false,
+		"Run offline filesystem check and exit")
+	flag.BoolVar(&cfg.RunInfo, "info", false,
+		"Print filesystem statistics and exit")
 
 	flag.Parse()
 

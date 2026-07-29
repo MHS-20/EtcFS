@@ -206,6 +206,22 @@ func (s *Scrubber) CheckRangeValidity(ctx context.Context) []Result {
 
 // checkGenerationConsistency detects extents with stale fencing generations.
 func (s *Scrubber) CheckGenerationConsistency(ctx context.Context) []Result {
+	// Read all known node generations
+	nodeGens := make(map[string]uint64)
+	genKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixGen)
+	for _, kv := range genKvs {
+		nodeID := string(kv.Key[len(metadata.PrefixGen):])
+		n := uint64(0)
+		_, _ = fmt.Sscanf(string(kv.Value), "%d", &n)
+		nodeGens[nodeID] = n
+	}
+	maxGen := uint64(0)
+	for _, g := range nodeGens {
+		if g > maxGen {
+			maxGen = g
+		}
+	}
+
 	var results []Result
 	extKvs, _ := s.store.GetPrefix(ctx, "extent:")
 	for _, kv := range extKvs {
@@ -214,19 +230,14 @@ func (s *Scrubber) CheckGenerationConsistency(ctx context.Context) []Result {
 		_, _ = fmt.Sscanf(string(kv.Key), "extent:%d/", &ino)
 		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
 
-		// Check the inode's current generation
-		genVal, _ := s.store.Get(ctx, metadata.GenKey(s.nodeID))
-		if genVal != nil {
-			currentGen := uint64(0)
-			_, _ = fmt.Sscanf(string(genVal), "%d", &currentGen)
-			if gen < currentGen {
-				results = append(results, Result{
-					Type:    "generation",
-					Detail:  fmt.Sprintf("extent %s stamped gen=%d, current=%d", string(kv.Key), gen, currentGen),
-					Ino:     ino,
-					DiskOff: diskOff,
-				})
-			}
+		if gen < maxGen {
+			results = append(results, Result{
+				Type: "generation",
+				Detail: fmt.Sprintf("extent %s stamped gen=%d, max_cluster_gen=%d",
+					string(kv.Key), gen, maxGen),
+				Ino:     ino,
+				DiskOff: diskOff,
+			})
 		}
 	}
 	return results

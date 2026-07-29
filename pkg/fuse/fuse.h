@@ -77,10 +77,11 @@ struct etcfs_dirent {
 struct ipc_worker;
 struct etcfs_context {
     struct ipc_worker *ipc;
-    int block_fd;    /* raw block device FD, opened with O_DIRECT */
-    int ipc_fd;      /* Unix socket fd to Go backend */
-    int ipc_sync;    /* 1 = synchronous IPC mode (no worker thread) */
-    int self_fenced; /* set to 1 when lease expiry detected */
+    int block_fd;     /* raw block device FD, opened with O_DIRECT */
+    int ipc_fd;       /* Unix socket fd to Go backend */
+    int ipc_sync;     /* 1 = synchronous IPC mode (no worker thread) */
+    int self_fenced;  /* set to 1 when lease expiry detected */
+    uint64_t next_fh; /* next file handle to assign */
     char *mountpoint;
     char *volume_id;
     char *node_id;

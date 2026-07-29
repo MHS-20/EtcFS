@@ -38,6 +38,8 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/compaction"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
+	"github.com/MHS-20/EtcFS/pkg/fsck"
+	"github.com/MHS-20/EtcFS/pkg/fsinfo"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 	"github.com/MHS-20/EtcFS/pkg/metrics"
 	"github.com/MHS-20/EtcFS/pkg/scrub"
@@ -79,6 +81,21 @@ func main() {
 
 	// Metadata store: wraps etcd client with schema-aware helpers
 	store := metadata.NewStore(etcdCli, cfg.NodeID)
+
+	if cfg.RunFsck {
+		chk := fsck.New(store)
+		findings := chk.Run(ctx)
+		fmt.Printf("fsck: %d errors, %d warnings\n", chk.ErrorCount(), chk.WarningCount())
+		for _, f := range findings {
+			fmt.Printf("  [%s] %s\n", f.Level, f.Message)
+		}
+		os.Exit(0)
+	}
+	if cfg.RunInfo {
+		info, _ := fsinfo.Collect(ctx, store)
+		fmt.Println(info.String())
+		os.Exit(0)
+	}
 
 	// Self-fencing watchdog
 	watchdog := fencing.NewWatchdog(membership, cfg.LeaseTTL)

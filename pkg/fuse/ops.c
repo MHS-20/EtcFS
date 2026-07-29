@@ -224,6 +224,10 @@ static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
     }
 
     size_t nlen = strlen(name);
+    if (nlen > MAX_NAME_LEN) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
     uint8_t payload[12 + 256];
     uint32_t off = 0;
     off += wb_u64(payload + off, parent);
@@ -465,7 +469,8 @@ static void ec_statfs(fuse_req_t req, fuse_ino_t ino)
 static void ec_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     (void) ino;
-    fi->fh = 0;
+    struct etcfs_context *ctx = fuse_req_userdata(req);
+    fi->fh = ++ctx->next_fh;
     fi->direct_io = 1;
     fi->keep_cache = 0;
     fuse_reply_open(req, fi);
@@ -474,7 +479,8 @@ static void ec_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 static void ec_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     (void) ino;
-    fi->fh = 0;
+    struct etcfs_context *ctx = fuse_req_userdata(req);
+    fi->fh = ++ctx->next_fh;
     fuse_reply_open(req, fi);
 }
 
