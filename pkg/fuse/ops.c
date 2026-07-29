@@ -22,30 +22,31 @@
 #include <fuse3/fuse_lowlevel.h>
 
 /* ---- opcodes (match Go side) ---- */
-#define IPC_OP_LOOKUP     1
-#define IPC_OP_GETATTR    2
-#define IPC_OP_READDIR    3
-#define IPC_OP_READLINK   4
-#define IPC_OP_CREATE     5
-#define IPC_OP_MKDIR      6
-#define IPC_OP_UNLINK     7
-#define IPC_OP_RMDIR      8
-#define IPC_OP_RENAME     9
-#define IPC_OP_SYMLINK    10
-#define IPC_OP_LINK       11
-#define IPC_OP_SETATTR    12
-#define IPC_OP_OPEN       13
-#define IPC_OP_RELEASE    14
-#define IPC_OP_OPENDIR    15
-#define IPC_OP_RELEASEDIR 16
-#define IPC_OP_STATFS     17
-#define IPC_OP_READ       22
-#define IPC_OP_WRITE      23
-#define IPC_OP_FSYNC      24
-#define IPC_OP_MKNOD      25
-#define IPC_OP_FLUSH      26
-#define IPC_OP_GETLK      27
-#define IPC_OP_SETLK      28
+#define IPC_OP_LOOKUP      1
+#define IPC_OP_GETATTR     2
+#define IPC_OP_READDIR     3
+#define IPC_OP_READLINK    4
+#define IPC_OP_CREATE      5
+#define IPC_OP_MKDIR       6
+#define IPC_OP_UNLINK      7
+#define IPC_OP_RMDIR       8
+#define IPC_OP_RENAME      9
+#define IPC_OP_SYMLINK     10
+#define IPC_OP_LINK        11
+#define IPC_OP_SETATTR     12
+#define IPC_OP_OPEN        13
+#define IPC_OP_RELEASE     14
+#define IPC_OP_OPENDIR     15
+#define IPC_OP_RELEASEDIR  16
+#define IPC_OP_STATFS      17
+#define IPC_OP_READ        22
+#define IPC_OP_WRITE       23
+#define IPC_OP_FSYNC       24
+#define IPC_OP_MKNOD       25
+#define IPC_OP_FLUSH       26
+#define IPC_OP_GETLK       27
+#define IPC_OP_SETLK       28
+#define IPC_OP_READDIRPLUS 29
 
 static int send_full(int fd, const void *buf, size_t len)
 {
@@ -337,6 +338,65 @@ static void ec_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
         st.st_ino = di;
         st.st_mode = (dt == 4) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
         size_t sz = fuse_add_direntry(req, dbuf + used, bufsz - used, dn, &st, (off_t) d_off);
+        if (sz > bufsz - used)
+            break;
+        used += sz;
+    }
+    free(resp);
+    fuse_reply_buf(req, dbuf, used);
+    free(dbuf);
+}
+
+static void ec_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
+                           struct fuse_file_info *fi)
+{
+    (void) fi;
+    uint8_t payload[20];
+    uint32_t p = 0;
+    p += wb_u64(payload + p, ino);
+    p += wb_u64(payload + p, (uint64_t) off);
+    p += wb_u32(payload + p, (uint32_t) size);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_READDIRPLUS, payload, p, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    uint32_t pos = 0;
+    int32_t e = rb_i32(resp, &pos);
+    if (e != 0) {
+        fuse_reply_err(req, -e);
+        free(resp);
+        return;
+    }
+
+    uint32_t count = rb_u32(resp, &pos);
+    size_t bufsz = size > 0 ? size : 4096;
+    char *dbuf = malloc(bufsz + 512);
+    size_t used = 0;
+    uint64_t off_cookie = (uint64_t) off;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t di = rb_u64(resp, &pos);
+        uint32_t nl = rb_u32(resp, &pos);
+        char *dn = (char *) (resp + pos);
+        pos += nl;
+        uint32_t dt __attribute__((unused)) = rb_u32(resp, &pos);
+        uint64_t d_off = rb_u64(resp, &pos);
+        if (d_off <= off_cookie)
+            continue;
+
+        struct fuse_entry_param ep;
+        memset(&ep, 0, sizeof(ep));
+        ep.ino = di;
+        struct etcfs_attr a;
+        rb_attr(resp, &pos, &a);
+        ep.entry_timeout = (double) rb_u32(resp, &pos);
+        ep.attr_timeout = (double) rb_u32(resp, &pos);
+        fill_stat(&ep.attr, &a);
+
+        size_t sz = fuse_add_direntry_plus(req, dbuf + used, bufsz - used, dn, &ep, d_off);
         if (sz > bufsz - used)
             break;
         used += sz;
@@ -893,6 +953,7 @@ struct fuse_lowlevel_ops *etcfs_fuse_ops(void)
     ops.lookup = ec_lookup;
     ops.getattr = ec_getattr;
     ops.readdir = ec_readdir;
+    ops.readdirplus = ec_readdirplus;
     ops.readlink = ec_readlink;
     ops.statfs = ec_statfs;
     ops.open = ec_open;

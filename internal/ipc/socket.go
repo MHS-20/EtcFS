@@ -13,36 +13,38 @@ import (
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	wal "github.com/MHS-20/EtcFS/pkg/walgo"
 )
 
 // opcodes matching pkg/fuse/ops.c
 const (
-	ipcOpLookup     = 1
-	ipcOpGetattr    = 2
-	ipcOpReaddir    = 3
-	ipcOpReadlink   = 4
-	ipcOpCreate     = 5
-	ipcOpMkdir      = 6
-	ipcOpUnlink     = 7
-	ipcOpRmdir      = 8
-	ipcOpRename     = 9
-	ipcOpSymlink    = 10
-	ipcOpLink       = 11
-	ipcOpSetattr    = 12
-	ipcOpOpen       = 13
-	ipcOpRelease    = 14
-	ipcOpOpendir    = 15
-	ipcOpReleasedir = 16
-	ipcOpStatfs     = 17
-	ipcOpAlloc      = 18
-	ipcOpCommit     = 19
-	ipcOpGetlk      = 27
-	ipcOpSetlk      = 28
-	ipcOpRead       = 22
-	ipcOpWrite      = 23
-	ipcOpFsync      = 24
-	ipcOpMknod      = 25
-	ipcOpFlush      = 26
+	ipcOpLookup      = 1
+	ipcOpGetattr     = 2
+	ipcOpReaddir     = 3
+	ipcOpReadlink    = 4
+	ipcOpCreate      = 5
+	ipcOpMkdir       = 6
+	ipcOpUnlink      = 7
+	ipcOpRmdir       = 8
+	ipcOpRename      = 9
+	ipcOpSymlink     = 10
+	ipcOpLink        = 11
+	ipcOpSetattr     = 12
+	ipcOpOpen        = 13
+	ipcOpRelease     = 14
+	ipcOpOpendir     = 15
+	ipcOpReleasedir  = 16
+	ipcOpStatfs      = 17
+	ipcOpAlloc       = 18
+	ipcOpCommit      = 19
+	ipcOpGetlk       = 27
+	ipcOpSetlk       = 28
+	ipcOpRead        = 22
+	ipcOpWrite       = 23
+	ipcOpFsync       = 24
+	ipcOpMknod       = 25
+	ipcOpFlush       = 26
+	ipcOpReadDirPlus = 29
 )
 
 // RunSocket starts a raw binary IPC server on the given listener.
@@ -188,6 +190,8 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 		return okResp(), nil
 	case ipcOpFsync:
 		return okResp(), nil
+	case ipcOpReadDirPlus:
+		return s.handleReaddirPlus(ctx, payload)
 	case ipcOpRead:
 		return s.handleRead(ctx, payload)
 	case ipcOpGetlk:
@@ -309,6 +313,52 @@ func (s *Service) handleReaddir(ctx context.Context, payload []byte) ([]byte, er
 		b.b = append(b.b, []byte(e.Name)...)
 		b.w32(dtype)
 		b.w64(uint64(i + 1)) // directory offset cookie
+	}
+
+	return b.b, nil
+}
+
+func (s *Service) handleReaddirPlus(ctx context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 20 {
+		return int32Resp(makeErrno(-22)), nil
+	}
+	ino, rest := readU64(payload)
+	_, rest = readU64(rest)
+	_ = rest
+
+	entries, err := s.store.ListDirents(ctx, ino)
+	if err != nil {
+		return int32Resp(makeErrno(-5)), nil
+	}
+
+	var b buf
+	b.w32(0)
+	b.w32(uint32(len(entries)))
+
+	for i, e := range entries {
+		rec, _ := s.store.GetInode(ctx, e.Ino)
+		dtype := uint32(metadata.DirentTypeFile)
+		if rec != nil {
+			if (rec.Mode & metadata.S_IFMT) == metadata.ModeDir {
+				dtype = metadata.DirentTypeDir
+			} else if (rec.Mode & metadata.S_IFMT) == metadata.ModeSymlink {
+				dtype = metadata.DirentTypeSymlink
+			}
+		}
+		b.w64(e.Ino)
+		b.w32(uint32(len(e.Name)))
+		b.b = append(b.b, []byte(e.Name)...)
+		b.w32(dtype)
+		b.w64(uint64(i + 1))
+		if rec != nil {
+			b.wAttr(rec)
+		} else {
+			for j := 0; j < 72; j++ {
+				b.b = append(b.b, 0)
+			}
+		}
+		b.w32(1)
+		b.w32(1)
 	}
 
 	return b.b, nil
@@ -620,6 +670,20 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return int32Resp(makeErrno(-5)), nil
 	}
 
+	if s.wal != nil {
+		gen, _ := s.store.GetMyGeneration(ctx)
+		if gen < 1 {
+			gen = 1
+		}
+		_ = s.wal.Append(&wal.Entry{
+			Ino:        ino,
+			LogicalOff: offset,
+			DiskOff:    diskOff,
+			Length:     uint64(dataLen),
+			Generation: gen,
+		})
+	}
+
 	if err := s.dev.SyncRange(int64(diskOff), int64(n)); err != nil {
 		s.log.Warn("write: sync failed", "error", err)
 	}
@@ -638,6 +702,10 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	if newEnd > rec.Size {
 		rec.Size = newEnd
 		_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+	}
+
+	if s.wal != nil {
+		_ = s.wal.MarkCommitted(ino, offset)
 	}
 
 	var b buf

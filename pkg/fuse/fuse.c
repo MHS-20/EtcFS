@@ -95,7 +95,8 @@ static int connect_to_meta(const char *socket_path)
 static void etcfs_init(void *userdata, struct fuse_conn_info *conn)
 {
     (void) userdata;
-    (void) conn;
+    conn->want |= FUSE_CAP_READDIRPLUS;
+    conn->want |= FUSE_CAP_ASYNC_READ;
 }
 
 /* ---- main entry ---- */

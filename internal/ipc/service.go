@@ -15,6 +15,7 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	wal "github.com/MHS-20/EtcFS/pkg/walgo"
 )
 
 // Service handles FUSE operation requests from the C daemon.
@@ -25,6 +26,7 @@ type Service struct {
 	alloc      *arena.Allocator
 	log        *config.Logger
 	dev        *blockio.Device
+	wal        *wal.WAL
 }
 
 // NewService creates a Service.
@@ -47,6 +49,14 @@ func (s *Service) SetBlockDevice(dev *blockio.Device) {
 // ReconstructArenas rebuilds the arena free-list from existing extents in etcd.
 func (s *Service) ReconstructArenas(ctx context.Context) error {
 	return s.alloc.Reconstruct(ctx)
+}
+
+func (s *Service) SetWAL(w *wal.WAL) {
+	s.wal = w
+}
+
+func (s *Service) FreeBlock(diskOff, length uint64) {
+	s.alloc.Free(diskOff, length)
 }
 
 // Store returns the underlying metadata store.
