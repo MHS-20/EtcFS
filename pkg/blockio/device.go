@@ -19,16 +19,19 @@ type Device struct {
 	path       string
 	sectorSize int
 	totalSize  int64
+	direct     bool
 }
 
 func Open(path string) (*Device, error) {
-	fd, err := syscall.Open(path, syscall.O_RDWR, 0)
+	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_DIRECT, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", path, err)
+		fd, err = syscall.Open(path, syscall.O_RDWR, 0)
+		if err != nil {
+			return nil, fmt.Errorf("open %s: %w", path, err)
+		}
 	}
 
-	d := &Device{fd: fd, path: path}
-
+	d := &Device{fd: fd, path: path, direct: (err == nil)}
 	if err := d.queryGeometry(); err != nil {
 		_ = syscall.Close(fd)
 		return nil, err
@@ -36,6 +39,8 @@ func Open(path string) (*Device, error) {
 
 	return d, nil
 }
+
+func (d *Device) IsDirect() bool { return d.direct }
 
 func (d *Device) queryGeometry() error {
 	d.sectorSize = 512
@@ -68,10 +73,22 @@ func (d *Device) TotalSize() int64 { return d.totalSize }
 func (d *Device) Path() string     { return d.path }
 
 func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
+	if d.direct {
+		if offset%int64(d.sectorSize) != 0 || len(buf)%d.sectorSize != 0 {
+			return 0, fmt.Errorf("misaligned O_DIRECT read: off=%d len=%d sector=%d",
+				offset, len(buf), d.sectorSize)
+		}
+	}
 	return unix.Pread(d.fd, buf, offset)
 }
 
 func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
+	if d.direct {
+		if offset%int64(d.sectorSize) != 0 || len(buf)%d.sectorSize != 0 {
+			return 0, fmt.Errorf("misaligned O_DIRECT write: off=%d len=%d sector=%d",
+				offset, len(buf), d.sectorSize)
+		}
+	}
 	return unix.Pwrite(d.fd, buf, offset)
 }
 

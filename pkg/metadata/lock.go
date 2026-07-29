@@ -47,16 +47,31 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 
 	switch mode {
 	case LockExclusive:
-		// No lock key can exist at all
 		cmps = []clientv3.Cmp{
 			clientv3.Compare(clientv3.CreateRevision(LockKey(ino)), "=", 0),
 		}
 	case LockShared:
-		// No exclusive lock can exist (shared is ok)
-		// We check for value containing "exclusive" — a simplified approach.
-		// Full implementation in Phase 3 uses a proper lock table.
-		cmps = []clientv3.Cmp{
-			clientv3.Compare(clientv3.CreateRevision(LockKey(ino)), "=", 0),
+		existing, _ := s.GetLockInfo(ctx, ino)
+		if existing != nil && existing.Mode == string(LockShared) {
+			existingVal, _ := s.Get(ctx, LockKey(ino))
+			existing.Holders = append(existing.Holders, s.nodeID)
+			holdersJSON := ""
+			for j, h := range existing.Holders {
+				if j > 0 {
+					holdersJSON += ","
+				}
+				holdersJSON += `"` + h + `"`
+			}
+			value = fmt.Sprintf(`{"mode":"%s","holders":[%s]}`, LockShared, holdersJSON)
+			if existingVal != nil {
+				cmps = []clientv3.Cmp{
+					clientv3.Compare(clientv3.Value(LockKey(ino)), "=", string(existingVal)),
+				}
+			}
+		} else {
+			cmps = []clientv3.Cmp{
+				clientv3.Compare(clientv3.CreateRevision(LockKey(ino)), "=", 0),
+			}
 		}
 	}
 

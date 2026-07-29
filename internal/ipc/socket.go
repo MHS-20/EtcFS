@@ -11,6 +11,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/internal/config"
+	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
@@ -585,7 +586,27 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return int32Resp(makeErrno(-28)), nil
 	}
 
-	n, werr := s.dev.WriteAt(data, int64(diskOff))
+	writeData := data
+	var alignedBuf []byte
+	if s.dev.IsDirect() {
+		ss := s.dev.SectorSize()
+		alignedLen := (dataLen + ss - 1) / ss * ss
+		buf, aerr := blockio.AlignedBuffer(alignedLen, ss)
+		if aerr != nil {
+			s.alloc.Free(diskOff, uint64(dataLen))
+			return int32Resp(makeErrno(-12)), nil
+		}
+		alignedBuf = buf
+		copy(buf, data)
+		writeData = buf[:alignedLen]
+	}
+	defer func() {
+		if alignedBuf != nil {
+			_ = blockio.FreeBuffer(alignedBuf)
+		}
+	}()
+
+	n, werr := s.dev.WriteAt(writeData, int64(diskOff))
 	if werr != nil {
 		s.alloc.Free(diskOff, uint64(dataLen))
 		s.log.Warn("write: block device write failed", "error", werr)
