@@ -12,6 +12,7 @@ import (
 const (
 	blkSSZGet    = 0x1268
 	blkGetSize64 = 0x80081272
+	blkFlushBuf  = 0x1261
 )
 
 type Device struct {
@@ -24,6 +25,7 @@ type Device struct {
 
 func Open(path string) (*Device, error) {
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_DIRECT, 0)
+	direct := (err == nil)
 	if err != nil {
 		fd, err = syscall.Open(path, syscall.O_RDWR, 0)
 		if err != nil {
@@ -31,13 +33,21 @@ func Open(path string) (*Device, error) {
 		}
 	}
 
-	d := &Device{fd: fd, path: path, direct: (err == nil)}
+	d := &Device{fd: fd, path: path, direct: direct}
 	if err := d.queryGeometry(); err != nil {
 		_ = syscall.Close(fd)
 		return nil, err
 	}
 
 	return d, nil
+}
+
+func (d *Device) FlushDevice() error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(d.fd), blkFlushBuf, 0)
+	if errno != 0 && errno != syscall.ENOTTY {
+		return errno
+	}
+	return nil
 }
 
 func (d *Device) IsDirect() bool { return d.direct }

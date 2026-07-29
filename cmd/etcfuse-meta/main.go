@@ -126,7 +126,8 @@ func main() {
 		}
 
 		log.Info("block device opened", "path", cfg.BlockDevice,
-			"sector_size", dev.SectorSize(), "total_size", dev.TotalSize())
+			"sector_size", dev.SectorSize(), "total_size", dev.TotalSize(),
+			"direct_io", dev.IsDirect())
 	}
 
 	// Start membership heartbeat

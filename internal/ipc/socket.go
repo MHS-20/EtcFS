@@ -685,6 +685,8 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return int32Resp(makeErrno(-5)), nil
 	}
 
+	_ = s.dev.FlushDevice()
+
 	if s.wal != nil {
 		gen, _ := s.store.GetMyGeneration(ctx)
 		if gen < 1 {
