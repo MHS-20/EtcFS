@@ -1,6 +1,8 @@
 package metrics
 
 import (
+	"fmt"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -110,4 +112,26 @@ func (r *Registry) HasGauge(name string) bool {
 	defer r.mu.Unlock()
 	_, ok := r.gauges[name]
 	return ok
+}
+
+func (r *Registry) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		w.Header().Set("Content-Type", "text/plain")
+		for name, c := range r.counters {
+			for label, val := range c.labels {
+				_, _ = fmt.Fprintf(w, "%s{label=%q} %g\n", name, label, val)
+			}
+		}
+		for name, g := range r.gauges {
+			_, _ = fmt.Fprintf(w, "%s %g\n", name, g.val)
+		}
+	})
+}
+
+func StartServer(addr string, reg *Registry) error {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", reg.Handler())
+	return http.ListenAndServe(addr, mux)
 }

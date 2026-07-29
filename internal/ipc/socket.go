@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
@@ -1046,7 +1047,7 @@ func (s *Service) handleSetlk(ctx context.Context, payload []byte) ([]byte, erro
 // allocInode reserves an inode number from etcd.
 // Simple sequential allocation for Phase 3.
 func (s *Service) allocInode(ctx context.Context) (uint64, error) {
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < 8; attempt++ {
 		v, err := s.store.Get(ctx, metadata.KeyInodeAllocCounter)
 		if err != nil {
 			return 0, err
@@ -1057,18 +1058,22 @@ func (s *Service) allocInode(ctx context.Context) (uint64, error) {
 		}
 		next := current + 1
 
-		ok, err := s.store.Txn(ctx,
-			[]clientv3.Cmp{clientv3.Compare(clientv3.Value(metadata.KeyInodeAllocCounter), "=",
-				string(metadata.EncodeUint64(current)))},
-			[]clientv3.Op{clientv3.OpPut(metadata.KeyInodeAllocCounter,
-				string(metadata.EncodeUint64(next)))},
-			nil)
+		var cmps []clientv3.Cmp
+		if current == 0 {
+			cmps = []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(metadata.KeyInodeAllocCounter), "=", 0)}
+		} else {
+			cmps = []clientv3.Cmp{clientv3.Compare(clientv3.Value(metadata.KeyInodeAllocCounter), "=", string(metadata.EncodeUint64(current)))}
+		}
+
+		ok, err := s.store.Txn(ctx, cmps,
+			[]clientv3.Op{clientv3.OpPut(metadata.KeyInodeAllocCounter, string(metadata.EncodeUint64(next)))}, nil)
 		if err != nil {
 			return 0, err
 		}
 		if ok {
 			return current, nil
 		}
+		time.Sleep(time.Duration(1<<attempt) * time.Millisecond)
 	}
 	return 0, fmt.Errorf("inode alloc exhausted")
 }

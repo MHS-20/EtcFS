@@ -27,6 +27,7 @@ type Config struct {
 	LogLevel      int
 	ShowVersion   bool
 	BlockDevice   string
+	MetricsAddr   string
 }
 
 // Parse reads CLI flags and returns a Config.
@@ -57,6 +58,8 @@ func Parse() *Config {
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
 	flag.StringVar(&cfg.BlockDevice, "block-device", "",
 		"Block device path for data I/O (e.g., /dev/nvme1n1)")
+	flag.StringVar(&cfg.MetricsAddr, "metrics-addr", "",
+		"Prometheus metrics HTTP listen address (e.g., :9090)")
 
 	flag.Parse()
 

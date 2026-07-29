@@ -39,6 +39,7 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/compaction"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 	"github.com/MHS-20/EtcFS/pkg/scrub"
 	wal "github.com/MHS-20/EtcFS/pkg/walgo"
 )
@@ -128,6 +129,13 @@ func main() {
 	// Start background compactor (checks hourly)
 	comp := compaction.New(store, cfg.NodeID)
 	go comp.Run(ctx, time.Hour)
+
+	// Start Prometheus metrics server if configured
+	if cfg.MetricsAddr != "" {
+		reg := metrics.NewRegistry()
+		go func() { _ = metrics.StartServer(cfg.MetricsAddr, reg) }()
+		log.Info("metrics server listening", "addr", cfg.MetricsAddr)
+	}
 
 	// Signal handling: graceful shutdown
 	sigCh := make(chan os.Signal, 1)
