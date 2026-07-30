@@ -8,6 +8,15 @@ mkdir -p "$REPORT_DIR"
 PASS=0; FAIL=0
 log() { echo "[$(date +%H:%M:%S)] $1" | tee -a "$REPORT_DIR/chaos.log"; }
 
+# logerr — like log, but never writes to stdout.  Helpers whose stdout is
+# captured by command substitution (readf) MUST use this: a diagnostic echoed
+# to stdout would be captured as if it were file content and turn a failed
+# read into a spurious non-empty result.
+logerr() {
+    echo "[$(date +%H:%M:%S)] $1" >&2
+    echo "[$(date +%H:%M:%S)] $1" >> "$REPORT_DIR/chaos.log"
+}
+
 wait_ssh() {
     local ip=$1; local max=$2
     for i in $(seq 1 $max); do
@@ -91,7 +100,10 @@ provision() {
         " 2>/dev/null
     done
     sleep 10
-    ssh -o StrictHostKeyChecking=no ec2-user@$N1 "sudo ETCDCTL_API=3 /usr/local/bin/etcdctl --endpoints=http://127.0.0.1:2379 put inode_alloc_counter 1" 2>/dev/null
+    # NOTE: do NOT seed inode_alloc_counter here.  The daemon stores that key
+    # as 8-byte big-endian; seeding it with etcdctl writes ASCII, which decodes
+    # to 0 and makes the allocator's CAS unsatisfiable — every create fails
+    # ENOSPC.  The absent-key path bootstraps correctly on its own.
     log "  etcd cluster running"
 
     # Start Go meta daemon + C FUSE daemon on all nodes
@@ -135,9 +147,70 @@ check_mount() {
 
 runcmd() { timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
 runcmd30() { timeout 30 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
-readf() { timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "sudo cat /mnt/etcfuse/$2" 2>/dev/null || echo ""; }
-writef() { echo -n "$2" | timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "sudo tee /mnt/etcfuse/$3 > /dev/null" 2>/dev/null; }
-writef() { echo -n "$2" | timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "sudo tee /mnt/etcfuse/$3 > /dev/null" 2>/dev/null; }
+# Daemon restarts poll for the socket (up to 10s) and the mountpoint (up to
+# 20s), so they need more headroom than runcmd30 allows.
+runcmd60() { timeout 60 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
+
+# readf <ip> <file> — prints file content on success.
+# On SSH/read failure prints nothing (so callers' -n tests still work) and
+# logs why, so a transport failure is distinguishable from real data loss.
+readf() {
+    local out rc
+    out=$(timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" "sudo cat /mnt/etcfuse/$2" 2>&1)
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        logerr "    readf($1,$2) failed rc=$rc: $(echo "$out" | tr '\n' ' ' | cut -c1-140)"
+        return 1
+    fi
+    printf '%s' "$out"
+}
+
+# writef <ip> <content> <file> — returns non-zero if the write did not land.
+writef() {
+    local out rc
+    out=$(printf '%s' "$2" | timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" \
+        "sudo tee /mnt/etcfuse/$3 > /dev/null" 2>&1)
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        logerr "    writef($1,$3) FAILED rc=$rc: $(echo "$out" | tr '\n' ' ' | cut -c1-140)"
+        return 1
+    fi
+    return 0
+}
+
+# restart_daemons <ip> <node_id> <etcd_endpoints> <cluster_tag>
+# Restarts the Go meta daemon, then the C FUSE daemon, polling for the IPC
+# socket (10s) and then the mountpoint (20s).  Echoes OK once remounted.
+# Runs under runcmd60 because those polls can legitimately take ~30s.
+restart_daemons() {
+    runcmd60 "$1" "
+      sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
+      sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$3 --node-id=$2 --cluster-name=$4 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
+      for k in \$(seq 1 10); do [ -S /tmp/etcfuse.sock ] && break; sleep 1; done
+      sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
+      for k in \$(seq 1 20); do
+        sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0
+        sleep 1
+      done
+      echo FAIL
+    "
+}
+
+# dump_logs <ip> — pull the daemon logs into the chaos log.  Called whenever a
+# setup step fails, so the report explains *why* rather than just that it did.
+dump_logs() {
+    local out
+    out=$(timeout 20 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" \
+        "echo '--- meta.log ---'; sudo tail -40 /tmp/meta.log 2>/dev/null; echo '--- fuse.log ---'; sudo tail -20 /tmp/fuse.log 2>/dev/null" 2>&1)
+    log "  ---- daemon logs from $1 ----"
+    while IFS= read -r line; do log "    $line"; done <<< "$out"
+    log "  ---- end daemon logs ----"
+}
+
+# etcd_endpoints — client URLs for all three nodes, read from the state file.
+etcd_endpoints() {
+    echo "http://$(jq -r '.compute_ips[0]' "$PROJECT_ROOT/$STATE_FILE"):2379,http://$(jq -r '.compute_ips[1]' "$PROJECT_ROOT/$STATE_FILE"):2379,http://$(jq -r '.compute_ips[2]' "$PROJECT_ROOT/$STATE_FILE"):2379"
+}
 
 teardown() {
     log "  Teardown ($STATE_FILE)..."
@@ -150,11 +223,18 @@ run_s1() {
     log "======== S1: C daemon SIGKILL ========"
     provision s1 || { FAIL=$((FAIL+1)); log "  FAIL: provision failed"; teardown; return; }
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; teardown; return; fi
-    writef "$N1" "s1-data" "hello.txt"
+    if ! writef "$N1" "s1-data" "hello.txt"; then
+        FAIL=$((FAIL+1)); log "  FAIL: pre-crash write did not land"; dump_logs "$N1"; teardown; return
+    fi
     readf "$N1" "hello.txt" > /dev/null
-    runcmd "$N1" "sudo pkill -9 etcfuse 2>/dev/null; sleep 1; sudo fusermount -uz /mnt/etcfuse 2>/dev/null; sleep 1; true"
+    # -x is required: pkill matches the process name as an unanchored regex, so
+    # a bare "etcfuse" also kills etcfuse-meta.  This scenario must kill only the
+    # C daemon and leave the Go daemon (and its socket) up.
+    runcmd "$N1" "sudo pkill -9 -x etcfuse 2>/dev/null; sleep 1; sudo fusermount -uz /mnt/etcfuse 2>/dev/null; sleep 1; true"
+    # Do NOT remove /tmp/etcfuse.sock here either: the Go daemon owns it, and
+    # unlinking it makes the new C daemon's connect() fail with ENOENT, so it
+    # exits before fuse_session_mount is ever reached.
     local M=$(runcmd30 "$N1" "
-      sudo rm -f /tmp/etcfuse.sock
       sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
       for i in \$(seq 1 20); do
         sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0
@@ -162,6 +242,7 @@ run_s1() {
       done
       echo FAIL
     ")
+    [[ "$M" == "OK" ]] || log "  WARN: n1 did not remount cleanly ($M)"
     local V=$(readf "$N1" "hello.txt")
     # shellcheck disable=SC2015
     [[ -n "$V" ]] && { PASS=$((PASS+1)); log "  PASS: $V"; } || { FAIL=$((FAIL+1)); log "  FAIL"; }
@@ -173,12 +254,14 @@ run_s2() {
     log "======== S2: Go daemon SIGKILL ========"
     provision s2 || { FAIL=$((FAIL+1)); log "  FAIL: provision failed"; teardown; return; }
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; teardown; return; fi
-    writef "$N1" "go-data" "hello.txt"
+    if ! writef "$N1" "go-data" "hello.txt"; then
+        FAIL=$((FAIL+1)); log "  FAIL: pre-crash write did not land"; dump_logs "$N1"; teardown; return
+    fi
     runcmd "$N1" "sudo pkill -9 etcfuse-meta 2>/dev/null; sleep 1; sudo rm -f /tmp/etcfuse.sock; true"
     runcmd "$N1" "sudo fusermount -uz /mnt/etcfuse 2>/dev/null; sleep 1; true"
     local ETCD="http://$(jq -r '.compute_ips[0]' $PROJECT_ROOT/$STATE_FILE):2379,http://$(jq -r '.compute_ips[1]' $PROJECT_ROOT/$STATE_FILE):2379,http://$(jq -r '.compute_ips[2]' $PROJECT_ROOT/$STATE_FILE):2379"
     local TAG=$(jq -r '.cluster_name' $PROJECT_ROOT/$STATE_FILE)
-    local M=$(runcmd30 "$N1" "
+    local M=$(runcmd60 "$N1" "
       sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$ETCD --node-id=n1 --cluster-name=$TAG --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
       for i in \$(seq 1 10); do [ -S /tmp/etcfuse.sock ] && break; sleep 1; done
       sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
@@ -188,6 +271,7 @@ run_s2() {
       done
       echo FAIL
     ")
+    [[ "$M" == "OK" ]] || log "  WARN: n1 did not remount cleanly ($M)"
     local V=$(readf "$N1" "hello.txt")
     # shellcheck disable=SC2015
     [[ -n "$V" ]] && { PASS=$((PASS+1)); log "  PASS: $V"; } || { FAIL=$((FAIL+1)); log "  FAIL"; }
@@ -199,8 +283,10 @@ run_s3() {
     log "======== S3: Network partition ========"
     provision s3 || { FAIL=$((FAIL+1)); log "  FAIL: provision failed"; teardown; return; }
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; teardown; return; fi
-    writef "$N1" "pre-part" "p1.txt"
-    writef "$N2" "survivor-write" "p2.txt"
+    if ! writef "$N1" "pre-part" "p1.txt"; then
+        FAIL=$((FAIL+1)); log "  FAIL: pre-partition write did not land"; dump_logs "$N1"; teardown; return
+    fi
+    writef "$N2" "survivor-write" "p2.txt" || log "  WARN: N2 pre-partition write failed"
     readf "$N3" "p1.txt" > /dev/null
 
     local SG=$(jq -r '.sg_id' $PROJECT_ROOT/$STATE_FILE)
@@ -235,6 +321,15 @@ run_s3() {
     aws ec2 delete-security-group --group-id "$TEMP_SG" 2>/dev/null || true
     sleep 20
 
+    # N1's watchdog self-fenced during the partition (os.Exit(77)) — that is
+    # correct behaviour, not a failure.  Nothing supervises the raw nohup'd
+    # daemons here, so restart them explicitly before asserting N1 recovers.
+    log "  Restarting N1 daemons after self-fence..."
+    local ETCD=$(etcd_endpoints)
+    local TAG=$(jq -r '.cluster_name' "$PROJECT_ROOT/$STATE_FILE")
+    local R=$(restart_daemons "$N1" "n1" "$ETCD" "$TAG")
+    [[ "$R" == "OK" ]] || log "  WARN: n1 did not remount cleanly ($R)"
+
     local V3=$(readf "$N1" "p3.txt")
     # shellcheck disable=SC2015
     [[ -n "$V3" ]] && { PASS=$((PASS+1)); log "  PASS: N1 reads survivor: $V3"; } || { FAIL=$((FAIL+1)); log "  FAIL: N1 restore"; }
@@ -264,7 +359,9 @@ run_s6() {
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; teardown; return; fi
     for i in 1 2 3; do
         eval "ip=\$N$i"
-        writef "$ip" "data-n$i" "ac$i.txt"
+        if ! writef "$ip" "data-n$i" "ac$i.txt"; then
+            FAIL=$((FAIL+1)); log "  FAIL: pre-crash write on n$i did not land"; dump_logs "$ip"; teardown; return
+        fi
     done
     for i in 1 2 3; do
         eval "ip=\$N$i"
@@ -276,7 +373,8 @@ run_s6() {
     local TAG=$(jq -r '.cluster_name' $PROJECT_ROOT/$STATE_FILE)
     for i in 1 2 3; do
         eval "ip=\$N$i"
-        runcmd "$ip" "sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock; sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$ETCD --node-id=n$i --cluster-name=$TAG --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 & sleep 4; sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=n$i --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 & sleep 5; sudo mountpoint -q /mnt/etcfuse && echo OK" 2>/dev/null
+        local R=$(restart_daemons "$ip" "n$i" "$ETCD" "$TAG")
+        [[ "$R" == "OK" ]] || log "  WARN: n$i did not remount cleanly ($R)"
     done
 
     local V ALL=0
@@ -295,14 +393,17 @@ run_s7() {
     log "======== S7: Mid-write crash ========"
     provision s7 || { FAIL=$((FAIL+1)); log "  FAIL: provision failed"; teardown; return; }
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; teardown; return; fi
-    writef "$N1" "wal-a" "wa.txt"
-    writef "$N1" "wal-b" "wb.txt"
-    writef "$N1" "wal-c" "wc.txt"
+    for f in a b c; do
+        if ! writef "$N1" "wal-$f" "w$f.txt"; then
+            FAIL=$((FAIL+1)); log "  FAIL: pre-crash write w$f.txt did not land"; dump_logs "$N1"; teardown; return
+        fi
+    done
 
     runcmd "$N1" "sudo pkill -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; sleep 2; true"
-    local ETCD="http://$(jq -r '.compute_ips[0]' $PROJECT_ROOT/$STATE_FILE):2379,http://$(jq -r '.compute_ips[1]' $PROJECT_ROOT/$STATE_FILE):2379,http://$(jq -r '.compute_ips[2]' $PROJECT_ROOT/$STATE_FILE):2379"
-    local TAG=$(jq -r '.cluster_name' $PROJECT_ROOT/$STATE_FILE)
-    runcmd "$N1" "sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock; sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$ETCD --node-id=n1 --cluster-name=$TAG --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 & sleep 4; sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 & sleep 5; sudo mountpoint -q /mnt/etcfuse && echo OK" 2>/dev/null
+    local ETCD=$(etcd_endpoints)
+    local TAG=$(jq -r '.cluster_name' "$PROJECT_ROOT/$STATE_FILE")
+    local R=$(restart_daemons "$N1" "n1" "$ETCD" "$TAG")
+    [[ "$R" == "OK" ]] || log "  WARN: n1 did not remount cleanly ($R)"
 
     local S=0
     for f in wa wb wc; do local V=$(readf "$N1" "$f.txt"); [[ -n "$V" ]] && S=$((S+1)); done

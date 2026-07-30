@@ -640,6 +640,14 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return b.b, nil
 	}
 
+	// A self-fenced node must not touch the shared device at all.  The
+	// generation guard below is the authoritative check, but refusing here
+	// avoids writing bytes we already know will never be referenced.
+	if s.IsFenced() {
+		s.log.Error("write: rejected, node has self-fenced", "ino", ino)
+		return int32Resp(makeErrno(-5)), nil
+	}
+
 	// Acquire exclusive lock for the duration of the write (with retry for failover)
 	var leaseID clientv3.LeaseID
 	var keepCh <-chan *clientv3.LeaseKeepAliveResponse
@@ -740,27 +748,28 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	extKey := fmt.Sprintf("extent:%d/%d", ino, chunk)
 	extVal := fmt.Sprintf("%d,%d,%d,%d", offset, diskOff, uint64(dataLen), gen)
 
-	var putErr error
-	s.retryKV(func(ictx context.Context) error {
-		_, putErr = s.store.Put(ictx, extKey, []byte(extVal))
-		return putErr
-	})
-	if putErr != nil {
-		s.alloc.Free(diskOff, uint64(dataLen))
-		return int32Resp(makeErrno(-5)), nil
-	}
-
+	// Commit the extent and any size change together, guarded by this node's
+	// fencing generation.  Data is already durable on the device; if the guard
+	// rejects the commit the bytes stay unreferenced and the blocks go back to
+	// the arena, which is the safe direction to fail in.
+	ops := []clientv3.Op{clientv3.OpPut(extKey, extVal)}
 	newEnd := offset + uint64(dataLen)
 	if newEnd > rec.Size {
 		rec.Size = newEnd
-		s.retryKV(func(ictx context.Context) error {
-			_, putErr = s.store.Put(ictx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
-			return putErr
-		})
-		if putErr != nil {
-			s.alloc.Free(diskOff, uint64(dataLen))
-			return int32Resp(makeErrno(-5)), nil
-		}
+		ops = append(ops, clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(rec))))
+	}
+
+	committed, cerr := s.commitGuarded(ops)
+	if cerr != nil {
+		s.alloc.Free(diskOff, uint64(dataLen))
+		s.log.Warn("write: metadata commit failed", "ino", ino, "error", cerr)
+		return int32Resp(makeErrno(-5)), nil
+	}
+	if !committed {
+		s.alloc.Free(diskOff, uint64(dataLen))
+		s.log.Error("write: rejected, node has been fenced",
+			"ino", ino, "start_generation", s.startGen)
+		return int32Resp(makeErrno(-5)), nil
 	}
 
 	if s.wal != nil {
@@ -777,6 +786,33 @@ func (s *Service) nextExtentChunk(ctx context.Context, ino uint64) uint64 {
 	prefix := fmt.Sprintf("extent:%d/", ino)
 	kvs, _ := s.store.GetPrefix(ctx, prefix)
 	return uint64(len(kvs))
+}
+
+// commitGuarded applies ops in one transaction guarded by this node's fencing
+// generation.  Returns (false, nil) when the guard rejected the commit — the
+// node has been fenced and must not mutate metadata again.  Transient etcd
+// errors are retried; a failed guard is not, because a fence is permanent.
+func (s *Service) commitGuarded(ops []clientv3.Op) (bool, error) {
+	gctx, gcancel := context.WithTimeout(context.Background(), 2*time.Second)
+	gen, err := s.guardGeneration(gctx)
+	gcancel()
+	if err != nil {
+		return false, err
+	}
+
+	guard := []clientv3.Cmp{metadata.WithGenerationGuard(s.membership.NodeID(), gen)}
+
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ok, terr := s.store.Txn(ctx, guard, ops, nil)
+		cancel()
+		if terr == nil {
+			return ok, nil
+		}
+		err = terr
+		time.Sleep(time.Duration(10+attempt*40) * time.Millisecond)
+	}
+	return false, err
 }
 
 // retryKV retries an etcd KV operation up to 3 times with backoff,
@@ -1160,7 +1196,12 @@ func (s *Service) handleSetlk(ctx context.Context, payload []byte) ([]byte, erro
 }
 
 // allocInode reserves an inode number from etcd.
-// Inode 0 is reserved — first allocation returns 1.
+//
+// Inodes 0 and 1 are both reserved: 0 is not a valid inode, and 1 is
+// FUSE_ROOT_ID — the root directory, which the C daemon answers for locally
+// and which seed-etcd writes to inode:1.  Handing 1 out to a regular file
+// overwrites the root inode record and makes the whole mount return EIO, so
+// the first allocation must be 2.
 func (s *Service) allocInode(ctx context.Context) (uint64, error) {
 	for attempt := 0; attempt < 8; attempt++ {
 		v, err := s.store.Get(ctx, metadata.KeyInodeAllocCounter)
@@ -1173,8 +1214,8 @@ func (s *Service) allocInode(ctx context.Context) (uint64, error) {
 		}
 
 		allocIno := etcdVal
-		if allocIno == 0 {
-			allocIno = 1
+		if allocIno < metadata.FirstUsableIno {
+			allocIno = metadata.FirstUsableIno
 		}
 		nextStore := allocIno + 1
 

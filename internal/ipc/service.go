@@ -9,6 +9,7 @@ package ipc
 
 import (
 	"context"
+	"sync"
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/arena"
@@ -28,6 +29,13 @@ type Service struct {
 	dev          *blockio.Device
 	wal          *wal.WAL
 	notifyServer *notifyServer
+
+	// Fencing generation this node started with.  Every data-path commit is
+	// guarded against it, so once the fencing controller bumps gen:<node_id>
+	// this node's commits stop being accepted by etcd.
+	genMu    sync.Mutex
+	genInit  bool
+	startGen uint64
 }
 
 // NewService creates a Service.
@@ -67,5 +75,39 @@ func (s *Service) Store() *metadata.Store {
 
 // IsFenced returns true if self-fencing has triggered.
 func (s *Service) IsFenced() bool {
-	return s.watchdog.IsFenced()
+	return s.watchdog != nil && s.watchdog.IsFenced()
+}
+
+// InitGeneration ensures this node's gen:<node_id> key exists and caches the
+// generation the node starts with.  Idempotent, and safe to retry after a
+// transient etcd failure.
+func (s *Service) InitGeneration(ctx context.Context) error {
+	s.genMu.Lock()
+	defer s.genMu.Unlock()
+	return s.initGenerationLocked(ctx)
+}
+
+func (s *Service) initGenerationLocked(ctx context.Context) error {
+	if s.genInit {
+		return nil
+	}
+	gen, err := s.store.EnsureGenerationKey(ctx, s.membership.NodeID())
+	if err != nil {
+		return err
+	}
+	s.startGen = gen
+	s.genInit = true
+	return nil
+}
+
+// guardGeneration returns the generation that data-path transactions must be
+// guarded against, initialising it on first use if startup initialisation was
+// skipped or failed.
+func (s *Service) guardGeneration(ctx context.Context) (uint64, error) {
+	s.genMu.Lock()
+	defer s.genMu.Unlock()
+	if err := s.initGenerationLocked(ctx); err != nil {
+		return 0, err
+	}
+	return s.startGen, nil
 }

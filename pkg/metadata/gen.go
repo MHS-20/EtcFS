@@ -82,6 +82,28 @@ func (s *Store) BumpGeneration(ctx context.Context, nodeID string, expectedOld u
 	return newGen, nil
 }
 
+// EnsureGenerationKey makes sure gen:<node_id> exists, creating it at
+// generation 0 if it does not, and returns the current generation.
+//
+// The key must exist before any generation-guarded transaction runs:
+// WithGenerationGuard compares the key's *value*, and a value comparison
+// against a missing key always fails, which would reject every write rather
+// than only a fenced node's writes.
+func (s *Store) EnsureGenerationKey(ctx context.Context, nodeID string) (uint64, error) {
+	key := GenKey(nodeID)
+
+	created, err := s.Txn(ctx,
+		[]clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "=", 0)},
+		[]clientv3.Op{clientv3.OpPut(key, "0")}, nil)
+	if err != nil {
+		return 0, fmt.Errorf("ensure generation key %s: %w", nodeID, err)
+	}
+	if created {
+		return 0, nil
+	}
+	return s.GetGeneration(ctx, nodeID)
+}
+
 // EnsureGeneration ensures that a gen:<node> key exists with at least
 // the given generation.  Used during node bootstrap to initialise the
 // generation counter.

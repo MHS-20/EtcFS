@@ -390,9 +390,12 @@ static void ec_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t of
         pos += nl;
         uint32_t dt __attribute__((unused)) = rb_u32(resp, &pos);
         uint64_t d_off = rb_u64(resp, &pos);
-        if (d_off <= off_cookie)
-            continue;
 
+        /* Consume the whole entry before deciding whether to skip it.  Each
+         * readdirplus entry carries an attr block and two timeouts after the
+         * offset cookie; skipping straight to the next iteration would leave
+         * those bytes unread and desynchronise the parser, turning every
+         * following entry into garbage. */
         struct fuse_entry_param ep;
         memset(&ep, 0, sizeof(ep));
         ep.ino = di;
@@ -401,6 +404,9 @@ static void ec_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t of
         ep.entry_timeout = (double) rb_u32(resp, &pos);
         ep.attr_timeout = (double) rb_u32(resp, &pos);
         fill_stat(&ep.attr, &a);
+
+        if (d_off <= off_cookie)
+            continue; /* already returned in an earlier call */
 
         size_t sz = fuse_add_direntry_plus(req, dbuf + used, bufsz - used, dn, &ep, d_off);
         if (sz > bufsz - used)

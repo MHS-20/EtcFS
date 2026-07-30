@@ -38,6 +38,17 @@ const (
 	KeyInodeAllocCounter = "inode_alloc_counter"
 )
 
+// Reserved inode numbers.
+//
+// RootIno matches FUSE_ROOT_ID from the kernel FUSE protocol: the C daemon
+// answers getattr/lookup for it locally, and seed-etcd writes the root
+// directory record to inode:1.  Inode 0 is never valid.  Allocators must
+// therefore start handing out numbers at FirstUsableIno.
+const (
+	RootIno        uint64 = 1
+	FirstUsableIno uint64 = 2
+)
+
 // InodeRecord is the serialised value stored at inode:<ino>.
 type InodeRecord struct {
 	Ino        uint64
