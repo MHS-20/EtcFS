@@ -10,25 +10,11 @@ The two daemons talk over a hand-rolled length-prefixed binary protocol on a Uni
 
 ### Chaos suite status
 
-`chaos-report-20260730-165637`: **5 pass / 2 fail of 7 assertions** (6 scenarios; S3 asserts twice; there is no S4), up from 1/7. S2, S3 (both), S6, S7 pass. Fixed in the 2026-07-30 pass:
+**7 of 7 assertions pass** (`chaos-report-20260730-180644`, commit `660a14a`), verified on real AWS infra: S1, S2, S3 (both assertions), S5, S6, S7. Full scenario descriptions, the two product bugs that were fixed to get here (an inode-numbering collision with the FUSE root directory, and a `readdirplus` parser desync), the harness bugs found along the way, and known gaps not covered by this suite are all in `docs/chaos-test-report.md` — read that before touching `scripts/test/chaos-test.sh` or the write path.
 
-- **Inode 1 collision (product bug).** `allocInode` handed out inode 1 to the first regular file, but 1 is `FUSE_ROOT_ID` — the root directory. The first file created overwrote the root inode record, so every subsequent op on the mount returned EIO. Allocation now starts at `metadata.FirstUsableIno` (2). This blocked every scenario.
-- **readdirplus parser desync (product bug).** `ec_readdirplus` skipped already-returned entries with `continue` *before* consuming their attr block and timeouts, desynchronising the response parser and emitting phantom directory entries with garbage names. Entry is now fully parsed before the skip check.
-- **Harness: poisoned seed.** The script seeded `inode_alloc_counter` with ASCII `1`, but the daemon stores it as 8-byte big-endian; `DecodeUint64` returns 0 for short values, making the allocator's CAS unsatisfiable (`create` → ENOSPC). The seed is gone — the absent-key path bootstraps correctly.
-- **Harness: S6/S7 restart raced a 10s SSH timeout** while sleeping 9s; S3 never restarted N1 after its (correct) self-fence. Both now use `restart_daemons` under a 60s budget.
+Not yet guarded: namespace mutations (create/mkdir/unlink/rename/setattr) still commit without a generation guard — only the data path (extent writes) is covered. See `docs/architecture/fencing-generation-protocol.md` § Implementation Status.
 
-Also fixed after that run:
-
-- **Fencing generation is now enforced on writes (S5).** The data path previously stamped the generation onto extents but committed them with unguarded `Put`s, so a fenced node's writes were accepted. `handleWriteBlock` now commits the extent and any inode size change in a single transaction guarded by `metadata.WithGenerationGuard`, and rejects the write when the guard fails. `Service.InitGeneration` seeds `gen:<node_id>` at startup (the guard compares the key's *value*, and a value comparison against a missing key always fails) and caches the generation the node started with; a restarted node re-reads the current generation and resumes normally. `Service.IsFenced()` is also checked before touching the device.
-- **S1's remount failure was two harness bugs**, not a daemon defect. `pkill` matches the process name as an *unanchored* regex, so `pkill -9 etcfuse` also killed `etcfuse-meta`; the scenario then restarted only the C daemon, which had no Go daemon left to talk to. S1 additionally ran `rm -f /tmp/etcfuse.sock`, unlinking the socket the Go daemon owns. Either way `connect()` failed with ENOENT and the C daemon exited before `fuse_session_mount` was reached — the mount-retry loop from `72180f6` never ran. Now `pkill -9 -x etcfuse`, and the socket is left alone; remount completes in ~1s. (S2 was unaffected: its pattern `etcfuse-meta` cannot match `etcfuse`, and it restarts both daemons.)
-
-Verified on AWS after these fixes: **S1 PASS** (`s1-data` read back, no remount warning) and **S5 PASS** (write rejected with EIO, `write: rejected, node has been fenced` in the daemon log).
-
-Caveat: S2/S3/S6/S7 last passed in `chaos-report-20260730-165637`, which predates the generation-guard change. They have not been re-run since and should be before the suite is called green.
-
-Not yet guarded: namespace mutations (create/mkdir/unlink/rename/setattr) still commit without a generation guard — only the data path is covered.
-
-See `docs/plans/04_hardening_plan.md` for the tracked gap ledger; verify each item against code before trusting its status.
+See `docs/plans/04_hardening_plan.md` for the tracked gap ledger; it is a point-in-time design-phase snapshot, not a live status tracker — verify each item against code before trusting it (e.g. it lists READDIRPLUS and the fencing controller as open, both of which are implemented in current code).
 
 ## Document map
 
