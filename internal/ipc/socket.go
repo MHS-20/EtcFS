@@ -10,6 +10,7 @@ import (
 	"time"
 	"unsafe"
 
+	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/internal/config"
@@ -738,12 +739,28 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	chunk := s.nextExtentChunk(ctx, ino)
 	extKey := fmt.Sprintf("extent:%d/%d", ino, chunk)
 	extVal := fmt.Sprintf("%d,%d,%d,%d", offset, diskOff, uint64(dataLen), gen)
-	_, _ = s.store.Put(ctx, extKey, []byte(extVal))
+
+	var putErr error
+	s.retryKV(func(ictx context.Context) error {
+		_, putErr = s.store.Put(ictx, extKey, []byte(extVal))
+		return putErr
+	})
+	if putErr != nil {
+		s.alloc.Free(diskOff, uint64(dataLen))
+		return int32Resp(makeErrno(-5)), nil
+	}
 
 	newEnd := offset + uint64(dataLen)
 	if newEnd > rec.Size {
 		rec.Size = newEnd
-		_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+		s.retryKV(func(ictx context.Context) error {
+			_, putErr = s.store.Put(ictx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+			return putErr
+		})
+		if putErr != nil {
+			s.alloc.Free(diskOff, uint64(dataLen))
+			return int32Resp(makeErrno(-5)), nil
+		}
 	}
 
 	if s.wal != nil {
@@ -760,6 +777,21 @@ func (s *Service) nextExtentChunk(ctx context.Context, ino uint64) uint64 {
 	prefix := fmt.Sprintf("extent:%d/", ino)
 	kvs, _ := s.store.GetPrefix(ctx, prefix)
 	return uint64(len(kvs))
+}
+
+// retryKV retries an etcd KV operation up to 3 times with backoff,
+// so transient connection drops during etcd failover don't surface as EIO.
+func (s *Service) retryKV(fn func(context.Context) error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := fn(ctx)
+		cancel()
+		if err == nil {
+			return
+		}
+		time.Sleep(time.Duration(10+attempt*40) * time.Millisecond)
+	}
+	s.log.Warn("etcd KV operation failed after retries")
 }
 
 // READ payload: [u64:ino][u64:offset][u32:size]
@@ -792,9 +824,14 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	_ = s.dev.FlushDevice()
 
 	prefix := fmt.Sprintf("extent:%d/", ino)
-	kvs, _ := s.store.GetPrefix(ctx, prefix)
+	var kvs []*mvccpb.KeyValue
+	var gerr error
+	s.retryKV(func(ictx context.Context) error {
+		kvs, gerr = s.store.GetPrefix(ictx, prefix)
+		return gerr
+	})
 	s.log.Info("READ extents", "ino", ino, "count", len(kvs))
-	if len(kvs) == 0 {
+	if gerr != nil || len(kvs) == 0 {
 		var b buf
 		b.w32(0)
 		b.w32(0)

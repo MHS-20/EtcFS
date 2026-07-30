@@ -278,9 +278,11 @@ run_s6() {
         eval "ip=\$N$i"
         runcmd "$ip" "sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock; sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$ETCD --node-id=n$i --cluster-name=$TAG --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 & sleep 4; sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=n$i --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 & sleep 5; sudo mountpoint -q /mnt/etcfuse && echo OK" 2>/dev/null
     done
+
+    local V ALL=0
     for i in 1 2 3; do
         eval "ip=\$N$i"
-        local V=$(readf "$ip" "ac$i.txt")
+        V=$(readf "$ip" "ac$i.txt")
         [[ -n "$V" ]] && ALL=$((ALL+1))
     done
     # shellcheck disable=SC2015

@@ -232,12 +232,25 @@ int etcfs_run(struct etcfs_context *ctx)
     }
 after_cleanup:
 
-    /* mount */
-    if (fuse_session_mount(se, mountpoint) != 0) {
-        etcfs_log(ETCFS_LOG_ERROR, "fuse_session_mount failed");
-        fuse_remove_signal_handlers(se);
-        fuse_session_destroy(se);
-        return -1;
+    /* mount — retry up to 5 times if the kernel hasn't released a stale
+     * FUSE superblock from a just-cleaned-up previous daemon instance. */
+    {
+        int mounted = -1;
+        for (int attempt = 0; attempt < 5; attempt++) {
+            if (fuse_session_mount(se, mountpoint) == 0) {
+                mounted = 0;
+                break;
+            }
+            etcfs_log(ETCFS_LOG_WARN, "fuse_session_mount attempt %d failed, retrying (2s)",
+                      attempt + 1);
+            sleep(2);
+        }
+        if (mounted != 0) {
+            etcfs_log(ETCFS_LOG_ERROR, "fuse_session_mount failed after 5 attempts");
+            fuse_remove_signal_handlers(se);
+            fuse_session_destroy(se);
+            return -1;
+        }
     }
 
     etcfs_log(ETCFS_LOG_INFO, "EtcFS mounted at %s", mountpoint);
