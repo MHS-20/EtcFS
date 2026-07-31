@@ -2,7 +2,6 @@ package harness
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
@@ -98,9 +97,8 @@ func (c *Cluster) PopulateExtents(ctx context.Context, inoStart, fileCount uint6
 	for i := uint64(0); i < fileCount; i++ {
 		ino := inoStart + i
 		diskOff := diskStart + i*arenaBlockSize
-		extKey := fmt.Sprintf("extent:%d/0", ino)
-		extVal := fmt.Sprintf("0,%d,%d,1", diskOff, arenaBlockSize)
-		_, _ = c.Store.Put(ctx, extKey, []byte(extVal))
+		ext := metadata.Extent{DiskOff: diskOff, Length: arenaBlockSize, Gen: 1}
+		_, _ = c.Store.Put(ctx, metadata.ExtentKey(ino, 0), []byte(ext.Encode()))
 
 		rec := &metadata.InodeRecord{
 			Ino: ino, Mode: 0100644, Nlink: 1,
@@ -123,14 +121,11 @@ func (c *Cluster) CountExtentsInArena(ctx context.Context, arenaID uint64) int {
 	diskStart := c.ArenaDiskStart(arenaID)
 	diskEnd := c.ArenaDiskEnd(arenaID)
 	count := 0
-	kvs, _ := c.Store.GetPrefix(ctx, "extent:")
-	for _, kv := range kvs {
-		var logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
-		if diskOff >= diskStart && diskOff+length <= diskEnd {
+	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixExtent)
+	for _, ext := range metadata.DecodeExtents(kvs) {
+		if ext.WithinDisk(diskStart, diskEnd) {
 			count++
 		}
 	}
-	_ = diskEnd
 	return count
 }

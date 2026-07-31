@@ -7,6 +7,8 @@
 //	dirent:<parent_ino>/<name>    → <ino> (uint64, big-endian)
 //	lock:<ino>                    → serialised LockRecord
 //	arena:<node_id>               → serialised ArenaRecord
+//	free_arena:<arena_id>         → arena returned to the global pool
+//	extent:<ino>/<chunk>          → <log_off>,<disk_off>,<length>,<generation>
 //	arena_alloc_log               → append-only allocation log key
 //	membership:<node_id>          → lease-backed liveness key
 //	gen:<node_id>                 → fencing generation counter
@@ -32,6 +34,7 @@ const (
 	PrefixLock       = "lock:"
 	PrefixArena      = "arena:"
 	PrefixExtent     = "extent:"
+	PrefixFreeArena  = "free_arena:"
 	PrefixMembership = "membership:"
 	PrefixGen        = "gen:"
 	PrefixArenaLog   = "arena_alloc_log"

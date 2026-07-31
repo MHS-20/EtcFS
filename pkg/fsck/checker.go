@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
+
+	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
 // MetadataStore is the interface required by the checker.
@@ -38,7 +40,6 @@ func (c *Checker) Run(ctx context.Context) []Finding {
 	c.checkDirentsReferenced(ctx)
 	c.checkNlinkConsistency(ctx)
 	c.checkExtentValidity(ctx)
-	c.checkOrphanExtents(ctx)
 	c.checkArenaBoundaries(ctx)
 
 	return c.Findings
@@ -67,7 +68,7 @@ func (c *Checker) WarningCount() int {
 // ---- individual checks ----
 
 func (c *Checker) checkInodesDecodable(ctx context.Context) {
-	kvs, _ := c.Store.GetPrefix(ctx, "inode:")
+	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixInode)
 	for _, kv := range kvs {
 		if len(kv.Value) < 72 {
 			c.Findings = append(c.Findings, Finding{
@@ -121,39 +122,26 @@ func (c *Checker) checkNlinkConsistency(ctx context.Context) {
 
 func (c *Checker) checkExtentValidity(ctx context.Context) {
 	seenInos := c.collectInodeSet(ctx)
-	extKvs, _ := c.Store.GetPrefix(ctx, "extent:")
-	for _, kv := range extKvs {
-		ino := inoFromExtentKey(string(kv.Key))
-		if !seenInos[ino] {
+	extKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixExtent)
+	for _, ext := range metadata.DecodeExtents(extKvs) {
+		if !seenInos[ext.Ino()] {
 			c.Findings = append(c.Findings, Finding{
 				Level:   "warning",
-				Message: fmt.Sprintf("orphan extent %s (no inode)", string(kv.Key)),
+				Message: fmt.Sprintf("orphan extent %s (no inode)", ext.Key),
 			})
 		}
-		var logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
-		if diskOff+length > maxArenaRange {
+		if ext.DiskOff+ext.Length > maxArenaRange {
 			c.Findings = append(c.Findings, Finding{
 				Level: "error",
 				Message: fmt.Sprintf("extent %s beyond arena range: disk_off=%d len=%d",
-					string(kv.Key), diskOff, length),
+					ext.Key, ext.DiskOff, ext.Length),
 			})
 		}
 	}
 }
 
-func (c *Checker) checkOrphanExtents(ctx context.Context) {
-	extKvs, _ := c.Store.GetPrefix(ctx, "extent:")
-	for _, kv := range extKvs {
-		if _, ok := c.collectInodeSet(ctx)[inoFromExtentKey(string(kv.Key))]; !ok {
-			break // already reported in checkExtentValidity
-		}
-	}
-	_ = extKvs
-}
-
 func (c *Checker) checkArenaBoundaries(ctx context.Context) {
-	kvs, _ := c.Store.GetPrefix(ctx, "arena:")
+	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixArena)
 	if len(kvs) == 0 {
 		c.Findings = append(c.Findings, Finding{
 			Level:   "info",
@@ -178,7 +166,7 @@ const maxArenaID = 1024
 
 func (c *Checker) collectInodeSet(ctx context.Context) map[uint64]bool {
 	set := make(map[uint64]bool)
-	kvs, _ := c.Store.GetPrefix(ctx, "inode:")
+	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixInode)
 	for _, kv := range kvs {
 		ino := inoFromKey(string(kv.Key))
 		set[ino] = true
@@ -187,23 +175,17 @@ func (c *Checker) collectInodeSet(ctx context.Context) map[uint64]bool {
 }
 
 func inoFromKey(key string) uint64 {
-	trimmed := strings.TrimPrefix(key, "inode:")
+	trimmed := strings.TrimPrefix(key, metadata.PrefixInode)
 	ino, _ := strconv.ParseUint(trimmed, 10, 64)
 	return ino
 }
 
-func inoFromExtentKey(key string) uint64 {
-	trimmed := strings.TrimPrefix(key, "extent:")
-	parts := strings.SplitN(trimmed, "/", 2)
-	ino, _ := strconv.ParseUint(parts[0], 10, 64)
-	return ino
-}
-
 func nlinkFromValue(val []byte) uint32 {
-	if len(val) < 6 {
+	rec := metadata.DecodeInode(val)
+	if rec == nil {
 		return 0
 	}
-	return uint32(val[5])<<24 | uint32(val[4])<<16 | uint32(val[3])<<8 | uint32(val[2])
+	return rec.Nlink
 }
 
 func decodeUint64(b []byte) uint64 {

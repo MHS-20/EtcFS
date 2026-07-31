@@ -26,14 +26,6 @@ type Compactor struct {
 	Ratio  float64
 }
 
-type ExtentMapping struct {
-	Key     string
-	LogOff  uint64
-	DiskOff uint64
-	Length  uint64
-	Gen     uint64
-}
-
 func New(store MetadataStore, nodeID string) *Compactor {
 	return &Compactor{Store: store, NodeID: nodeID, Ratio: DefaultCompactRatio}
 }
@@ -80,14 +72,8 @@ func (c *Compactor) arenaUsage(ctx context.Context, arenaID uint64) float64 {
 	totalBlocks := ArenaSizeBytes / BlockSize
 
 	used := uint64(0)
-	extKvs, _ := c.Store.GetPrefix(ctx, "extent:")
-	for _, kv := range extKvs {
-		var logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
-		if diskOff >= diskStart && diskOff+length <= diskEnd {
-			blocks := (length + BlockSize - 1) / BlockSize
-			used += blocks
-		}
+	for _, ext := range c.extentsIn(ctx, diskStart, diskEnd) {
+		used += (ext.Length + BlockSize - 1) / BlockSize
 	}
 	return float64(used) / float64(totalBlocks)
 }
@@ -96,19 +82,10 @@ func (c *Compactor) CompactArena(ctx context.Context, srcArenaID, dstArenaID uin
 	diskStart := srcArenaID * ArenaSizeBytes
 	diskEnd := diskStart + ArenaSizeBytes
 
-	extKvs, _ := c.Store.GetPrefix(ctx, "extent:")
-	var toRemap []ExtentMapping
-	for _, kv := range extKvs {
-		var logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
-		if diskOff >= diskStart && diskOff+length <= diskEnd {
-			ino := c.inoFromExtentKey(string(kv.Key))
-			if _, err := c.Store.Get(ctx, metadata.InodeKey(ino)); err == nil {
-				toRemap = append(toRemap, ExtentMapping{
-					Key: string(kv.Key), LogOff: logOff,
-					DiskOff: diskOff, Length: length, Gen: gen,
-				})
-			}
+	var toRemap []metadata.Extent
+	for _, ext := range c.extentsIn(ctx, diskStart, diskEnd) {
+		if _, err := c.Store.Get(ctx, metadata.InodeKey(ext.Ino())); err == nil {
+			toRemap = append(toRemap, ext)
 		}
 	}
 
@@ -124,9 +101,9 @@ func (c *Compactor) CompactArena(ctx context.Context, srcArenaID, dstArenaID uin
 
 		var ops []clientv3.Op
 		for _, m := range batch {
-			newDiskOff := dstStart + (m.DiskOff - diskStart)
-			newVal := fmt.Sprintf("%d,%d,%d,%d", m.LogOff, newDiskOff, m.Length, m.Gen)
-			ops = append(ops, clientv3.OpPut(m.Key, newVal))
+			moved := m
+			moved.DiskOff = dstStart + (m.DiskOff - diskStart)
+			ops = append(ops, clientv3.OpPut(m.Key, moved.Encode()))
 		}
 		_, err := c.Store.Txn(ctx, nil, ops, nil)
 		if err != nil {
@@ -141,7 +118,7 @@ func (c *Compactor) CompactArena(ctx context.Context, srcArenaID, dstArenaID uin
 }
 
 func (c *Compactor) markGlobalArenaAvailable(ctx context.Context, arenaID uint64) {
-	key := fmt.Sprintf("%s%d", "free_arena:", arenaID)
+	key := fmt.Sprintf("%s%d", metadata.PrefixFreeArena, arenaID)
 	_, _ = c.Store.Put(ctx, key, []byte("free"))
 }
 
@@ -150,11 +127,17 @@ func (c *Compactor) markGlobalArenaAcquired(ctx context.Context, arenaID uint64,
 	_, _ = c.Store.Put(ctx, key, []byte(fmt.Sprintf("id=%d", arenaID)))
 }
 
-func (c *Compactor) inoFromExtentKey(key string) uint64 {
-	trimmed := strings.TrimPrefix(key, "extent:")
-	parts := strings.SplitN(trimmed, "/", 2)
-	ino, _ := strconv.ParseUint(parts[0], 10, 64)
-	return ino
+// extentsIn returns every extent lying entirely within the device byte range
+// [diskStart, diskEnd) — i.e. the live contents of one arena.
+func (c *Compactor) extentsIn(ctx context.Context, diskStart, diskEnd uint64) []metadata.Extent {
+	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixExtent)
+	var in []metadata.Extent
+	for _, ext := range metadata.DecodeExtents(kvs) {
+		if ext.WithinDisk(diskStart, diskEnd) {
+			in = append(in, ext)
+		}
+	}
+	return in
 }
 
 func (c *Compactor) arenaIDFromKey(key string) uint64 {
@@ -166,16 +149,5 @@ func (c *Compactor) arenaIDFromKey(key string) uint64 {
 func (c *Compactor) ArenaLiveExtents(ctx context.Context, arenaID uint64) int {
 	diskStart := arenaID * ArenaSizeBytes
 	diskEnd := diskStart + ArenaSizeBytes
-	count := 0
-	extKvs, _ := c.Store.GetPrefix(ctx, "extent:")
-	for _, kv := range extKvs {
-		var _, diskOff, length, _ uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d",
-			new(uint64), &diskOff, &length, new(uint64))
-		if diskOff >= diskStart && diskOff+length <= diskEnd {
-			count++
-		}
-	}
-	_ = diskEnd
-	return count
+	return len(c.extentsIn(ctx, diskStart, diskEnd))
 }

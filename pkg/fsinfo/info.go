@@ -48,7 +48,7 @@ func Collect(ctx context.Context, store MetadataStore) (*Info, error) {
 		}
 	}
 
-	extKvs, _ := store.GetPrefix(ctx, "extent:")
+	extKvs, _ := store.GetPrefix(ctx, metadata.PrefixExtent)
 	info.TotalExtents = uint64(len(extKvs))
 
 	direntKvs, _ := store.GetPrefix(ctx, "dirent:")
@@ -62,7 +62,7 @@ func Collect(ctx context.Context, store MetadataStore) (*Info, error) {
 
 	for _, kv := range arenaKvs {
 		node := strings.TrimPrefix(string(kv.Key), "arena:")
-		freeKvs, _ := store.GetPrefix(ctx, "free_arena:")
+		freeKvs, _ := store.GetPrefix(ctx, metadata.PrefixFreeArena)
 		info.ArenaUtilization[node] = float64(len(freeKvs))
 	}
 

@@ -196,14 +196,15 @@ func (a *Allocator) Reconstruct(ctx context.Context) error {
 		a.mu.Unlock()
 	}
 
-	extKvs, _ := a.store.GetPrefix(ctx, "extent:")
-	for _, kv := range extKvs {
-		var logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
+	extents, err := a.store.AllExtents(ctx)
+	if err != nil {
+		return err
+	}
+	for _, ext := range extents {
 		for _, free := range a.arenas {
-			if diskOff >= free.DiskStart && diskOff+length <= free.DiskEnd {
-				start := (diskOff - free.DiskStart) / BlockSize
-				blocks := (length + BlockSize - 1) / BlockSize
+			if ext.WithinDisk(free.DiskStart, free.DiskEnd) {
+				start := (ext.DiskOff - free.DiskStart) / BlockSize
+				blocks := (ext.Length + BlockSize - 1) / BlockSize
 				for i := uint64(0); i < blocks && start+i < BlocksPerArena; i++ {
 					free.markAllocated(start + i)
 				}

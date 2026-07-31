@@ -28,7 +28,8 @@ type Result struct {
 	Detail  string
 	Ino     uint64
 	DiskOff uint64
-	AutoFix bool // true if the scrubber can safely remediate
+	Key     string // etcd key the finding refers to, when it is a single key
+	AutoFix bool   // true if the scrubber can safely remediate
 }
 
 // Scrubber runs continuous verification of filesystem invariants.
@@ -107,7 +108,7 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	for _, r := range orphans {
 		if r.AutoFix {
 			s.log.Info("scrub auto-fix: reclaiming orphan extent", "detail", r.Detail)
-			_ = s.store.Delete(ctx, fmt.Sprintf("extent:%d/0", r.Ino))
+			_ = s.store.Delete(ctx, r.Key)
 		}
 	}
 
@@ -124,7 +125,7 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 
 // checkExtentCollisions detects two different inodes claiming the same disk offset.
 func (s *Scrubber) CheckExtentCollisions(ctx context.Context) []Result {
-	kvs, err := s.store.GetPrefix(ctx, "extent:")
+	kvs, err := s.store.GetPrefix(ctx, metadata.PrefixExtent)
 	if err != nil {
 		s.log.Error("scrub: cannot scan extents", "error", err)
 		return nil
@@ -134,47 +135,44 @@ func (s *Scrubber) CheckExtentCollisions(ctx context.Context) []Result {
 	seen := make(map[uint64][]uint64)
 	var results []Result
 
-	for _, kv := range kvs {
-		// Parse extent format: "logical_off,disk_off,length,generation"
-		var ino, logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
-		// Extract inode from key: "extent:<ino>/<chunk>"
-		_, _ = fmt.Sscanf(string(kv.Key), "extent:%d/", &ino)
-
-		for _, existingIno := range seen[diskOff] {
+	for _, ext := range metadata.DecodeExtents(kvs) {
+		ino := ext.Ino()
+		for _, existingIno := range seen[ext.DiskOff] {
 			if existingIno != ino {
 				results = append(results, Result{
 					Type:    "collision",
-					Detail:  fmt.Sprintf("ino %d and %d both claim disk_off=%d", ino, existingIno, diskOff),
+					Detail:  fmt.Sprintf("ino %d and %d both claim disk_off=%d", ino, existingIno, ext.DiskOff),
 					Ino:     ino,
-					DiskOff: diskOff,
+					DiskOff: ext.DiskOff,
+					Key:     ext.Key,
 				})
 			}
 		}
-		seen[diskOff] = append(seen[diskOff], ino)
+		seen[ext.DiskOff] = append(seen[ext.DiskOff], ino)
 	}
 	return results
 }
 
 // checkOrphanExtents detects allocated extents with no inode reference.
 func (s *Scrubber) CheckOrphanExtents(ctx context.Context) []Result {
-	extKvs, err := s.store.GetPrefix(ctx, "extent:")
+	extKvs, err := s.store.GetPrefix(ctx, metadata.PrefixExtent)
 	if err != nil {
 		return nil
 	}
 
 	var results []Result
 	for _, kv := range extKvs {
-		var ino uint64
-		_, _ = fmt.Sscanf(string(kv.Key), "extent:%d/", &ino)
+		key := string(kv.Key)
+		ino := metadata.InoFromExtentKey(key)
 
 		// Check if the inode exists
 		val, _ := s.store.Get(ctx, metadata.InodeKey(ino))
 		if val == nil {
 			results = append(results, Result{
 				Type:    "orphan",
-				Detail:  fmt.Sprintf("extent %s has no inode reference", string(kv.Key)),
+				Detail:  fmt.Sprintf("extent %s has no inode reference", key),
 				Ino:     ino,
+				Key:     key,
 				AutoFix: true,
 			})
 		}
@@ -189,15 +187,15 @@ func (s *Scrubber) CheckRangeValidity(ctx context.Context) []Result {
 	const arenaSize = 1 << 30
 
 	var results []Result
-	extKvs, _ := s.store.GetPrefix(ctx, "extent:")
-	for _, kv := range extKvs {
-		var logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
-		if diskOff+length > maxArena*arenaSize {
+	extKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixExtent)
+	for _, ext := range metadata.DecodeExtents(extKvs) {
+		if ext.DiskOff+ext.Length > maxArena*arenaSize {
 			results = append(results, Result{
 				Type:    "range",
-				Detail:  fmt.Sprintf("extent %s disk_off=%d+%d exceeds arena range", string(kv.Key), diskOff, length),
-				DiskOff: diskOff,
+				Detail:  fmt.Sprintf("extent %s disk_off=%d+%d exceeds arena range", ext.Key, ext.DiskOff, ext.Length),
+				Ino:     ext.Ino(),
+				DiskOff: ext.DiskOff,
+				Key:     ext.Key,
 			})
 		}
 	}
@@ -223,20 +221,18 @@ func (s *Scrubber) CheckGenerationConsistency(ctx context.Context) []Result {
 	}
 
 	var results []Result
-	extKvs, _ := s.store.GetPrefix(ctx, "extent:")
-	for _, kv := range extKvs {
-		var ino uint64
-		var logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Key), "extent:%d/", &ino)
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
+	extKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixExtent)
+	for _, ext := range metadata.DecodeExtents(extKvs) {
+		ino, gen := ext.Ino(), ext.Gen
 
 		if gen < maxGen {
 			results = append(results, Result{
 				Type: "generation",
 				Detail: fmt.Sprintf("extent %s stamped gen=%d, max_cluster_gen=%d",
-					string(kv.Key), gen, maxGen),
+					ext.Key, gen, maxGen),
 				Ino:     ino,
-				DiskOff: diskOff,
+				DiskOff: ext.DiskOff,
+				Key:     ext.Key,
 			})
 		}
 	}
