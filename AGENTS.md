@@ -10,7 +10,7 @@ The two daemons talk over a hand-rolled length-prefixed binary protocol on a Uni
 
 ### Chaos suite status
 
-**7 of 7 assertions pass** (`chaos-report-20260730-180644`, commit `660a14a`), verified on real AWS infra: S1, S2, S3 (both assertions), S5, S6, S7. Full scenario descriptions, the two product bugs that were fixed to get here (an inode-numbering collision with the FUSE root directory, and a `readdirplus` parser desync), the harness bugs found along the way, and known gaps not covered by this suite are all in `docs/chaos-test-report.md` — read that before touching `scripts/test/chaos-test.sh` or the write path.
+**7 of 7 assertions pass** (`chaos-report-20260730-180644`, commit `660a14a`), verified on real AWS infra: S1, S2, S3 (both assertions), S5, S6, S7. Full scenario descriptions, the two product bugs that were fixed to get here (an inode-numbering collision with the FUSE root directory, and a `readdirplus` parser desync), the harness bugs found along the way, and known gaps not covered by this suite are all in `docs/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md` — read that before touching `scripts/test/chaos-test.sh` or the write path. Single-cluster sequential and randomized-fuzz results are in `docs/chaos-reports/2026-07-31-single-cluster-and-fuzz.md`.
 
 Not yet guarded: namespace mutations (create/mkdir/unlink/rename/setattr) still commit without a generation guard — only the data path (extent writes) is covered. See `docs/architecture/fencing-generation-protocol.md` § Implementation Status.
 

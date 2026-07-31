@@ -14,3 +14,4 @@ light-test-results/
 vendor/
 *.exe
 .DS_Store
+.claude/

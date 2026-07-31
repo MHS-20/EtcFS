@@ -110,101 +110,141 @@ services:
       - etcfuse-net
 
   # ---- EtcFS Meta nodes (Go — metadata backend) ----
-  # These will connect to their respective etcd instance and expose a
-  # Unix socket for the C FUSE daemon.
-  #
-  # Uncomment when the Go binary is built:
-  #   docker compose build etcfuse-meta1
+  etcfuse-meta1:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.etcfuse-meta
+    container_name: etcfs-meta1
+    command:
+      - --listen=/var/run/etcfuse.sock
+      - --etcd-endpoints=http://etcd1:2379
+      - --node-id=n1
+      - --cluster-name=docker-chaos
+      - --lease-ttl=10s
+      - --block-device=/block-device/etcfuse.img
+      - --log-level=1
+    volumes:
+      - meta1_sock:/var/run
+      - block_data:/block-device
+    networks:
+      - etcfuse-net
+    depends_on:
+      etcd1:
+        condition: service_healthy
+      block-init:
+        condition: service_completed_successfully
 
-  # etcfuse-meta1:
-  #   build:
-  #     context: ../..
-  #     dockerfile: deploy/docker/Dockerfile.etcfuse-meta
-  #   container_name: etcfs-meta1
-  #   command:
-  #     - /usr/local/bin/etcfuse-meta
-  #     - --listen=/var/run/etcfuse.sock
-  #     - --etcd-endpoints=http://etcd1:2379
-  #     - --node-id=etcfuse-node-1
-  #     - --lease-ttl=10s
-  #   volumes:
-  #     - meta1_sock:/var/run
-  #   networks:
-  #     - etcfuse-net
-  #   depends_on:
-  #     etcd1:
-  #       condition: service_healthy
-  #     block-init:
-  #       condition: service_completed_successfully
+  etcfuse-meta2:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.etcfuse-meta
+    container_name: etcfs-meta2
+    command:
+      - --listen=/var/run/etcfuse.sock
+      - --etcd-endpoints=http://etcd2:2379
+      - --node-id=n2
+      - --cluster-name=docker-chaos
+      - --lease-ttl=10s
+      - --block-device=/block-device/etcfuse.img
+      - --log-level=1
+    volumes:
+      - meta2_sock:/var/run
+      - block_data:/block-device
+    networks:
+      - etcfuse-net
+    depends_on:
+      etcd2:
+        condition: service_healthy
+      block-init:
+        condition: service_completed_successfully
 
-  # etcfuse-meta2:
-  #   build:
-  #     context: ../..
-  #     dockerfile: deploy/docker/Dockerfile.etcfuse-meta
-  #   container_name: etcfs-meta2
-  #   command:
-  #     - /usr/local/bin/etcfuse-meta
-  #     - --listen=/var/run/etcfuse.sock
-  #     - --etcd-endpoints=http://etcd2:2379
-  #     - --node-id=etcfuse-node-2
-  #     - --lease-ttl=10s
-  #   volumes:
-  #     - meta2_sock:/var/run
-  #   networks:
-  #     - etcfuse-net
-  #   depends_on:
-  #     etcd2:
-  #       condition: service_healthy
-
-  # etcfuse-meta3:
-  #   build:
-  #     context: ../..
-  #     dockerfile: deploy/docker/Dockerfile.etcfuse-meta
-  #   container_name: etcfs-meta3
-  #   command:
-  #     - /usr/local/bin/etcfuse-meta
-  #     - --listen=/var/run/etcfuse.sock
-  #     - --etcd-endpoints=http://etcd3:2379
-  #     - --node-id=etcfuse-node-3
-  #     - --lease-ttl=10s
-  #   volumes:
-  #     - meta3_sock:/var/run
-  #   networks:
-  #     - etcfuse-net
-  #   depends_on:
-  #     etcd3:
-  #       condition: service_healthy
+  etcfuse-meta3:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.etcfuse-meta
+    container_name: etcfs-meta3
+    command:
+      - --listen=/var/run/etcfuse.sock
+      - --etcd-endpoints=http://etcd3:2379
+      - --node-id=n3
+      - --cluster-name=docker-chaos
+      - --lease-ttl=10s
+      - --block-device=/block-device/etcfuse.img
+      - --log-level=1
+    volumes:
+      - meta3_sock:/var/run
+      - block_data:/block-device
+    networks:
+      - etcfuse-net
+    depends_on:
+      etcd3:
+        condition: service_healthy
+      block-init:
+        condition: service_completed_successfully
 
   # ---- EtcFS FUSE nodes (C — FUSE daemon) ----
-  # These mount the actual FUSE filesystem.  Privileged mode is required
-  # for FUSE.  In development, you can also test without FUSE by running
-  # the C daemon directly on the host.
-  #
-  # Uncomment when the C binary is built:
-  #   docker compose build etcfuse1
+  etcfuse1:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.etcfuse
+    container_name: etcfs-fuse1
+    privileged: true
+    devices:
+      - /dev/fuse
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /mnt/etcfuse && exec /usr/local/bin/etcfuse \"$@\"", "--"]
+    command:
+      - --socket=/var/run/etcfuse.sock
+      - --node-id=n1
+      - --log-level=1
+      - /mnt/etcfuse
+    volumes:
+      - meta1_sock:/var/run
+    networks:
+      - etcfuse-net
+    depends_on:
+      - etcfuse-meta1
 
-  # etcfuse1:
-  #   build:
-  #     context: ../..
-  #     dockerfile: deploy/docker/Dockerfile.etcfuse
-  #   container_name: etcfs-fuse1
-  #   privileged: true
-  #   devices:
-  #     - /dev/fuse
-  #   command:
-  #     - /usr/local/bin/etcfuse
-  #     - --socket=/var/run/etcfuse.sock
-  #     - --volume-id=/block-device/etcfuse.img
-  #     - --node-id=etcfuse-node-1
-  #     - --log-level=2
-  #     - /mnt/etcfuse
-  #   volumes:
-  #     - meta1_sock:/var/run
-  #     - block_data:/block-device:shared
-  #   networks:
-  #     - etcfuse-net
-  #   depends_on:
-  #     - etcfuse-meta1
+  etcfuse2:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.etcfuse
+    container_name: etcfs-fuse2
+    privileged: true
+    devices:
+      - /dev/fuse
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /mnt/etcfuse && exec /usr/local/bin/etcfuse \"$@\"", "--"]
+    command:
+      - --socket=/var/run/etcfuse.sock
+      - --node-id=n2
+      - --log-level=1
+      - /mnt/etcfuse
+    volumes:
+      - meta2_sock:/var/run
+    networks:
+      - etcfuse-net
+    depends_on:
+      - etcfuse-meta2
+
+  etcfuse3:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.etcfuse
+    container_name: etcfs-fuse3
+    privileged: true
+    devices:
+      - /dev/fuse
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /mnt/etcfuse && exec /usr/local/bin/etcfuse \"$@\"", "--"]
+    command:
+      - --socket=/var/run/etcfuse.sock
+      - --node-id=n3
+      - --log-level=1
+      - /mnt/etcfuse
+    volumes:
+      - meta3_sock:/var/run
+    networks:
+      - etcfuse-net
+    depends_on:
+      - etcfuse-meta3
 
 volumes:
   etcd1_data:
