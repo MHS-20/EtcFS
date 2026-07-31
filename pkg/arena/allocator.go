@@ -12,6 +12,7 @@ package arena
 import (
 	"context"
 	"fmt"
+	"math/bits"
 	"sync"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -277,10 +278,8 @@ func (ar *Arena) markFree(block uint64) {
 
 func (ar *Arena) countAllocated() uint64 {
 	var count uint64
-	for i := uint64(0); i < BlocksPerArena; i++ {
-		if !ar.isFree(i) {
-			count++
-		}
+	for _, word := range ar.bitmap {
+		count += uint64(bits.OnesCount64(word))
 	}
 	return count
 }
