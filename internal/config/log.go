@@ -2,8 +2,6 @@
 package config
 
 import (
-	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"time"
@@ -42,15 +40,4 @@ func NewLogger(level int) *Logger {
 func (l *Logger) Fatal(msg string, args ...any) {
 	l.Error(msg, args...)
 	os.Exit(1)
-}
-
-// Printf satisfies the interface expected by some gRPC internals.
-func (l *Logger) Printf(format string, v ...any) {
-	// Route to Debug — gRPC debug logs are verbose.
-	l.Debug(fmt.Sprintf(format, v...))
-}
-
-// DiscardLogger returns a logger that writes to io.Discard.
-func DiscardLogger() *Logger {
-	return &Logger{slog.New(slog.NewTextHandler(io.Discard, nil))}
 }
