@@ -478,10 +478,11 @@ func TestIntegration_LargeExtentMap(t *testing.T) {
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, len(extents), totalExtents, "should have at least %d extents", totalExtents)
 
-	// Verify first and last
-	assert.Equal(t, uint64(0), extents[0][0])       // logical_off
-	assert.Equal(t, uint64(1000000), extents[0][1]) // disk_off
-	assert.Equal(t, uint64((totalExtents-1)*4096), extents[totalExtents-1][0])
+	// Verify first and last.  More than ten chunks exist, so this also
+	// covers that GetExtents orders by logical offset and not by key.
+	assert.Equal(t, uint64(0), extents[0].LogOff)
+	assert.Equal(t, uint64(1000000), extents[0].DiskOff)
+	assert.Equal(t, uint64((totalExtents-1)*4096), extents[totalExtents-1].LogOff)
 }
 
 // ---- Additional: Inode CRUD ----

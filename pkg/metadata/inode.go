@@ -1,7 +1,6 @@
 package metadata
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -231,87 +230,4 @@ func DecodeInode(data []byte) *InodeRecord {
 	rec.Ctime = time.Unix(int64(binary.BigEndian.Uint64(data[pos:])), 0)
 
 	return rec
-}
-
-// ---- extent helpers ----
-
-// extentKey returns the etcd key for a chunk of an inode's extent map.
-// Extents are stored in chunks to stay under the 1.5 MiB etcd value limit.
-func extentKey(ino uint64, chunk uint32) string {
-	return fmt.Sprintf("extent:%d/%d", ino, chunk)
-}
-
-// AppendExtent adds an extent to an inode's extent map.
-// Extents are appended to the last chunk; if the chunk exceeds 1 MiB,
-// a new chunk is created.
-func (s *Store) AppendExtent(ctx context.Context, ino uint64, logicalOff, diskOff, length, generation uint64) error {
-	const chunkSize = 1024 * 1024 // 1 MiB per chunk (safe under 1.5 MiB limit)
-
-	// Read existing extent data for the last chunk
-	prefix := fmt.Sprintf("extent:%d/", ino)
-	kvs, err := s.GetPrefix(ctx, prefix)
-	if err != nil {
-		return fmt.Errorf("append extent ino %d: %w", ino, err)
-	}
-
-	chunk := uint32(0)
-	if len(kvs) > 0 {
-		chunk = uint32(len(kvs) - 1)
-	}
-
-	key := extentKey(ino, chunk)
-
-	// Read current chunk value
-	resp, err := s.client.Get(ctx, key)
-	if err != nil {
-		return fmt.Errorf("append extent ino %d chunk %d: %w", ino, chunk, err)
-	}
-
-	var buf bytes.Buffer
-	if len(resp.Kvs) > 0 {
-		buf.Write(resp.Kvs[0].Value)
-	}
-	if buf.Len() >= chunkSize {
-		chunk++
-		key = extentKey(ino, chunk)
-		buf.Reset()
-	}
-
-	// Append extent: 4 × uint64 = 32 bytes per extent
-	var ext [32]byte
-	binary.BigEndian.PutUint64(ext[0:], logicalOff)
-	binary.BigEndian.PutUint64(ext[8:], diskOff)
-	binary.BigEndian.PutUint64(ext[16:], length)
-	binary.BigEndian.PutUint64(ext[24:], generation)
-	buf.Write(ext[:])
-
-	_, err = s.Put(ctx, key, buf.Bytes())
-	if err != nil {
-		return fmt.Errorf("append extent ino %d: %w", ino, err)
-	}
-	return nil
-}
-
-// GetExtents returns all extents for an inode.
-func (s *Store) GetExtents(ctx context.Context, ino uint64) ([][4]uint64, error) {
-	prefix := fmt.Sprintf("extent:%d/", ino)
-	kvs, err := s.GetPrefix(ctx, prefix)
-	if err != nil {
-		return nil, fmt.Errorf("get extents ino %d: %w", ino, err)
-	}
-
-	var extents [][4]uint64
-	for _, kv := range kvs {
-		data := kv.Value
-		for i := 0; i+32 <= len(data); i += 32 {
-			ext := [4]uint64{
-				binary.BigEndian.Uint64(data[i:]),
-				binary.BigEndian.Uint64(data[i+8:]),
-				binary.BigEndian.Uint64(data[i+16:]),
-				binary.BigEndian.Uint64(data[i+24:]),
-			}
-			extents = append(extents, ext)
-		}
-	}
-	return extents, nil
 }

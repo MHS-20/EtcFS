@@ -31,6 +31,7 @@ const (
 	PrefixDirent     = "dirent:"
 	PrefixLock       = "lock:"
 	PrefixArena      = "arena:"
+	PrefixExtent     = "extent:"
 	PrefixMembership = "membership:"
 	PrefixGen        = "gen:"
 	PrefixArenaLog   = "arena_alloc_log"
