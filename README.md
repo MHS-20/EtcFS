@@ -54,12 +54,12 @@ Each node runs two cooperating processes, not one monolith:
 
 **Why two processes, not one:** FUSE protocol handling needs timely response to kernel upcalls — a single-threaded libfuse event loop, synchronous IPC per request. Metadata and data I/O involve network round trips (etcd) and block device access with variable latency and retryable failures — goroutines, connection pools, retry logic. Splitting them means neither concern's failure/latency model contaminates the other. Full detail: [`docs/architecture/fuse-architecture.md`](docs/architecture/fuse-architecture.md).
 
-The C daemon owns all FUSE state (session, mount, request handles); the Go daemon owns all etcd state (client connection, lease keepalives, watch channels). The wire protocol is a hand-rolled length-prefixed binary format on a Unix socket (`internal/ipc/socket.go`) — `proto/ipc.proto` documents the *intended* shapes but is **not** the actual runtime wire format; don't assume gRPC/protobuf is in the hot path.
+The C daemon owns all FUSE state (session, mount, request handles); the Go daemon owns all etcd state (client connection, lease keepalives, watch channels). The wire protocol is a hand-rolled length-prefixed binary format on a Unix socket (`internal/ipc/socket.go`); there's no gRPC/protobuf in the hot path.
 
 Four logical subsystems live inside the Go daemon:
 
 1. **Metadata client** (`pkg/metadata`) — inode table, directory entries, locks, allocator state, all as etcd transactions.
-2. **Data engine** (`pkg/blockio`, `pkg/arena`, `pkg/wal`) — O_DIRECT `pread`/`pwrite` against the shared block device at extents handed down by the metadata layer, plus a small local write-ahead buffer for crash-safety ordering.
+2. **Data engine** (`pkg/blockio`, `pkg/arena`, `pkg/walgo`) — O_DIRECT `pread`/`pwrite` against the shared block device at extents handed down by the metadata layer, plus a small local write-ahead buffer for crash-safety ordering.
 3. **Membership/fencing agent** (`pkg/membership`, `pkg/fencing`) — etcd lease heartbeat, watches on cluster membership, self-fencing watchdog, coordination with an external fencing controller.
 4. **Continuous verification** (`pkg/scrub`, `pkg/compaction`, `pkg/fsck`) — background scrubbing of etcd metadata against actual disk state, arena compaction, offline consistency checking.
 
@@ -128,7 +128,7 @@ Verified in practice: `docs/chaos-reports/2026-07-31-elastic-scale-out-in.md` �
 
 ## Journaling — what replaces it
 
-There is deliberately no on-disk journal in the ext4/GFS2 sense. **etcd's Raft log is the durable, replicated write-ahead record for all metadata** — every inode/dirent/lock mutation is committed to a replicated log before the etcd client call returns. What's built on top of that is data-path crash safety: the data-then-metadata / metadata-then-data ordering rules above, plus a **small local WAL** (`pkg/wal`, `pkg/walgo`) covering only the short window between issuing a data write and committing its metadata — on restart, a node reconciles any locally-recorded in-flight writes against etcd's current state, discarding anything not reflected in a committed inode record. This is not a full filesystem journal; it never needs to be, because the durable source of truth for "did this write happen" is etcd's log, not the local WAL.
+There is deliberately no on-disk journal in the ext4/GFS2 sense. **etcd's Raft log is the durable, replicated write-ahead record for all metadata** — every inode/dirent/lock mutation is committed to a replicated log before the etcd client call returns. What's built on top of that is data-path crash safety: the data-then-metadata / metadata-then-data ordering rules above, plus a **small local WAL** (`pkg/walgo`) covering only the short window between issuing a data write and committing its metadata — on restart, a node reconciles any locally-recorded in-flight writes against etcd's current state, discarding anything not reflected in a committed inode record. This is not a full filesystem journal; it never needs to be, because the durable source of truth for "did this write happen" is etcd's log, not the local WAL.
 
 Node restart is cheap versus GFS2-style recovery: reconnect to etcd, re-register membership, replay the small local WAL, resume. There's no cluster-wide recovery barrier, because no other node's metadata access was ever blocked by this node's absence — locks it held stay held (and unavailable to others) until fencing confirms it's actually gone.
 

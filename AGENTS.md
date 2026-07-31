@@ -6,7 +6,7 @@
 
 Layout: `cmd/etcfuse` (C FUSE daemon) · `cmd/etcfuse-meta` (Go metadata daemon) · `pkg/{metadata,fencing,blockio,arena,scrub,compaction,wal,walgo,fuse,block}` · `internal/{ipc,config}` · `test/harness` (Go, mock-store + simulator) · `scripts/{infra,test}` (AWS provisioning + chaos).
 
-The two daemons talk over a hand-rolled length-prefixed binary protocol on a Unix socket (`internal/ipc/socket.go`). `proto/ipc.proto` documents the intended message shapes but is **not** the wire format in use — do not assume gRPC/protobuf at runtime.
+The two daemons talk over a hand-rolled length-prefixed binary protocol on a Unix socket (`internal/ipc/socket.go`). There is no gRPC/protobuf anywhere in the wire path — an earlier `proto/ipc.proto` sketch was removed as dead weight.
 
 ### Chaos suite status
 
