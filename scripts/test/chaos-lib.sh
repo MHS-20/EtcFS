@@ -244,7 +244,13 @@ else
     }
     teardown_cluster() {
         log "  Teardown ($STATE_FILE)..."
-        ETCFS_STATE="$STATE_FILE" bash "$PROJECT_ROOT/scripts/infra/destroy-infra.sh" --force > /dev/null 2>&1 &
-        log "  Teardown launched (async)"
+        # nohup + disown: this runs async so the caller doesn't block on
+        # instance termination, but a bare `&` dies with the parent shell —
+        # if the script exits (or is killed) before termination finishes,
+        # the volume and security group are orphaned and keep billing.
+        ETCFS_STATE="$STATE_FILE" nohup bash "$PROJECT_ROOT/scripts/infra/destroy-infra.sh" --force \
+            > "$PROJECT_ROOT/teardown-$STATE_FILE.log" 2>&1 &
+        disown
+        log "  Teardown launched (async, log: teardown-$STATE_FILE.log)"
     }
 fi

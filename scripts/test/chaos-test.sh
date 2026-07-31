@@ -214,8 +214,12 @@ etcd_endpoints() {
 
 teardown() {
     log "  Teardown ($STATE_FILE)..."
-    ETCFS_STATE="$STATE_FILE" bash "$PROJECT_ROOT/scripts/infra/destroy-infra.sh" --force > /dev/null 2>&1 &
-    log "  Teardown launched (async)"
+    # nohup + disown: a bare `&` dies with the parent shell, orphaning the
+    # volume and security group (still billing) if this script exits first.
+    ETCFS_STATE="$STATE_FILE" nohup bash "$PROJECT_ROOT/scripts/infra/destroy-infra.sh" --force \
+        > "$PROJECT_ROOT/teardown-$STATE_FILE.log" 2>&1 &
+    disown
+    log "  Teardown launched (async, log: teardown-$STATE_FILE.log)"
 }
 
 # === S1: C daemon SIGKILL ===
