@@ -1126,58 +1126,53 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 }
 
 // ---- lock handlers ----
+//
+// EtcFS does not track byte-range locks in etcd.  The lock:<ino> keys used by
+// the read and write paths are whole-inode leases held for the duration of a
+// single operation, which is a different thing from a process-owned POSIX
+// record lock and cannot answer GETLK/SETLK on its own.
+//
+// So both handlers report "no conflict", which leaves the kernel's own local
+// lock bookkeeping in charge: correct within one node, not enforced across
+// nodes.  This matches the documented Phase 3 behaviour.  Reporting a
+// conflict instead would be worse than useless — SETLK cannot grant a lock it
+// does not track, so every caller would spin on EAGAIN forever.
+
+// POSIX lock types, from <fcntl.h>.
+const (
+	fRdlck = 0
+	fWrlck = 1
+	fUnlck = 2
+)
 
 // GETLK payload: [u64:ino][u64:start][u64:len][u32:type][u32:pid]
-func (s *Service) handleGetlk(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 40 {
-		return int32Resp(makeErrno(-22)), nil
+// Response: [i32:error][u64:start][u64:len][u32:type][u32:pid]
+func (s *Service) handleGetlk(_ context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 32 {
+		return int32Resp(-22), nil
 	}
-	ino, rest := readU64(payload)
+	_, rest := readU64(payload) // ino
 	start, rest := readU64(rest)
 	length, rest := readU64(rest)
-	ltype, rest := readU32(rest)
+	_, rest = readU32(rest) // requested type
 	pid, _ := readU32(rest)
 
-	rec, _ := s.store.GetLockInfo(ctx, ino)
-	_ = start
-	_ = length
-	_ = pid
-
-	if rec == nil || rec.Mode == string(metadata.LockShared) {
-		var b buf
-		b.w32(0)
-		b.w64(start)
-		b.w64(length)
-		b.w32(0)
-		b.w32(pid)
-		return b.b, nil
-	}
 	var b buf
 	b.w32(0)
 	b.w64(start)
 	b.w64(length)
-	b.w32(ltype)
+	b.w32(fUnlck) // range reported free
 	b.w32(pid)
 	return b.b, nil
 }
 
 // SETLK payload: [u64:ino][u64:start][u64:len][u32:type][u32:pid][u32:sleep]
-func (s *Service) handleSetlk(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 44 {
-		return int32Resp(makeErrno(-22)), nil
+// Response: [i32:error]
+func (s *Service) handleSetlk(_ context.Context, payload []byte) ([]byte, error) {
+	if len(payload) < 36 {
+		return int32Resp(-22), nil
 	}
-	ino, rest := readU64(payload)
-	_, rest = readU64(rest) // start
-	_, rest = readU64(rest) // len
-	ltype, rest := readU32(rest)
-	_, rest = readU32(rest) // pid
-	_, _ = readU32(rest)    // sleep
-	_ = ino
-
-	if ltype == 2 { // F_UNLCK
-		return okResp(), nil
-	}
-	return int32Resp(makeErrno(-11)), nil // EAGAIN
+	return okResp(), nil
 }
 
 // allocInode reserves an inode number from etcd.
