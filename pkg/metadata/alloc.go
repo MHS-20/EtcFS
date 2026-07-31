@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -22,11 +23,15 @@ import (
 // missing or still below it starts there.  The key stores the *next* value to
 // hand out, so a reader can always take the stored value as-is.
 //
-// The CAS is retried on contention with exponential backoff.  A missing key is
-// compared on CreateRevision rather than value, because a value comparison
-// against a key that does not exist never matches.
+// The CAS is retried on contention with exponential backoff plus jitter —
+// without jitter, callers that lose a race tend to have started their retry
+// in lockstep and collide again on the same tick, which is what let 16
+// concurrent callers exhaust an 8-attempt budget with only 9 successes in
+// TestIntegration_CounterIsUniqueUnderConcurrency.  A missing key is compared
+// on CreateRevision rather than value, because a value comparison against a
+// key that does not exist never matches.
 func (s *Store) NextCounter(ctx context.Context, key string, floor uint64) (uint64, error) {
-	for attempt := 0; attempt < 8; attempt++ {
+	for attempt := 0; attempt < 20; attempt++ {
 		v, err := s.Get(ctx, key)
 		if err != nil {
 			return 0, err
@@ -54,7 +59,11 @@ func (s *Store) NextCounter(ctx context.Context, key string, floor uint64) (uint
 		if ok {
 			return reserved, nil
 		}
-		time.Sleep(time.Duration(1<<attempt) * time.Millisecond)
+		backoff := 1 << attempt
+		if backoff > 200 {
+			backoff = 200
+		}
+		time.Sleep(time.Duration(backoff/2+rand.Intn(backoff/2+1)) * time.Millisecond)
 	}
 	return 0, fmt.Errorf("counter %s: contended beyond retry limit", key)
 }
