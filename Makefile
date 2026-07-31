@@ -46,7 +46,7 @@ $(GO_OUT): $(shell find . -name '*.go' -not -path './vendor/*' -not -path './tes
 
 C_SRCS := $(shell find cmd/etcfuse pkg/fuse pkg/block pkg/wal -name '*.c')
 C_HDRS := $(shell find cmd/etcfuse pkg/fuse pkg/block pkg/wal -name '*.h')
-C_CFLAGS := -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g
+C_CFLAGS := -I. -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g
 C_LIBS   := -lfuse3 -lpthread
 
 $(C_OUT): $(C_SRCS) $(C_HDRS)
