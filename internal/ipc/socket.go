@@ -281,17 +281,27 @@ func (s *Service) handleGetattr(ctx context.Context, payload []byte) ([]byte, er
 // Response: [i32:error][u32:count][entries...]
 // Each entry: [u64:ino][u32:name_len][name_bytes][u32:type][u64:off]
 func (s *Service) handleReaddir(ctx context.Context, payload []byte) ([]byte, error) {
+	return s.readdirResp(ctx, payload, false)
+}
+
+// READDIRPLUS is READDIR with an attr block and two timeouts appended to
+// every entry.
+func (s *Service) handleReaddirPlus(ctx context.Context, payload []byte) ([]byte, error) {
+	return s.readdirResp(ctx, payload, true)
+}
+
+func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([]byte, error) {
 	if len(payload) < 20 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 
-	ino, rest := readU64(payload)
-	_, rest = readU64(rest) // offset (not used yet)
-	_ = rest                // size hint
+	ino, _ := readU64(payload)
+	// The remaining offset and size hints are unused: the whole directory is
+	// returned and the C daemon skips entries at or below its own cookie.
 
 	entries, err := s.store.ListDirents(ctx, ino)
 	if err != nil {
-		return int32Resp(makeErrno(-5)), nil
+		return int32Resp(-5), nil
 	}
 
 	var b buf
@@ -299,71 +309,46 @@ func (s *Service) handleReaddir(ctx context.Context, payload []byte) ([]byte, er
 	b.w32(uint32(len(entries)))
 
 	for i, e := range entries {
-		// Determine type from inode
 		rec, _ := s.store.GetInode(ctx, e.Ino)
-		dtype := uint32(metadata.DirentTypeFile)
-		if rec != nil {
-			if (rec.Mode & metadata.S_IFMT) == metadata.ModeDir {
-				dtype = metadata.DirentTypeDir
-			} else if (rec.Mode & metadata.S_IFMT) == metadata.ModeSymlink {
-				dtype = metadata.DirentTypeSymlink
-			}
-		}
 
 		b.w64(e.Ino)
 		b.w32(uint32(len(e.Name)))
 		b.b = append(b.b, []byte(e.Name)...)
-		b.w32(dtype)
+		b.w32(direntType(rec))
 		b.w64(uint64(i + 1)) // directory offset cookie
+
+		if !plus {
+			continue
+		}
+		// The attr block is fixed-width, so an entry whose inode record has
+		// vanished still has to write a full-size placeholder — a short write
+		// here desynchronises the C parser and turns every following entry
+		// into garbage.
+		if rec == nil {
+			rec = &metadata.InodeRecord{Ino: e.Ino}
+		}
+		b.wAttr(rec)
+		b.w32(1) // entry_timeout (seconds)
+		b.w32(1) // attr_timeout (seconds)
 	}
 
 	return b.b, nil
 }
 
-func (s *Service) handleReaddirPlus(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 20 {
-		return int32Resp(makeErrno(-22)), nil
+// direntType maps an inode record to its DT_* directory entry type.
+// A missing record is reported as a regular file.
+func direntType(rec *metadata.InodeRecord) uint32 {
+	if rec == nil {
+		return metadata.DirentTypeFile
 	}
-	ino, rest := readU64(payload)
-	_, rest = readU64(rest)
-	_ = rest
-
-	entries, err := s.store.ListDirents(ctx, ino)
-	if err != nil {
-		return int32Resp(makeErrno(-5)), nil
+	switch rec.Mode & metadata.S_IFMT {
+	case metadata.ModeDir:
+		return metadata.DirentTypeDir
+	case metadata.ModeSymlink:
+		return metadata.DirentTypeSymlink
+	default:
+		return metadata.DirentTypeFile
 	}
-
-	var b buf
-	b.w32(0)
-	b.w32(uint32(len(entries)))
-
-	for i, e := range entries {
-		rec, _ := s.store.GetInode(ctx, e.Ino)
-		dtype := uint32(metadata.DirentTypeFile)
-		if rec != nil {
-			if (rec.Mode & metadata.S_IFMT) == metadata.ModeDir {
-				dtype = metadata.DirentTypeDir
-			} else if (rec.Mode & metadata.S_IFMT) == metadata.ModeSymlink {
-				dtype = metadata.DirentTypeSymlink
-			}
-		}
-		b.w64(e.Ino)
-		b.w32(uint32(len(e.Name)))
-		b.b = append(b.b, []byte(e.Name)...)
-		b.w32(dtype)
-		b.w64(uint64(i + 1))
-		if rec != nil {
-			b.wAttr(rec)
-		} else {
-			for j := 0; j < 72; j++ {
-				b.b = append(b.b, 0)
-			}
-		}
-		b.w32(1)
-		b.w32(1)
-	}
-
-	return b.b, nil
 }
 
 // READLINK payload: [u64:ino]
