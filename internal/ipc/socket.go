@@ -152,7 +152,6 @@ func (b *buf) w64(v uint64) {
 }
 
 func (b *buf) wAttr(rec *metadata.InodeRecord) {
-	_ = metadata.InodeRecord{} // ensure import
 	b.w64(rec.Ino)
 	b.w64(rec.Size)
 	b.w64(rec.Blocks)
@@ -223,9 +222,9 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 		return s.handleMknod(ctx, payload)
 	case ipcOpAlloc, ipcOpCommit:
 		// Block allocation — Phase 6
-		return int32Resp(makeErrno(-38)), nil // ENOSYS
+		return int32Resp(-38), nil // ENOSYS
 	default:
-		return int32Resp(makeErrno(-38)), nil // ENOSYS
+		return int32Resp(-38), nil // ENOSYS
 	}
 }
 
@@ -235,7 +234,7 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 // Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 12 {
-		return int32Resp(makeErrno(-22)), nil // EINVAL
+		return int32Resp(-22), nil // EINVAL
 	}
 
 	parent, rest := readU64(payload)
@@ -245,16 +244,16 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 	ino, err := s.store.LookupDirent(ctx, parent, name)
 	if err != nil {
 		s.log.Warn("lookup dirent", "parent", parent, "name", name, "error", err)
-		return int32Resp(makeErrno(-5)), nil
+		return int32Resp(-5), nil
 	}
 	if ino == 0 {
-		return int32Resp(makeErrno(-2)), nil // ENOENT
+		return int32Resp(-2), nil // ENOENT
 	}
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
 		s.log.Warn("lookup getinode", "ino", ino, "error", err)
-		return int32Resp(makeErrno(-5)), nil
+		return int32Resp(-5), nil
 	}
 
 	return lookupResp(0, ino, rec), nil
@@ -264,14 +263,14 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 // Response: [i32:error][u64×9+u32×6:attr][u32:attr_timeout]
 func (s *Service) handleGetattr(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 8 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 
 	ino, _ := readU64(payload)
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
-		return int32Resp(makeErrno(-2)), nil // ENOENT
+		return int32Resp(-2), nil // ENOENT
 	}
 
 	return attrResp(rec), nil
@@ -355,14 +354,14 @@ func direntType(rec *metadata.InodeRecord) uint32 {
 // Response: [i32:error][u32:target_len][target_bytes]
 func (s *Service) handleReadlink(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 8 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 
 	ino, _ := readU64(payload)
 
 	target, err := s.store.Get(ctx, metadata.InodeSymlinkKey(ino))
 	if err != nil || target == nil {
-		return int32Resp(makeErrno(-2)), nil // ENOENT
+		return int32Resp(-2), nil // ENOENT
 	}
 
 	var b buf
@@ -404,8 +403,6 @@ func (s *Service) handleStatfs(ctx context.Context, _ []byte) ([]byte, error) {
 
 // ---- response helpers ----
 
-func makeErrno(e int) int32 { return int32(e) }
-
 func int32Resp(v int32) []byte {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, uint32(v))
@@ -440,7 +437,7 @@ func attrResp(rec *metadata.InodeRecord) []byte {
 // Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 20 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
 	nameLen, rest := readU32(rest)
@@ -454,12 +451,12 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 	// Reserve inode number
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(makeErrno(-28)), nil // ENOSPC
+		return int32Resp(-28), nil // ENOSPC
 	}
 
 	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, mode, 1000, 1000)
 	if err != nil {
-		return int32Resp(makeErrno(-17)), nil // EEXIST
+		return int32Resp(-17), nil // EEXIST
 	}
 
 	var b buf
@@ -475,7 +472,7 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 // Response: same as CREATE
 func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 20 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
 	nameLen, rest := readU32(rest)
@@ -486,12 +483,12 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(makeErrno(-28)), nil
+		return int32Resp(-28), nil
 	}
 
 	rec, err := s.store.AtomicCreateDir(ctx, parent, name, ino, mode, 1000, 1000)
 	if err != nil {
-		return int32Resp(makeErrno(-17)), nil
+		return int32Resp(-17), nil
 	}
 
 	var b buf
@@ -507,7 +504,7 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 // Response: [i32:error]
 func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 12 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
 	nameLen, _ := readU32(rest)
@@ -515,7 +512,7 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 
 	err := s.store.AtomicUnlink(ctx, parent, name)
 	if err != nil {
-		return int32Resp(makeErrno(-2)), nil // ENOENT
+		return int32Resp(-2), nil // ENOENT
 	}
 	return okResp(), nil
 }
@@ -524,7 +521,7 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 // Response: [i32:error]
 func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 12 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
 	nameLen, _ := readU32(rest)
@@ -532,21 +529,21 @@ func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, erro
 
 	ino, err := s.store.LookupDirent(ctx, parent, name)
 	if err != nil || ino == 0 {
-		return int32Resp(makeErrno(-2)), nil
+		return int32Resp(-2), nil
 	}
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil || rec.Mode&metadata.ModeDir == 0 {
-		return int32Resp(makeErrno(-20)), nil // ENOTDIR
+		return int32Resp(-20), nil // ENOTDIR
 	}
 	// Check directory is empty
 	entries, _ := s.store.ListDirents(ctx, ino)
 	if len(entries) > 0 {
-		return int32Resp(makeErrno(-39)), nil // ENOTEMPTY
+		return int32Resp(-39), nil // ENOTEMPTY
 	}
 
 	err = s.store.AtomicUnlink(ctx, parent, name)
 	if err != nil {
-		return int32Resp(makeErrno(-2)), nil
+		return int32Resp(-2), nil
 	}
 	return okResp(), nil
 }
@@ -555,7 +552,7 @@ func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, erro
 // Response: [i32:error]
 func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 28 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	oldParent, rest := readU64(payload)
 	oldNameLen, rest := readU32(rest)
@@ -570,12 +567,12 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 	// Resolve old inode
 	ino, err := s.store.LookupDirent(ctx, oldParent, oldName)
 	if err != nil || ino == 0 {
-		return int32Resp(makeErrno(-2)), nil
+		return int32Resp(-2), nil
 	}
 
 	err = s.store.AtomicRename(ctx, oldParent, oldName, newParent, newName, ino, flags)
 	if err != nil {
-		return int32Resp(makeErrno(-17)), nil // EEXIST or other
+		return int32Resp(-17), nil // EEXIST or other
 	}
 	return okResp(), nil
 }
@@ -584,7 +581,7 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 // Response: [i32:error][u32:written]
 func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 20 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	ino, rest := readU64(payload)
 	offset, rest := readU64(rest)
@@ -593,7 +590,7 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
-		return int32Resp(makeErrno(-2)), nil
+		return int32Resp(-2), nil
 	}
 
 	if s.dev != nil {
@@ -629,7 +626,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	// avoids writing bytes we already know will never be referenced.
 	if s.IsFenced() {
 		s.log.Error("write: rejected, node has self-fenced", "ino", ino)
-		return int32Resp(makeErrno(-5)), nil
+		return int32Resp(-5), nil
 	}
 
 	// Acquire exclusive lock for the duration of the write (with retry for failover)
@@ -644,7 +641,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		time.Sleep(time.Duration(10+attempt*40) * time.Millisecond)
 	}
 	if lerr != nil {
-		return int32Resp(makeErrno(-11)), nil // EAGAIN after retries
+		return int32Resp(-11), nil // EAGAIN after retries
 	}
 	defer func() { _ = s.store.ReleaseLock(ctx, ino, leaseID) }()
 	go func() {
@@ -655,7 +652,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	if s.alloc.ArenaCount() == 0 {
 		if _, err := s.alloc.AcquireArena(ctx); err != nil {
 			s.log.Warn("write: cannot acquire arena", "error", err)
-			return int32Resp(makeErrno(-28)), nil
+			return int32Resp(-28), nil
 		}
 	}
 
@@ -663,12 +660,12 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	if err != nil {
 		if _, aerr := s.alloc.AcquireArena(ctx); aerr != nil {
 			s.log.Warn("write: cannot allocate blocks or acquire arena", "error", err)
-			return int32Resp(makeErrno(-28)), nil
+			return int32Resp(-28), nil
 		}
 		diskOff, err = s.alloc.Allocate(uint64(dataLen))
 		if err != nil {
 			s.log.Warn("write: cannot allocate blocks even after arena expansion", "error", err)
-			return int32Resp(makeErrno(-28)), nil
+			return int32Resp(-28), nil
 		}
 	}
 
@@ -680,7 +677,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		buf, aerr := blockio.AlignedBuffer(alignedLen, ss)
 		if aerr != nil {
 			s.alloc.Free(diskOff, uint64(dataLen))
-			return int32Resp(makeErrno(-12)), nil
+			return int32Resp(-12), nil
 		}
 		alignedBuf = buf
 		copy(buf, data)
@@ -696,7 +693,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	if werr != nil {
 		s.alloc.Free(diskOff, uint64(dataLen))
 		s.log.Warn("write: block device write failed", "error", werr)
-		return int32Resp(makeErrno(-5)), nil
+		return int32Resp(-5), nil
 	}
 
 	_ = s.dev.FlushDevice()
@@ -754,13 +751,13 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	if cerr != nil {
 		s.alloc.Free(diskOff, uint64(dataLen))
 		s.log.Warn("write: metadata commit failed", "ino", ino, "error", cerr)
-		return int32Resp(makeErrno(-5)), nil
+		return int32Resp(-5), nil
 	}
 	if !committed {
 		s.alloc.Free(diskOff, uint64(dataLen))
 		s.log.Error("write: rejected, node has been fenced",
 			"ino", ino, "start_generation", s.startGen)
-		return int32Resp(makeErrno(-5)), nil
+		return int32Resp(-5), nil
 	}
 
 	if s.wal != nil {
@@ -819,18 +816,17 @@ func (s *Service) retryKV(fn func(context.Context) error) {
 // Response: [i32:error][u32:data_len][data_bytes]
 func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 20 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	ino, rest := readU64(payload)
 	offset, rest := readU64(rest)
 	size, rest := readU32(rest)
 	_ = rest
 
-	s.log.Info("READ", "ino", ino, "offset", offset, "size", size,
-		"data", fmt.Sprintf("%x", payload))
+	s.log.Debug("READ", "ino", ino, "offset", offset, "size", size)
 
 	if s.dev == nil {
-		return int32Resp(makeErrno(-5)), nil
+		return int32Resp(-5), nil
 	}
 
 	leaseID, keepCh, err := s.store.AcquireLock(ctx, ino, metadata.LockShared, 2*time.Second)
@@ -959,7 +955,7 @@ const fattrSize = 1 << 3
 
 func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 28 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	ino, rest := readU64(payload)
 	_, rest = readU64(rest)
@@ -968,7 +964,7 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
-		return int32Resp(makeErrno(-2)), nil
+		return int32Resp(-2), nil
 	}
 
 	if valid&fattrSize != 0 && newSize < rec.Size {
@@ -1011,7 +1007,7 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
 // Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 20 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
 	nameLen, rest := readU32(rest)
@@ -1022,13 +1018,13 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(makeErrno(-28)), nil
+		return int32Resp(-28), nil
 	}
 
 	// Create inode with symlink mode
 	_, err = s.store.CreateInode(ctx, ino, metadata.ModeSymlink|0777, 1000, 1000)
 	if err != nil {
-		return int32Resp(makeErrno(-17)), nil
+		return int32Resp(-17), nil
 	}
 
 	// Store target
@@ -1037,7 +1033,7 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 	// Create directory entry
 	err = s.store.CreateDirent(ctx, parent, name, ino)
 	if err != nil {
-		return int32Resp(makeErrno(-17)), nil
+		return int32Resp(-17), nil
 	}
 
 	var b buf
@@ -1055,7 +1051,7 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 // Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 24 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	ino, rest := readU64(payload)
 	newParent, rest := readU64(rest)
@@ -1065,13 +1061,13 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 	// Increment nlink
 	err := s.store.IncrementNlink(ctx, ino)
 	if err != nil {
-		return int32Resp(makeErrno(-2)), nil
+		return int32Resp(-2), nil
 	}
 
 	// Create new directory entry
 	err = s.store.CreateDirent(ctx, newParent, name, ino)
 	if err != nil {
-		return int32Resp(makeErrno(-17)), nil
+		return int32Resp(-17), nil
 	}
 
 	rec, _ := s.store.GetInode(ctx, ino)
@@ -1090,7 +1086,7 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 // Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, error) {
 	if len(payload) < 24 {
-		return int32Resp(makeErrno(-22)), nil
+		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
 	nameLen, rest := readU32(rest)
@@ -1101,19 +1097,19 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(makeErrno(-28)), nil
+		return int32Resp(-28), nil
 	}
 
 	rec, err := s.store.CreateInode(ctx, ino, mode, 1000, 1000)
 	if err != nil {
-		return int32Resp(makeErrno(-17)), nil
+		return int32Resp(-17), nil
 	}
 	rec.Rdev = rdev
 	_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
 
 	err = s.store.CreateDirent(ctx, parent, name, ino)
 	if err != nil {
-		return int32Resp(makeErrno(-17)), nil
+		return int32Resp(-17), nil
 	}
 
 	var b buf
