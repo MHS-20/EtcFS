@@ -5,12 +5,20 @@ import (
 	"fmt"
 	"time"
 
+	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
-type MetadataStore = metadata.MetadataStore
+// MetadataStore is the slice of the metadata store membership needs.
+type MetadataStore interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+	GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.KeyValue, error)
+	Put(ctx context.Context, key string, value []byte, opts ...clientv3.OpOption) (int64, error)
+	Delete(ctx context.Context, key string) error
+	Txn(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, error)
+}
 
 type Manager struct {
 	Store  MetadataStore

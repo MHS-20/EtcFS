@@ -19,8 +19,20 @@ import (
 	"sync"
 	"time"
 
+	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
+
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
+
+// MetadataStore is the slice of the metadata store the scrubber needs: it
+// reads keys and deletes the orphans it is allowed to reclaim, and nothing
+// else.  Declaring only that keeps the scrubber testable against a stub and
+// makes the blast radius of a scrub bug obvious from its dependencies.
+type MetadataStore interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+	GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.KeyValue, error)
+	Delete(ctx context.Context, key string) error
+}
 
 // Result records a single scrub finding.
 type Result struct {
@@ -34,7 +46,7 @@ type Result struct {
 
 // Scrubber runs continuous verification of filesystem invariants.
 type Scrubber struct {
-	store     metadata.MetadataStore
+	store     MetadataStore
 	log       Logger
 	nodeID    string
 	interval  time.Duration
@@ -54,7 +66,7 @@ type Logger interface {
 }
 
 // New creates a Scrubber.
-func New(store metadata.MetadataStore, nodeID string, interval time.Duration, log Logger) *Scrubber {
+func New(store MetadataStore, nodeID string, interval time.Duration, log Logger) *Scrubber {
 	return &Scrubber{
 		store:     store,
 		log:       log,
