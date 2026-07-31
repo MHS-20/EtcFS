@@ -3,103 +3,58 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// Inode number allocation via per-node range reservation.
+// Shared monotonic counters.
 //
-// To avoid the hot-key problem of a single global inode counter, each node
-// reserves a block of inode numbers via a CAS against a shared counter.
-// Once reserved, the node hands out numbers from its local range without
-// touching etcd until the range is exhausted.
+// Inode numbers and arena IDs are both handed out from a single etcd key
+// incremented under CAS.  Contention is low enough that a per-node reservation
+// range is not worth its extra failure modes: a node that dies mid-range
+// silently strands every number it had reserved.
+
+// NextCounter atomically reserves the next value of a monotonically increasing
+// counter key, returning the reserved value.
 //
-// This is the same sharding pattern used for arena allocation (§6 of init_plan).
+// floor is the lowest value that may ever be handed out; a counter that is
+// missing or still below it starts there.  The key stores the *next* value to
+// hand out, so a reader can always take the stored value as-is.
+//
+// The CAS is retried on contention with exponential backoff.  A missing key is
+// compared on CreateRevision rather than value, because a value comparison
+// against a key that does not exist never matches.
+func (s *Store) NextCounter(ctx context.Context, key string, floor uint64) (uint64, error) {
+	for attempt := 0; attempt < 8; attempt++ {
+		v, err := s.Get(ctx, key)
+		if err != nil {
+			return 0, err
+		}
 
-// AllocRangeSize is the number of inode numbers per range reservation.
-const AllocRangeSize = 1_000_000
+		var guard clientv3.Cmp
+		stored := uint64(0)
+		if v == nil {
+			guard = clientv3.Compare(clientv3.CreateRevision(key), "=", 0)
+		} else {
+			stored = DecodeUint64(v)
+			guard = clientv3.Compare(clientv3.Value(key), "=", string(v))
+		}
 
-// AllocInodeRange reserves the next N inode numbers for this node.
-// Returns the start of the reserved range (inclusive) and end (exclusive).
-func (s *Store) AllocInodeRange(ctx context.Context) (start, end uint64, err error) {
-	key := KeyInodeAllocCounter
+		reserved := stored
+		if reserved < floor {
+			reserved = floor
+		}
 
-	// Read current counter
-	value, err := s.Get(ctx, key)
-	if err != nil {
-		return 0, 0, fmt.Errorf("alloc inode range: %w", err)
+		ok, err := s.Txn(ctx, []clientv3.Cmp{guard},
+			[]clientv3.Op{clientv3.OpPut(key, string(EncodeUint64(reserved+1)))}, nil)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return reserved, nil
+		}
+		time.Sleep(time.Duration(1<<attempt) * time.Millisecond)
 	}
-
-	current := uint64(0)
-	if value != nil {
-		current = DecodeUint64(value)
-	}
-
-	next := current + AllocRangeSize
-
-	var cmps []clientv3.Cmp
-	if current == 0 {
-		// Key doesn't exist yet — first allocation
-		cmps = []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "=", 0)}
-	} else {
-		cmps = []clientv3.Cmp{clientv3.Compare(clientv3.Value(key), "=", string(EncodeUint64(current)))}
-	}
-
-	op := clientv3.OpPut(key, string(EncodeUint64(next)))
-
-	ok, err := s.Txn(ctx, cmps, []clientv3.Op{op}, nil)
-	if err != nil {
-		return 0, 0, fmt.Errorf("alloc inode range: %w", err)
-	}
-	if !ok {
-		return 0, 0, fmt.Errorf("alloc inode range: CAS conflict (another node reserved concurrently)")
-	}
-
-	return current, next, nil
-}
-
-// NodeInodeAlloc manages a local inode number free-list.
-// After reserving a range from etcd via AllocInodeRange, the node
-// uses this allocator to hand out individual inode numbers locally.
-type NodeInodeAlloc struct {
-	nodeID string
-	start  uint64 // first usable inode in current range
-	end    uint64 // one past the last usable inode
-	next   uint64 // next inode to allocate
-}
-
-// NewNodeInodeAlloc creates a local inode allocator.
-func NewNodeInodeAlloc(nodeID string) *NodeInodeAlloc {
-	return &NodeInodeAlloc{nodeID: nodeID}
-}
-
-// Reserve obtains the next inode range from etcd.
-func (a *NodeInodeAlloc) Reserve(ctx context.Context, store *Store) error {
-	start, end, err := store.AllocInodeRange(ctx)
-	if err != nil {
-		return err
-	}
-	a.start = start
-	a.end = end
-	a.next = start
-	return nil
-}
-
-// Allocate returns the next available inode number from the local range.
-// If the range is exhausted, the caller must call Reserve again.
-func (a *NodeInodeAlloc) Allocate() (uint64, error) {
-	if a.next >= a.end {
-		return 0, fmt.Errorf("inode range exhausted (need to reserve)")
-	}
-	ino := a.next
-	a.next++
-	return ino, nil
-}
-
-// Available returns the number of inode numbers remaining in the local range.
-func (a *NodeInodeAlloc) Available() uint64 {
-	if a.next >= a.end {
-		return 0
-	}
-	return a.end - a.next
+	return 0, fmt.Errorf("counter %s: contended beyond retry limit", key)
 }

@@ -1179,44 +1179,7 @@ func (s *Service) handleSetlk(_ context.Context, payload []byte) ([]byte, error)
 // overwrites the root inode record and makes the whole mount return EIO, so
 // the first allocation must be 2.
 func (s *Service) allocInode(ctx context.Context) (uint64, error) {
-	for attempt := 0; attempt < 8; attempt++ {
-		v, err := s.store.Get(ctx, metadata.KeyInodeAllocCounter)
-		if err != nil {
-			return 0, err
-		}
-		etcdVal := uint64(0)
-		if v != nil {
-			etcdVal = metadata.DecodeUint64(v)
-		}
-
-		allocIno := etcdVal
-		if allocIno < metadata.FirstUsableIno {
-			allocIno = metadata.FirstUsableIno
-		}
-		nextStore := allocIno + 1
-
-		var cmps []clientv3.Cmp
-		if etcdVal == 0 {
-			if v == nil {
-				cmps = []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(metadata.KeyInodeAllocCounter), "=", 0)}
-			} else {
-				cmps = []clientv3.Cmp{clientv3.Compare(clientv3.Value(metadata.KeyInodeAllocCounter), "=", string(metadata.EncodeUint64(0)))}
-			}
-		} else {
-			cmps = []clientv3.Cmp{clientv3.Compare(clientv3.Value(metadata.KeyInodeAllocCounter), "=", string(metadata.EncodeUint64(etcdVal)))}
-		}
-
-		ok, err := s.store.Txn(ctx, cmps,
-			[]clientv3.Op{clientv3.OpPut(metadata.KeyInodeAllocCounter, string(metadata.EncodeUint64(nextStore)))}, nil)
-		if err != nil {
-			return 0, err
-		}
-		if ok {
-			return allocIno, nil
-		}
-		time.Sleep(time.Duration(1<<attempt) * time.Millisecond)
-	}
-	return 0, fmt.Errorf("inode alloc exhausted")
+	return s.store.NextCounter(ctx, metadata.KeyInodeAllocCounter, metadata.FirstUsableIno)
 }
 
 // StartSocketServer is the public entry point: listens on the Unix socket path

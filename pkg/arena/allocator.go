@@ -15,8 +15,6 @@ import (
 	"math/bits"
 	"sync"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
-
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
@@ -82,36 +80,7 @@ func (a *Allocator) AcquireArena(ctx context.Context) (*Arena, error) {
 
 // allocateArenaID reserves the next arena ID via etcd CAS.
 func (a *Allocator) allocateArenaID(ctx context.Context) (uint64, error) {
-	key := metadata.PrefixArenaLog
-
-	for attempt := 0; attempt < 5; attempt++ {
-		v, err := a.store.Get(ctx, key)
-		if err != nil {
-			return 0, fmt.Errorf("read arena counter: %w", err)
-		}
-		current := uint64(0)
-		if v != nil {
-			current = metadata.DecodeUint64(v)
-		}
-		next := current + 1
-
-		var cmps []clientv3.Cmp
-		if current == 0 {
-			cmps = []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "=", 0)}
-		} else {
-			cmps = []clientv3.Cmp{clientv3.Compare(clientv3.Value(key), "=", string(metadata.EncodeUint64(current)))}
-		}
-
-		op := clientv3.OpPut(key, string(metadata.EncodeUint64(next)))
-		ok, err := a.store.Txn(ctx, cmps, []clientv3.Op{op}, nil)
-		if err != nil {
-			return 0, err
-		}
-		if ok {
-			return current, nil
-		}
-	}
-	return 0, fmt.Errorf("arena ID exhausted")
+	return a.store.NextCounter(ctx, metadata.PrefixArenaLog, 0)
 }
 
 // Allocate finds and marks a contiguous range of blocks as allocated.

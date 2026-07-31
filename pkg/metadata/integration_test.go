@@ -290,37 +290,49 @@ func TestIntegration_GenerationBump(t *testing.T) {
 	assert.Equal(t, uint64(2), newGen)
 }
 
-// ---- C1.8: Inode range reservation ----
+// ---- C1.8: Inode number allocation ----
 
-func TestIntegration_InodeRangeAllocation(t *testing.T) {
+func TestIntegration_InodeAllocation(t *testing.T) {
 	store := testStore(t, "node-1")
 	ctx := context.Background()
 
-	// Reserve a range
-	start, end, err := store.AllocInodeRange(ctx)
+	// The first number handed out is FirstUsableIno: 0 is never valid and 1 is
+	// the root directory.
+	ino, err := store.NextCounter(ctx, KeyInodeAllocCounter, FirstUsableIno)
 	require.NoError(t, err)
-	assert.Equal(t, uint64(0), start)
-	assert.Equal(t, uint64(AllocRangeSize), end)
+	assert.Equal(t, FirstUsableIno, ino)
 
-	// Reserve another range (should get next block)
-	start2, end2, err := store.AllocInodeRange(ctx)
+	next, err := store.NextCounter(ctx, KeyInodeAllocCounter, FirstUsableIno)
 	require.NoError(t, err)
-	assert.Equal(t, uint64(AllocRangeSize), start2)
-	assert.Equal(t, uint64(2*AllocRangeSize), end2)
+	assert.Equal(t, FirstUsableIno+1, next)
+}
 
-	// Local allocator
-	alloc := NewNodeInodeAlloc("node-1")
+func TestIntegration_CounterIsUniqueUnderConcurrency(t *testing.T) {
+	store := testStore(t, "node-1")
+	ctx := context.Background()
 
-	err = alloc.Reserve(ctx, store)
-	require.NoError(t, err)
+	const n = 16
+	results := make(chan uint64, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v, err := store.NextCounter(ctx, KeyInodeAllocCounter, FirstUsableIno)
+			if err == nil {
+				results <- v
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
 
-	ino, err := alloc.Allocate()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(2*AllocRangeSize), ino)
-
-	ino2, err := alloc.Allocate()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(2*AllocRangeSize+1), ino2)
+	seen := make(map[uint64]bool)
+	for v := range results {
+		assert.False(t, seen[v], "handed out %d twice", v)
+		seen[v] = true
+	}
+	assert.Equal(t, n, len(seen), "every concurrent caller should get a distinct number")
 }
 
 // ---- C1.9: Watch delivery ----
