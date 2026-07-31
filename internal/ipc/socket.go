@@ -10,7 +10,6 @@ import (
 	"time"
 	"unsafe"
 
-	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/internal/config"
@@ -744,9 +743,16 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		gen = 1
 	}
 
-	chunk := s.nextExtentChunk(ctx, ino)
-	extKey := fmt.Sprintf("extent:%d/%d", ino, chunk)
-	extVal := fmt.Sprintf("%d,%d,%d,%d", offset, diskOff, uint64(dataLen), gen)
+	chunk, cherr := s.store.NextExtentChunk(ctx, ino)
+	if cherr != nil {
+		s.alloc.Free(diskOff, uint64(dataLen))
+		s.log.Warn("write: cannot determine extent chunk", "ino", ino, "error", cherr)
+		return int32Resp(-5), nil
+	}
+	extKey := metadata.ExtentKey(ino, chunk)
+	extVal := metadata.Extent{
+		LogOff: offset, DiskOff: diskOff, Length: uint64(dataLen), Gen: gen,
+	}.Encode()
 
 	// Commit the extent and any size change together, guarded by this node's
 	// fencing generation.  Data is already durable on the device; if the guard
@@ -780,12 +786,6 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	b.w32(0)
 	b.w32(uint32(dataLen))
 	return b.b, nil
-}
-
-func (s *Service) nextExtentChunk(ctx context.Context, ino uint64) uint64 {
-	prefix := fmt.Sprintf("extent:%d/", ino)
-	kvs, _ := s.store.GetPrefix(ctx, prefix)
-	return uint64(len(kvs))
 }
 
 // commitGuarded applies ops in one transaction guarded by this node's fencing
@@ -859,15 +859,14 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 
 	_ = s.dev.FlushDevice()
 
-	prefix := fmt.Sprintf("extent:%d/", ino)
-	var kvs []*mvccpb.KeyValue
+	var extents []metadata.Extent
 	var gerr error
 	s.retryKV(func(ictx context.Context) error {
-		kvs, gerr = s.store.GetPrefix(ictx, prefix)
+		extents, gerr = s.store.GetExtents(ictx, ino)
 		return gerr
 	})
-	s.log.Info("READ extents", "ino", ino, "count", len(kvs))
-	if gerr != nil || len(kvs) == 0 {
+	s.log.Debug("READ extents", "ino", ino, "count", len(extents))
+	if gerr != nil || len(extents) == 0 {
 		var b buf
 		b.w32(0)
 		b.w32(0)
@@ -897,14 +896,13 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	bytesRead := uint32(0)
 	rem := size
 
-	for _, kv := range kvs {
-		var logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
+	for _, ext := range extents {
+		diskOff, length := ext.DiskOff, ext.Length
 
-		s.log.Info("READ ext", "key", string(kv.Key), "log", logOff, "disk", diskOff, "len", length)
+		s.log.Debug("READ ext", "key", ext.Key, "log", ext.LogOff, "disk", diskOff, "len", length)
 
-		eStart := logOff
-		eEnd := logOff + length
+		eStart := ext.LogOff
+		eEnd := ext.End()
 
 		if offset >= eEnd || offset+uint64(rem) <= eStart {
 			if offset < eStart && offset+uint64(rem) > eStart {
@@ -989,7 +987,7 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	}
 
 	if valid&fattrSize != 0 && newSize < rec.Size {
-		s.truncate(ctx, ino, newSize, rec)
+		s.truncate(ctx, ino, newSize)
 		rec.Size = newSize
 		_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
 	}
@@ -997,29 +995,31 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	return attrResp(rec), nil
 }
 
-func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64, rec *metadata.InodeRecord) {
-	prefix := fmt.Sprintf("extent:%d/", ino)
-	kvs, _ := s.store.GetPrefix(ctx, prefix)
-	for _, kv := range kvs {
-		var logOff, diskOff, length, gen uint64
-		_, _ = fmt.Sscanf(string(kv.Value), "%d,%d,%d,%d", &logOff, &diskOff, &length, &gen)
-		eEnd := logOff + length
-		if logOff >= newSize {
-			_ = s.store.Delete(ctx, string(kv.Key))
+// truncate drops or shortens every extent of an inode that lies beyond
+// newSize, returning the freed device ranges to the arena.
+func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
+	extents, err := s.store.GetExtents(ctx, ino)
+	if err != nil {
+		s.log.Warn("truncate: cannot read extents", "ino", ino, "error", err)
+		return
+	}
+	for _, ext := range extents {
+		switch {
+		case ext.LogOff >= newSize:
+			_ = s.store.Delete(ctx, ext.Key)
 			if s.dev != nil {
-				s.alloc.Free(diskOff, length)
+				s.alloc.Free(ext.DiskOff, ext.Length)
 			}
-		} else if eEnd > newSize {
-			keepLen := newSize - logOff
-			freeLen := length - keepLen
-			newVal := fmt.Sprintf("%d,%d,%d,%d", logOff, diskOff, keepLen, gen)
-			_, _ = s.store.Put(ctx, string(kv.Key), []byte(newVal))
+		case ext.End() > newSize:
+			keepLen := newSize - ext.LogOff
+			shortened := ext
+			shortened.Length = keepLen
+			_, _ = s.store.Put(ctx, ext.Key, []byte(shortened.Encode()))
 			if s.dev != nil {
-				s.alloc.Free(diskOff+keepLen, freeLen)
+				s.alloc.Free(ext.DiskOff+keepLen, ext.Length-keepLen)
 			}
 		}
 	}
-	_ = rec
 }
 
 // SYMLINK payload: [u64:parent][u32:name_len][name][u32:target_len][target]
