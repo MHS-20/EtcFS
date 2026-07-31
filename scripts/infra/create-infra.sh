@@ -243,10 +243,10 @@ log "=== Attaching EBS to compute nodes ==="
 for i in "${!COMPUTE_IDS[@]}"; do
     id="${COMPUTE_IDS[$i]}"
     log "Attaching $VOL_ID to $id..."
-    aws ec2 attach-volume \
+    ATTACH_ERR=$(aws ec2 attach-volume \
         --volume-id "$VOL_ID" \
         --instance-id "$id" \
-        --device /dev/sdf 2>/dev/null || true
+        --device /dev/sdf 2>&1 >/dev/null) || log "  attach-volume error: $ATTACH_ERR"
 done
 
 log "Waiting for all attachments..."
@@ -257,11 +257,12 @@ for i in $(seq 1 30); do
         log "All $ATTACH_COUNT attachments complete"
         break
     fi
-    if [[ $i -eq 30 ]]; then
-        log "WARNING: only $ATTACH_COUNT/${#COMPUTE_IDS[@]} attachments after 60s"
-    fi
     sleep 2
 done
+
+if [[ "$ATTACH_COUNT" -lt "${#COMPUTE_IDS[@]}" ]]; then
+    die "only $ATTACH_COUNT/${#COMPUTE_IDS[@]} attachments after 60s — infra left up for inspection, run destroy-infra.sh to tear down"
+fi
 
 # ---- Done ----
 
