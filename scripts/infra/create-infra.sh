@@ -117,6 +117,16 @@ if [[ -z "$SG_ID" ]]; then
     fi
 fi
 
+# Compute nodes launch into $SUBNET_ID and the EBS volume is created in $AZ
+# (below) — they must be the same AZ or the attach fails. Resolve a real
+# subnet now if one wasn't given explicitly, instead of launching instances
+# into whatever AZ AWS treats as the account default.
+if [[ -z "$SUBNET_ID" ]]; then
+    SUBNET_ID=$(discover_subnet)
+    [[ -n "$SUBNET_ID" && "$SUBNET_ID" != "None" ]] || die "no subnet found for AZ $AZ in VPC $VPC_ID"
+    log "Resolved subnet: $SUBNET_ID (AZ $AZ)"
+fi
+
 state_put vpc_id "\"$VPC_ID\""
 state_put subnet_id "\"$SUBNET_ID\""
 state_put sg_id "\"$SG_ID\""
