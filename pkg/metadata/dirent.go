@@ -178,11 +178,6 @@ func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string
 		return nil, fmt.Errorf("atomic create %d/%q: transaction failed", parent, name)
 	}
 
-	// Verify: read both keys back
-	dv, _ := s.Get(ctx, DirentKey(parent, name))
-	iv, _ := s.Get(ctx, InodeKey(ino))
-	fmt.Printf("  DEBUG AtomicCreateFile: ok=%v dirent_len=%d inode_len=%d\n", ok, len(dv), len(iv))
-
 	return rec, nil
 }
 
