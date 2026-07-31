@@ -40,7 +40,7 @@ run_check "go vet"    go vet ./...
 run_check "golangci-lint" golangci-lint run --timeout=5m ./...
 run_check "C build"   make -C cmd/etcfuse
 run_check "clang-format" clang-format --dry-run --Werror \
-    $(find cmd/etcfuse pkg/fuse pkg/block pkg/wal -name '*.c' -o -name '*.h')
+    $(find cmd/etcfuse pkg/fuse pkg/block -name '*.c' -o -name '*.h')
 run_check "shellcheck" shellcheck scripts/infra/*.sh scripts/test/*.sh
 
 if [[ "$failures" -gt 0 ]]; then

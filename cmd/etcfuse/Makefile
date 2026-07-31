@@ -4,7 +4,6 @@
 #   cmd/etcfuse/   (entry point)
 #   pkg/fuse/      (FUSE protocol, op handlers, IPC)
 #   pkg/block/     (block device I/O)
-#   pkg/wal/       (local write-ahead log)
 #
 # Invoked from the top-level Makefile or directly:
 #   make -C cmd/etcfuse
@@ -15,8 +14,7 @@ SRCS := $(ROOT)/cmd/etcfuse/main.c \
         $(ROOT)/pkg/fuse/fuse.c \
         $(ROOT)/pkg/fuse/ops.c \
         $(ROOT)/pkg/fuse/pool.c \
-        $(ROOT)/pkg/block/block.c \
-        $(ROOT)/pkg/wal/wal.c
+        $(ROOT)/pkg/block/block.c
 
 BINARY := $(ROOT)/bin/etcfuse
 CFLAGS := -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g \

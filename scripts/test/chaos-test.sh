@@ -35,7 +35,7 @@ ssh_retry() {
 log "Building Go binary..."
 go build -o "$PROJECT_ROOT/bin/etcfuse-meta" "$PROJECT_ROOT/cmd/etcfuse-meta/" 2>&1 | tail -1
 log "Packaging C source..."
-tar czf /tmp/chaos.tar.gz -C "$PROJECT_ROOT" cmd/etcfuse pkg/fuse pkg/block pkg/wal
+tar czf /tmp/chaos.tar.gz -C "$PROJECT_ROOT" cmd/etcfuse pkg/fuse pkg/block
 
 provision() {
     local TAG="chaos-$1-$$"
@@ -76,7 +76,7 @@ provision() {
         ssh_retry "$ip" "
             rm -rf /tmp/s && mkdir /tmp/s && cd /tmp/s && tar xzf /tmp/chaos.tar.gz && \
             gcc -I. -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g \
-                cmd/etcfuse/main.c pkg/fuse/fuse.c pkg/fuse/ops.c pkg/block/block.c pkg/wal/wal.c \
+                cmd/etcfuse/main.c pkg/fuse/fuse.c pkg/fuse/ops.c pkg/block/block.c \
                 -o /tmp/etcfuse -lfuse3 -lpthread 2>&1 && \
             sudo cp /tmp/etcfuse /usr/local/bin/etcfuse && sudo chmod +x /usr/local/bin/etcfuse
         " || true
