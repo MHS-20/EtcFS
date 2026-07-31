@@ -68,8 +68,8 @@ if [[ "$MODE" == "docker" ]]; then
         done
         echo FAIL
     }
-    partition_node() { docker network disconnect etcfuse-net "$1" 2>/dev/null; docker network disconnect etcfuse-net "$2" 2>/dev/null; }
-    heal_node()      { docker network connect etcfuse-net "$1" 2>/dev/null; docker network connect etcfuse-net "$2" 2>/dev/null; }
+    partition_node() { docker network disconnect docker_etcfuse-net "$1" 2>/dev/null; docker network disconnect docker_etcfuse-net "$2" 2>/dev/null; }
+    heal_node()      { docker network connect docker_etcfuse-net "$1" 2>/dev/null; docker network connect docker_etcfuse-net "$2" 2>/dev/null; }
     etcdctl_on()     { docker exec etcfs-etcd1 etcdctl --endpoints=http://127.0.0.1:2379 "$@"; }
 
     provision_cluster() {
