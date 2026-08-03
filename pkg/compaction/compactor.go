@@ -129,9 +129,14 @@ func (c *Compactor) markGlobalArenaAvailable(ctx context.Context, arenaID uint64
 	_, _ = c.Store.Put(ctx, key, []byte("free"))
 }
 
+// markGlobalArenaAcquired records that nodeID owns arenaID.
+//
+// The value must be the same 8-byte big-endian encoding that membership writes
+// and that the allocator reads back on restart: an ASCII form here decodes to
+// arena 0, which would hand the node an arena it does not own.
 func (c *Compactor) markGlobalArenaAcquired(ctx context.Context, arenaID uint64, nodeID string) {
 	key := metadata.ArenaKey(nodeID)
-	_, _ = c.Store.Put(ctx, key, []byte(fmt.Sprintf("id=%d", arenaID)))
+	_, _ = c.Store.Put(ctx, key, metadata.EncodeUint64(arenaID))
 }
 
 // extentsIn returns every extent lying entirely within the device byte range

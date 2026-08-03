@@ -64,6 +64,13 @@ func (a *Allocator) AcquireArena(ctx context.Context) (*Arena, error) {
 	diskStart := arenaID * ArenaSizeBytes
 	diskEnd := diskStart + ArenaSizeBytes
 
+	// Record ownership before using the arena.  Without this the node has no
+	// durable claim on the range it is about to write into, and a restart
+	// cannot tell which arenas were its own.
+	if _, err := a.store.Put(ctx, metadata.ArenaKey(a.nodeID), metadata.EncodeUint64(arenaID)); err != nil {
+		return nil, fmt.Errorf("acquire arena %d: record ownership: %w", arenaID, err)
+	}
+
 	free := &Arena{
 		ID:        arenaID,
 		DiskStart: diskStart,
@@ -184,19 +191,36 @@ func (a *Allocator) Reconstruct(ctx context.Context) error {
 	return nil
 }
 
+// existingArenaIDs returns the arenas this node owns, read from its own
+// arena:<node_id> ownership record.
+//
+// Only this node's record is read, never the whole arena: prefix.  Scanning the
+// prefix would pull every *other* live node's arenas into this node's
+// free-list, and Allocate would then hand out disk offsets inside a range
+// another node is actively writing.  Both nodes would write different data to
+// the same block and both extent commits would succeed, because neither node
+// is fenced and the generation guard has nothing to object to — silent
+// corruption, detectable only after the fact by the scrubber's
+// CheckExtentCollisions.
+//
+// ponytail: one arena recorded per node, so a node holding several recovers
+// only its most recent one after a restart and leaks the others (safe, they
+// are simply never reallocated). Move to arena:<node_id>/<arena_id> records if
+// multi-arena recovery starts to matter.
 func (a *Allocator) existingArenaIDs(ctx context.Context) ([]uint64, error) {
-	kvs, err := a.store.GetPrefix(ctx, metadata.PrefixArena)
+	v, err := a.store.Get(ctx, metadata.ArenaKey(a.nodeID))
 	if err != nil {
 		return nil, err
 	}
-	var ids []uint64
-	for _, kv := range kvs {
-		id := metadata.DecodeUint64(kv.Value)
-		if id > 0 {
-			ids = append(ids, id)
-		}
+	// A record is exactly the 8-byte big-endian arena ID.  Anything else is
+	// malformed, and adopting it would mean allocating into an arena this node
+	// may not own — treat it as "nothing recorded" instead, which only costs a
+	// fresh arena.  Note arena ID 0 is a valid ID, so a present record must be
+	// distinguished by length, not by a zero test.
+	if len(v) != 8 {
+		return nil, nil
 	}
-	return ids, nil
+	return []uint64{metadata.DecodeUint64(v)}, nil
 }
 
 // ArenaCount returns the number of arenas managed by this allocator.
