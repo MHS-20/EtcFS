@@ -142,6 +142,15 @@ else
     etcd_endpoints() {
         echo "http://$(jq -r '.compute_ips[0]' "$PROJECT_ROOT/$STATE_FILE"):2379,http://$(jq -r '.compute_ips[1]' "$PROJECT_ROOT/$STATE_FILE"):2379,http://$(jq -r '.compute_ips[2]' "$PROJECT_ROOT/$STATE_FILE"):2379"
     }
+    # etcdctl_on — run etcdctl against the cluster, over SSH via N1.
+    # Docker mode's equivalent execs inside a container; there is no local
+    # etcd client here, so this shells out through N1 instead. Runs against
+    # the full endpoint list (not just N1's own node) so a query still works
+    # even if N1 itself is the node currently being restarted/partitioned.
+    etcdctl_on() {
+        timeout 15 ssh -o StrictHostKeyChecking=no -q ec2-user@"$N1" \
+            "/usr/local/bin/etcdctl --endpoints=$(etcd_endpoints) $*" 2>/dev/null
+    }
     restart_daemons() {
         local etcd=$(etcd_endpoints); local tag=$(jq -r '.cluster_name' "$PROJECT_ROOT/$STATE_FILE")
         runcmd60 "$1" "
