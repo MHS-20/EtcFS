@@ -26,7 +26,7 @@ Traditional cluster filesystems (GFS2, OCFS2) keep durable truth *on disk* — i
 
 This means atomicity, consistency, and metadata recovery come from etcd's existing quorum-replicated log almost for free, instead of reimplementing a bespoke recovery protocol. The tradeoff is that every structural operation is an etcd round trip — mitigated by aggressive client-side metadata caching with watch-based invalidation, and by keeping the hot data path (reads/writes to already-allocated extents) entirely on direct block I/O with no etcd round trip at all.
 
-Full rationale: [`docs/plans/init_plan.md`](docs/plans/init_plan.md) — read this before making any design decision that touches fencing, the write path, or the metadata schema.
+Full rationale: [`docs/architecture/`](docs/architecture/) — read the relevant subsystem doc before making any design decision that touches fencing, the write path, or the metadata schema.
 
 ## Architecture
 
@@ -204,16 +204,12 @@ Chaos scenarios cost real AWS resources and take a few minutes each to provision
 Implemented and under hardening — this is not yet a system to trust with data you can't afford to lose. In particular:
 
 - Namespace mutations (create/mkdir/unlink/rename/setattr) still commit without a generation guard — only the data path (extent writes) is currently covered by the fencing-generation check. See [`docs/architecture/fencing-generation-protocol.md`](docs/architecture/fencing-generation-protocol.md) § Implementation Status.
-- `docs/plans/04_hardening_plan.md` tracks a point-in-time gap ledger (Critical/Major/Minor) between the design and the implementation as of when it was written — it is **not** a live status tracker; verify any specific item against the current code before trusting it (some listed items, e.g. READDIRPLUS and the external fencing controller, are implemented in current code despite being listed there as open).
 - The chaos/fuzz testing tiers above stress crash recovery, fencing, and elastic membership changes fairly hard, but do not yet cover: concurrent multi-node scale-out, fault injection *during* a join/leave, or long-duration (multi-hour+) fuzz runs that would surface slow-leak bugs.
 
 ## Document map
 
 | Document | Purpose |
 |---|---|
-| [`docs/plans/init_plan.md`](docs/plans/init_plan.md) | Authoritative architectural design — subsystems, etcd schema, locking, data path, fencing, invariants |
-| [`docs/plans/02_implementation_phases.md`](docs/plans/02_implementation_phases.md) | 12-phase build plan with dependencies and research-informed rationale |
-| [`docs/plans/04_hardening_plan.md`](docs/plans/04_hardening_plan.md) | Point-in-time gap ledger between design and implementation |
 | `docs/architecture/*.md` | Per-subsystem design docs (~24 files) — fencing, WAL, write ordering, schema, coherence, scrubber |
 | [`docs/chaos-reports/`](docs/chaos-reports/) | Chaos/stress testing results, by date |
 | [`docs/etcd_raft_research.md`](docs/etcd_raft_research.md) | etcd/Raft internals research — transactions, leases, watches, scaling limits |

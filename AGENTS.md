@@ -14,15 +14,10 @@ The two daemons talk over a hand-rolled length-prefixed binary protocol on a Uni
 
 Not yet guarded: namespace mutations (create/mkdir/unlink/rename/setattr) still commit without a generation guard — only the data path (extent writes) is covered. See `docs/architecture/fencing-generation-protocol.md` § Implementation Status.
 
-See `docs/plans/04_hardening_plan.md` for the tracked gap ledger; it is a point-in-time design-phase snapshot, not a live status tracker — verify each item against code before trusting it (e.g. it lists READDIRPLUS and the fencing controller as open, both of which are implemented in current code).
-
 ## Document map
 
 | Document | Purpose |
 |----------|---------|
-| `docs/plans/init_plan.md` | Authoritative architectural design — subsystems, etcd schema, locking, data path, fencing, invariants |
-| `docs/plans/02_implementation_phases.md` | 12-phase build plan (Phase 0–11) with dependencies and research-informed rationale |
-| `docs/plans/04_hardening_plan.md` | Gap ledger between design and implementation (Critical/Major/Minor) |
 | `docs/architecture/*.md` | Per-subsystem design docs (~24 files) — fencing, WAL, write ordering, schema, coherence, scrubber |
 | `docs/etcd_raft_research.md` | etcd/Raft internals research — transaction model, leases, watches, scaling limits (~1M files per cluster), watch amplification, pagination |
 | `docs/research/cluster-fs-survey.md` | Cluster/distributed filesystem survey — GFS2, OCFS2, CephFS, GlusterFS, Lustre, EBS Multi-Attach failure modes, design lessons |
@@ -31,7 +26,7 @@ See `docs/plans/04_hardening_plan.md` for the tracked gap ledger; it is a point-
 | `scripts/infra/` | AWS EC2 + EBS Multi-Attach provisioning, etcd deployment, FUSE daemon bootstrap (template), node add/remove |
 | `scripts/test/` | Chaos engineering, fencing validation, epoch tests, network isolation (adapted from QAttach) |
 
-## Architecture (from `docs/plans/init_plan.md`)
+## Architecture
 
 Four subsystems per node (FUSE userspace daemon):
 1. **FUSE frontend** — VFS ops → metadata + data calls
@@ -48,11 +43,9 @@ Key design invariants:
 
 ## Conventions
 
-- `docs/plans/init_plan.md` is the authoritative reference — consult it before making any design decision.
+- `docs/architecture/*.md` is the authoritative reference — consult the relevant subsystem doc before making any design decision.
 - Language/build decisions are made: C (FUSE frontend, C11, `-Wall -Wextra -Werror`) + Go (metadata backend). Build with `make`; `make check` runs lint + tests.
-- The fencing/epoch invariants in §9 of init_plan are the most safety-critical part of the design. Any change touching `pkg/fencing`, `pkg/metadata/gen.go`, or the extent-commit path must preserve them.
-- The 12-phase build order in `02_implementation_phases.md` supersedes the 6-step sketch in init_plan §15.
-- Phase 4 (fault-injection harness) must be built before trusting any phase that writes to real block devices.
+- The fencing/generation invariants (see `docs/architecture/fencing-generation-protocol.md`) are the most safety-critical part of the design. Any change touching `pkg/fencing`, `pkg/metadata/gen.go`, or the extent-commit path must preserve them.
 - etcd value encodings are **not uniform**: `inode_alloc_counter` and dirent values are 8-byte big-endian; `gen:<node>` is decimal ASCII; `extent:<ino>/<chunk>` is comma-separated ASCII. Match the existing encoding when seeding keys by hand or via `etcdctl`.
 - Chaos scenarios cost real AWS resources and take ~4 min each to provision. Run a single scenario (`chaos-test.sh 1`) while iterating, not `all`.
 - The chaos harness swallows errors (`readf`/`writef`/`runcmd` return `""` on any failure), so an SSH timeout looks identical to data loss. Confirm a failure's cause in `/tmp/meta.log` and `/tmp/fuse.log` on the node before treating it as a product bug.
