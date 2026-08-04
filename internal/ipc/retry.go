@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -33,9 +34,20 @@ func retry(attempts int, fn func() error) error {
 		if err = fn(); err == nil {
 			return nil
 		}
+		if permanent(err) {
+			return err
+		}
 		time.Sleep(retryDelay(attempt))
 	}
 	return err
+}
+
+// permanent reports whether an error will still hold on a retry.  A fence is
+// permanent by definition — retrying it only delays the EIO the caller is
+// going to get anyway, while holding the FUSE request open.
+func permanent(err error) bool {
+	return errors.Is(err, metadata.ErrFenced) ||
+		errors.Is(err, metadata.ErrGuardUnavailable)
 }
 
 // retryEtcd runs fn against a fresh bounded context on every attempt.  Each
@@ -86,22 +98,30 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 // generation.  Returns (false, nil) when the guard rejected the commit — the
 // node has been fenced and must not mutate metadata again.  Transient etcd
 // errors are retried; a failed guard is not, because a fence is permanent.
+//
+// The guard itself is applied by the store (see metadata.Store.SetGuard), which
+// covers every mutation path rather than only the ones that remember to ask.
+// This wrapper keeps the retry policy and the boolean "was it a fence" contract
+// its callers are written against.
 func (s *Service) commitGuarded(ops []clientv3.Op) (bool, error) {
+	// Ensure the generation is resolved before committing, so a first write
+	// fails with a real etcd error rather than ErrGuardUnavailable.
 	gctx, gcancel := context.WithTimeout(context.Background(), etcdOpTimeout)
-	gen, err := s.guardGeneration(gctx)
+	_, err := s.guardGeneration(gctx)
 	gcancel()
 	if err != nil {
 		return false, err
 	}
 
-	guard := []clientv3.Cmp{metadata.WithGenerationGuard(s.membership.NodeID(), gen)}
-
 	committed := false
 	err = retryEtcd(func(ctx context.Context) error {
 		var terr error
-		committed, terr = s.store.Txn(ctx, guard, ops, nil)
+		committed, terr = s.store.Txn(ctx, nil, ops, nil)
 		return terr
 	})
+	if errors.Is(err, metadata.ErrFenced) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
