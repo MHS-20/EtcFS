@@ -244,6 +244,97 @@ func TestElastic_MultipleJoinLeaveCycles(t *testing.T) {
 	_ = cluster
 }
 
+// TestElastic_ConcurrentJoin is the in-memory equivalent of
+// scripts/test/chaos-elastic-concurrent.sh: several nodes join at the same
+// time, against the same shared store, instead of one after another. The
+// chaos script proves this against real containers/EC2 in minutes; this
+// proves the same property against MockStore in milliseconds, so a
+// regression here is caught by `go test ./...` rather than only by someone
+// remembering to run the chaos script.
+//
+// Covers what TestElastic_ArenaPoolContention does not: concurrent inode
+// allocation. Both membership.Manager.AcquireArena (arenas) and
+// ReserveInodeRange (inodes) CAS against the same shared counter pattern
+// under concurrency here.
+//
+// Note: ReserveInodeRange CASes against the same inode_alloc_counter key
+// that the real request path's Service.allocInode -> Store.NextCounter
+// uses, so this exercises the identical etcd primitive under contention —
+// but ReserveInodeRange's own retry budget (5 attempts, no jitter) is looser
+// than NextCounter's (20 attempts, backoff+jitter, added after a documented
+// near-miss under load — see the comment on NextCounter in
+// pkg/metadata/alloc.go). This test can't fail for a NextCounter-specific
+// retry regression; it can only prove the shared counter never hands out
+// the same value twice under concurrent CAS pressure.
+func TestElastic_ConcurrentJoin(t *testing.T) {
+	cluster := NewCluster(1)
+	ctx := t.Context()
+	store := cluster.Store
+
+	const nodes = 5
+	const inodesPerNode = 1000
+	var wg sync.WaitGroup
+
+	type joinResult struct {
+		nodeID   string
+		arena    uint64
+		lo, hi   uint64
+		joinErr  error
+		rangeErr error
+	}
+	results := make([]joinResult, nodes)
+
+	for i := 0; i < nodes; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			nodeID := fmt.Sprintf("concurrent-join-%d", idx)
+			mgr := membership.New(store, nodeID)
+
+			joinErr := mgr.Join(ctx)
+			rangeErr := mgr.ReserveInodeRange(ctx, 0, inodesPerNode)
+			lo, hi := mgr.InodeRange(ctx, nodeID)
+
+			arenaVal, _ := store.Get(ctx, metadata.ArenaKey(nodeID))
+			var arena uint64
+			if arenaVal != nil {
+				arena = metadata.DecodeUint64(arenaVal)
+			}
+
+			results[idx] = joinResult{nodeID: nodeID, arena: arena, lo: lo, hi: hi, joinErr: joinErr, rangeErr: rangeErr}
+		}(i)
+	}
+	wg.Wait()
+
+	seenArenas := make(map[uint64]bool)
+	type ivl struct{ lo, hi uint64 }
+	ranges := make([]ivl, 0, nodes)
+
+	for _, r := range results {
+		require.NoError(t, r.joinErr, "join must succeed for %s", r.nodeID)
+		require.NoError(t, r.rangeErr, "inode range reservation must succeed for %s", r.nodeID)
+
+		assert.False(t, seenArenas[r.arena], "arena %d handed to more than one node", r.arena)
+		seenArenas[r.arena] = true
+
+		assert.Less(t, r.lo, r.hi, "%s got an empty or inverted range [%d,%d)", r.nodeID, r.lo, r.hi)
+		ranges = append(ranges, ivl{r.lo, r.hi})
+	}
+
+	// No two nodes' inode ranges may overlap — that's the actual hazard a
+	// broken CAS retry produces (two nodes creating files with the same
+	// inode number).
+	for i := 0; i < len(ranges); i++ {
+		for j := i + 1; j < len(ranges); j++ {
+			overlap := ranges[i].lo <= ranges[j].hi && ranges[j].lo <= ranges[i].hi
+			assert.False(t, overlap, "inode ranges overlap: [%d,%d] and [%d,%d]",
+				ranges[i].lo, ranges[i].hi, ranges[j].lo, ranges[j].hi)
+		}
+	}
+
+	assert.Zero(t, cluster.checkAllInvariants())
+}
+
 func TestElastic_RebalanceIdempotent(t *testing.T) {
 	cluster := NewCluster(1)
 	ctx := t.Context()
