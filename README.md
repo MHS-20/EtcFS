@@ -205,7 +205,7 @@ Chaos scenarios cost real AWS resources and take a few minutes each to provision
 
 Implemented and under hardening — this is not yet a system to trust with data you can't afford to lose. In particular:
 
-- Namespace mutations (create/mkdir/unlink/rename/setattr) still commit without a generation guard — only the data path (extent writes) is currently covered by the fencing-generation check. See [`docs/architecture/fencing-generation-protocol.md`](docs/architecture/fencing-generation-protocol.md) § Implementation Status.
+- Namespace mutations (create/mkdir/unlink/rename/setattr) are now covered by the fencing-generation guard, applied store-wide rather than per call site. See [`docs/architecture/fencing/fencing-generation-protocol.md`](docs/architecture/fencing/fencing-generation-protocol.md) § Implementation Status. Verified by `scripts/test/chaos-fencing-namespace.sh`, which has not yet been run against AWS.
 - The chaos/fuzz testing tiers above stress crash recovery, fencing, and elastic membership changes fairly hard, but do not yet cover: concurrent multi-node scale-out, fault injection *during* a join/leave, or long-duration (multi-hour+) fuzz runs that would surface slow-leak bugs.
 
 ## Document map
