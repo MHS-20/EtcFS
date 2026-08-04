@@ -139,6 +139,27 @@ func TestGuard_CASFailureIsNotReportedAsFenced(t *testing.T) {
 	assert.ErrorIs(t, err, ErrExists)
 }
 
+// The first fence of a node that has already started (and so already ran
+// EnsureGenerationKey, which creates gen:<node> at "0") must succeed.
+//
+// Regression test: BumpGeneration used to require the generation key to be
+// entirely absent when expectedOld was 0, but EnsureGenerationKey runs at
+// every node's startup and creates that key at "0" before the node serves
+// anything — so the key always already existed by the time a real fence
+// happened, and every first-ever fence was silently rejected.
+func TestGuard_FirstFenceOfInitialisedNodeSucceeds(t *testing.T) {
+	store := testStore(t, "fresh-node")
+	ctx := context.Background()
+
+	gen, err := store.EnsureGenerationKey(ctx, "fresh-node")
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), gen)
+
+	newGen, err := store.BumpGeneration(ctx, "fresh-node", gen)
+	require.NoError(t, err, "fencing a freshly-initialised node must succeed")
+	assert.Equal(t, uint64(1), newGen)
+}
+
 // The control-plane paths must stay usable on a fenced node, or the fencing
 // controller could not fence a node twice and a restart could not recover.
 func TestGuard_ControlPlaneRemainsUnguarded(t *testing.T) {

@@ -55,31 +55,38 @@ func (s *Store) PutGeneration(ctx context.Context, nodeID string, gen uint64) er
 // Called by the fencing controller after dual-confirmed fence.
 //
 // If the generation key does not exist yet, it is treated as generation 0.
+//
+// EnsureGenerationKey runs at every node's startup and creates gen:<node_id>
+// at "0" before the node serves anything, so by the time a fence can be
+// triggered the key almost always already exists with that value — the
+// "key never existed" case below is a fallback for a node fenced before its
+// own daemon ever ran, not the common path.
 func (s *Store) BumpGeneration(ctx context.Context, nodeID string, expectedOld uint64) (uint64, error) {
 	key := GenKey(nodeID)
 	newGen := expectedOld + 1
-
-	// Use CreateRevision=0 to detect missing key (treat as value "0")
-	cmp := clientv3.Compare(clientv3.CreateRevision(key), "=", 0)
-	valCmp := clientv3.Compare(clientv3.Value(key), "=", strconv.FormatUint(expectedOld, 10))
-
-	cmps := []clientv3.Cmp{}
-	if expectedOld == 0 {
-		// Key must not exist (generation starts at 0 implicitly)
-		cmps = append(cmps, cmp)
-	} else {
-		cmps = append(cmps, valCmp)
-	}
-
 	op := clientv3.OpPut(key, strconv.FormatUint(newGen, 10))
 
 	// Unguarded: this transaction *is* the fence.  Guarding a generation bump
 	// by the generation it changes would make the fencing controller unable to
 	// fence a node once that node's own store carried a guard.
-	ok, err := s.txnRaw(ctx, cmps, []clientv3.Op{op}, nil)
+	valCmp := clientv3.Compare(clientv3.Value(key), "=", strconv.FormatUint(expectedOld, 10))
+	ok, err := s.txnRaw(ctx, []clientv3.Cmp{valCmp}, []clientv3.Op{op}, nil)
 	if err != nil {
 		return 0, fmt.Errorf("bump generation %s: %w", nodeID, err)
 	}
+
+	// A value comparison against a genuinely missing key always evaluates
+	// false, indistinguishable from a stale expectedOld — so on a rejected
+	// bump at expectedOld=0, separately check for "key never existed" and
+	// accept that too, atomically, before treating it as a real CAS failure.
+	if !ok && expectedOld == 0 {
+		absentCmp := clientv3.Compare(clientv3.CreateRevision(key), "=", 0)
+		ok, err = s.txnRaw(ctx, []clientv3.Cmp{absentCmp}, []clientv3.Op{op}, nil)
+		if err != nil {
+			return 0, fmt.Errorf("bump generation %s: %w", nodeID, err)
+		}
+	}
+
 	if !ok {
 		current, _ := s.GetGeneration(ctx, nodeID)
 		return 0, fmt.Errorf("bump generation %s: CAS failed (expected %d, got %d)", nodeID, expectedOld, current)
