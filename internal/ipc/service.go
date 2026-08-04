@@ -11,13 +11,14 @@ import (
 	"context"
 	"sync"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 	wal "github.com/MHS-20/EtcFS/pkg/walgo"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Service handles FUSE operation requests from the C daemon.
