@@ -2,12 +2,27 @@ package ipc
 
 import (
 	"context"
+	"errors"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
 // Metadata operation handlers: everything answerable from etcd alone.
 // Operations that touch the block device live in datapath.go.
+
+// errnoFor maps a store error to the errno the FUSE client should see.
+//
+// A fencing rejection must surface as EIO and never as the operation's usual
+// failure code: reporting a fenced create as EEXIST, or a fenced unlink as
+// ENOENT, makes a fencing bug indistinguishable from ordinary contention in a
+// fuzz log, and misleads anyone reading the mount's errors during an incident.
+// Anything else keeps the caller's ordinary errno.
+func errnoFor(err error, fallback int32) int32 {
+	if errors.Is(err, metadata.ErrFenced) || errors.Is(err, metadata.ErrGuardUnavailable) {
+		return -5 // EIO
+	}
+	return fallback
+}
 
 // LOOKUP payload: [u64:parent][u32:name_len][name_bytes]
 // Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout]
@@ -205,7 +220,7 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 
 	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, mode, 1000, 1000)
 	if err != nil {
-		return int32Resp(-17), nil // EEXIST
+		return int32Resp(errnoFor(err, -17)), nil // EEXIST unless fenced
 	}
 
 	return entryResp(rec.Ino, rec), nil
@@ -231,7 +246,7 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 
 	rec, err := s.store.AtomicCreateDir(ctx, parent, name, ino, mode, 1000, 1000)
 	if err != nil {
-		return int32Resp(-17), nil
+		return int32Resp(errnoFor(err, -17)), nil
 	}
 
 	return entryResp(rec.Ino, rec), nil
@@ -249,7 +264,7 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 
 	err := s.store.AtomicUnlink(ctx, parent, name)
 	if err != nil {
-		return int32Resp(-2), nil // ENOENT
+		return int32Resp(errnoFor(err, -2)), nil // ENOENT unless fenced
 	}
 	return okResp(), nil
 }
@@ -280,7 +295,7 @@ func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, erro
 
 	err = s.store.AtomicUnlink(ctx, parent, name)
 	if err != nil {
-		return int32Resp(-2), nil
+		return int32Resp(errnoFor(err, -2)), nil
 	}
 	return okResp(), nil
 }
@@ -309,7 +324,7 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 
 	err = s.store.AtomicRename(ctx, oldParent, oldName, newParent, newName, ino, flags)
 	if err != nil {
-		return int32Resp(-17), nil // EEXIST or other
+		return int32Resp(errnoFor(err, -17)), nil // EEXIST or other, unless fenced
 	}
 	return okResp(), nil
 }
@@ -336,7 +351,11 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	if valid&fattrSize != 0 && newSize < rec.Size {
 		s.truncate(ctx, ino, newSize)
 		rec.Size = newSize
-		_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+		if _, err := s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec)); err != nil {
+			// Previously discarded.  A fenced node must not report a truncate
+			// as successful when the size update was rejected.
+			return int32Resp(errnoFor(err, -5)), nil
+		}
 	}
 
 	return attrResp(rec), nil
@@ -363,16 +382,18 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 	// Create inode with symlink mode
 	_, err = s.store.CreateInode(ctx, ino, metadata.ModeSymlink|0777, 1000, 1000)
 	if err != nil {
-		return int32Resp(-17), nil
+		return int32Resp(errnoFor(err, -17)), nil
 	}
 
 	// Store target
-	_, _ = s.store.Put(ctx, metadata.InodeSymlinkKey(ino), []byte(target))
+	if _, err := s.store.Put(ctx, metadata.InodeSymlinkKey(ino), []byte(target)); err != nil {
+		return int32Resp(errnoFor(err, -5)), nil
+	}
 
 	// Create directory entry
 	err = s.store.CreateDirent(ctx, parent, name, ino)
 	if err != nil {
-		return int32Resp(-17), nil
+		return int32Resp(errnoFor(err, -17)), nil
 	}
 
 	return entryResp(ino, &metadata.InodeRecord{
@@ -394,13 +415,13 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 	// Increment nlink
 	err := s.store.IncrementNlink(ctx, ino)
 	if err != nil {
-		return int32Resp(-2), nil
+		return int32Resp(errnoFor(err, -2)), nil
 	}
 
 	// Create new directory entry
 	err = s.store.CreateDirent(ctx, newParent, name, ino)
 	if err != nil {
-		return int32Resp(-17), nil
+		return int32Resp(errnoFor(err, -17)), nil
 	}
 
 	rec, _ := s.store.GetInode(ctx, ino)
@@ -427,14 +448,16 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 
 	rec, err := s.store.CreateInode(ctx, ino, mode, 1000, 1000)
 	if err != nil {
-		return int32Resp(-17), nil
+		return int32Resp(errnoFor(err, -17)), nil
 	}
 	rec.Rdev = rdev
-	_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
+	if _, err := s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec)); err != nil {
+		return int32Resp(errnoFor(err, -5)), nil
+	}
 
 	err = s.store.CreateDirent(ctx, parent, name, ino)
 	if err != nil {
-		return int32Resp(-17), nil
+		return int32Resp(errnoFor(err, -17)), nil
 	}
 
 	return entryResp(ino, rec), nil
