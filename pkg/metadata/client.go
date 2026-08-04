@@ -164,7 +164,21 @@ func (s *Store) GetRevision(ctx context.Context, key string, opts ...clientv3.Op
 }
 
 // Put writes a key-value pair.  Returns the new revision.
+//
+// When a guard is installed the write is issued as a guarded transaction, not
+// a bare Put: a fenced node must not be able to mutate metadata through a call
+// that happens to skip Txn.  Several namespace handlers (setattr, symlink,
+// mknod) and the truncate path write inode records this way.
 func (s *Store) Put(ctx context.Context, key string, value []byte, opts ...clientv3.OpOption) (int64, error) {
+	if s.guard != nil {
+		return s.guardedWrite(ctx, clientv3.OpPut(key, string(value), opts...), "put", key)
+	}
+	return s.putRaw(ctx, key, value, opts...)
+}
+
+// putRaw writes without the fencing guard.  Control-plane use only — see
+// txnRaw for the rules.
+func (s *Store) putRaw(ctx context.Context, key string, value []byte, opts ...clientv3.OpOption) (int64, error) {
 	resp, err := s.client.Put(ctx, key, string(value), opts...)
 	if err != nil {
 		return 0, fmt.Errorf("put %s: %w", key, err)
@@ -172,8 +186,29 @@ func (s *Store) Put(ctx context.Context, key string, value []byte, opts ...clien
 	return resp.Header.Revision, nil
 }
 
-// Delete removes a key.
+// guardedWrite applies a single mutation inside a generation-guarded
+// transaction, translating a guard rejection into ErrFenced.
+func (s *Store) guardedWrite(ctx context.Context, op clientv3.Op, verb, key string) (int64, error) {
+	cmp, _, ok := s.guard()
+	if !ok {
+		return 0, fmt.Errorf("%s %s: %w", verb, key, ErrGuardUnavailable)
+	}
+	resp, err := s.client.Txn(ctx).If(cmp).Then(op).Commit()
+	if err != nil {
+		return 0, fmt.Errorf("%s %s: %w", verb, key, err)
+	}
+	if !resp.Succeeded {
+		return 0, fmt.Errorf("%s %s: %w", verb, key, ErrFenced)
+	}
+	return resp.Header.Revision, nil
+}
+
+// Delete removes a key.  Guarded when a guard is installed — see Put.
 func (s *Store) Delete(ctx context.Context, key string) error {
+	if s.guard != nil {
+		_, err := s.guardedWrite(ctx, clientv3.OpDelete(key), "delete", key)
+		return err
+	}
 	_, err := s.client.Delete(ctx, key)
 	if err != nil {
 		return fmt.Errorf("delete %s: %w", key, err)
@@ -181,8 +216,26 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// DeletePrefix removes all keys with the given prefix.
+// DeletePrefix removes all keys with the given prefix.  Guarded when a guard
+// is installed — see Put.
 func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int64, error) {
+	if s.guard != nil {
+		cmp, _, ok := s.guard()
+		if !ok {
+			return 0, fmt.Errorf("delete prefix %s: %w", prefix, ErrGuardUnavailable)
+		}
+		resp, err := s.client.Txn(ctx).
+			If(cmp).
+			Then(clientv3.OpDelete(prefix, clientv3.WithPrefix())).
+			Commit()
+		if err != nil {
+			return 0, fmt.Errorf("delete prefix %s: %w", prefix, err)
+		}
+		if !resp.Succeeded {
+			return 0, fmt.Errorf("delete prefix %s: %w", prefix, ErrFenced)
+		}
+		return resp.Responses[0].GetResponseDeleteRange().Deleted, nil
+	}
 	resp, err := s.client.Delete(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return 0, fmt.Errorf("delete prefix %s: %w", prefix, err)

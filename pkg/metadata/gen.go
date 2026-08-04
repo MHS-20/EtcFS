@@ -41,7 +41,9 @@ func (s *Store) GetMyGeneration(ctx context.Context) (uint64, error) {
 // PutGeneration atomically sets the fencing generation for a node.
 // Used by the fencing controller after confirmed fence.
 func (s *Store) PutGeneration(ctx context.Context, nodeID string, gen uint64) error {
-	_, err := s.Put(ctx, GenKey(nodeID), []byte(strconv.FormatUint(gen, 10)))
+	// Unguarded: sets the generation the guard compares against.  Guarding it
+	// would make the fencing controller unable to fence a node.
+	_, err := s.putRaw(ctx, GenKey(nodeID), []byte(strconv.FormatUint(gen, 10)))
 	return err
 }
 
