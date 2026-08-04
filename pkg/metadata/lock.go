@@ -28,6 +28,18 @@ var ErrConflict = fmt.Errorf("lock conflict")
 // ErrExists is returned when a resource already exists.
 var ErrExists = fmt.Errorf("already exists")
 
+// ErrFenced is returned when a transaction was rejected because this node's
+// fencing generation was bumped — the node has been fenced and must not mutate
+// shared state again.  Callers must surface this as EIO, never as a
+// contention or not-found error: a fence is permanent, and misreporting it
+// makes a fencing bug look like ordinary contention.
+var ErrFenced = fmt.Errorf("node is fenced")
+
+// ErrGuardUnavailable is returned when a guarded transaction is attempted
+// before the fencing generation is known.  Failing closed is deliberate — an
+// unguarded mutation is exactly what the guard exists to prevent.
+var ErrGuardUnavailable = fmt.Errorf("fencing guard unavailable")
+
 // AcquireLock attempts to acquire a lock on an inode.
 //
 // For exclusive locks: CAS — succeed only if no lock key exists.

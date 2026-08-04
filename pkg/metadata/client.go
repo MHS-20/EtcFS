@@ -9,20 +9,53 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
+// GuardFunc supplies the fencing-generation comparison that every structural
+// mutation must carry.  It returns the comparison, the generation that
+// comparison encodes, and true once the node's generation is known; false
+// means the guard is not yet available (generation not initialised) and the
+// transaction must not proceed.
+//
+// It is a function rather than a stored Cmp because the generation is resolved
+// lazily, on first use, by the owning service.  The generation is returned
+// alongside the Cmp so a failed transaction can be classified without
+// unpacking the comparison's protobuf representation.
+type GuardFunc func() (cmp clientv3.Cmp, gen uint64, ok bool)
+
 // Store is the primary metadata facade.  It wraps the etcd client and
 // provides schema-aware operations (inode CRUD, dirent mutation, locking,
 // fencing generation).  All structural mutations go through this type.
 type Store struct {
 	client *clientv3.Client
 	nodeID string
+
+	// guard, when set, is prepended to the comparisons of every Txn.  A nil
+	// guard leaves transactions unguarded — correct only for control-plane
+	// stores (see SetGuard).
+	guard GuardFunc
 }
 
 // NewStore creates a Store backed by the given etcd client.
+//
+// The returned Store is unguarded.  Callers serving filesystem requests must
+// call SetGuard before serving, or a fenced node's namespace mutations will be
+// accepted.
 func NewStore(client *clientv3.Client, nodeID string) *Store {
 	return &Store{
 		client: client,
 		nodeID: nodeID,
 	}
+}
+
+// SetGuard installs the fencing-generation guard applied to every Txn.
+//
+// The guard is deliberately opt-out rather than opt-in: the failure mode being
+// designed against is a new mutation path forgetting to guard itself, which is
+// exactly how namespace operations went unguarded while the helper existed.
+// Paths that must bypass it call txnRaw explicitly — there are only three
+// (see EnsureGenerationKey, BumpGeneration, and bootstrap membership
+// registration), and each is unguarded for a reason documented at the call.
+func (s *Store) SetGuard(g GuardFunc) {
+	s.guard = g
 }
 
 // Client returns the underlying etcd client (for direct use by watch
@@ -36,15 +69,67 @@ func (s *Store) NodeID() string {
 	return s.nodeID
 }
 
-// Txn executes a transaction.  The caller provides comparison ops,
-// success ops, and failure ops.  Returns true if the transaction succeeded
-// (all comparisons matched and success ops were applied).
+// Txn executes a transaction guarded by this node's fencing generation.
+// The caller provides comparison ops, success ops, and failure ops.  Returns
+// true if the transaction succeeded (all comparisons matched and success ops
+// were applied).
+//
+// When the transaction fails, the guard is re-checked to tell a fence apart
+// from an ordinary CAS miss: a guard failure returns ErrFenced, because the
+// two demand opposite responses.  A CAS miss is retryable contention; a fence
+// is permanent and the caller must stop mutating metadata.
 func (s *Store) Txn(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, error) {
+	guarded := ifs
+	if s.guard != nil {
+		cmp, _, ok := s.guard()
+		if !ok {
+			return false, fmt.Errorf("txn: %w", ErrGuardUnavailable)
+		}
+		// Prepend so the guard is evaluated with the caller's comparisons in
+		// one atomic evaluation, not as a separate round trip that could race
+		// a fence landing in between.
+		guarded = append([]clientv3.Cmp{cmp}, ifs...)
+	}
+
+	ok, err := s.txnRaw(ctx, guarded, thens, elses)
+	if err != nil {
+		return false, err
+	}
+	if !ok && s.guard != nil {
+		if fenced, ferr := s.guardFailed(ctx); ferr == nil && fenced {
+			return false, fmt.Errorf("txn: %w", ErrFenced)
+		}
+	}
+	return ok, nil
+}
+
+// txnRaw executes a transaction without the fencing guard.
+//
+// Only for control-plane paths that cannot be guarded: creating the generation
+// key the guard compares against, bumping a node's generation (which must not
+// be guarded by the generation it is changing), and bootstrap membership
+// registration that runs before the generation is known.  Everything else must
+// use Txn.
+func (s *Store) txnRaw(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, error) {
 	resp, err := s.client.Txn(ctx).If(ifs...).Then(thens...).Else(elses...).Commit()
 	if err != nil {
 		return false, fmt.Errorf("txn: %w", err)
 	}
 	return resp.Succeeded, nil
+}
+
+// guardFailed reports whether the installed guard no longer matches the stored
+// generation — that is, whether this node has been fenced since it started.
+func (s *Store) guardFailed(ctx context.Context) (bool, error) {
+	_, expected, ok := s.guard()
+	if !ok {
+		return false, nil
+	}
+	current, err := s.GetGeneration(ctx, s.nodeID)
+	if err != nil {
+		return false, err
+	}
+	return current != expected, nil
 }
 
 // Get reads a single key's value.  Returns nil if the key doesn't exist.

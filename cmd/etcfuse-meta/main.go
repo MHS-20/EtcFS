@@ -107,12 +107,18 @@ func main() {
 	// IPC service: handles FUSE op requests from the C daemon
 	svc := ipc.NewService(store, membership, watchdog, log)
 
-	// Establish this node's fencing generation before serving any request.
-	// Data-path commits are guarded against it, so a later bump by the fencing
-	// controller stops this node from referencing anything it writes.
+	// Establish this node's fencing generation before serving any request, then
+	// install it as the store-wide guard so namespace mutations are covered too,
+	// not only extent writes.  A later bump by the fencing controller stops this
+	// node from mutating anything.
+	//
+	// Fatal on failure: without the generation, every guarded transaction fails
+	// closed, so the daemon could not serve writes anyway — exiting reports the
+	// real cause instead of an unexplained EIO on every mutation.
 	if err := svc.InitGeneration(ctx); err != nil {
-		log.Error("cannot initialise fencing generation", "error", err)
+		log.Fatal("cannot initialise fencing generation", "error", err)
 	}
+	svc.InstallStoreGuard()
 
 	if cfg.BlockDevice != "" {
 		dev, err := blockio.Open(cfg.BlockDevice)

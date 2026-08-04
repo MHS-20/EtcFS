@@ -17,6 +17,7 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 	wal "github.com/MHS-20/EtcFS/pkg/walgo"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Service handles FUSE operation requests from the C daemon.
@@ -85,6 +86,25 @@ func (s *Service) InitGeneration(ctx context.Context) error {
 	s.genMu.Lock()
 	defer s.genMu.Unlock()
 	return s.initGenerationLocked(ctx)
+}
+
+// InstallStoreGuard makes every store transaction carry this node's fencing
+// generation, so namespace mutations are rejected once the node is fenced —
+// not just extent writes.
+//
+// The guard reports unavailable rather than falling back to generation 0 when
+// initialisation has not happened yet: a wrong guard value is worse than no
+// transaction, since generation 0 would compare successfully on a node that
+// has never been fenced and mask the missing initialisation.
+func (s *Service) InstallStoreGuard() {
+	s.store.SetGuard(func() (clientv3.Cmp, uint64, bool) {
+		s.genMu.Lock()
+		defer s.genMu.Unlock()
+		if !s.genInit {
+			return clientv3.Cmp{}, 0, false
+		}
+		return metadata.WithGenerationGuard(s.membership.NodeID(), s.startGen), s.startGen, true
+	})
 }
 
 func (s *Service) initGenerationLocked(ctx context.Context) error {
