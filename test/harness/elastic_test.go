@@ -356,3 +356,88 @@ func TestElastic_RebalanceIdempotent(t *testing.T) {
 
 	assert.Zero(t, cluster.checkAllInvariants())
 }
+
+// ---- Fault injection during join/leave (TODO-hardening.md item 3) ----
+//
+// These are the cheap, deterministic equivalent of two of the four
+// scripts/test/chaos-elastic-fault-injection.sh scenarios (FJ1, FJ3). The
+// other two (FJ2: partition mid-join, FJ4: kill a survivor while a
+// different node is mid-join) have no meaningful equivalent against
+// MockStore/membership.Manager — FJ2 needs a real self-fencing watchdog
+// process to observe, and FJ4 needs a real daemon crash affecting a real
+// FUSE mount, neither of which the harness's Join()/LeaveGraceful()
+// abstraction models. Both are chaos-script-only; see the report.
+
+// TestElastic_JoinInterruptedBeforeArena is the harness equivalent of FJ1:
+// a node's daemon dies after registering membership but before its first
+// write (arena acquisition is lazy — see pkg/arena/allocator.go,
+// AcquireArena is only called from handleWriteBlock, not at startup — so
+// "before FUSE mount" and "before any write" are the same instant from the
+// allocator's perspective). Manager.Join() bundles membership registration
+// and arena acquisition in one call with no way to stop between them from
+// outside the package, so this simulates the interruption the same way
+// registerMembership itself would: writing the membership key directly via
+// the public Store, then simply never calling AcquireArena.
+func TestElastic_JoinInterruptedBeforeArena(t *testing.T) {
+	cluster := NewCluster(2)
+	ctx := t.Context()
+	store := cluster.Store
+
+	const nodeID = "half-joined"
+	_, err := store.Put(ctx, metadata.MembershipKey(nodeID), []byte(`{"joined":1}`))
+	require.NoError(t, err)
+
+	// The crash happens here — no AcquireArena call ever happens.
+
+	arenaVal, _ := store.Get(ctx, metadata.ArenaKey(nodeID))
+	assert.Nil(t, arenaVal, "a node that never reached its first write must not hold an arena")
+
+	// The rest of the cluster must be completely unaffected: another node
+	// joining and creating files does not observe the half-joined node at
+	// all (it has no arena, so nothing depends on reclaiming from it).
+	mgr := membership.New(store, "node-other")
+	require.NoError(t, mgr.Join(ctx))
+	assert.True(t, mgr.IsMember(ctx, "node-other"))
+
+	assert.Zero(t, cluster.checkAllInvariants())
+}
+
+// TestElastic_GenerationBumpDuringGracefulLeave is the harness equivalent
+// of FJ3: a node's fencing generation is bumped (as the fencing controller
+// would on a lease expiry) while it is in the middle of leaving gracefully.
+//
+// Caveat, stated plainly: MockStore has no SetGuard/guard-enforcement
+// concept — unlike the production metadata.Store, LeaveGraceful's Delete/Put
+// calls here are never rejected by a generation mismatch, because nothing in
+// the harness checks one. This test can only verify the structural
+// invariant (no orphaned arena, membership key gone, cluster consistent
+// afterward), not that the bump actually blocks the leaving node's own
+// writes — that guard-rejection behavior is real in production
+// (verified by scripts/test/chaos-fencing-namespace.sh) but is not modeled
+// by this harness type at all.
+func TestElastic_GenerationBumpDuringGracefulLeave(t *testing.T) {
+	cluster := NewCluster(1)
+	ctx := t.Context()
+	store := cluster.Store
+
+	const nodeID = "leaving-node"
+	mgr := membership.New(store, nodeID)
+	require.NoError(t, mgr.Join(ctx))
+
+	arenaKey := metadata.ArenaKey(nodeID)
+	arenaVal, _ := store.Get(ctx, arenaKey)
+	require.NotNil(t, arenaVal, "node must hold an arena before it can leave")
+
+	// Fencing controller bumps the generation mid-leave.
+	_, err := store.BumpGeneration(ctx, nodeID, 0)
+	require.NoError(t, err)
+
+	err = mgr.LeaveGraceful(ctx)
+	require.NoError(t, err)
+
+	assert.False(t, mgr.IsMember(ctx, nodeID), "membership key must be gone after leave")
+	arenaVal, _ = store.Get(ctx, arenaKey)
+	assert.Nil(t, arenaVal, "arena must not be orphaned — released back to the free pool")
+
+	assert.Zero(t, cluster.checkAllInvariants())
+}
