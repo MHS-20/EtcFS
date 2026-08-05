@@ -20,6 +20,7 @@ Status: implemented and under hardening (Phases 0–6 built, Phase 11 hardening 
 - [How to use it](#how-to-use-it)
 - [Testing](#testing)
 - [State](#state)
+- [Possible future extensions](#possible-future-extensions)
 - [Document map](#document-map)
 
 ## The idea
@@ -74,7 +75,7 @@ inode:<ino>                    → {mode, uid, gid, size, nlink, mtime, ctime,
                                     extents: [(logical_off, disk_off, len), ...],
                                     generation}
 dirent:<parent_ino>/<name>     → <ino>
-inode_alloc_counter             → next free inode number (8-byte big-endian; sharded per-node in practice)
+inode_alloc_counter             → next free inode number (8-byte big-endian; one global counter)
 lock:<ino>                      → {mode: shared|exclusive, holders: [node_id, ...], lease_id}
 arena:<node_id>                 → {disk_range: (start,end), free_list}
 arena_alloc_log                 → append-only record of arena grants
@@ -84,11 +85,15 @@ gen:<node_id>                   → fencing generation/epoch counter (decimal AS
 
 Every inode carries its own extent list — extents are only ever touched together with their owning file's metadata, so colocating them keeps the natural transaction boundary (a write commit) aligned with a single etcd key update, no extra round trips. Directory listings are prefix range-scans over `dirent:<parent_ino>/`.
 
-**Why not a single global counter or bitmap:** a lone `inode_alloc_counter` or free-space bitmap becomes a hot key under concurrent create/delete load — every mutation CASes against it. Both inode allocation and block allocation are sharded instead (below). Directory entries and per-file locks don't have this problem, since each key is naturally partitioned by parent/inode.
+**Why not a free-space bitmap:** a single global bitmap becomes a hot key under concurrent write load — every allocation CASes against it. Block allocation is sharded into per-node arenas instead (below). Directory entries and per-file locks don't have this problem, since each key is naturally partitioned by parent/inode.
+
+Inode allocation *is* a lone global counter, and does have exactly that hot-key property — one CAS per file creation, cluster-wide. It is the known exception to the sharding principle, kept for simplicity at current scale; see [Possible future extensions](#possible-future-extensions).
 
 Note: etcd value encodings are **not uniform** — `inode_alloc_counter` and dirent values are 8-byte big-endian, `gen:<node>` is decimal ASCII, `extent:<ino>/<chunk>` is comma-separated ASCII. Match the existing encoding exactly if seeding keys by hand or via `etcdctl` (inode `1` is reserved for the FUSE root directory — see [`docs/architecture/metadata-schema.md`](docs/architecture/metadata-schema.md) § Reserved inode numbers).
 
-**Sharding hot structures.** Inode numbers are allocated from per-node ranges (a node CASes a small `inode_range` table once, then hands out numbers locally until exhausted). Block allocation uses **arenas** — large contiguous ranges of the raw device (e.g. 1GB) leased exclusively to one node at a time via a transaction against `arena:<node_id>`. A node allocates from its own arena using a local free-list, only touching etcd to acquire or return an arena — roughly once per GB of write activity, not once per block. Both follow the same pattern: infrequent coarse-grained etcd coordination, frequent fine-grained local decision-making.
+**Sharding hot structures.** Block allocation uses **arenas** — large contiguous ranges of the raw device (e.g. 1GB) leased exclusively to one node at a time via a transaction against `arena:<node_id>`. A node allocates from its own arena using a local free-list, only touching etcd to acquire or return an arena — roughly once per GB of write activity, not once per block. Infrequent coarse-grained etcd coordination, frequent fine-grained local decision-making.
+
+Inode numbers do **not** follow that pattern. They come from a single global counter (`inode_alloc_counter`), CAS-retried on conflict, one etcd round trip per file creation from every node. This is a deliberate simplicity-over-scalability choice, not an oversight: it is the one metadata structure that is genuinely cluster-wide serialised, and at the cluster sizes and metadata churn rates targeted so far it has not been a bottleneck. It does not scale the way arenas do — contention grows with node count rather than staying flat — so a create-heavy or many-node workload would want the same per-node-range treatment arenas already get. See [Possible future extensions](#possible-future-extensions).
 
 ## Data path and crash consistency
 
@@ -206,7 +211,26 @@ Chaos scenarios cost real AWS resources and take a few minutes each to provision
 Implemented and under hardening — this is not yet a system to trust with data you can't afford to lose. In particular:
 
 - Namespace mutations (create/mkdir/unlink/rename/setattr) are now covered by the fencing-generation guard, applied store-wide rather than per call site. See [`docs/architecture/fencing/fencing-generation-protocol.md`](docs/architecture/fencing/fencing-generation-protocol.md) § Implementation Status. Verified by `scripts/test/chaos-fencing-namespace.sh`, which has not yet been run against AWS.
-- The chaos/fuzz testing tiers above stress crash recovery, fencing, and elastic membership changes fairly hard, but do not yet cover: concurrent multi-node scale-out, fault injection *during* a join/leave, or long-duration (multi-hour+) fuzz runs that would surface slow-leak bugs.
+- The chaos/fuzz testing tiers above stress crash recovery, fencing, elastic membership changes, concurrent multi-node scale-out, and fault injection *during* a join/leave. Not yet covered: long-duration (multi-hour+) fuzz runs that would surface slow-leak bugs.
+- POSIX `fcntl`/`flock` advisory locks are accepted but **not enforced across nodes** — `GETLK` always reports the range free and `SETLK` always succeeds. The per-inode lease lock the read/write path uses internally is a separate mechanism and does work. Cross-node coordination between application processes via `flock` is therefore unsafe today.
+- Arena space is never reclaimed. `arena:<node_id>` is not lease-bound and no departure path deletes it, so an arena is leaked permanently on every node departure, graceful or not.
+
+## Possible future extensions
+
+Directions that are deliberately not built yet, recorded so the reasoning isn't lost. The full list with implementation notes lives in [`docs/TODO-hardening.md`](docs/TODO-hardening.md).
+
+**Per-node inode ranges.** Inode allocation is currently a single global CAS-retried counter — one etcd round trip per file creation, from every node, against one key. Unlike arena allocation it does not shard, so contention grows with node count rather than staying flat. The obvious fix mirrors the arena allocator: reserve a block of inode numbers per node with one CAS, then hand them out from memory until exhausted, touching etcd once per N creations instead of once per creation.
+
+This was in fact described in the docs as though implemented, and partial dead code for it existed (`ReserveInodeRange`/`InodeRange` in `pkg/membership`) with no caller outside the test harness. Both have been removed. It was not built because at the cluster sizes and metadata churn rates targeted so far the global counter has not been a bottleneck, and the change carries real subtleties worth paying for only once a workload demands it:
+
+- **The `FirstUsableIno = 2` floor must survive.** Inode 1 is `FUSE_ROOT_ID`; handing it to a regular file overwrites the root inode record and makes the whole mount return `EIO`. That was a real defect once already. The deleted range code did *not* preserve the floor — it would have started ranges at 0.
+- **Restart leaks the unused remainder of a range.** Persisting the cursor per allocation would defeat the purpose, and resuming requires knowing how far the node got, which it doesn't. Discarding is correct but makes inode numbers sparse and non-monotonic across nodes, so anything assuming density breaks.
+- **A fenced node keeps consuming numbers locally.** Refill is generation-guarded, so a fenced node cannot get a *new* range — but it can keep issuing numbers from a range it already holds. Still safe, because the create's guarded transaction is rejected, but the fence no longer bounds number consumption.
+- **`pkg/membership.Manager` is never constructed in production**, so the code would need a production home; wiring `Manager` in wholesale would also drag in `RebalanceArena`, which transfers arena ownership with no generation guard and no drain.
+
+Adopting ranges would also make the inode cross-check described in [`elastic-join-leave.md`](docs/architecture/cluster-ops/elastic-join-leave.md) § Interaction with the Scrubber implementable — with a global counter there are no ranges to validate against.
+
+**Other tracked directions.** Arena reclamation (nothing reuses freed arenas today, and safe reissue needs a time-bound argument that etcd state alone cannot supply); enforced cross-node POSIX locks; dual-confirmed external fencing backed by an actual cloud API call rather than a generation bump on lease expiry; bounded contexts for FUSE handlers, which currently run with `context.Background()`.
 
 ## Document map
 
