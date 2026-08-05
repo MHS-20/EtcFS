@@ -87,38 +87,6 @@ func (m *Manager) AcquireArena(ctx context.Context) error {
 	return fmt.Errorf("arena acquisition exhausted retries")
 }
 
-func (m *Manager) ReserveInodeRange(ctx context.Context, base, count uint64) error {
-	key := metadata.KeyInodeAllocCounter
-	for attempt := 0; attempt < 5; attempt++ {
-		val, err := m.Store.Get(ctx, key)
-		if err != nil {
-			return err
-		}
-		current := uint64(0)
-		if val != nil {
-			current = metadata.DecodeUint64(val)
-		}
-		next := current + count
-
-		cmps := []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "=", 0)}
-		if current != 0 {
-			cmps = []clientv3.Cmp{clientv3.Compare(clientv3.Value(key), "=", string(metadata.EncodeUint64(current)))}
-		}
-		op := clientv3.OpPut(key, string(metadata.EncodeUint64(next)))
-		ok, txErr := m.Store.Txn(ctx, cmps, []clientv3.Op{op}, nil)
-		if txErr != nil {
-			return txErr
-		}
-		if ok {
-			rangeKey := fmt.Sprintf("inode_range:%s", m.NodeID)
-			rangeVal := fmt.Sprintf("%d,%d", base+current, base+next-1)
-			_, _ = m.Store.Put(ctx, rangeKey, []byte(rangeVal))
-			return nil
-		}
-	}
-	return fmt.Errorf("inode range reservation exhausted retries")
-}
-
 func (m *Manager) LeaveGraceful(ctx context.Context) error {
 	arenas, _ := m.Store.GetPrefix(ctx, metadata.PrefixArena)
 	var toRelease []uint64
@@ -174,15 +142,4 @@ func (m *Manager) ArenaCount(ctx context.Context, nodeID string) int {
 		return 0
 	}
 	return 1
-}
-
-func (m *Manager) InodeRange(ctx context.Context, nodeID string) (uint64, uint64) {
-	key := fmt.Sprintf("inode_range:%s", nodeID)
-	val, _ := m.Store.Get(ctx, key)
-	if val == nil {
-		return 0, 0
-	}
-	var lo, hi uint64
-	_, _ = fmt.Sscanf(string(val), "%d,%d", &lo, &hi)
-	return lo, hi
 }
