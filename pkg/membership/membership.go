@@ -136,7 +136,7 @@ func (m *Manager) LeaveUngraceful(ctx context.Context) {
 // which is a real signal (the fenced node cannot commit further writes) but
 // not a guarantee its kernel has stopped issuing them at the block-device
 // level. That gap is unchanged by this guard; see
-// docs/TODO-hardening.md § 8.
+// docs/TODO-hardening.md § 6 (arena reclamation, invariant 4).
 func (m *Manager) RebalanceArena(ctx context.Context, fromNode, toNode string, arenaID uint64) error {
 	fromKey := metadata.ArenaKey(fromNode)
 	fromVal, err := m.Store.Get(ctx, fromKey)

@@ -226,33 +226,88 @@ func TestIntegration_LockAcquireRelease(t *testing.T) {
 
 // ---- C1.6: Lease expiry releases lock ----
 
+// TestIntegration_LockLeaseExpiry simulates a holder that dies outright: its
+// client goes away, so nothing renews the lease and etcd expires it.
+//
+// The holder gets its own client precisely so it can be killed.  Cancelling
+// the acquisition context would not do this — the keepalive stream is
+// deliberately not bound to that context (see AcquireLock), because a lock
+// that lapsed while its holder still believed it held it is the exact hazard
+// locking exists to prevent.
 func TestIntegration_LockLeaseExpiry(t *testing.T) {
-	store := testStore(t, "node-b")
-	ctx, cancel := context.WithCancel(context.Background())
+	observer := testStore(t, "node-observer")
 	ino := uint64(200)
 
-	// Acquire lock with short TTL
-	leaseID, keepCh, err := store.AcquireLock(ctx, ino, LockExclusive, 3*time.Second)
+	endpoints := os.Getenv("ETCD_ENDPOINTS")
+	if endpoints == "" {
+		endpoints = "http://localhost:2379"
+	}
+	holderCli, err := clientv3.New(clientv3.Config{
+		Endpoints:   strings.Split(endpoints, ","),
+		DialTimeout: 5 * time.Second,
+	})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = holderCli.Close() })
+	holder := NewStore(holderCli, "node-b")
 
-	// Stop keepalive by cancelling context
-	cancel()
-	_ = leaseID
+	leaseID, keepCh, err := holder.AcquireLock(context.Background(), ino, LockExclusive, 3*time.Second)
+	require.NoError(t, err)
+	require.NotZero(t, leaseID)
 
-	// Drain keepalive channel
 	go func() {
 		for range keepCh {
 		}
 	}()
 
-	// Wait for TTL expiry
-	t.Log("waiting for lease expiry (3s TTL + 2s grace)...")
-	time.Sleep(6 * time.Second)
+	locked, err := observer.IsLocked(context.Background(), ino)
+	require.NoError(t, err)
+	require.True(t, locked, "lock should be held while the holder is alive")
 
-	// Lock should be auto-deleted by etcd
+	// The holder dies: no further keepalives reach etcd.
+	require.NoError(t, holderCli.Close())
+
+	t.Log("waiting for lease expiry (3s TTL + grace)...")
+	require.Eventually(t, func() bool {
+		l, ierr := observer.IsLocked(context.Background(), ino)
+		return ierr == nil && !l
+	}, 15*time.Second, 500*time.Millisecond, "lock should be auto-deleted after lease expiry")
+}
+
+// TestIntegration_LockSurvivesAcquisitionContextCancel pins the reason
+// AcquireLock does not hand the caller's context to KeepAlive.
+//
+// The data path acquires this lock under a request-scoped context with a
+// deadline (see internal/ipc.lockInode).  If the keepalive stream were bound
+// to that context, every lock held past the request deadline would stop being
+// renewed and lapse at its TTL with the holder none the wiser — a silent
+// stale-holder bug.  Against that earlier behaviour this test fails: the lock
+// is gone well before the assertion runs.
+func TestIntegration_LockSurvivesAcquisitionContextCancel(t *testing.T) {
+	store := testStore(t, "node-c")
+	ino := uint64(210)
+
+	acquireCtx, cancel := context.WithCancel(context.Background())
+	leaseID, keepCh, err := store.AcquireLock(acquireCtx, ino, LockExclusive, 3*time.Second)
+	require.NoError(t, err)
+	require.NotZero(t, leaseID)
+
+	go func() {
+		for range keepCh {
+		}
+	}()
+
+	// The context that acquired the lock goes away; the lock must not.
+	cancel()
+
+	// Comfortably past the 3s TTL — a keepalive bound to acquireCtx would have
+	// stopped renewing at cancel() and the lease would have lapsed by now.
+	time.Sleep(7 * time.Second)
+
 	locked, err := store.IsLocked(context.Background(), ino)
 	require.NoError(t, err)
-	assert.False(t, locked, "lock should be auto-deleted after lease expiry")
+	assert.True(t, locked, "lock must outlive the context used to acquire it")
+
+	require.NoError(t, store.ReleaseLock(context.Background(), ino, leaseID))
 }
 
 // ---- C1.7: Fencing generation CAS ----

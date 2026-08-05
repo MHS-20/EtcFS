@@ -1,6 +1,6 @@
 #!/bin/bash
 # chaos-elastic-fault-injection.sh — fault injection DURING the join/leave
-# window itself (TODO-hardening.md item 3), not on a stable cluster like
+# window itself (TODO-hardening.md item 2), not on a stable cluster like
 # every other chaos-*.sh script. The membership set, quorum size, and arena
 # ownership are all in flux during a join/leave — the most likely place for
 # a fencing or allocator bug to hide, and untested until now.

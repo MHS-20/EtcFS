@@ -19,6 +19,20 @@ const (
 	inodeLockTTL   = 2 * time.Second
 	retryBaseDelay = 10 * time.Millisecond
 	retryStep      = 40 * time.Millisecond
+
+	// requestTimeout bounds the etcd work behind a single FUSE request.  It
+	// has to sit between two limits.  Above: a routine leader election (~1-2s)
+	// plus the several sequential store calls a handler such as RMDIR makes,
+	// or an otherwise healthy cluster starts returning EIO during ordinary
+	// failover.  Below: the self-fencing window (2-3x the membership lease
+	// TTL, so 20-30s at the 10s default), or the daemon exits first and this
+	// deadline never gets to fire — which is the situation it exists to fix.
+	//
+	// One value for every operation class, deliberately.  Metadata reads could
+	// justify a tighter bound than lock acquisition, but splitting them is
+	// speculative tuning until there is evidence a single ceiling is the wrong
+	// shape; the property that matters here is that a bound exists at all.
+	requestTimeout = 10 * time.Second
 )
 
 // retryDelay is the pause before the attempt following the given one.
@@ -73,13 +87,21 @@ func (s *Service) retryKV(fn func(context.Context) error) {
 // function.  The lease keepalive stream is drained for the lifetime of the
 // lock — the lease expires on its own once the lock is released, so nothing
 // is left running past the release.
+//
+// Each acquisition attempt runs against its own bounded context.  This is the
+// first etcd call on both the read and the write path, so an unbounded one
+// stalls I/O here, before any generation guard is consulted; the caller's ctx
+// still caps the total, so a request that has already run out of time does not
+// start another attempt.
 func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockMode) (release func(), err error) {
 	var leaseID clientv3.LeaseID
 	var keepCh <-chan *clientv3.LeaseKeepAliveResponse
 
 	err = retry(etcdAttempts, func() error {
+		actx, cancel := context.WithTimeout(ctx, etcdOpTimeout)
+		defer cancel()
 		var aerr error
-		leaseID, keepCh, aerr = s.store.AcquireLock(ctx, ino, mode, inodeLockTTL)
+		leaseID, keepCh, aerr = s.store.AcquireLock(actx, ino, mode, inodeLockTTL)
 		return aerr
 	})
 	if err != nil {
@@ -91,7 +113,14 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 		}
 	}()
 
-	return func() { _ = s.store.ReleaseLock(ctx, ino, leaseID) }, nil
+	return func() {
+		// Fresh context rather than the request's: releasing has to work even
+		// when the request deadline has already expired, otherwise the lock
+		// lingers to its TTL and blocks the next writer for no reason.
+		rctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
+		defer cancel()
+		_ = s.store.ReleaseLock(rctx, ino, leaseID)
+	}, nil
 }
 
 // commitGuarded applies ops in one transaction guarded by this node's fencing

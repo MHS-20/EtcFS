@@ -1,6 +1,6 @@
 #!/bin/bash
 # chaos-fencing-detach.sh — verify dual-confirmed external fencing on real
-# AWS infrastructure (TODO-hardening.md item 7): partition a node from etcd,
+# AWS infrastructure: partition a node from etcd,
 # and assert that a SURVIVING node's fencing controller actually calls
 # ec2:DetachVolume against the real EBS Multi-Attach volume, confirms the
 # detachment via ec2:DescribeVolumes, and only THEN bumps the fencing
@@ -90,7 +90,7 @@ else
 fi
 
 log "======== Partitioning n1 from etcd peers (n2, n3) via iptables ========"
-# Same technique as FJ2 / S3 (see TODO-hardening.md item 3): SG swaps do not
+# Same technique as FJ2 / S3 (see TODO-hardening.md item 2): SG swaps do not
 # sever established connections, iptables does.
 IPT_SETUP=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" \
     "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -2; command -v iptables || echo NO_IPTABLES" 2>&1)

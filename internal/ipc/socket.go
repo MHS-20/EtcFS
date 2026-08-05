@@ -223,7 +223,15 @@ func attrResp(rec *metadata.InodeRecord) []byte {
 // ---- dispatch ----
 
 func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
-	ctx := context.Background()
+	// Bounded here rather than at each of the ~35 individual store calls the
+	// handlers make: a context without a deadline blocks for as long as the
+	// etcd client will keep retrying, which under a partition is indefinitely,
+	// and every handler inherits this one.  Calls that manage their own budget
+	// (commitGuarded, retryKV) build their contexts from Background and are
+	// deliberately not truncated by this deadline — a commit already in flight
+	// should finish or fail on its own terms rather than be cut mid-transaction.
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
 
 	switch op {
 	case ipcOpLookup:

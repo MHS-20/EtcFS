@@ -348,7 +348,7 @@ func TestElastic_RebalanceIdempotent(t *testing.T) {
 	assert.Zero(t, cluster.checkAllInvariants())
 }
 
-// ---- Fault injection during join/leave (TODO-hardening.md item 3) ----
+// ---- Fault injection during join/leave (TODO-hardening.md item 2) ----
 //
 // These are the cheap, deterministic equivalent of two of the four
 // scripts/test/chaos-elastic-fault-injection.sh scenarios (FJ1, FJ3). The

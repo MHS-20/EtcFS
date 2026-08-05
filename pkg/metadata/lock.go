@@ -47,6 +47,11 @@ var ErrGuardUnavailable = fmt.Errorf("fencing guard unavailable")
 //
 // Returns the lease ID that backs the lock and a keepalive channel.
 // The caller must receive from keepaliveCh to keep the lock alive.
+//
+// ctx bounds the acquisition RPCs only.  It deliberately does not bound the
+// keepalive stream — see the comment at the KeepAlive call below — so a
+// caller may pass a context with a deadline without the resulting lock
+// quietly expiring once that deadline passes.
 func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl time.Duration) (clientv3.LeaseID, <-chan *clientv3.LeaseKeepAliveResponse, error) {
 	leaseID, err := s.GrantLease(ctx, ttl)
 	if err != nil {
@@ -99,7 +104,13 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 		return 0, nil, fmt.Errorf("acquire lock ino %d: %w", ino, ErrConflict)
 	}
 
-	keepCh, err := s.KeepAlive(ctx, leaseID)
+	// Not ctx: clientv3 ties a keepalive stream's lifetime to the context it
+	// is given.  Passing the caller's context here would stop renewing the
+	// lease the moment that context is cancelled — the lock would silently
+	// expire at its TTL while the holder still believed it held it, which is
+	// precisely the stale-holder situation locking exists to prevent.  The
+	// stream ends when the lease is revoked (ReleaseLock) or expires.
+	keepCh, err := s.KeepAlive(context.Background(), leaseID)
 	if err != nil {
 		_ = s.ReleaseLock(ctx, ino, leaseID)
 		return 0, nil, fmt.Errorf("acquire lock ino %d: keepalive: %w", ino, err)
