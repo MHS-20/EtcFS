@@ -82,6 +82,10 @@ func main() {
 
 	// Membership: register this node with a lease-backed key
 	membership := metadata.NewMembership(etcdCli, cfg.NodeID, cfg.ClusterName, cfg.LeaseTTL)
+	// Recorded in the membership key so a peer can detach the shared volume
+	// from this node after its lease expires — at which point the key is gone
+	// and this node can no longer be asked for it.
+	membership.SetInstanceID(cfg.EC2InstanceID)
 
 	// Metadata store: wraps etcd client with schema-aware helpers
 	store := metadata.NewStore(etcdCli, cfg.NodeID)
@@ -155,6 +159,21 @@ func main() {
 
 	// Start external fencing controller
 	controller := fencing.NewController(store, membership, log)
+	if cfg.EBSVolumeID != "" {
+		detacher, derr := fencing.NewEBSDetacher(ctx, cfg.EBSVolumeID)
+		if derr != nil {
+			// Fatal rather than degrading silently: an operator who passed
+			// --ebs-volume-id is asking for dual-confirmed fencing, and
+			// quietly running with the weaker single-signal guarantee is the
+			// kind of gap that only shows up as corruption during an incident.
+			log.Fatal("cannot initialise EBS fencing", "volume", cfg.EBSVolumeID, "error", derr)
+		}
+		controller.SetDetacher(detacher)
+		log.Info("external fencing: dual-confirmed (EBS detach + poll)", "volume", cfg.EBSVolumeID)
+	} else {
+		log.Warn("external fencing: single-signal (generation bump on lease expiry only); " +
+			"pass --ebs-volume-id to detach the shared volume before bumping")
+	}
 	go controller.Run(ctx)
 
 	// Start background scrubber (checks every 30s)

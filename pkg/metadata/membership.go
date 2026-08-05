@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,16 +14,23 @@ import (
 //
 // On start, it creates a lease-backed membership key in etcd:
 //
-//	membership:<node_id> = {node_id, cluster_name, joined_at, address}
+//	membership:<node_id> = {node_id, cluster_name, joined_at, instance_id}
+//
+// instance_id is the cloud instance backing this node, recorded so the
+// fencing controller can detach the shared volume from a node that has
+// already expired and can no longer be asked.  Empty when not running on a
+// cloud instance (Docker, bare metal); external fencing then degrades to a
+// generation bump without a detach.
 //
 // The node's liveness is tied to the etcd lease — if the node stops
 // sending keepalives, the key is auto-deleted and other nodes (including
 // the fencing controller) detect the expiry.
 type Membership struct {
-	client   *clientv3.Client
-	nodeID   string
-	cluster  string
-	leaseTTL time.Duration
+	client     *clientv3.Client
+	nodeID     string
+	cluster    string
+	leaseTTL   time.Duration
+	instanceID string
 
 	mu        sync.Mutex
 	leaseID   clientv3.LeaseID
@@ -38,6 +46,16 @@ func NewMembership(client *clientv3.Client, nodeID, cluster string, leaseTTL tim
 		cluster:  cluster,
 		leaseTTL: leaseTTL,
 	}
+}
+
+// SetInstanceID records the cloud instance backing this node.  It must be set
+// before Run, because the value is written into the membership key and cannot
+// be added afterwards — by the time the fencing controller needs it, the key
+// has already been deleted by lease expiry.
+func (m *Membership) SetInstanceID(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.instanceID = id
 }
 
 // Run starts the membership heartbeat loop.  Blocks until ctx is cancelled.
@@ -91,8 +109,11 @@ func (m *Membership) grantAndRegister(ctx context.Context) (clientv3.LeaseID, er
 		return 0, fmt.Errorf("membership: grant lease: %w", err)
 	}
 
-	value := fmt.Sprintf(`{"node_id":"%s","cluster":"%s","joined_at":"%s"}`,
-		m.nodeID, m.cluster, time.Now().UTC().Format(time.RFC3339))
+	m.mu.Lock()
+	instanceID := m.instanceID
+	m.mu.Unlock()
+	value := fmt.Sprintf(`{"node_id":"%s","cluster":"%s","joined_at":"%s","instance_id":"%s"}`,
+		m.nodeID, m.cluster, time.Now().UTC().Format(time.RFC3339), instanceID)
 
 	_, err = m.client.Put(ctx, MembershipKey(m.nodeID), value, clientv3.WithLease(resp.ID))
 	if err != nil {
@@ -176,4 +197,26 @@ func (m *Membership) NodeID() string {
 // LeaseTTL returns the configured lease TTL.
 func (m *Membership) LeaseTTL() time.Duration {
 	return m.leaseTTL
+}
+
+// InstanceIDFromMembership extracts instance_id from a membership key's value.
+//
+// The value is hand-rolled JSON (see grantAndRegister), so this is a
+// deliberately narrow scan rather than a full unmarshal: it must not fail or
+// panic on a value written by an older node that has no instance_id field at
+// all, which is exactly the case during a rolling upgrade.  A missing field
+// yields "", and the caller treats that as "cannot detach".
+func InstanceIDFromMembership(value []byte) string {
+	const key = `"instance_id":"`
+	s := string(value)
+	i := strings.Index(s, key)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(key):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
 }

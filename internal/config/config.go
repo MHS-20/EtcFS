@@ -30,6 +30,13 @@ type Config struct {
 	MetricsAddr   string
 	RunFsck       bool
 	RunInfo       bool
+
+	// External fencing (AWS). When EBSVolumeID is set the fencing controller
+	// detaches the shared volume from an expired node and waits for the
+	// detachment to be confirmed before bumping its generation.  Unset (the
+	// default, and the only option off EC2) leaves fencing single-signal.
+	EBSVolumeID   string
+	EC2InstanceID string
 }
 
 // Parse reads CLI flags and returns a Config.
@@ -66,6 +73,10 @@ func Parse() *Config {
 		"Run offline filesystem check and exit")
 	flag.BoolVar(&cfg.RunInfo, "info", false,
 		"Print filesystem statistics and exit")
+	flag.StringVar(&cfg.EBSVolumeID, "ebs-volume-id", "",
+		"Shared EBS volume ID; enables dual-confirmed external fencing (detach + poll) when set")
+	flag.StringVar(&cfg.EC2InstanceID, "ec2-instance-id", "",
+		"This node's EC2 instance ID, recorded in its membership key so peers can detach the volume when it expires")
 
 	flag.Parse()
 

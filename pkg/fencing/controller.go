@@ -17,17 +17,29 @@ import (
 // expired node, which prevents any stale lock grants and marks the node
 // as fenced for the scrubber.
 //
-// In production, the Controller is backed by AWS APIs (DetachVolume,
-// DescribeInstances) for dual-confirmed fencing.  For local testing,
-// the Controller bumps the generation directly on membership expiry.
+// Fencing is dual-signalled when a VolumeDetacher is configured: the lease
+// expiry is only a suspicion, and the generation is not bumped until the
+// shared volume is *confirmed* detached from the expired node.  Without a
+// detacher the controller degrades to single-signal fencing — bumping on
+// lease expiry alone — which is correct for Docker and single-host testing
+// where there is no volume to detach, but is a weaker guarantee: it stops the
+// node publishing metadata without stopping it writing bytes.  See
+// SetDetacher.
 type Controller struct {
 	store      *metadata.Store
 	log        *config.Logger
 	nodeID     string
 	membership *metadata.Membership // own membership for leader election
+	detacher   VolumeDetacher       // nil = single-signal fencing
 
 	mu           sync.Mutex
 	activeFences map[string]time.Time // nodeID → when fence started
+}
+
+// SetDetacher enables dual-confirmed fencing.  A nil detacher (the default)
+// leaves the controller in single-signal mode.
+func (c *Controller) SetDetacher(d VolumeDetacher) {
+	c.detacher = d
 }
 
 // NewController creates a fencing controller.
@@ -48,7 +60,12 @@ func NewController(store *metadata.Store, membership *metadata.Membership, log *
 func (c *Controller) Run(ctx context.Context) {
 	c.log.Info("fencing controller started", "node", c.nodeID)
 
-	watchCh := c.store.Watch(ctx, metadata.PrefixMembership, clientv3.WithPrefix())
+	// WithPrevKV: a delete event carries the key but not the value, and the
+	// value is where the expired node recorded its EC2 instance ID.  Without
+	// the previous value there is nothing to detach — the node is already
+	// gone, so it cannot be asked.
+	watchOpts := []clientv3.OpOption{clientv3.WithPrefix(), clientv3.WithPrevKV()}
+	watchCh := c.store.Watch(ctx, metadata.PrefixMembership, watchOpts...)
 
 	for {
 		select {
@@ -58,15 +75,21 @@ func (c *Controller) Run(ctx context.Context) {
 		case resp, ok := <-watchCh:
 			if !ok {
 				c.log.Warn("fencing watch channel closed, reconnecting")
-				watchCh = c.store.Watch(ctx, metadata.PrefixMembership, clientv3.WithPrefix())
+				watchCh = c.store.Watch(ctx, metadata.PrefixMembership, watchOpts...)
 				continue
 			}
 			for _, ev := range resp.Events {
-				if ev.Type == clientv3.EventTypeDelete {
-					nodeID := extractNodeID(string(ev.Kv.Key))
-					c.log.Warn("membership key deleted, initiating fence", "node", nodeID)
-					go c.fenceNode(ctx, nodeID)
+				if ev.Type != clientv3.EventTypeDelete {
+					continue
 				}
+				nodeID := extractNodeID(string(ev.Kv.Key))
+				var instanceID string
+				if ev.PrevKv != nil {
+					instanceID = metadata.InstanceIDFromMembership(ev.PrevKv.Value)
+				}
+				c.log.Warn("membership key deleted, initiating fence",
+					"node", nodeID, "instance", instanceID)
+				go c.fenceNode(ctx, nodeID, instanceID)
 			}
 		}
 	}
@@ -74,7 +97,7 @@ func (c *Controller) Run(ctx context.Context) {
 
 // fenceNode performs external fencing for a node whose membership key expired.
 // It bumps the fencing generation to prevent stale locks and marks the node as fenced.
-func (c *Controller) fenceNode(ctx context.Context, nodeID string) {
+func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string) {
 	c.mu.Lock()
 	if _, active := c.activeFences[nodeID]; active {
 		c.mu.Unlock()
@@ -90,7 +113,35 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID string) {
 		c.mu.Unlock()
 	}()
 
-	c.log.Info("fencing node", "node_id", nodeID)
+	c.log.Info("fencing node", "node_id", nodeID, "instance_id", instanceID)
+
+	// Detach the shared volume *before* bumping the generation, and only
+	// proceed once the detachment is confirmed.
+	//
+	// The order is the entire point.  Bumping first would advertise "this
+	// node is fenced, its arenas and locks may be reclaimed" while the node
+	// may still be issuing writes to the device — the reclaiming node would
+	// then allocate into a range the fenced node is actively writing, which
+	// is the arena-collision hazard in kleppmann-stale-write-analysis.md, and
+	// no guard would catch it because both nodes pass their own checks.
+	//
+	// A failed detach therefore aborts the fence rather than falling back to
+	// bumping anyway: an unfenced node the cluster believes is fenced is more
+	// dangerous than one it knows it has not fenced.  The lease stays expired,
+	// so the next watch event retries.
+	if c.detacher != nil {
+		if instanceID == "" {
+			c.log.Error("cannot fence: no instance ID recorded for node, skipping generation bump",
+				"node", nodeID)
+			return
+		}
+		if err := c.detacher.DetachAndConfirm(ctx, instanceID); err != nil {
+			c.log.Error("volume detach not confirmed, NOT bumping generation",
+				"node", nodeID, "instance", instanceID, "error", err)
+			return
+		}
+		c.log.Info("volume detach confirmed", "node", nodeID, "instance", instanceID)
+	}
 
 	// Get current generation
 	currentGen, err := c.store.GetGeneration(ctx, nodeID)
