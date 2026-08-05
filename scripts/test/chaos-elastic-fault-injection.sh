@@ -259,22 +259,16 @@ run_fj1() {
 # ============================================================
 # FJ2: partition the joining node from etcd right after it mounts.
 #
-# KNOWN CAVEAT (confirmed by manual investigation, not fixed here — see
-# docs/TODO-hardening.md item 3 follow-up and the chat report this ran
-# under): on AWS, the SG-swap partition technique below (same technique
-# chaos-test.sh's pre-existing S3 scenario uses) does NOT sever a node's
-# already-established connections — AWS security groups are stateful and
-# only evaluate NEW connection attempts against the new rules. A fresh
-# `etcdctl` process from node4 correctly sees "unhealthy cluster" after the
-# swap, but node4's own daemon, which opened its etcd connection before the
-# swap, may keep using that pre-existing connection right through the
-# "partition." This means the AWS run's write-probe result can look like
-# "fencing failed" when it is actually "the node was never fully cut off in
-# the first place." Docker's `docker network disconnect` does not have this
-# problem — it is a hard, total interface removal (verified: empty network
-# attachment map immediately after disconnect) — so the Docker run's
-# results for this scenario are the reliable ones; treat the AWS run's
-# results for this specific scenario as informative but not conclusive.
+# History worth keeping: this scenario originally partitioned on AWS by
+# swapping the instance's security group (the technique chaos-test.sh's
+# pre-existing S3 scenario still uses). That does NOT sever established
+# connections — AWS security groups are stateful and only evaluate NEW
+# connection attempts — so node4's daemon kept using the etcd connection it
+# had opened before the swap and was never actually partitioned, producing a
+# false "fencing failed" result. It now uses iptables instead, and verifies
+# the cut took effect before proceeding. Note that S3 still has the original
+# blind spot; it only asserts survivors keep working, never that the
+# partitioned node's own operations are blocked, so it would not surface it.
 # ============================================================
 run_fj2() {
     log "======== FJ2: partition joining node from etcd post-join ========"
@@ -288,63 +282,131 @@ run_fj2() {
     if [[ "$MODE" == "docker" ]]; then
         docker network disconnect docker_etcfuse-net etcfs-meta4 2>/dev/null
     else
-        local eni sg
-        eni=$(aws ec2 describe-instances --instance-ids "$(node_inst 4)" \
-            --query 'Reservations[0].Instances[0].NetworkInterfaces[0].NetworkInterfaceId' --output text 2>/dev/null)
-        sg=$(jq -r '.sg_id' "$PROJECT_ROOT/$STATE_FILE")
-        local vpc; vpc=$(jq -r '.vpc_id' "$PROJECT_ROOT/$STATE_FILE")
-        local my_ip; my_ip=$(curl -s http://checkip.amazonaws.com 2>/dev/null || echo "0.0.0.0")
-        local temp_sg; temp_sg=$(aws ec2 create-security-group --group-name "fj2-temp-$$" \
-            --description "FJ2 partition SG" --vpc-id "$vpc" --query 'GroupId' --output text 2>/dev/null)
-        aws ec2 authorize-security-group-ingress --group-id "$temp_sg" --protocol tcp --port 22 --cidr "${my_ip}/32" >/dev/null 2>&1
-        aws ec2 modify-network-interface-attribute --network-interface-id "$eni" --groups "$temp_sg" 2>/dev/null
-        echo "$temp_sg $eni $sg" > "$REPORT_DIR/fj2-partition.info"
+        # iptables on the instance, NOT a security-group swap.
+        #
+        # SG swaps do not sever already-established connections — AWS security
+        # groups are stateful and only evaluate NEW connection attempts against
+        # the changed rules, so a daemon whose etcd connection predates the swap
+        # keeps using it and is never actually partitioned. That produced a
+        # false "fencing failed" result on a previous run of this scenario;
+        # confirmed by direct testing (a fresh etcdctl correctly saw "unhealthy
+        # cluster" post-swap while the daemon's existing connection kept
+        # working). iptables filters every packet, established or not, so it is
+        # a genuine cut. Same technique as scripts/test/isolate-node.sh.
+        #
+        # Port 22 is deliberately left open so the harness can still reach the
+        # node to observe it; only etcd's client (2379) and peer (2380) ports
+        # are dropped, in both directions.
+        # Amazon Linux 2023 does not ship the iptables CLI in the base AMI, and
+        # add_node's setup only installs fuse3/gcc — so install it here if
+        # absent. nftables is the AL2023 default backend; the iptables package
+        # provides the iptables-nft shim that drives it.
+        local ipt_setup
+        ipt_setup=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$node4" \
+            "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -3; command -v iptables || echo NO_IPTABLES" 2>&1)
+        log "  iptables availability on node4: $(echo "$ipt_setup" | tr '\n' ' ' | cut -c1-160)"
+
+        # Do NOT use runcmd here: it redirects stderr to /dev/null, which hid
+        # the reason these rules failed on a previous run (only "ERR:1" was
+        # visible). Capture stderr so a failure is diagnosable from the log.
+        local peer ipt_out ipt_rc
+        for peer in "$P1" "$P2" "$P3"; do
+            ipt_out=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$node4" "
+                set -e
+                sudo iptables -A OUTPUT -p tcp -d $peer --dport 2379 -j DROP
+                sudo iptables -A OUTPUT -p tcp -d $peer --dport 2380 -j DROP
+                sudo iptables -A INPUT  -p tcp -s $peer --sport 2379 -j DROP
+                sudo iptables -A INPUT  -p tcp -s $peer --sport 2380 -j DROP
+                sudo iptables -A INPUT  -p tcp -s $peer --dport 2379 -j DROP
+                sudo iptables -A INPUT  -p tcp -s $peer --dport 2380 -j DROP
+            " 2>&1); ipt_rc=$?
+            echo "iptables peer=$peer rc=$ipt_rc out=$ipt_out" >> "$REPORT_DIR/chaos.log"
+            [[ "$ipt_rc" -ne 0 ]] && logerr "  iptables rules for peer $peer FAILED rc=$ipt_rc: $(echo "$ipt_out" | tr '\n' ' ' | cut -c1-200)"
+        done
+        # Verify the cut actually took effect rather than assuming it did —
+        # this check is what would have caught the SG-statefulness problem.
+        local probe
+        probe=$(runcmd "$node4" "timeout 5 curl -s -o /dev/null -w '%{http_code}' http://$P1:2379/health 2>&1; echo rc=\$?")
+        if [[ "$probe" == *"rc=0"* && "$probe" != *"000"* ]]; then
+            bad "partition did not take effect — node4 still reached etcd at $P1 (probe=$probe)"
+        else
+            log "  partition verified: node4 cannot reach etcd (probe=$probe)"
+        fi
     fi
 
-    log "  waiting ~25s for self-fence margin (2x lease_ttl)..."
-    sleep 25
+    # Watch the META daemon, not the FUSE mount.
+    #
+    # Self-fencing is os.Exit(77) in the Go meta daemon. The C FUSE daemon is
+    # a separate process and keeps the mount listed in /proc/mounts after its
+    # meta peer dies — measured: meta exits 77 at t+20s while the mount is
+    # still MOUNTED at t+41s and beyond. Operations on it correctly fail
+    # (see the write probe below), but "is it still mounted" is simply not a
+    # test of whether self-fencing fired, and asserting on it reported a
+    # working fence as a failure.
+    #
+    # Poll rather than sleep a fixed interval: the watchdog ticks once per
+    # lease TTL and fires on the first tick where the lease has been dead
+    # longer than 2x TTL, so the fence lands 2-3x TTL after the last
+    # keepalive depending on tick phase, plus up to TTL/3 because that last
+    # keepalive precedes the partition. With TTL=10s that is ~20-33s, which a
+    # fixed 25s wait races.
+    local fence_deadline=45 fence_waited=0 fenced=0
+    log "  waiting up to ${fence_deadline}s for the meta daemon to self-fence..."
+    while [[ "$fence_waited" -lt "$fence_deadline" ]]; do
+        if [[ "$MODE" == "docker" ]]; then
+            [[ "$(docker inspect etcfs-meta4 --format '{{.State.Status}}' 2>/dev/null)" != "running" ]] && { fenced=1; break; }
+        else
+            # No container to inspect on AWS — check the process directly.
+            local alive
+            alive=$(runcmd "$(node_pub 4)" "pgrep -x etcfuse-meta >/dev/null && echo ALIVE || echo GONE")
+            [[ "$alive" == *GONE* ]] && { fenced=1; break; }
+        fi
+        sleep 5; fence_waited=$((fence_waited+5))
+    done
 
-    # Check 1: did the CLIENT-SIDE self-fencing watchdog fire (still mounted
-    # implies it did not)? Verified by direct investigation (see chat report)
-    # that under a full network partition this does NOT fire within 2x TTL,
-    # or within many minutes — pkg/metadata.Membership.Run()'s alive flag is
-    # only set false when the etcd client's lease KeepAlive channel closes,
-    # and that channel does not appear to close under total unreachability
-    # (DNS/connection failures just retry forever without ever surfacing as
-    # a channel close). This is a real, reproducible finding, not fixed here
-    # per instruction — see docs/TODO-hardening.md item 3 follow-up.
-    local still_mounted=1
-    if [[ "$MODE" == "docker" ]]; then
-        docker exec etcfs-fuse4 sh -c "grep -q ' /mnt/etcfuse ' /proc/mounts" 2>/dev/null && still_mounted=0
+    if [[ "$fenced" -eq 1 ]]; then
+        local exitcode=""
+        [[ "$MODE" == "docker" ]] && exitcode=$(docker inspect etcfs-meta4 --format '{{.State.ExitCode}}' 2>/dev/null)
+        # 77 is the self-fence exit code (pkg/fencing/watchdog.go trigger()).
+        if [[ "$MODE" == "docker" && "$exitcode" != "77" ]]; then
+            bad "meta daemon on node4 stopped after ${fence_waited}s but with exit code $exitcode, not 77 (self-fence)"
+        else
+            ok "node4's meta daemon self-fenced after ~${fence_waited}s${exitcode:+ (exit $exitcode)}"
+        fi
     else
-        check_mount "$(node_pub 4)" && still_mounted=0
-    fi
-    if [[ "$still_mounted" -eq 0 ]]; then
-        bad "node4 is still mounted/serving after being partitioned from etcd — self-fencing watchdog did not fire"
-    else
-        ok "node4 stopped serving after partition (self-fenced or crashed out)"
+        bad "node4's meta daemon still running ${fence_deadline}s after partition — self-fencing watchdog did not fire"
     fi
 
-    # Check 2: did the SERVER-SIDE mechanism (external fencing, independent
-    # of node4's own client-side belief) still work? membership:n4's lease
-    # expires at etcd regardless of what node4's client thinks, the fencing
-    # controller on a healthy node watches for that deletion and bumps
-    # gen:n4 — this does not depend on node4's watchdog at all, and is the
-    # real backstop this investigation confirmed still functions correctly
-    # even while the self-fencing watchdog is inert.
+    # The self-fence assertion above is the regression test for this: before
+    # the fix, Membership.IsAlive() returned the raw `alive` flag, which is
+    # only cleared when the etcd client's lease KeepAlive channel closes — and
+    # under a total partition that channel never closes, the client just
+    # retries silently forever. A partitioned node therefore believed itself
+    # alive indefinitely (verified: 8+ minutes, no fence). IsAlive() now also
+    # requires the last successful keepalive to be within the lease TTL, which
+    # is exactly when etcd expires the lease server-side, making the partition
+    # locally detectable without depending on the client library surfacing it.
+
+    # Did the SERVER-SIDE mechanism (external fencing) also fire?
+    # membership:n4's lease expires at etcd regardless of what node4's client
+    # believes, and the fencing controller on a healthy node watches for that
+    # deletion and bumps gen:n4. This path is independent of node4's own
+    # watchdog — it was already working correctly even when the self-fencing
+    # watchdog was inert, and is what kept the system safe in the meantime.
     local gen4; gen4=$(gen_val n4)
     if [[ -n "$gen4" && "$gen4" != "0" ]]; then
-        ok "gen:n4 was bumped to $gen4 by external fencing despite the self-fencing gap above"
+        ok "gen:n4 was bumped to $gen4 by external fencing"
     else
-        bad "gen:n4 was never bumped ($gen4) — external fencing did not fire either"
+        bad "gen:n4 was never bumped ($gen4) — external fencing did not fire"
     fi
 
-    # Check 3: does a write attempt from the now-fenced node fail FAST, or
-    # hang? Direct investigation found it hangs indefinitely (killed after
-    # 7+ minutes with no response) rather than returning EIO in bounded
-    # time — a second, independent finding from the self-fence gap above.
-    # Bounded here so a re-run of this script can never hang on it again.
-    log "  probing a write from the (now fenced, still-mounted) node4, bounded to 20s..."
+    # Does a write attempt from the fenced node fail in bounded time?
+    # Pre-fix this hung indefinitely (killed after 7+ minutes, no response),
+    # because the node never self-fenced and the guarded commit's etcd call
+    # simply blocked. With the watchdog firing, the daemon is gone by now and
+    # the write should fail fast instead. Still bounded to 20s so a
+    # regression can never hang this script again.
+    log "  probing a write from the fenced node4, bounded to 20s..."
     local probe_rc=0
     if [[ "$MODE" == "docker" ]]; then
         timeout 20 docker exec etcfs-fuse4 sh -c "echo probe > /mnt/etcfuse/fj2-probe.txt" >/dev/null 2>&1 || probe_rc=$?
@@ -353,7 +415,7 @@ run_fj2() {
             "echo probe | sudo tee /mnt/etcfuse/fj2-probe.txt >/dev/null" >/dev/null 2>&1 || probe_rc=$?
     fi
     if [[ "$probe_rc" -eq 124 ]]; then
-        bad "write from fenced node4 hung past 20s instead of failing fast (matches the 7+ minute hang found under manual investigation)"
+        bad "write from fenced node4 hung past 20s instead of failing fast (regression: this was the pre-fix behavior)"
     elif [[ "$probe_rc" -ne 0 ]]; then
         ok "write from fenced node4 failed fast (rc=$probe_rc) — generation guard rejected it promptly"
     else
@@ -377,12 +439,11 @@ run_fj2() {
     if [[ "$MODE" == "docker" ]]; then
         docker network connect docker_etcfuse-net etcfs-meta4 2>/dev/null
     else
-        if [[ -f "$REPORT_DIR/fj2-partition.info" ]]; then
-            read -r temp_sg eni orig_sg < "$REPORT_DIR/fj2-partition.info"
-            aws ec2 modify-network-interface-attribute --network-interface-id "$eni" --groups "$orig_sg" 2>/dev/null
-            sleep 5
-            aws ec2 delete-security-group --group-id "$temp_sg" 2>/dev/null || true
-        fi
+        # Flush the DROP rules added above. The node may have self-fenced
+        # (os.Exit(77)) by now, which is fine — this only touches the kernel's
+        # firewall, not the daemon, and the instance is terminated moments
+        # later by remove_node anyway.
+        runcmd "$node4" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >>"$REPORT_DIR/chaos.log" 2>&1
     fi
     remove_node 4 &
     local rm_pid=$! rm_waited=0 rm_ok=0
