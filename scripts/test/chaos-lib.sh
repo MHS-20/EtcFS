@@ -240,11 +240,17 @@ else
         timeout 15 ssh -o StrictHostKeyChecking=no -q ec2-user@"$N1" \
             "/usr/local/bin/etcdctl --endpoints=$(etcd_endpoints) $*" 2>/dev/null
     }
+    # restart_daemons <ip> <node_id> [ebs_volume_id] [ec2_instance_id]
+    # The last two args are optional and opt this node's daemon into
+    # dual-confirmed external fencing (see provision_cluster's daemon-start
+    # block); omitted, restart preserves prior single-signal behavior.
     restart_daemons() {
         local etcd=$(etcd_endpoints); local tag=$(jq -r '.cluster_name' "$PROJECT_ROOT/$STATE_FILE")
+        local fence_flags=""
+        [[ -n "${3:-}" && -n "${4:-}" ]] && fence_flags="--ebs-volume-id=$3 --ec2-instance-id=$4"
         runcmd60 "$1" "
           sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
-          sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
+          sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
           for k in \$(seq 1 10); do [ -S /tmp/etcfuse.sock ] && break; sleep 1; done
           sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
           for k in \$(seq 1 20); do sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0; sleep 1; done
@@ -312,14 +318,24 @@ else
 
         log "  Starting daemons..."
         local ETCD="http://$P1:2379,http://$P2:2379,http://$P3:2379"
+        # Both flags enable dual-confirmed external fencing (detach + poll
+        # before the generation bumps, see pkg/fencing/detach.go). Without
+        # them the controller degrades to single-signal fencing. Requires the
+        # instance to carry the etcfs-nodes IAM instance profile
+        # (scripts/infra/fencing-iam.sh), which create-infra.sh attaches by
+        # default — omitted here only if the state file predates that.
+        local vol_id; vol_id=$(jq -r '.volume_id // empty' "$PROJECT_ROOT/$STATE_FILE")
         for i in 1 2 3; do
             eval "ip=\$N$i"
+            local inst_id; inst_id=$(jq -r ".compute_instance_ids[$((i-1))] // empty" "$PROJECT_ROOT/$STATE_FILE")
+            local fence_flags=""
+            [[ -n "$vol_id" && -n "$inst_id" ]] && fence_flags="--ebs-volume-id=$vol_id --ec2-instance-id=$inst_id"
             ssh -o StrictHostKeyChecking=no ec2-user@$ip "
                 sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; sleep 1
                 sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
                 sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
                     --etcd-endpoints=$ETCD --node-id=n$i --cluster-name=$TAG \
-                    --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
+                    --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
                 sleep 4
                 sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock \
                     --node-id=n$i --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
@@ -385,9 +401,11 @@ else
         vol_id=$(jq -r '.volume_id' "$PROJECT_ROOT/$STATE_FILE")
         logerr "  add_node $id: launching EC2 instance..."
         local inst
+        local iam_profile; iam_profile=$("$PROJECT_ROOT/scripts/infra/fencing-iam.sh" profile-name)
         inst=$(aws ec2 run-instances \
             --image-id "$ami_id" --instance-type t3.medium --key-name "$key_name" \
             --security-group-ids "$sg" --subnet-id "$subnet_id" --associate-public-ip-address \
+            --iam-instance-profile "Name=$iam_profile" \
             --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$name},{Key=ClusterName,Value=$TAG}]" \
             --query 'Instances[0].InstanceId' --output text 2>/dev/null)
@@ -459,7 +477,8 @@ else
         ssh -o StrictHostKeyChecking=no ec2-user@"$pub" "
             sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
                 --etcd-endpoints=$endpoints --node-id=n$id --cluster-name=$TAG \
-                --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
+                --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 \
+                --ebs-volume-id=$vol_id --ec2-instance-id=$inst > /tmp/meta.log 2>&1 &
             sleep 4
             sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock \
                 --node-id=n$id --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &

@@ -190,6 +190,13 @@ fi
 if [[ "$EXISTING_IDS" -lt "$COMPUTE_NODES" ]]; then
     log "=== Creating compute nodes ($COMPUTE_NODES nodes) ==="
 
+    # Permanent role every EtcFS node runs under (detach/reattach the shared
+    # volume for fencing, describe peers/volumes). Not per-cluster, not torn
+    # down — idempotent, so safe to call on every provision.
+    "$SCRIPT_DIR/fencing-iam.sh" create
+    IAM_PROFILE=$("$SCRIPT_DIR/fencing-iam.sh" profile-name)
+    log "IAM instance profile: $IAM_PROFILE"
+
     COMPUTE_IDS=()
     COMPUTE_IPS=()
     COMPUTE_PUB_IPS=()
@@ -204,6 +211,7 @@ if [[ "$EXISTING_IDS" -lt "$COMPUTE_NODES" ]]; then
             --security-group-ids "$SG_ID" \
             --subnet-id "$SUBNET_ID" \
             --associate-public-ip-address \
+            --iam-instance-profile "Name=$IAM_PROFILE" \
             --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=ClusterName,Value=$CLUSTER_NAME}]" \
             --query 'Instances[0].InstanceId' --output text)
