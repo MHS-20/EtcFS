@@ -129,7 +129,7 @@ A secondary split-brain vector — etcd's own partition behavior — already ben
 
 ## Elasticity
 
-Every node registers a `membership:<node_id>` key backed by an etcd lease (2–5s TTL, tunable). A lease expiry is the liveness-loss signal that kicks off fencing. Because membership is just etcd leases rather than a totem/CPG protocol, nodes join or leave far more cheaply than in DLM: joining is "start heartbeating and read current metadata," leaving is "stop heartbeating" — no cluster-wide stop-the-world recovery step for membership churn itself. Adding or removing a node only affects the locks and arenas that node personally held; etcd's watch mechanism surfaces this incrementally, not as a synchronous global barrier. No manual rebalancing step is needed — inode-range and arena acquisition happen automatically on a new node's first write.
+Every node registers a `membership:<node_id>` key backed by an etcd lease (2–5s TTL, tunable). A lease expiry is the liveness-loss signal that kicks off fencing. Because membership is just etcd leases rather than a totem/CPG protocol, nodes join or leave far more cheaply than in DLM: joining is "start heartbeating and read current metadata," leaving is "stop heartbeating" — no cluster-wide stop-the-world recovery step for membership churn itself. Adding or removing a node only affects the locks and arenas that node personally held; etcd's watch mechanism surfaces this incrementally, not as a synchronous global barrier. No manual rebalancing step is needed — arena acquisition happens automatically on a new node's first write.
 
 Verified in practice: `docs/chaos-reports/2026-07-31-elastic-scale-out-in.md` — 3→5→3 node scale-out/scale-in, both local and on real AWS infrastructure.
 
@@ -230,7 +230,9 @@ This was in fact described in the docs as though implemented, and partial dead c
 
 Adopting ranges would also make the inode cross-check described in [`elastic-join-leave.md`](docs/architecture/cluster-ops/elastic-join-leave.md) § Interaction with the Scrubber implementable — with a global counter there are no ranges to validate against.
 
-**Other tracked directions.** Arena reclamation (nothing reuses freed arenas today, and safe reissue needs a time-bound argument that etcd state alone cannot supply); enforced cross-node POSIX locks; dual-confirmed external fencing backed by an actual cloud API call rather than a generation bump on lease expiry; bounded contexts for FUSE handlers, which currently run with `context.Background()`.
+**Other tracked directions.** Arena reclamation (nothing reuses freed arenas today, and safe reissue needs a time-bound argument that etcd state alone cannot supply); enforced cross-node POSIX locks; bounded contexts for FUSE handlers, which currently run with `context.Background()`; retrying a fenced node whose EBS detach failed or timed out, which currently has no automatic retry path and stays in a documented limbo state until an operator intervenes.
+
+Dual-confirmed external fencing (EBS detach + poll before the generation bumps) is implemented — see `pkg/fencing/detach.go` and the Fencing section above.
 
 ## Document map
 
