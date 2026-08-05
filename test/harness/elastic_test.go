@@ -138,7 +138,14 @@ func TestElastic_RebalanceArena(t *testing.T) {
 	arenaBVal, _ := store.Get(ctx, metadata.ArenaKey("node-B"))
 	require.NotNil(t, arenaBVal)
 
-	err := mgrA.RebalanceArena(ctx, "node-A", "node-B", arenaAID)
+	// RebalanceArena requires the source to already be fenced (see the
+	// function's doc comment for why this is the one case reassignment is
+	// actually safe) — bump node-A's generation first, as the fencing
+	// controller would after a confirmed fence.
+	_, err := store.BumpGeneration(ctx, "node-A", 0)
+	require.NoError(t, err)
+
+	err = mgrA.RebalanceArena(ctx, "node-A", "node-B", arenaAID)
 	require.NoError(t, err)
 
 	arenaAValAfter, _ := store.Get(ctx, metadata.ArenaKey("node-A"))
@@ -149,6 +156,39 @@ func TestElastic_RebalanceArena(t *testing.T) {
 
 	assert.Zero(t, cluster.checkAllInvariants())
 	_ = arenaBVal
+}
+
+// TestElastic_RebalanceArenaRejectsUnfencedSource is the actual point of the
+// guard added to RebalanceArena: moving an arena away from a live, healthy
+// node is the one case Kleppmann's stale-write analysis identifies as
+// unclosable by any check (both nodes would be unfenced, so nothing has
+// grounds to reject it) — so the function must refuse it outright rather than
+// perform it and hope. See the doc comment on RebalanceArena for the full
+// argument.
+func TestElastic_RebalanceArenaRejectsUnfencedSource(t *testing.T) {
+	cluster := NewCluster(2)
+	ctx := t.Context()
+	store := cluster.Store
+
+	mgrA := membership.New(store, "live-node")
+	require.NoError(t, mgrA.Join(ctx))
+	mgrB := membership.New(store, "target-node")
+	require.NoError(t, mgrB.Join(ctx))
+
+	arenaVal, _ := store.Get(ctx, metadata.ArenaKey("live-node"))
+	require.NotNil(t, arenaVal)
+	arenaID := metadata.DecodeUint64(arenaVal)
+
+	// live-node was never fenced (generation stays 0) — the rebalance must
+	// be rejected, and the arena must stay exactly where it was.
+	err := mgrA.RebalanceArena(ctx, "live-node", "target-node", arenaID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not been fenced")
+
+	stillThere, _ := store.Get(ctx, metadata.ArenaKey("live-node"))
+	assert.Equal(t, arenaVal, stillThere, "arena must be untouched after a rejected rebalance")
+
+	assert.Zero(t, cluster.checkAllInvariants())
 }
 
 // ---- C10.11: Global arena pool under contention ----
@@ -293,11 +333,17 @@ func TestElastic_RebalanceIdempotent(t *testing.T) {
 	arenaAVal, _ := store.Get(ctx, metadata.ArenaKey("src"))
 	arenaAID := metadata.DecodeUint64(arenaAVal)
 
-	_ = mgrA.RebalanceArena(ctx, "src", "dst", arenaAID)
+	_, err := store.BumpGeneration(ctx, "src", 0)
+	require.NoError(t, err)
 
-	// Rebalancing again should fail (src no longer has the arena)
-	err := mgrA.RebalanceArena(ctx, "src", "dst", arenaAID)
+	require.NoError(t, mgrA.RebalanceArena(ctx, "src", "dst", arenaAID))
+
+	// Rebalancing again should fail (src no longer has the arena) — a
+	// different reason than the fencing guard, which "src" still passes
+	// (its generation only ever increases, so it stays fenced).
+	err = mgrA.RebalanceArena(ctx, "src", "dst", arenaAID)
 	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no arena registered")
 
 	assert.Zero(t, cluster.checkAllInvariants())
 }
