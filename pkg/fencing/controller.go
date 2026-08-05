@@ -127,8 +127,17 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string) {
 	//
 	// A failed detach therefore aborts the fence rather than falling back to
 	// bumping anyway: an unfenced node the cluster believes is fenced is more
-	// dangerous than one it knows it has not fenced.  The lease stays expired,
-	// so the next watch event retries.
+	// dangerous than one it knows it has not fenced.
+	//
+	// This does NOT retry automatically. The watch that triggers fenceNode
+	// fires once, on the membership key's DELETE event; that key is already
+	// gone, so no further event exists to re-trigger on. A failed detach
+	// leaves the node in the limbo state external-fencing-controller.md
+	// describes — generation not bumped, requiring either the node's own
+	// self-fencing watchdog to have already stopped it, or operator
+	// intervention. No periodic reconciliation sweep exists to retry a failed
+	// detach; building one is out of scope here and is not implied by
+	// anything above.
 	if c.detacher != nil {
 		if instanceID == "" {
 			c.log.Error("cannot fence: no instance ID recorded for node, skipping generation bump",
