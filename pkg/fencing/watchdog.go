@@ -1,17 +1,26 @@
 // Package fencing implements the EtcFS self-fencing watchdog and
 // external fencing controller interfaces.
 //
-// Self-fencing is the first line of defence against split-brain:
-// each EtcFS daemon monitors its own etcd lease health.  If the lease
-// keepalive stream is disconnected and reconnection fails within
-// 2× the TTL margin, the watchdog declares the node fenced and:
-//  1. Stops accepting new FUSE write requests
-//  2. Closes the block device file descriptor
-//  3. Optionally remounts the FUSE filesystem read-only
-//  4. Exits the process
+// Self-fencing is the first line of defence against split-brain: each EtcFS
+// daemon monitors its own etcd lease health.  Once the lease has been dead
+// longer than 2× the TTL, the watchdog declares the node fenced and exits the
+// process with code 77.
 //
-// This closes the most dangerous window — a node partitioned from etcd
-// but still connected to the shared block device.
+// Exiting is the whole sequence — it does not drain writes, close the block
+// device, or remount read-only first.  That is deliberate: a node that cannot
+// reach etcd cannot trust its own view of the cluster, so attempting an
+// orderly shutdown risks acting on stale state.  Process exit lets the kernel
+// release the block device and the FUSE mount, and open handles get EIO,
+// which is the correct outcome for a node that no longer trusts itself.
+//
+// Because the check runs on a ticker of one TTL, the fence lands 2-3× TTL
+// after the last successful keepalive depending on tick phase, not a flat 2×.
+//
+// This narrows, but does not close, the most dangerous window — a node
+// partitioned from etcd but still connected to the shared block device.
+// Writes already issued to the kernel are not cancelled by the exit; they are
+// made unreachable instead, because the generation guard rejects the metadata
+// commit that would have published them.
 package fencing
 
 import (
