@@ -132,11 +132,33 @@ func (m *Membership) setAlive(v bool) {
 	m.alive = v
 }
 
-// IsAlive returns true if the membership lease is currently active.
+// IsAlive reports whether this node's membership lease is currently active.
+//
+// Being "alive" requires two things: the keepalive loop has not observed a
+// terminal failure, *and* the last successful keepalive is recent enough that
+// etcd cannot already have expired the lease server-side.
+//
+// The second condition is not redundant.  Under a total network partition the
+// etcd client's KeepAlive channel is never closed — the client retries
+// indefinitely and reports nothing — so the loop in Run never reaches the
+// reconnect path that clears the flag.  Without a deadline check a partitioned
+// node believes itself alive forever, the self-fencing watchdog never fires,
+// and the node keeps serving while etcd has already handed its lease's
+// expiry to the fencing controller.  Verified: 8+ minutes partitioned with no
+// self-fence before this check existed (docs/chaos-reports/
+// 2026-08-05-fault-injection-during-join-leave.md).
+//
+// The lease TTL is the correct threshold because it is exactly the point at
+// which etcd expires the lease after the last renewal.  The client library
+// renews at roughly TTL/3, so a healthy node has ~3x margin and this cannot
+// produce a false positive from ordinary jitter.
 func (m *Membership) IsAlive() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.alive
+	if !m.alive || m.lastAlive.IsZero() {
+		return false
+	}
+	return time.Since(m.lastAlive) <= m.leaseTTL
 }
 
 // LastAlive returns the time of the last successful keepalive.

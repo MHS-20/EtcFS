@@ -65,6 +65,15 @@ func (w *Watchdog) Run(ctx context.Context) {
 				continue
 			}
 
+			// Membership was never established at all (the heartbeat loop
+			// failed before its first successful keepalive).  A node with no
+			// lease must not serve, so fence immediately rather than
+			// computing an elapsed time against a zero timestamp.
+			if w.membership.LastAlive().IsZero() {
+				w.trigger()
+				return
+			}
+
 			// Lease is dead.  Check how long it's been dead.
 			deadSince := time.Since(w.membership.LastAlive())
 			if deadSince > 2*w.leaseTTL {
