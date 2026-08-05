@@ -282,7 +282,22 @@ run_s2() {
     teardown
 }
 
-# === S3: Network partition via SG swap ===
+# === S3: Network partition via iptables ===
+#
+# Partitions with iptables on the instance, not by swapping its security
+# group. SG swaps do not sever already-established connections — AWS security
+# groups are stateful and only evaluate NEW connection attempts against the
+# changed rules — so a daemon whose etcd connection predates the swap keeps
+# using it and is never actually partitioned. Verified directly: a fresh
+# etcdctl on the "partitioned" node correctly reported "unhealthy cluster"
+# while the daemon's existing connection kept working normally.
+#
+# This scenario did not surface a wrong result from that, because it only
+# asserts survivors keep working and that N1 recovers afterwards — never that
+# N1's own operations were blocked while cut off. It was still testing
+# something weaker than it claimed. iptables filters every packet regardless
+# of connection state, so the partition is now real, and it is verified to
+# have taken effect rather than assumed.
 run_s3() {
     log "======== S3: Network partition ========"
     provision s3 || { FAIL=$((FAIL+1)); log "  FAIL: provision failed"; teardown; return; }
@@ -293,22 +308,40 @@ run_s3() {
     writef "$N2" "survivor-write" "p2.txt" || log "  WARN: N2 pre-partition write failed"
     readf "$N3" "p1.txt" > /dev/null
 
-    local SG=$(jq -r '.sg_id' $PROJECT_ROOT/$STATE_FILE)
-    local VPC=$(jq -r '.vpc_id' $PROJECT_ROOT/$STATE_FILE)
-    local N1_INST=$(jq -r '.compute_instance_ids[0]' $PROJECT_ROOT/$STATE_FILE)
-    local N1_ENI=$(aws ec2 describe-instances --instance-ids $N1_INST \
-        --query 'Reservations[0].Instances[0].NetworkInterfaces[0].NetworkInterfaceId' --output text 2>/dev/null)
-    local MY_IP=$(curl -s http://checkip.amazonaws.com 2>/dev/null || echo "0.0.0.0")
+    # Stock Amazon Linux 2023 ships neither iptables nor nft, and the compute
+    # setup only installs fuse3/gcc — install it here if absent. iptables-nft
+    # is the shim over the nftables backend AL2023 actually uses.
+    local IPT_SETUP
+    IPT_SETUP=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" \
+        "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -2; command -v iptables || echo NO_IPTABLES" 2>&1)
+    log "  iptables on N1: $(echo "$IPT_SETUP" | tr '\n' ' ' | cut -c1-120)"
 
-    # Create temp SG that allows SSH only (no etcd ports)
-    local TEMP_SG=$(aws ec2 create-security-group \
-        --group-name "chaos-temp-$$" \
-        --description "Temp partition SG" \
-        --vpc-id "$VPC" --query 'GroupId' --output text 2>/dev/null)
-    aws ec2 authorize-security-group-ingress --group-id "$TEMP_SG" --protocol tcp --port 22 --cidr "${MY_IP}/32" 2>/dev/null || true
+    log "  Partitioning N1 from etcd peers via iptables..."
+    # stderr is captured deliberately: the shared runcmd() discards it, which
+    # previously hid the reason these rules failed behind a bare "ERR:1".
+    local PEER IPT_OUT IPT_RC
+    for PEER in "$P2" "$P3"; do
+        IPT_OUT=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" "
+            set -e
+            sudo iptables -A OUTPUT -p tcp -d $PEER --dport 2379 -j DROP
+            sudo iptables -A OUTPUT -p tcp -d $PEER --dport 2380 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $PEER --sport 2379 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $PEER --sport 2380 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $PEER --dport 2379 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $PEER --dport 2380 -j DROP
+        " 2>&1); IPT_RC=$?
+        [[ "$IPT_RC" -ne 0 ]] && log "  WARN: iptables for peer $PEER rc=$IPT_RC: $(echo "$IPT_OUT" | tr '\n' ' ' | cut -c1-160)"
+    done
 
-    log "  Swapping N1 to TEMP_SG=$TEMP_SG (no etcd ports)..."
-    aws ec2 modify-network-interface-attribute --network-interface-id "$N1_ENI" --groups "$TEMP_SG" 2>/dev/null
+    # Verify the cut actually happened rather than assuming it did — this is
+    # the check whose absence let the SG-swap version look like it worked.
+    local PROBE
+    PROBE=$(runcmd "$N1" "timeout 5 curl -s -o /dev/null -w '%{http_code}' http://$P2:2379/health 2>&1; echo rc=\$?")
+    if [[ "$PROBE" == *"rc=0"* && "$PROBE" != *"000"* ]]; then
+        FAIL=$((FAIL+1)); log "  FAIL: partition did not take effect — N1 still reached etcd at $P2 (probe=$PROBE)"
+    else
+        log "  Partition verified: N1 cannot reach etcd (probe=$PROBE)"
+    fi
     sleep 15
 
     # Survivors should still work
@@ -317,17 +350,19 @@ run_s3() {
     # shellcheck disable=SC2015
     [[ -n "$V2" ]] && { PASS=$((PASS+1)); log "  PASS: Survivors work: $V2"; } || { FAIL=$((FAIL+1)); log "  FAIL: survivors"; }
 
-    # Restore: reattach the original SG, then delete the temp one
-    log "  Restoring N1 to original SG..."
-    aws ec2 modify-network-interface-attribute --network-interface-id "$N1_ENI" --groups "$SG" "$TEMP_SG" 2>/dev/null || true
-    sleep 5
-    aws ec2 modify-network-interface-attribute --network-interface-id "$N1_ENI" --groups "$SG" 2>/dev/null || true
-    aws ec2 delete-security-group --group-id "$TEMP_SG" 2>/dev/null || true
+    log "  Restoring N1 connectivity (flushing iptables)..."
+    runcmd "$N1" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >/dev/null 2>&1
     sleep 20
 
-    # N1's watchdog self-fenced during the partition (os.Exit(77)) — that is
+    # N1's watchdog self-fences during the partition (os.Exit(77)) — that is
     # correct behaviour, not a failure.  Nothing supervises the raw nohup'd
     # daemons here, so restart them explicitly before asserting N1 recovers.
+    #
+    # Worth noting this comment predates the fix that made it true: with the
+    # SG-swap partition the connection was never actually severed, and even
+    # under a genuine cut the watchdog did not fire at all until
+    # Membership.IsAlive() gained a keepalive-deadline check.  The restart
+    # below was therefore restarting daemons that had never exited.
     log "  Restarting N1 daemons after self-fence..."
     local ETCD=$(etcd_endpoints)
     local TAG=$(jq -r '.cluster_name' "$PROJECT_ROOT/$STATE_FILE")
