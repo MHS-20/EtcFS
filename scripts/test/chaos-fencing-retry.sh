@@ -85,11 +85,45 @@ run_r1() {
     etcdctl_on put "fence_pending:$node" "i-simulated" >/dev/null
     log "  planted fence_pending:$node with no membership key (simulated controller death after recording intent)"
 
+    # Two sweep cycles: one is enough to prove the retry fires, two proves it
+    # keeps firing rather than giving up after a single attempt.
+    wait_sweep
     wait_sweep
 
     local gen pending
     gen=$(gen_val "$node")
     pending=$(fence_pending_val "$node")
+
+    if [[ "$MODE" == "aws" ]]; then
+        # On AWS the controller drives a real EBSDetacher, and this node is a
+        # fiction — no such EC2 instance exists, so ec2:DetachVolume can never
+        # confirm and the fence correctly refuses to complete. That makes this
+        # the sharper of the two assertions rather than a weaker one: it proves
+        # the retry loop keeps running against a fence that genuinely cannot
+        # succeed, and that an unconfirmed fence is never papered over with a
+        # generation bump. Completion is asserted against real nodes in R3/R4.
+        local retries
+        retries=$(runcmd "$N2" "grep -c 'retrying incomplete fence.*$node' /tmp/meta.log 2>/dev/null" 2>/dev/null | tr -d '[:space:]')
+        retries=${retries:-0}
+        if [[ "$retries" -ge 2 ]]; then
+            ok "sweep retried the unfencable node $retries times on n2 — the retry loop persists"
+        else
+            bad "sweep retried only $retries times — the edge-triggered gap is not closed"
+        fi
+        if [[ -z "$gen" || "$gen" == "0" ]]; then
+            ok "generation NOT bumped for a fence that was never confirmed (got '$gen')"
+        else
+            bad "generation bumped to $gen without a confirmed detach — dual confirmation bypassed"
+        fi
+        if [[ -n "$pending" ]]; then
+            ok "fence_pending:$node survives the failed attempts — still owed, still retryable"
+        else
+            bad "fence_pending:$node was dropped despite the fence never completing"
+        fi
+        etcdctl_on del "fence_pending:$node" >/dev/null 2>&1
+        return
+    fi
+
     if [[ -n "$gen" && "$gen" != "0" ]]; then
         ok "sweep bumped gen:$node to $gen unprompted"
     else
@@ -147,7 +181,14 @@ run_r2() {
         bad "fence_pending:$node still present — sweep never reconciled it ('$pending')"
     fi
 
+    # Deleting the membership key is itself a DELETE event, so the watch path
+    # records a fresh intent for this fictional node. Left behind, it makes
+    # every later sweep retry a fence that can never complete, polluting the
+    # logs R3/R4 read. Clear both, then let one sweep pass consume the race.
     etcdctl_on del "membership:$node" >/dev/null 2>&1
+    sleep 5
+    etcdctl_on del "fence_pending:$node" >/dev/null 2>&1
+    etcdctl_on del "gen:$node" >/dev/null 2>&1
 }
 
 # ============================================================
@@ -276,20 +317,27 @@ run_r3_aws() {
 # ec2:DetachVolume, then a genuine recovery once the permission returns.
 # ============================================================
 run_r4_aws() {
+    # Targets n3, not n1. R3 kills n1's daemons and leaves its mount dead
+    # ("Transport endpoint is not connected"), so R4 cannot use n1 for its own
+    # baseline write when both run in one invocation. n3 is untouched by every
+    # preceding scenario.
     log "======== R4: genuine detach failure via IAM deny, then sweep-driven recovery ========"
-    local vol_id inst1
+    local vol_id
     vol_id=$(jq -r '.volume_id' "$PROJECT_ROOT/$STATE_FILE")
-    inst1=$(jq -r '.compute_instance_ids[0]' "$PROJECT_ROOT/$STATE_FILE")
 
-    # See run_r3_*: gen:n1 must NOT be deleted while n1 is live, or n1's own
+    # See run_r3_*: gen:n3 must NOT be deleted while n3 is live, or n3's own
     # guarded writes fail as ErrFenced (surfacing as -ENOSPC) before the test
     # even starts. Baseline the value and assert the delta instead.
-    etcdctl_on del "fence_pending:n1" >/dev/null 2>&1
-    local gen_before; gen_before=$(gen_val n1); gen_before=${gen_before:-0}
-    log "  gen:n1 before the deny: $gen_before"
+    #
+    # Only n2's controller can fence n3 here: R3 killed n1's daemons (its etcd
+    # keeps running, so quorum is unaffected, but its fencing controller is
+    # gone). One live fencer is enough to exercise fail-then-retry.
+    etcdctl_on del "fence_pending:n3" >/dev/null 2>&1
+    local gen_before; gen_before=$(gen_val n3); gen_before=${gen_before:-0}
+    log "  gen:n3 before the deny: $gen_before"
 
-    if writef "$N1" "pre-deny" "retry-r4.txt" && [[ -n "$(readf "$N2" retry-r4.txt)" ]]; then
-        ok "baseline write on n1, visible from n2"
+    if writef "$N3" "pre-deny" "retry-r4.txt" && [[ -n "$(readf "$N2" retry-r4.txt)" ]]; then
+        ok "baseline write on n3, visible from n2"
     else
         bad "baseline write failed"; return
     fi
@@ -311,33 +359,33 @@ EOF
     log "  waiting for IAM propagation..."
     sleep 15
 
-    log "  partitioning n1 from etcd peers (n2, n3)..."
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" \
+    log "  partitioning n3 from etcd peers (n1, n2)..."
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N3" \
         "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -2" >>"$REPORT_DIR/chaos.log" 2>&1
-    local p2 p3
+    local p1 p2
+    p1=$(jq -r '.compute_ips[0]' "$PROJECT_ROOT/$STATE_FILE")
     p2=$(jq -r '.compute_ips[1]' "$PROJECT_ROOT/$STATE_FILE")
-    p3=$(jq -r '.compute_ips[2]' "$PROJECT_ROOT/$STATE_FILE")
-    for peer in "$p2" "$p3"; do
-        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" "
+    for peer in "$p1" "$p2"; do
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N3" "
             sudo iptables -A OUTPUT -p tcp -d $peer --dport 2379 -j DROP
             sudo iptables -A INPUT  -p tcp -s $peer --sport 2379 -j DROP
         " >>"$REPORT_DIR/chaos.log" 2>&1
     done
 
-    log "  waiting for n1's lease to expire and the (doomed) fence attempt to run..."
+    log "  waiting for n3's lease to expire and the (doomed) fence attempt to run..."
     local deadline=120 waited=0 gen="" pending=""
     while [[ "$waited" -lt "$deadline" ]]; do
-        pending=$(fence_pending_val n1)
+        pending=$(fence_pending_val n3)
         [[ -n "$pending" ]] && break
         sleep 5; waited=$((waited+5))
     done
 
     if [[ -n "$pending" ]]; then
-        ok "fence_pending:n1 recorded (~${waited}s) — the watch path saw the expiry"
+        ok "fence_pending:n3 recorded (~${waited}s) — the watch path saw the expiry"
     else
-        bad "fence_pending:n1 never appeared after ${deadline}s — cannot proceed with R4"
+        bad "fence_pending:n3 never appeared after ${deadline}s — cannot proceed with R4"
         aws iam delete-role-policy --role-name etcfs-nodes --policy-name etcfs-deny-detach-test >/dev/null 2>&1
-        runcmd "$N1" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >/dev/null 2>&1
+        runcmd "$N3" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >/dev/null 2>&1
         return
     fi
 
@@ -345,7 +393,7 @@ EOF
     # before checking — PollTimeout in EBSDetacher plus the DetachVolume call
     # itself denied outright, so this should be fast, but leave margin.
     sleep 20
-    gen=$(gen_val n1); gen=${gen:-0}
+    gen=$(gen_val n3); gen=${gen:-0}
     if [[ "$gen" -eq "$gen_before" ]]; then
         ok "generation NOT bumped while detach is denied (still $gen) — failure did not get papered over"
     else
@@ -363,7 +411,7 @@ EOF
     # AWS API round trip.
     deadline=150; waited=0
     while [[ "$waited" -lt "$deadline" ]]; do
-        gen=$(gen_val n1); gen=${gen:-0}
+        gen=$(gen_val n3); gen=${gen:-0}
         [[ "$gen" -gt "$gen_before" ]] && break
         sleep 10; waited=$((waited+10))
     done
@@ -373,15 +421,15 @@ EOF
     else
         bad "sweep never completed the fence after ${deadline}s post-restore (still $gen)"
     fi
-    pending=$(fence_pending_val n1)
-    [[ -z "$pending" ]] && ok "fence_pending:n1 cleared" || bad "fence_pending:n1 still present ('$pending')"
+    pending=$(fence_pending_val n3)
+    [[ -z "$pending" ]] && ok "fence_pending:n3 cleared" || bad "fence_pending:n3 still present ('$pending')"
 
-    log "  n2/n3 controller logs (should show one failed attempt, then a retry that succeeds):"
-    for ip in "$N2" "$N3"; do
+    log "  n1/n2 controller logs (should show failed attempts, then a retry that succeeds):"
+    for ip in "$N1" "$N2"; do
         runcmd "$ip" "grep -E 'fencing node|not confirmed severed|retrying incomplete fence|node fenced' /tmp/meta.log 2>/dev/null | tail -15" 2>/dev/null | while IFS= read -r line; do log "    [$ip] $line"; done
     done
 
-    runcmd "$N1" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >/dev/null 2>&1
+    runcmd "$N3" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >/dev/null 2>&1
 }
 
 # ============================================================
