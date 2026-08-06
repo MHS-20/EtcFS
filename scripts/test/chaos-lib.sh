@@ -246,6 +246,39 @@ else
         timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$N1" \
             "/usr/local/bin/etcdctl --endpoints=$(etcd_endpoints) $*" 2>/dev/null
     }
+    # resolve_block_device <ip> — the shared volume's current path on this
+    # node, matched by EBS serial (stable across attach cycles) rather than
+    # assumed as /dev/nvme1n1 (not stable — Nitro's guest-side NVMe
+    # enumeration is reassigned on each attach, so a node whose volume was
+    # detached and reattached, or whose daemon simply restarts after some
+    # other node's attach churned the numbering, can find the shared volume
+    # at nvme2n1 or elsewhere). Falls back to the old fixed-path guesses
+    # only if serial matching finds nothing, e.g. lsblk/python3 unavailable.
+    #
+    # This is the one existing implementation of this match
+    # (scripts/infra/state.sh's detect_ebs_dev) inlined rather than sourced:
+    # state.sh sets its own `set -euo pipefail` and redefines log()/SCRIPT_DIR,
+    # sourcing it into chaos-lib.sh would fight this file's own set/log.
+    resolve_block_device() {
+        local ip="$1"
+        local vol_id; vol_id=$(jq -r '.volume_id' "$PROJECT_ROOT/$STATE_FILE")
+        local serial="${vol_id//-/}"
+        timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$ip" "
+            dev=\$(lsblk -J -o NAME,SERIAL 2>/dev/null | python3 -c \"
+import sys, json
+for d in json.load(sys.stdin).get('blockdevices', []):
+    if d.get('serial','') == '$serial':
+        print('/dev/' + d['name']); break
+\" 2>/dev/null)
+            if [[ -z \"\$dev\" ]]; then
+                for cand in /dev/nvme1n1 /dev/sdf /dev/xvdf; do
+                    [[ -b \"\$cand\" ]] && dev=\$cand && break
+                done
+            fi
+            echo \"\$dev\"
+        " 2>/dev/null
+    }
+
     # restart_daemons <ip> <node_id> [ebs_volume_id] [ec2_instance_id]
     # The last two args are optional and opt this node's daemon into
     # dual-confirmed external fencing (see provision_cluster's daemon-start
@@ -257,9 +290,14 @@ else
         # ETCFS_FENCE_MODE=nvme replaces control-plane fencing with
         # device-enforced NVMe reservations (see chaos-nvme-fencing.sh).
         [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" ]] && fence_flags="--nvme-reservations"
+        local dev; dev=$(resolve_block_device "$1")
+        [[ -n "$dev" ]] || dev=/dev/nvme1n1
         runcmd60 "$1" "
+          sudo killall -9 etcfuse-meta etcfuse 2>/dev/null
+          sudo umount -l /mnt/etcfuse 2>/dev/null
+          sleep 1
           sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
-          sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
+          sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s --block-device=$dev --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
           for k in \$(seq 1 10); do [ -S /tmp/etcfuse.sock ] && break; sleep 1; done
           sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
           for k in \$(seq 1 20); do sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0; sleep 1; done

@@ -184,6 +184,9 @@ writef() {
 # Runs under runcmd60 because those polls can legitimately take ~30s.
 restart_daemons() {
     runcmd60 "$1" "
+      sudo killall -9 etcfuse-meta etcfuse 2>/dev/null
+      sudo umount -l /mnt/etcfuse 2>/dev/null
+      sleep 1
       sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
       sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$3 --node-id=$2 --cluster-name=$4 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
       for k in \$(seq 1 10); do [ -S /tmp/etcfuse.sock ] && break; sleep 1; done
