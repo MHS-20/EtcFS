@@ -77,7 +77,7 @@ func TestController_BumpsOnlyAfterConfirmedDetach(t *testing.T) {
 	stub := &stubFencer{}
 	c.SetFencer(stub)
 
-	c.fenceNode(ctx, "dead-node", "i-0123456789")
+	c.fenceNode(ctx, "dead-node", "i-0123456789", false)
 
 	assert.Equal(t, 1, stub.called, "the fence must be attempted")
 	assert.Equal(t, "dead-node", stub.nodeID)
@@ -97,7 +97,7 @@ func TestController_DoesNotBumpWhenDetachFails(t *testing.T) {
 	stub := &stubFencer{err: errors.New("still attached after 60s")}
 	c.SetFencer(stub)
 
-	c.fenceNode(ctx, "wedged-node", "i-0123456789")
+	c.fenceNode(ctx, "wedged-node", "i-0123456789", false)
 
 	assert.Equal(t, 1, stub.called)
 
@@ -117,7 +117,7 @@ func TestController_DoesNotBumpWithoutInstanceID(t *testing.T) {
 	c, store, ctx := testController(t, "controller-node")
 	c.SetFencer(&EBSDetacher{api: &fakeEC2{}, volumeID: "vol-test"})
 
-	c.fenceNode(ctx, "legacy-node", "")
+	c.fenceNode(ctx, "legacy-node", "", false)
 
 	gen, err := store.GetGeneration(ctx, "legacy-node")
 	require.NoError(t, err)
@@ -129,7 +129,7 @@ func TestController_DoesNotBumpWithoutInstanceID(t *testing.T) {
 func TestController_SingleSignalWhenNoFencer(t *testing.T) {
 	c, store, ctx := testController(t, "controller-node")
 
-	c.fenceNode(ctx, "plain-node", "")
+	c.fenceNode(ctx, "plain-node", "", false)
 
 	gen, err := store.GetGeneration(ctx, "plain-node")
 	require.NoError(t, err)
@@ -193,7 +193,7 @@ func TestController_SweepRetriesFailedFence(t *testing.T) {
 	c.SetFencer(stub)
 
 	require.NoError(t, store.RecordFenceIntent(ctx, "wedged-node", "i-0123456789"))
-	c.fenceNode(ctx, "wedged-node", "i-0123456789")
+	c.fenceNode(ctx, "wedged-node", "i-0123456789", true)
 
 	gen, err := store.GetGeneration(ctx, "wedged-node")
 	require.NoError(t, err)
@@ -216,7 +216,7 @@ func TestController_SuccessfulFenceClearsIntent(t *testing.T) {
 	c.SetFencer(&stubFencer{})
 
 	require.NoError(t, store.RecordFenceIntent(ctx, "dead-node", "i-0123456789"))
-	c.fenceNode(ctx, "dead-node", "i-0123456789")
+	c.fenceNode(ctx, "dead-node", "i-0123456789", true)
 
 	intents, err := store.ListFenceIntents(ctx)
 	require.NoError(t, err)
@@ -263,14 +263,54 @@ func TestController_ConcurrentControllersFenceOnce(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, won)
 
-	c2.fenceNode(ctx, "dead-node", "i-0123456789")
+	c2.fenceNode(ctx, "dead-node", "i-0123456789", true)
 	assert.Equal(t, 0, stub2.called, "the loser of the claim must not fence")
 
 	require.NoError(t, store.ReleaseFenceClaim(ctx, leaseID))
-	c1.fenceNode(ctx, "dead-node", "i-0123456789")
+	c1.fenceNode(ctx, "dead-node", "i-0123456789", true)
 	assert.Equal(t, 1, stub1.called)
 
 	gen, err := store.GetGeneration(ctx, "dead-node")
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), gen, "exactly one fence must have landed")
+}
+
+// The TOCTOU the claim alone does not close: a sweep decides what to fence
+// from a ListFenceIntents snapshot, and that snapshot can go stale while the
+// call waits on the claim. Without the post-claim re-check, a straggler
+// replays a fence another controller already finished — a second real preempt
+// or detach, and a second generation bump.
+func TestController_SweepSkipsFenceCompletedWhileWaitingForClaim(t *testing.T) {
+	c, store, ctx := testController(t, "straggler")
+	stub := &stubFencer{}
+	c.SetFencer(stub)
+
+	// Exactly the state a straggler wakes up to: it listed the intent, another
+	// controller then completed the fence (bumped, cleared, released), and the
+	// claim is free again by the time this call reaches it.
+	require.NoError(t, store.PutGeneration(ctx, "dead-node", 1))
+
+	c.fenceNode(ctx, "dead-node", "i-0123456789", true)
+
+	assert.Equal(t, 0, stub.called,
+		"a fence already completed must not be re-issued against the device")
+	gen, err := store.GetGeneration(ctx, "dead-node")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), gen, "the generation must not be bumped a second time")
+}
+
+// The watch path must stay unguarded by that re-check: it acts on a DELETE
+// event it observed itself, so there is no stale snapshot, and an intent that
+// failed to record must not silently disable fencing.
+func TestController_WatchPathFencesWithoutARecordedIntent(t *testing.T) {
+	c, store, ctx := testController(t, "watcher")
+	stub := &stubFencer{}
+	c.SetFencer(stub)
+
+	c.fenceNode(ctx, "dead-node", "i-0123456789", false)
+
+	assert.Equal(t, 1, stub.called, "the watch path must fence regardless of intent state")
+	gen, err := store.GetGeneration(ctx, "dead-node")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), gen)
 }

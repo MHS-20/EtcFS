@@ -118,7 +118,7 @@ func (c *Controller) Run(ctx context.Context) {
 					c.log.Error("failed to record fence intent, fence will not be retried if it fails",
 						"node", nodeID, "error", err)
 				}
-				go c.fenceNode(ctx, nodeID, instanceID)
+				go c.fenceNode(ctx, nodeID, instanceID, false)
 			}
 		}
 	}
@@ -126,7 +126,14 @@ func (c *Controller) Run(ctx context.Context) {
 
 // fenceNode performs external fencing for a node whose membership key expired.
 // It bumps the fencing generation to prevent stale locks and marks the node as fenced.
-func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string) {
+//
+// fromSweep marks the reconciliation sweep as the caller.  The sweep decides
+// what to fence from a ListFenceIntents snapshot, and that snapshot can go
+// stale while this call waits on the claim — see the re-check below.  The
+// watch path passes false: it acts on a single DELETE event it observed
+// itself, and records the intent immediately before calling, so there is no
+// snapshot to go stale.
+func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, fromSweep bool) {
 	// Cluster-wide dedup, not merely per-process: every survivor watches the
 	// same membership prefix and sees the same DELETE, so without this all of
 	// them fence the same node simultaneously.  Observed directly on AWS
@@ -147,6 +154,29 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string) {
 				"node", nodeID, "error", rerr)
 		}
 	}()
+
+	// Winning the claim is not proof the fence is still owed.  Two sweeps can
+	// list the same intent before either clears it; the first completes the
+	// fence and releases its claim, and the second — still holding a snapshot
+	// taken before any of that — then wins the free claim and would replay the
+	// whole fence, bumping the generation a second time and re-issuing a real
+	// preempt or detach.  The claim only serialises concurrent execution; it
+	// cannot tell a straggler its snapshot is obsolete.  Re-reading the intent
+	// here, after the claim, is what closes that.  Observed on Docker with 3
+	// controllers, 2026-08-06.
+	if fromSweep {
+		pending, perr := c.store.Get(ctx, metadata.FencePendingKey(nodeID))
+		if perr != nil {
+			c.log.Error("cannot re-check fence intent, skipping this attempt",
+				"node", nodeID, "error", perr)
+			return
+		}
+		if pending == nil {
+			c.log.Info("fence already completed by another controller, nothing owed",
+				"node", nodeID)
+			return
+		}
+	}
 
 	c.log.Info("fencing node", "node_id", nodeID, "instance_id", instanceID)
 
@@ -246,7 +276,7 @@ func (c *Controller) reconcile(ctx context.Context) {
 			continue
 		}
 		c.log.Warn("retrying incomplete fence", "node", nodeID, "instance", instanceID)
-		c.fenceNode(ctx, nodeID, instanceID)
+		c.fenceNode(ctx, nodeID, instanceID, true)
 	}
 }
 

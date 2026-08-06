@@ -118,32 +118,20 @@ run_r1() {
     else
         bad "fence_pending:$node still present after completion ('$pending')"
     fi
-    # NOT asserted as exactly 1: reproduced via this scenario on 2026-08-06
-    # (docker, 3 controllers) that gen can land on 2. Root cause confirmed
-    # from controller logs — this is a genuine TOCTOU in Controller.reconcile
-    # (pkg/fencing/controller.go), not a flake of this script. When a
-    # long-lived intent is visible across a sweep tick, two controllers can
-    # each list it as pending before either clears it; the first claims and
-    # completes the fence (bump N->N+1, clear intent, release claim); the
-    # second, still holding its now-stale copy of that intent from its own
-    # List() call, then successfully claims the (now-released) key and
-    # replays the entire fence unconditionally, bumping N+1->N+2. The claim
-    # only serialises truly concurrent execution; it does not stop a
-    # straggler from acting on a List() snapshot that is already out of
-    # date by the time it gets the claim.
-    #
-    # This is the SAME class of duplicate the item's design already accepts
-    # as benign — both Fencer implementations are idempotent and the
-    # generation CAS only ever increases — just reachable through the sweep
-    # path (a long-lived intent visible to multiple independent tickers) in
-    # addition to the original watch path (one shared DELETE event). It
-    # costs a redundant real Fence() call (an extra EC2 API round trip or
-    # NVMe preempt) per straggler, not correctness, but it is worth fixing
-    # in reconcile() — re-check the intent still exists AFTER winning the
-    # claim, before calling fenceNode — rather than leaving it to recur on
-    # every long-pending intent. Not fixed here per instruction to
-    # investigate rather than patch source; recorded for follow-up.
-    log "  gen after sweep: $gen (informational — see comment above; not required to equal 1)"
+    # Exactly 1, not merely non-zero. Every controller sweeps on its own
+    # ticker, so all three see this intent within milliseconds of each
+    # other. Before the post-claim intent re-check existed (added
+    # 2026-08-06, found by this very scenario) this landed on 2: the
+    # straggler won the claim the winner had just released and replayed the
+    # whole fence off its stale ListFenceIntents snapshot. A value above 1
+    # here means that re-check regressed — a redundant real preempt/detach
+    # per straggler, not a correctness failure, but exactly the waste the
+    # claim exists to prevent.
+    if [[ "$gen" == "1" ]]; then
+        ok "fenced exactly once across all three controllers' sweeps (gen=1)"
+    else
+        bad "gen:$node=$gen — expected exactly 1; the sweep's post-claim intent re-check has regressed"
+    fi
 }
 
 # ============================================================
