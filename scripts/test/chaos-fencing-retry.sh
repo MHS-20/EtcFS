@@ -365,10 +365,20 @@ EOF
     local p1 p2
     p1=$(jq -r '.compute_ips[0]' "$PROJECT_ROOT/$STATE_FILE")
     p2=$(jq -r '.compute_ips[1]' "$PROJECT_ROOT/$STATE_FILE")
+    # Both ports, both directions — the same rule set chaos-fencing-detach.sh
+    # uses. Blocking only the client port (2379) is not a partition: n3's own
+    # etcd stays in the Raft quorum over the peer port (2380) and n3's daemon
+    # still reaches its *local* etcd, so its lease keeps renewing, the
+    # membership key never expires, and no fence is ever triggered. That is
+    # exactly how this scenario first failed.
     for peer in "$p1" "$p2"; do
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N3" "
             sudo iptables -A OUTPUT -p tcp -d $peer --dport 2379 -j DROP
+            sudo iptables -A OUTPUT -p tcp -d $peer --dport 2380 -j DROP
             sudo iptables -A INPUT  -p tcp -s $peer --sport 2379 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $peer --sport 2380 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $peer --dport 2379 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $peer --dport 2380 -j DROP
         " >>"$REPORT_DIR/chaos.log" 2>&1
     done
 
