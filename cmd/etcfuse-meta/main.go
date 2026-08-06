@@ -218,5 +218,23 @@ func main() {
 		log.Fatal("IPC server failed", "error", err)
 	}
 
+	// Return this node's arena to the global pool now that it is serving
+	// nothing.  A departing node is its own proof of quiescence — the IPC
+	// server has stopped, so no further write can be issued from here — which
+	// is what a fenced node needs an external Fencer to establish.  Skipping
+	// this is what made arena space leak on every departure, graceful or not.
+	//
+	// A context of its own: ctx is already cancelled by the time this runs.
+	relCtx, relCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	arenaID, released, rerr := store.ReleaseArena(relCtx, cfg.NodeID)
+	relCancel()
+	switch {
+	case rerr != nil:
+		log.Warn("arena not released on shutdown, its space stays leaked",
+			"node", cfg.NodeID, "error", rerr)
+	case released:
+		log.Info("released arena on shutdown", "node", cfg.NodeID, "arena", arenaID)
+	}
+
 	log.Info("etcfuse-meta stopped")
 }

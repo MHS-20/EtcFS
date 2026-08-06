@@ -221,6 +221,29 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, f
 		return
 	}
 
+	// Reclaim the fenced node's arena, but only where the fence was
+	// device-enforced.
+	//
+	// This is invariant 4 from kleppmann-stale-write-analysis.md: an arena may
+	// return to the pool only once the previous owner is provably done with
+	// it.  A confirmed Fencer.Fence is exactly that proof — the device itself
+	// is already rejecting the node's writes, so the range can be reissued
+	// immediately, with no grace period and no clock-bound argument.  In
+	// single-signal mode (no Fencer) there is no such proof: the node's
+	// metadata mutations are rejected, but its kernel may still be writing
+	// bytes, and handing its arena to a live node would put both of them in
+	// the same range.  Leaking the arena is the correct trade there.
+	if c.fencer != nil {
+		arenaID, released, err := c.store.ReleaseArena(ctx, nodeID)
+		switch {
+		case err != nil:
+			c.log.Warn("fenced node's arena not reclaimed, its space stays leaked",
+				"node", nodeID, "error", err)
+		case released:
+			c.log.Info("reclaimed fenced node's arena", "node", nodeID, "arena", arenaID)
+		}
+	}
+
 	// Only now is the fence complete, so only now is nothing owed.
 	if err := c.store.ClearFenceIntent(ctx, nodeID); err != nil {
 		c.log.Warn("fence complete but intent not cleared, sweep will re-fence harmlessly",
