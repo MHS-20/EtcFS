@@ -286,8 +286,15 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 }
 
 // StartSocketServer is the public entry point: listens on the Unix socket path
-// and handles binary IPC connections.
-func StartSocketServer(svc *Service, sockPath string, log *config.Logger) error {
+// and blocks until ctx is cancelled or the listener errors.
+//
+// RunSocket's Accept loop has no ctx of its own — closing the listener from a
+// side goroutine when ctx is cancelled is what turns "the process received
+// SIGTERM" into "Accept returns an error and RunSocket returns", which is what
+// lets main's post-serve shutdown steps (releasing this node's arena) run at
+// all. Without this, main blocked in RunSocket forever and never reached them
+// on anything short of SIGKILL.
+func StartSocketServer(ctx context.Context, svc *Service, sockPath string, log *config.Logger) error {
 	_ = os.Remove(sockPath)
 
 	listener, err := net.Listen("unix", sockPath)
@@ -296,10 +303,18 @@ func StartSocketServer(svc *Service, sockPath string, log *config.Logger) error 
 	}
 	defer func() { _ = listener.Close() }()
 
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+
 	if err := os.Chmod(sockPath, 0600); err != nil {
 		log.Warn("cannot chmod socket", "path", sockPath, "error", err)
 	}
 
 	log.Info("binary IPC server listening", "path", sockPath)
-	return svc.RunSocket(listener)
+	if err := svc.RunSocket(listener); err != nil && ctx.Err() == nil {
+		return err
+	}
+	return nil
 }

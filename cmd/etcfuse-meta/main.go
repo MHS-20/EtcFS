@@ -218,7 +218,7 @@ func main() {
 	log.Info("binary IPC server starting")
 	svc.StartNotificationServer(ctx)
 	go func() { _ = ipc.StartNotifyServer(svc, "/tmp/etcfuse-notify.sock") }()
-	if err := ipc.StartSocketServer(svc, cfg.ListenAddr, log); err != nil {
+	if err := ipc.StartSocketServer(ctx, svc, cfg.ListenAddr, log); err != nil {
 		log.Fatal("IPC server failed", "error", err)
 	}
 
