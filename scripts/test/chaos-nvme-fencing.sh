@@ -299,7 +299,18 @@ log "======== R7: n1 rejoins — registration is re-established on restart =====
 runcmd "$N1" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >/dev/null 2>&1
 sleep 5
 RESTART=$(restart_daemons "$N1" n1)
-log "  restart_daemons(n1): $(echo "$RESTART" | tr '\n' ' ' | cut -c1-120)"
+if [[ "$RESTART" == OK* ]]; then
+    log "  restart_daemons(n1): OK"
+else
+    log "  restart_daemons(n1): FAIL, full output below"
+    while IFS= read -r line; do log "    $line"; done <<< "$RESTART"
+    log "  ps on n1:"
+    runcmd "$N1" "ps aux | grep -E 'etcfuse|fuse' | grep -v grep" 2>/dev/null \
+        | while IFS= read -r line; do log "    $line"; done
+    log "  /mnt/etcfuse and /proc/mounts on n1:"
+    runcmd "$N1" "ls -la /mnt/etcfuse 2>&1; grep etcfuse /proc/mounts 2>&1" 2>/dev/null \
+        | while IFS= read -r line; do log "    $line"; done
+fi
 
 REJOINED=0
 for _ in $(seq 1 10); do
