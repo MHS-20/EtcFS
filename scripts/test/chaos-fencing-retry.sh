@@ -413,13 +413,44 @@ EOF
     log "  restoring ec2:DetachVolume permission..."
     aws iam delete-role-policy --role-name etcfs-nodes --policy-name etcfs-deny-detach-test || \
         logerr "  WARNING: failed to remove deny policy — remove manually: aws iam delete-role-policy --role-name etcfs-nodes --policy-name etcfs-deny-detach-test"
-    log "  waiting for IAM propagation..."
-    sleep 15
+
+    # Deleting the policy is not the same as the deny being gone. IAM is
+    # eventually consistent, and the delete lands in IAM long before the
+    # already-active assumed-role sessions on the survivors stop being denied:
+    # measured 3 minutes of continued "explicit deny in an identity-based
+    # policy" 403s after a delete that `get-role-policy` already reported as
+    # NoSuchEntity. Sleeping a guessed interval races that. Probe instead,
+    # with a dry-run detach issued from a survivor under the very instance-role
+    # credentials the daemon uses, and only start the recovery clock once the
+    # authorisation actually succeeds.
+    local inst3 region probe
+    inst3=$(jq -r '.compute_instance_ids[2]' "$PROJECT_ROOT/$STATE_FILE")
+    region=$(aws configure get region 2>/dev/null); region=${region:-eu-west-1}
+    log "  polling until the deny has actually cleared on the instance role..."
+    local cleared=0
+    waited=0
+    while [[ "$waited" -lt 420 ]]; do
+        probe=$(runcmd "$N1" "aws ec2 detach-volume --dry-run --region $region --volume-id $vol_id --instance-id $inst3 2>&1 | tail -2")
+        if [[ "$probe" == *"DryRunOperation"* ]]; then
+            cleared=1
+            break
+        fi
+        if [[ "$probe" != *"UnauthorizedOperation"* && "$probe" != *"AccessDenied"* ]]; then
+            # Not a deny and not a dry-run success — most likely no aws CLI on
+            # the node. Stop probing and fall back to waiting it out.
+            log "  dry-run probe inconclusive ($(echo "$probe" | tr '\n' ' ' | cut -c1-100)), falling back to a fixed wait"
+            sleep 120
+            break
+        fi
+        sleep 15; waited=$((waited+15))
+    done
+    [[ "$cleared" -eq 1 ]] && log "  deny cleared on the instance role after ~${waited}s" \
+        || log "  deny not confirmed cleared after ${waited}s; continuing anyway"
 
     log "  waiting for the reconciliation sweep to retry and complete the fence..."
-    # sweepInterval (30s) + a detach/poll cycle, generous margin for a real
-    # AWS API round trip.
-    deadline=150; waited=0
+    # One sweepInterval (30s) plus a detach/poll cycle is the expected case;
+    # the margin covers a slow EC2 control-plane round trip.
+    deadline=240; waited=0
     while [[ "$waited" -lt "$deadline" ]]; do
         gen=$(gen_val n3); gen=${gen:-0}
         [[ "$gen" -gt "$gen_before" ]] && break
