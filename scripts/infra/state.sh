@@ -39,7 +39,22 @@ export AWS_DEFAULT_REGION="$REGION"
 
 # Expand ~ in PEM_PATH
 PEM="${PEM_PATH/#\~/$HOME}"
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i $PEM"
+
+# UserKnownHostsFile=/dev/null is not redundant with StrictHostKeyChecking=no.
+# StrictHostKeyChecking=no only auto-accepts an *unknown* host key; it does not
+# override a *conflicting* one. AWS recycles public IPs between runs, so an IP
+# from a torn-down cluster is routinely reissued to a new instance with a new
+# host key, and ssh then refuses the connection outright with "REMOTE HOST
+# IDENTIFICATION HAS CHANGED" — which stalls provisioning until someone runs
+# ssh-keygen -R by hand. Observed on 2026-08-06. Discarding the known-hosts
+# file means no entry is ever recorded, so no conflict can arise, and the
+# harness stops accumulating dozens of dead IPs in the operator's
+# ~/.ssh/known_hosts. The host-key check this gives up was already disabled by
+# StrictHostKeyChecking=no; these are ephemeral, self-provisioned test
+# instances, so its only practical effect here was the false positive above.
+# LogLevel=ERROR suppresses the "Permanently added ... to the list of known
+# hosts" line that /dev/null would otherwise print on every single connection.
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes -i $PEM"
 SSH_CMD="ssh $SSH_OPTS"
 
 log()  { echo "[$(date +%T)] $*"; }

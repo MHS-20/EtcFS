@@ -299,7 +299,7 @@ run_r3_aws() {
     fi
 
     local pending; pending=$(fence_pending_val n1)
-    [[ -z "$pending" ]] && ok "fence_pending:n1 cleared" || bad "fence_pending:n1 still present ('$pending')"
+    if [[ -z "$pending" ]]; then ok "fence_pending:n1 cleared"; else bad "fence_pending:n1 still present ('$pending')"; fi
     if fence_claim_present n1; then
         bad "fence_claim:n1 still held"
     else
@@ -360,7 +360,7 @@ EOF
     sleep 15
 
     log "  partitioning n3 from etcd peers (n1, n2)..."
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N3" \
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$N3" \
         "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -2" >>"$REPORT_DIR/chaos.log" 2>&1
     local p1 p2
     p1=$(jq -r '.compute_ips[0]' "$PROJECT_ROOT/$STATE_FILE")
@@ -372,7 +372,7 @@ EOF
     # membership key never expires, and no fence is ever triggered. That is
     # exactly how this scenario first failed.
     for peer in "$p1" "$p2"; do
-        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N3" "
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$N3" "
             sudo iptables -A OUTPUT -p tcp -d $peer --dport 2379 -j DROP
             sudo iptables -A OUTPUT -p tcp -d $peer --dport 2380 -j DROP
             sudo iptables -A INPUT  -p tcp -s $peer --sport 2379 -j DROP
@@ -444,8 +444,11 @@ EOF
         fi
         sleep 15; waited=$((waited+15))
     done
-    [[ "$cleared" -eq 1 ]] && log "  deny cleared on the instance role after ~${waited}s" \
-        || log "  deny not confirmed cleared after ${waited}s; continuing anyway"
+    if [[ "$cleared" -eq 1 ]]; then
+        log "  deny cleared on the instance role after ~${waited}s"
+    else
+        log "  deny not confirmed cleared after ${waited}s; continuing anyway"
+    fi
 
     log "  waiting for the reconciliation sweep to retry and complete the fence..."
     # One sweepInterval (30s) plus a detach/poll cycle is the expected case;
@@ -463,7 +466,7 @@ EOF
         bad "sweep never completed the fence after ${deadline}s post-restore (still $gen)"
     fi
     pending=$(fence_pending_val n3)
-    [[ -z "$pending" ]] && ok "fence_pending:n3 cleared" || bad "fence_pending:n3 still present ('$pending')"
+    if [[ -z "$pending" ]]; then ok "fence_pending:n3 cleared"; else bad "fence_pending:n3 still present ('$pending')"; fi
 
     log "  n1/n2 controller logs (should show failed attempts, then a retry that succeeds):"
     for ip in "$N1" "$N2"; do

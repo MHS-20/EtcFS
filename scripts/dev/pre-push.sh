@@ -39,8 +39,8 @@ run_check "go test"   go test -race -count=1 ./...
 run_check "go vet"    go vet ./...
 run_check "golangci-lint" golangci-lint run --timeout=5m ./...
 run_check "C build"   make -C cmd/etcfuse
-run_check "clang-format" clang-format --dry-run --Werror \
-    $(find cmd/etcfuse pkg/fuse pkg/block -name '*.c' -o -name '*.h')
+mapfile -d '' c_files < <(find cmd/etcfuse pkg/fuse pkg/block \( -name '*.c' -o -name '*.h' \) -print0)
+run_check "clang-format" clang-format --dry-run --Werror "${c_files[@]}"
 run_check "shellcheck" shellcheck scripts/infra/*.sh scripts/test/*.sh
 
 if [[ "$failures" -gt 0 ]]; then

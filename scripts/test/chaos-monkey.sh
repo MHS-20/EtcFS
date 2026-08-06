@@ -41,7 +41,7 @@ source "$INFRA_DIR/state.sh"
 # ---- Config ----
 PEM="${ETCFS_PEM_PATH:-~/.ssh/id_ed25519}"
 PEM="${PEM/#\~/$HOME}"
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $PEM"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -i $PEM"
 DESTRUCTIVE=false
 SKIP_SETUP=false
 SETUP_ONLY=false

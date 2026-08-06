@@ -75,7 +75,7 @@ PY
 # Read via nvme-cli rather than through the daemon: the point is to observe
 # the device's own state, independently of what EtcFS believes.
 resv_report() {
-    runcmd30 "$1" "sudo nvme resv-report $DEV -c 16 -o json 2>&1"
+    runcmd30 "$1" "sudo nvme resv-report $DEV -o json 2>&1"
 }
 
 # key_registered <public-ip> <key-decimal> — true if the device reports the
@@ -93,7 +93,7 @@ key_registered() {
 # which reads exactly like "generation never bumped". Same trap documented in
 # chaos-fencing-detach.sh. Query via N2, never partitioned here.
 gen_val() {
-    timeout 15 ssh -o StrictHostKeyChecking=no -q ec2-user@"$N2" \
+    timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$N2" \
         "/usr/local/bin/etcdctl --endpoints=http://$P1_PRIV:2379,http://$P2_PRIV:2379,http://$P3_PRIV:2379 get gen:$1 --print-value-only" \
         2>/dev/null | tr -d '[:space:]'
 }
@@ -157,7 +157,7 @@ log "======== Partitioning n1 from etcd peers (n2, n3) via iptables ========"
 runcmd60 "$N1" "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -1" \
     >>"$REPORT_DIR/chaos.log" 2>&1
 for PEER in "$P2_PRIV" "$P3_PRIV"; do
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" "
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$N1" "
         sudo iptables -A OUTPUT -p tcp -d $PEER --dport 2379 -j DROP
         sudo iptables -A OUTPUT -p tcp -d $PEER --dport 2380 -j DROP
         sudo iptables -A INPUT  -p tcp -s $PEER --sport 2379 -j DROP
@@ -304,7 +304,12 @@ fi
 RESTART3=$(restart_daemons "$N3" n3)
 log "  restart_daemons(n3): $(echo "$RESTART3" | tr '\n' ' ' | cut -c1-120)"
 REJOINED3=0
-for _ in $(seq 1 10); do
+# 60s, not 30s: a hot-reattached NVMe namespace takes the guest kernel longer
+# to re-enumerate than a device already attached at boot, on top of
+# restart_daemons' own ~30s startup allowance. Confirmed by a 2026-08-06 run
+# where the 30s version reported FAIL but the resv-report captured moments
+# later showed n3 registered — the recovery was real, the wait was short.
+for _ in $(seq 1 20); do
     if key_registered "$N2" "$K3"; then REJOINED3=1; break; fi
     sleep 3
 done

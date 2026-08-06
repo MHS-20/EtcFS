@@ -48,7 +48,7 @@ bad() { FAIL=$((FAIL+1)); log "  FAIL: $1"; }
 # a bug in this script, not in fencing. Query via N2 instead, which is never
 # partitioned in this scenario.
 gen_val() {
-    timeout 15 ssh -o StrictHostKeyChecking=no -q ec2-user@"$N2" \
+    timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$N2" \
         "/usr/local/bin/etcdctl --endpoints=http://$P1_PRIV:2379,http://$P2_PRIV:2379,http://$P3_PRIV:2379 get gen:$1 --print-value-only" \
         2>/dev/null | tr -d '[:space:]'
 }
@@ -92,12 +92,12 @@ fi
 log "======== Partitioning n1 from etcd peers (n2, n3) via iptables ========"
 # Same technique as FJ2 / S3 (see TODO-hardening.md item 2): SG swaps do not
 # sever established connections, iptables does.
-IPT_SETUP=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" \
+IPT_SETUP=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$N1" \
     "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -2; command -v iptables || echo NO_IPTABLES" 2>&1)
 log "  iptables on n1: $(echo "$IPT_SETUP" | tr '\n' ' ' | cut -c1-120)"
 
 for PEER in "$P2_PRIV" "$P3_PRIV"; do
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" "
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$N1" "
         sudo iptables -A OUTPUT -p tcp -d $PEER --dport 2379 -j DROP
         sudo iptables -A OUTPUT -p tcp -d $PEER --dport 2380 -j DROP
         sudo iptables -A INPUT  -p tcp -s $PEER --sport 2379 -j DROP

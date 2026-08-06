@@ -148,7 +148,7 @@ else
                 sudo tar -xzf /tmp/etcd.tar.gz -C /usr/local/bin --strip-components=1 etcd-v3.5.18-linux-amd64/etcd etcd-v3.5.18-linux-amd64/etcdctl && \
                 sudo chmod +x /usr/local/bin/etcd /usr/local/bin/etcdctl
             " || true
-            scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q "$PROJECT_ROOT/bin/etcfuse-meta" ec2-user@"$pub":/tmp/ 2>/dev/null || true
+            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q "$PROJECT_ROOT/bin/etcfuse-meta" ec2-user@"$pub":/tmp/ 2>/dev/null || true
             ssh_retry "$pub" "sudo cp /tmp/etcfuse-meta /usr/local/bin/etcfuse-meta && sudo chmod +x /usr/local/bin/etcfuse-meta" || true
             ssh_retry "$pub" "sudo mkdir -p /mnt/etcfuse" || true
         } >> "$REPORT_DIR/chaos.log" 2>&1
@@ -164,7 +164,7 @@ else
         done
         [[ -n "$initial_cluster" ]] || { logerr "  FJ1: could not parse ETCD_INITIAL_CLUSTER"; return 1; }
 
-        ssh -o StrictHostKeyChecking=no ec2-user@"$pub" "
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@"$pub" "
             sudo mkdir -p /var/lib/etcd
             sudo nohup /usr/local/bin/etcd --name $ename --data-dir /var/lib/etcd \
                 --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://$priv:2379 \
@@ -174,7 +174,7 @@ else
         sleep 8
 
         local endpoints="http://$P1:2379,http://$P2:2379,http://$P3:2379"
-        ssh -o StrictHostKeyChecking=no ec2-user@"$pub" "
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@"$pub" "
             sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
                 --etcd-endpoints=$endpoints --node-id=n$id --cluster-name=$TAG \
                 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
@@ -302,7 +302,7 @@ run_fj2() {
         # absent. nftables is the AL2023 default backend; the iptables package
         # provides the iptables-nft shim that drives it.
         local ipt_setup
-        ipt_setup=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$node4" \
+        ipt_setup=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$node4" \
             "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -3; command -v iptables || echo NO_IPTABLES" 2>&1)
         log "  iptables availability on node4: $(echo "$ipt_setup" | tr '\n' ' ' | cut -c1-160)"
 
@@ -311,7 +311,7 @@ run_fj2() {
         # visible). Capture stderr so a failure is diagnosable from the log.
         local peer ipt_out ipt_rc
         for peer in "$P1" "$P2" "$P3"; do
-            ipt_out=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$node4" "
+            ipt_out=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$node4" "
                 set -e
                 sudo iptables -A OUTPUT -p tcp -d $peer --dport 2379 -j DROP
                 sudo iptables -A OUTPUT -p tcp -d $peer --dport 2380 -j DROP
@@ -411,7 +411,7 @@ run_fj2() {
     if [[ "$MODE" == "docker" ]]; then
         timeout 20 docker exec etcfs-fuse4 sh -c "echo probe > /mnt/etcfuse/fj2-probe.txt" >/dev/null 2>&1 || probe_rc=$?
     else
-        timeout 20 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -q ec2-user@"$(node_pub 4)" \
+        timeout 20 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -q ec2-user@"$(node_pub 4)" \
             "echo probe | sudo tee /mnt/etcfuse/fj2-probe.txt >/dev/null" >/dev/null 2>&1 || probe_rc=$?
     fi
     if [[ "$probe_rc" -eq 124 ]]; then

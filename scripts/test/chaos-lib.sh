@@ -4,6 +4,12 @@
 # and defining log()/logerr(). Provides: runcmd/runcmd30/runcmd60, check_mount,
 # readf, writef, dump_logs, restart_fuse, restart_pair, partition_node,
 # heal_node, etcdctl_on, provision_cluster, teardown_cluster.
+#
+# Every ssh/scp here carries StrictHostKeyChecking=no, UserKnownHostsFile=
+# /dev/null and LogLevel=ERROR together. The second of those is the load-bearing
+# one and is easy to mistake for redundant — see the comment on SSH_OPTS in
+# scripts/infra/state.sh for why a recycled EC2 IP breaks ssh outright without
+# it. Keep the three together when adding a new call site.
 COMPOSE="docker compose -f $PROJECT_ROOT/deploy/docker/docker-compose.yml"
 
 if [[ "$MODE" == "docker" ]]; then
@@ -183,7 +189,7 @@ else
     wait_ssh() {
         local ip=$1; local max=$2
         for i in $(seq 1 $max); do
-            timeout 5 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ec2-user@$ip "echo ok" 2>/dev/null && return 0
+            timeout 5 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 ec2-user@$ip "echo ok" 2>/dev/null && return 0
             sleep 5
         done
         return 1
@@ -191,15 +197,15 @@ else
     ssh_retry() {
         local ip=$1; shift
         wait_ssh "$ip" 12
-        timeout 120 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ec2-user@$ip "$@" 2>&1
+        timeout 120 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 ec2-user@$ip "$@" 2>&1
     }
-    runcmd()   { timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
-    runcmd30() { timeout 30 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
-    runcmd60() { timeout 60 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
+    runcmd()   { timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
+    runcmd30() { timeout 30 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
+    runcmd60() { timeout 60 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
     check_mount() { local M=$(runcmd "$1" "sudo mountpoint -q /mnt/etcfuse && echo OK || echo FAIL"); [[ "$M" == "OK" ]]; }
     readf() {
         local out rc
-        out=$(timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" "sudo cat /mnt/etcfuse/$2" 2>&1); rc=$?
+        out=$(timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" "sudo cat /mnt/etcfuse/$2" 2>&1); rc=$?
         if [[ $rc -ne 0 ]]; then
             logerr "    readf($1,$2) failed rc=$rc: $(echo "$out" | tr '\n' ' ' | cut -c1-140)"
             return 1
@@ -208,21 +214,21 @@ else
     }
     writef() {
         local out rc
-        out=$(printf '%s' "$2" | timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" "sudo tee /mnt/etcfuse/$3 > /dev/null" 2>&1); rc=$?
+        out=$(printf '%s' "$2" | timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" "sudo tee /mnt/etcfuse/$3 > /dev/null" 2>&1); rc=$?
         if [[ $rc -ne 0 ]]; then
             logerr "    writef($1,$3) FAILED rc=$rc: $(echo "$out" | tr '\n' ' ' | cut -c1-140)"
             return 1
         fi
         return 0
     }
-    rmf()  { timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" "sudo rm -f /mnt/etcfuse/$2" 2>&1; }
-    mvf()  { timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" "sudo mv /mnt/etcfuse/$2 /mnt/etcfuse/$3" 2>&1; }
-    mkdirf() { timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" "sudo mkdir -p /mnt/etcfuse/$2" 2>&1; }
-    lsf()  { timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" "sudo ls /mnt/etcfuse/ 2>/dev/null"; }
+    rmf()  { timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" "sudo rm -f /mnt/etcfuse/$2" 2>&1; }
+    mvf()  { timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" "sudo mv /mnt/etcfuse/$2 /mnt/etcfuse/$3" 2>&1; }
+    mkdirf() { timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" "sudo mkdir -p /mnt/etcfuse/$2" 2>&1; }
+    lsf()  { timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" "sudo ls /mnt/etcfuse/ 2>/dev/null"; }
 
     dump_logs() {
         local out
-        out=$(timeout 20 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" \
+        out=$(timeout 20 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" \
             "echo '--- meta.log ---'; sudo tail -40 /tmp/meta.log 2>/dev/null; echo '--- fuse.log ---'; sudo tail -20 /tmp/fuse.log 2>/dev/null" 2>&1)
         log "  ---- daemon logs from $1 ----"
         while IFS= read -r line; do log "    $line"; done <<< "$out"
@@ -237,7 +243,7 @@ else
     # the full endpoint list (not just N1's own node) so a query still works
     # even if N1 itself is the node currently being restarted/partitioned.
     etcdctl_on() {
-        timeout 15 ssh -o StrictHostKeyChecking=no -q ec2-user@"$N1" \
+        timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$N1" \
             "/usr/local/bin/etcdctl --endpoints=$(etcd_endpoints) $*" 2>/dev/null
     }
     # restart_daemons <ip> <node_id> [ebs_volume_id] [ec2_instance_id]
@@ -290,9 +296,9 @@ else
                 sudo chmod +x /usr/local/bin/etcd /usr/local/bin/etcdctl
             " || true
             wait_ssh "$ip" 3
-            scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q "$PROJECT_ROOT/bin/etcfuse-meta" ec2-user@$ip:/tmp/ 2>/dev/null || true
+            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q "$PROJECT_ROOT/bin/etcfuse-meta" ec2-user@$ip:/tmp/ 2>/dev/null || true
             ssh_retry "$ip" "sudo cp /tmp/etcfuse-meta /usr/local/bin/etcfuse-meta && sudo chmod +x /usr/local/bin/etcfuse-meta" || true
-            scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q /tmp/chaos.tar.gz ec2-user@$ip:/tmp/ 2>/dev/null || true
+            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q /tmp/chaos.tar.gz ec2-user@$ip:/tmp/ 2>/dev/null || true
             ssh_retry "$ip" "
                 rm -rf /tmp/s && mkdir /tmp/s && cd /tmp/s && tar xzf /tmp/chaos.tar.gz && \
                 gcc -I. -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g \
@@ -308,7 +314,7 @@ else
         for i in 1 2 3; do
             eval "ip=\$N$i"; eval "priv=\$P$i"; local ename="e$((i-1))"
             # shellcheck disable=SC2154
-            ssh -o StrictHostKeyChecking=no ec2-user@$ip "
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip "
                 sudo rm -rf /var/lib/etcd && sudo mkdir -p /var/lib/etcd
                 sudo nohup /usr/local/bin/etcd --name $ename --data-dir /var/lib/etcd \
                     --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://$priv:2379 \
@@ -339,7 +345,7 @@ else
             # exclusive with the EBS flags by design — the preempt is the
             # stronger signal and needs nothing from the EC2 control plane.
             [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" ]] && fence_flags="--nvme-reservations"
-            ssh -o StrictHostKeyChecking=no ec2-user@$ip "
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip "
                 sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; sleep 1
                 sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
                 sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
@@ -440,9 +446,9 @@ else
                 sudo tar -xzf /tmp/etcd.tar.gz -C /usr/local/bin --strip-components=1 etcd-v3.5.18-linux-amd64/etcd etcd-v3.5.18-linux-amd64/etcdctl && \
                 sudo chmod +x /usr/local/bin/etcd /usr/local/bin/etcdctl
             " || true
-            scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q "$PROJECT_ROOT/bin/etcfuse-meta" ec2-user@"$pub":/tmp/ 2>/dev/null || true
+            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q "$PROJECT_ROOT/bin/etcfuse-meta" ec2-user@"$pub":/tmp/ 2>/dev/null || true
             ssh_retry "$pub" "sudo cp /tmp/etcfuse-meta /usr/local/bin/etcfuse-meta && sudo chmod +x /usr/local/bin/etcfuse-meta" || true
-            scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q /tmp/chaos.tar.gz ec2-user@"$pub":/tmp/ 2>/dev/null || true
+            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q /tmp/chaos.tar.gz ec2-user@"$pub":/tmp/ 2>/dev/null || true
             ssh_retry "$pub" "
                 rm -rf /tmp/s && mkdir /tmp/s && cd /tmp/s && tar xzf /tmp/chaos.tar.gz && \
                 gcc -I. -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g \
@@ -466,7 +472,7 @@ else
         done
         [[ -n "$initial_cluster" ]] || { logerr "  add_node $id: could not parse ETCD_INITIAL_CLUSTER after $attempt attempts"; return 1; }
 
-        ssh -o StrictHostKeyChecking=no ec2-user@"$pub" "
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@"$pub" "
             sudo mkdir -p /var/lib/etcd
             sudo nohup /usr/local/bin/etcd --name $ename --data-dir /var/lib/etcd \
                 --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://$priv:2379 \
@@ -483,7 +489,7 @@ else
             [[ -n "$jpriv" ]] && endpoints="$endpoints,http://$jpriv:2379"
         done
 
-        ssh -o StrictHostKeyChecking=no ec2-user@"$pub" "
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@"$pub" "
             sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
                 --etcd-endpoints=$endpoints --node-id=n$id --cluster-name=$TAG \
                 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 \

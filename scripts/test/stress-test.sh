@@ -179,7 +179,7 @@ WORKER
 log "Deploying worker to $COUNT nodes"
 for i in "${!PUB_IPS[@]}"; do
     ip="${PUB_IPS[$i]}"
-    scp -o StrictHostKeyChecking=no /tmp/etcfuse-stress-worker.sh ec2-user@$ip:/tmp/stress.sh 2>/dev/null
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR /tmp/etcfuse-stress-worker.sh ec2-user@$ip:/tmp/stress.sh 2>/dev/null
     chmod +x /tmp/stress.sh 2>/dev/null
 done
 
@@ -191,7 +191,7 @@ PIDS=""
 for i in "${!PUB_IPS[@]}"; do
     ip="${PUB_IPS[$i]}"
     SEED=$(( $(date +%s) + i * 1000 ))
-    ssh -o StrictHostKeyChecking=no -f ec2-user@$ip "nohup bash /tmp/stress.sh n$((i+1)) $SEED $DUR $TEST_DIR > /tmp/stress-result-$i.json 2>/dev/null &"
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -f ec2-user@$ip "nohup bash /tmp/stress.sh n$((i+1)) $SEED $DUR $TEST_DIR > /tmp/stress-result-$i.json 2>/dev/null &"
     PIDS="$PIDS $!"
 done
 
@@ -202,7 +202,7 @@ sleep $((DUR + 10))
 log "Collecting results"
 for i in "${!PUB_IPS[@]}"; do
     ip="${PUB_IPS[$i]}"
-    scp -o StrictHostKeyChecking=no ec2-user@$ip:/tmp/stress-result-$i.json "$REPORT_DIR/node-$i.json" 2>/dev/null || true
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip:/tmp/stress-result-$i.json "$REPORT_DIR/node-$i.json" 2>/dev/null || true
 done
 
 # ---- Generate report ----

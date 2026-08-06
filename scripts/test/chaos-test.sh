@@ -20,7 +20,7 @@ logerr() {
 wait_ssh() {
     local ip=$1; local max=$2
     for i in $(seq 1 $max); do
-        timeout 5 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ec2-user@$ip "echo ok" 2>/dev/null && return 0
+        timeout 5 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 ec2-user@$ip "echo ok" 2>/dev/null && return 0
         sleep 5
     done
     return 1
@@ -29,7 +29,7 @@ wait_ssh() {
 ssh_retry() {
     local ip=$1; shift
     wait_ssh "$ip" 12
-    timeout 120 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ec2-user@$ip "$@" 2>&1
+    timeout 120 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 ec2-user@$ip "$@" 2>&1
 }
 
 log "Building Go binary..."
@@ -69,10 +69,10 @@ provision() {
         " || true
         # Copy Go binary
         wait_ssh "$ip" 3
-        scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q "$PROJECT_ROOT/bin/etcfuse-meta" ec2-user@$ip:/tmp/ 2>/dev/null || true
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q "$PROJECT_ROOT/bin/etcfuse-meta" ec2-user@$ip:/tmp/ 2>/dev/null || true
         ssh_retry "$ip" "sudo cp /tmp/etcfuse-meta /usr/local/bin/etcfuse-meta && sudo chmod +x /usr/local/bin/etcfuse-meta" || true
         # Copy and compile C source
-        scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q /tmp/chaos.tar.gz ec2-user@$ip:/tmp/ 2>/dev/null || true
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q /tmp/chaos.tar.gz ec2-user@$ip:/tmp/ 2>/dev/null || true
         ssh_retry "$ip" "
             rm -rf /tmp/s && mkdir /tmp/s && cd /tmp/s && tar xzf /tmp/chaos.tar.gz && \
             gcc -I. -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g \
@@ -91,7 +91,7 @@ provision() {
     for i in 1 2 3; do
         eval "ip=\$N$i"; eval "priv=\$P$i"; ename="e$((i-1))"
         # shellcheck disable=SC2154
-        ssh -o StrictHostKeyChecking=no ec2-user@$ip "
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip "
             sudo rm -rf /var/lib/etcd && sudo mkdir -p /var/lib/etcd
             sudo nohup /usr/local/bin/etcd --name $ename --data-dir /var/lib/etcd \
                 --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://$priv:2379 \
@@ -111,7 +111,7 @@ provision() {
     local ETCD="http://$P1:2379,http://$P2:2379,http://$P3:2379"
     for i in 1 2 3; do
         eval "ip=\$N$i"
-        ssh -o StrictHostKeyChecking=no ec2-user@$ip "
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip "
             sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; sleep 1
             sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
             sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
@@ -145,18 +145,18 @@ check_mount() {
     [[ "$M" == "OK" ]]
 }
 
-runcmd() { timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
-runcmd30() { timeout 30 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
+runcmd() { timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
+runcmd30() { timeout 30 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
 # Daemon restarts poll for the socket (up to 10s) and the mountpoint (up to
 # 20s), so they need more headroom than runcmd30 allows.
-runcmd60() { timeout 60 ssh -o StrictHostKeyChecking=no -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
+runcmd60() { timeout 60 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@$1 "$2" 2>/dev/null || echo "ERR:$?"; }
 
 # readf <ip> <file> — prints file content on success.
 # On SSH/read failure prints nothing (so callers' -n tests still work) and
 # logs why, so a transport failure is distinguishable from real data loss.
 readf() {
     local out rc
-    out=$(timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" "sudo cat /mnt/etcfuse/$2" 2>&1)
+    out=$(timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" "sudo cat /mnt/etcfuse/$2" 2>&1)
     rc=$?
     if [[ $rc -ne 0 ]]; then
         logerr "    readf($1,$2) failed rc=$rc: $(echo "$out" | tr '\n' ' ' | cut -c1-140)"
@@ -168,7 +168,7 @@ readf() {
 # writef <ip> <content> <file> — returns non-zero if the write did not land.
 writef() {
     local out rc
-    out=$(printf '%s' "$2" | timeout 10 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" \
+    out=$(printf '%s' "$2" | timeout 10 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" \
         "sudo tee /mnt/etcfuse/$3 > /dev/null" 2>&1)
     rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -200,7 +200,7 @@ restart_daemons() {
 # setup step fails, so the report explains *why* rather than just that it did.
 dump_logs() {
     local out
-    out=$(timeout 20 ssh -o StrictHostKeyChecking=no -q ec2-user@"$1" \
+    out=$(timeout 20 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" \
         "echo '--- meta.log ---'; sudo tail -40 /tmp/meta.log 2>/dev/null; echo '--- fuse.log ---'; sudo tail -20 /tmp/fuse.log 2>/dev/null" 2>&1)
     log "  ---- daemon logs from $1 ----"
     while IFS= read -r line; do log "    $line"; done <<< "$out"
@@ -312,7 +312,7 @@ run_s3() {
     # setup only installs fuse3/gcc — install it here if absent. iptables-nft
     # is the shim over the nftables backend AL2023 actually uses.
     local IPT_SETUP
-    IPT_SETUP=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" \
+    IPT_SETUP=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$N1" \
         "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -2; command -v iptables || echo NO_IPTABLES" 2>&1)
     log "  iptables on N1: $(echo "$IPT_SETUP" | tr '\n' ' ' | cut -c1-120)"
 
@@ -321,7 +321,7 @@ run_s3() {
     # previously hid the reason these rules failed behind a bare "ERR:1".
     local PEER IPT_OUT IPT_RC
     for PEER in "$P2" "$P3"; do
-        IPT_OUT=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q ec2-user@"$N1" "
+        IPT_OUT=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$N1" "
             set -e
             sudo iptables -A OUTPUT -p tcp -d $PEER --dport 2379 -j DROP
             sudo iptables -A OUTPUT -p tcp -d $PEER --dport 2380 -j DROP
