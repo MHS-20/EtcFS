@@ -404,16 +404,20 @@ else
     add_node() {
         local id="$1"
         local ename="e$((id-1))"
-        local name="${TAG}-compute-${id}"
-        # SG/AMI_ID/SUBNET_ID/KEY_NAME/VOL_ID are locals scoped inside
+        # SG/AMI_ID/SUBNET_ID/KEY_NAME/VOL_ID/TAG are locals scoped inside
         # chaos-lib.sh's aws provision_cluster(); read fresh from the state
-        # file it wrote instead of depending on that scope.
-        local ami_id subnet_id key_name sg vol_id
+        # file it wrote instead of depending on that scope, which is gone
+        # the instant provision_cluster returns — a bare $TAG here is an
+        # unbound-variable error under `set -u` for any caller that adds a
+        # node after provisioning finished, which is every caller.
+        local ami_id subnet_id key_name sg vol_id TAG
         ami_id=$(jq -r '.ami_id' "$PROJECT_ROOT/$STATE_FILE")
         subnet_id=$(jq -r '.subnet_id' "$PROJECT_ROOT/$STATE_FILE")
         key_name=$(jq -r '.key_name' "$PROJECT_ROOT/$STATE_FILE")
         sg=$(jq -r '.sg_id' "$PROJECT_ROOT/$STATE_FILE")
         vol_id=$(jq -r '.volume_id' "$PROJECT_ROOT/$STATE_FILE")
+        TAG=$(jq -r '.cluster_name' "$PROJECT_ROOT/$STATE_FILE")
+        local name="${TAG}-compute-${id}"
         logerr "  add_node $id: launching EC2 instance..."
         local inst
         local iam_profile; iam_profile=$("$PROJECT_ROOT/scripts/infra/fencing-iam.sh" profile-name)
