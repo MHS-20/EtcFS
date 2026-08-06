@@ -44,6 +44,8 @@ func testController(t *testing.T, nodeID string) (*Controller, *metadata.Store, 
 	t.Cleanup(func() {
 		cli.Delete(context.Background(), metadata.PrefixGen, clientv3.WithPrefix())
 		cli.Delete(context.Background(), metadata.PrefixMembership, clientv3.WithPrefix())
+		cli.Delete(context.Background(), metadata.PrefixFencePending, clientv3.WithPrefix())
+		cli.Delete(context.Background(), metadata.PrefixFenceClaim, clientv3.WithPrefix())
 		cli.Close()
 	})
 
@@ -180,4 +182,95 @@ func TestInstanceIDFromMembership_MissingFieldIsEmpty(t *testing.T) {
 	// empty rather than panicking or returning garbage.
 	legacy := []byte(`{"node_id":"n1","cluster":"c","joined_at":"2026-01-01T00:00:00Z"}`)
 	assert.Equal(t, "", metadata.InstanceIDFromMembership(legacy))
+}
+
+// The retry gap this mechanism closes: the membership watch is edge-triggered,
+// so a fence that fails has no event left to re-trigger it. The intent record
+// is what survives the failed attempt, and the sweep is what consumes it.
+func TestController_SweepRetriesFailedFence(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	stub := &stubFencer{err: errors.New("preempt timed out")}
+	c.SetFencer(stub)
+
+	require.NoError(t, store.RecordFenceIntent(ctx, "wedged-node", "i-0123456789"))
+	c.fenceNode(ctx, "wedged-node", "i-0123456789")
+
+	gen, err := store.GetGeneration(ctx, "wedged-node")
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), gen, "precondition: the first attempt did not fence")
+
+	// The device comes back; the sweep must pick the owed fence up unprompted.
+	stub.err = nil
+	c.reconcile(ctx)
+
+	assert.Equal(t, 2, stub.called, "the sweep must re-attempt the failed fence")
+	gen, err = store.GetGeneration(ctx, "wedged-node")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), gen, "the retry must complete the fence")
+}
+
+// The intent is the record of a fence that is *owed*; leaving it after a
+// successful fence would make the sweep re-fence the node forever.
+func TestController_SuccessfulFenceClearsIntent(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	c.SetFencer(&stubFencer{})
+
+	require.NoError(t, store.RecordFenceIntent(ctx, "dead-node", "i-0123456789"))
+	c.fenceNode(ctx, "dead-node", "i-0123456789")
+
+	intents, err := store.ListFenceIntents(ctx)
+	require.NoError(t, err)
+	assert.NotContains(t, intents, "dead-node", "a completed fence owes nothing")
+}
+
+// A node that re-registered holds a live lease again, so it recovered from the
+// expiry that triggered the fence. Severing its device access at that point
+// would take down a healthy node.
+func TestController_SweepDropsIntentWhenNodeRejoins(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	stub := &stubFencer{}
+	c.SetFencer(stub)
+
+	require.NoError(t, store.RecordFenceIntent(ctx, "rejoined-node", "i-0123456789"))
+	_, err := store.Put(ctx, metadata.MembershipKey("rejoined-node"),
+		[]byte(`{"node_id":"rejoined-node","instance_id":"i-0123456789"}`))
+	require.NoError(t, err)
+
+	c.reconcile(ctx)
+
+	assert.Equal(t, 0, stub.called, "a re-registered node must not be fenced")
+	gen, err := store.GetGeneration(ctx, "rejoined-node")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), gen)
+	intents, err := store.ListFenceIntents(ctx)
+	require.NoError(t, err)
+	assert.NotContains(t, intents, "rejoined-node")
+}
+
+// The race half of the gap: every survivor sees the same DELETE event, so
+// dedup has to be cluster-wide, not the per-process map it used to be.
+func TestController_ConcurrentControllersFenceOnce(t *testing.T) {
+	c1, store, ctx := testController(t, "survivor-1")
+	c2, _, _ := testController(t, "survivor-2")
+	stub1, stub2 := &stubFencer{}, &stubFencer{}
+	c1.SetFencer(stub1)
+	c2.SetFencer(stub2)
+
+	require.NoError(t, store.RecordFenceIntent(ctx, "dead-node", "i-0123456789"))
+
+	// c1 holds the claim for the whole of c2's attempt.
+	leaseID, won, err := store.ClaimFence(ctx, "dead-node", c1.claimTTL)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	c2.fenceNode(ctx, "dead-node", "i-0123456789")
+	assert.Equal(t, 0, stub2.called, "the loser of the claim must not fence")
+
+	require.NoError(t, store.ReleaseFenceClaim(ctx, leaseID))
+	c1.fenceNode(ctx, "dead-node", "i-0123456789")
+	assert.Equal(t, 1, stub1.called)
+
+	gen, err := store.GetGeneration(ctx, "dead-node")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), gen, "exactly one fence must have landed")
 }

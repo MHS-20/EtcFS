@@ -3,7 +3,6 @@ package fencing
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -33,9 +32,26 @@ type Controller struct {
 	membership *metadata.Membership // own membership for leader election
 	fencer     Fencer               // nil = single-signal fencing
 
-	mu           sync.Mutex
-	activeFences map[string]time.Time // nodeID → when fence started
+	sweepInterval time.Duration
+	claimTTL      time.Duration
 }
+
+// Reconciliation timing.
+//
+// sweepInterval is how long a fence that failed on every survivor can stay
+// owed.  It trades retry latency against a periodic etcd range read of a
+// prefix that is empty in a healthy cluster, so it is cheap to keep short.
+//
+// claimTTL must exceed the longest a single fence attempt can take — the EBS
+// detach path polls for up to a minute — or a second controller would start
+// fencing a node the first is still fencing.  That duplicate is benign (both
+// Fencer implementations are idempotent and the generation CAS serialises the
+// bumps), so erring long costs only retry latency after a crash, while erring
+// short reintroduces the very race the claim removes.
+const (
+	defaultSweepInterval = 30 * time.Second
+	defaultClaimTTL      = 120 * time.Second
+)
 
 // SetFencer enables dual-confirmed fencing.  A nil fencer (the default)
 // leaves the controller in single-signal mode.
@@ -46,20 +62,24 @@ func (c *Controller) SetFencer(f Fencer) {
 // NewController creates a fencing controller.
 func NewController(store *metadata.Store, membership *metadata.Membership, log *config.Logger) *Controller {
 	return &Controller{
-		store:        store,
-		log:          log,
-		nodeID:       membership.NodeID(),
-		membership:   membership,
-		activeFences: make(map[string]time.Time),
+		store:         store,
+		log:           log,
+		nodeID:        membership.NodeID(),
+		membership:    membership,
+		sweepInterval: defaultSweepInterval,
+		claimTTL:      defaultClaimTTL,
 	}
 }
 
 // Run starts the controller.  It watches the membership key prefix for
-// deletions (lease expiry) and fences expired nodes.
+// deletions (lease expiry) and fences expired nodes, and runs a periodic
+// reconciliation sweep that retries any fence the watch path did not finish.
 //
 // Blocks until ctx is cancelled.
 func (c *Controller) Run(ctx context.Context) {
 	c.log.Info("fencing controller started", "node", c.nodeID)
+
+	go c.runSweep(ctx)
 
 	// WithPrevKV: a delete event carries the key but not the value, and the
 	// value is where the expired node recorded its EC2 instance ID.  Without
@@ -90,6 +110,14 @@ func (c *Controller) Run(ctx context.Context) {
 				}
 				c.log.Warn("membership key deleted, initiating fence",
 					"node", nodeID, "instance", instanceID)
+				// Record the intent on the watch goroutine, before the fence
+				// runs asynchronously: this is the only moment the instance ID
+				// is still readable, and an intent recorded here survives even
+				// a controller that dies before fenceNode gets to run.
+				if err := c.store.RecordFenceIntent(ctx, nodeID, instanceID); err != nil {
+					c.log.Error("failed to record fence intent, fence will not be retried if it fails",
+						"node", nodeID, "error", err)
+				}
 				go c.fenceNode(ctx, nodeID, instanceID)
 			}
 		}
@@ -99,19 +127,25 @@ func (c *Controller) Run(ctx context.Context) {
 // fenceNode performs external fencing for a node whose membership key expired.
 // It bumps the fencing generation to prevent stale locks and marks the node as fenced.
 func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string) {
-	c.mu.Lock()
-	if _, active := c.activeFences[nodeID]; active {
-		c.mu.Unlock()
-		c.log.Info("fence already in progress", "node", nodeID)
+	// Cluster-wide dedup, not merely per-process: every survivor watches the
+	// same membership prefix and sees the same DELETE, so without this all of
+	// them fence the same node simultaneously.  Observed directly on AWS
+	// (2026-08-06) with two survivors fencing n1 within 2ms of each other.
+	leaseID, won, err := c.store.ClaimFence(ctx, nodeID, c.claimTTL)
+	if err != nil {
+		c.log.Error("failed to claim fence, leaving it to the reconciliation sweep",
+			"node", nodeID, "error", err)
 		return
 	}
-	c.activeFences[nodeID] = time.Now()
-	c.mu.Unlock()
-
+	if !won {
+		c.log.Info("fence already claimed by another controller", "node", nodeID)
+		return
+	}
 	defer func() {
-		c.mu.Lock()
-		delete(c.activeFences, nodeID)
-		c.mu.Unlock()
+		if rerr := c.store.ReleaseFenceClaim(context.Background(), leaseID); rerr != nil {
+			c.log.Warn("failed to release fence claim, it will expire with its lease",
+				"node", nodeID, "error", rerr)
+		}
 	}()
 
 	c.log.Info("fencing node", "node_id", nodeID, "instance_id", instanceID)
@@ -130,15 +164,10 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string) {
 	// anyway: an uncut node the cluster believes is fenced is more dangerous
 	// than one it knows it has not fenced.
 	//
-	// This does NOT retry automatically. The watch that triggers fenceNode
-	// fires once, on the membership key's DELETE event; that key is already
-	// gone, so no further event exists to re-trigger on. A failed fence
-	// leaves the node in the limbo state external-fencing-controller.md
-	// describes — generation not bumped, requiring either the node's own
-	// self-fencing watchdog to have already stopped it, or operator
-	// intervention. No periodic reconciliation sweep exists to retry a failed
-	// fence; building one is out of scope here and is not implied by
-	// anything above.
+	// A failed fence is retried, not abandoned: the fence_pending intent
+	// recorded before this point outlives the attempt, and the reconciliation
+	// sweep re-runs it until the generation is bumped or the node re-registers.
+	// Every return path below therefore leaves the intent in place.
 	if c.fencer != nil {
 		if err := c.fencer.Fence(ctx, nodeID, instanceID); err != nil {
 			c.log.Error("device access not confirmed severed, NOT bumping generation",
@@ -162,7 +191,63 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string) {
 		return
 	}
 
+	// Only now is the fence complete, so only now is nothing owed.
+	if err := c.store.ClearFenceIntent(ctx, nodeID); err != nil {
+		c.log.Warn("fence complete but intent not cleared, sweep will re-fence harmlessly",
+			"node", nodeID, "error", err)
+	}
+
 	c.log.Info("node fenced", "node_id", nodeID, "generation", newGen, "previous", currentGen)
+}
+
+// runSweep periodically retries fences that were never completed.
+//
+// Blocks until ctx is cancelled.
+func (c *Controller) runSweep(ctx context.Context) {
+	ticker := time.NewTicker(c.sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.reconcile(ctx)
+		}
+	}
+}
+
+// reconcile retries every fence still recorded as owed.
+//
+// A node that has re-registered is no longer owed one: it holds a live
+// membership lease again, which means its own self-fencing watchdog did not
+// stop it and it is reachable from etcd. Fencing it at that point would sever
+// a healthy node's device access on the strength of an expiry it has already
+// recovered from — and the epoch separation the generation provides is only
+// needed against a node that cannot be told it is gone.
+func (c *Controller) reconcile(ctx context.Context) {
+	intents, err := c.store.ListFenceIntents(ctx)
+	if err != nil {
+		c.log.Error("fence reconciliation sweep failed to list intents", "error", err)
+		return
+	}
+	for nodeID, instanceID := range intents {
+		alive, err := c.store.Get(ctx, metadata.MembershipKey(nodeID))
+		if err != nil {
+			c.log.Error("fence reconciliation sweep: cannot read membership",
+				"node", nodeID, "error", err)
+			continue
+		}
+		if alive != nil {
+			c.log.Info("node re-registered before its fence completed, dropping intent",
+				"node", nodeID)
+			if err := c.store.ClearFenceIntent(ctx, nodeID); err != nil {
+				c.log.Warn("failed to drop fence intent", "node", nodeID, "error", err)
+			}
+			continue
+		}
+		c.log.Warn("retrying incomplete fence", "node", nodeID, "instance", instanceID)
+		c.fenceNode(ctx, nodeID, instanceID)
+	}
 }
 
 // extractNodeID extracts the node ID from a membership key.

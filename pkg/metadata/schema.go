@@ -39,6 +39,10 @@ const (
 	PrefixGen        = "gen:"
 	PrefixArenaLog   = "arena_alloc_log"
 
+	// Fencing control plane — see fence.go.
+	PrefixFencePending = "fence_pending:"
+	PrefixFenceClaim   = "fence_claim:"
+
 	KeyInodeAllocCounter = "inode_alloc_counter"
 )
 
