@@ -40,6 +40,7 @@ type Result struct {
 	Detail  string
 	Ino     uint64
 	DiskOff uint64
+	Length  uint64 // length of the disk range, when the finding refers to one
 	Key     string // etcd key the finding refers to, when it is a single key
 	AutoFix bool   // true if the scrubber can safely remediate
 }
@@ -51,11 +52,27 @@ type Scrubber struct {
 	nodeID    string
 	interval  time.Duration
 	rateLimit float64 // max fraction of foreground I/O bandwidth to use
+	reclaimer Reclaimer
 
 	mu           sync.Mutex
 	lastRun      time.Time
 	anomalies    []Result
 	totalChecked int64
+}
+
+// Reclaimer returns a disk range to the block allocator.  Implemented by
+// pkg/arena.Allocator, whose Free ignores ranges outside the arenas this node
+// owns — the free list is per-process and in-memory, so a node can only
+// reclaim its own space.  Ranges belonging to another node's arena stay
+// allocated until that node scrubs, or until the arena is compacted.
+//
+// ponytail: in-memory reclamation only, so a range freed here is lost again on
+// restart (Reconstruct rebuilds the bitmap from live extents, which no longer
+// include the deleted file, so the space does come back — but only for arenas
+// this node re-acquires).  Move to a durable free list if reclamation needs to
+// be visible cluster-wide.
+type Reclaimer interface {
+	Free(diskOff, size uint64)
 }
 
 // Logger is the logging interface used by the scrubber.
@@ -74,6 +91,13 @@ func New(store MetadataStore, nodeID string, interval time.Duration, log Logger)
 		interval:  interval,
 		rateLimit: 0.1, // default: 10% of I/O bandwidth
 	}
+}
+
+// SetReclaimer attaches the block allocator whose space the scrubber may
+// return on an auto-fix.  Without one the scrubber still deletes orphaned
+// extent records, but their blocks stay allocated.
+func (s *Scrubber) SetReclaimer(r Reclaimer) {
+	s.reclaimer = r
 }
 
 // Run starts the scrub loop.  Blocks until ctx is cancelled.
@@ -118,9 +142,20 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	s.mu.Unlock()
 
 	for _, r := range orphans {
-		if r.AutoFix {
-			s.log.Info("scrub auto-fix: reclaiming orphan extent", "detail", r.Detail)
-			_ = s.store.Delete(ctx, r.Key)
+		if !r.AutoFix {
+			continue
+		}
+		s.log.Info("scrub auto-fix: reclaiming orphan extent", "detail", r.Detail)
+		// Delete first: the blocks must stop being reachable through metadata
+		// before they can be handed to another allocation, or a reader
+		// resolving the extent could land on data already overwritten.
+		if err := s.store.Delete(ctx, r.Key); err != nil {
+			s.log.Error("scrub auto-fix: orphan extent not deleted, blocks not reclaimed",
+				"key", r.Key, "error", err)
+			continue
+		}
+		if s.reclaimer != nil && r.Length > 0 {
+			s.reclaimer.Free(r.DiskOff, r.Length)
 		}
 	}
 
@@ -180,10 +215,19 @@ func (s *Scrubber) CheckOrphanExtents(ctx context.Context) []Result {
 		// Check if the inode exists
 		val, _ := s.store.Get(ctx, metadata.InodeKey(ino))
 		if val == nil {
+			// The disk range is carried along, not just the key: deleting the
+			// extent record makes the metadata clean but leaves the blocks
+			// behind it marked allocated forever.  Reclaiming them is what
+			// makes deletion actually return space.  A malformed value yields
+			// a zero range, and Free ignores ranges outside this node's own
+			// arenas, so the metadata cleanup still happens either way.
+			ext, _ := metadata.DecodeExtent(key, kv.Value)
 			results = append(results, Result{
 				Type:    "orphan",
 				Detail:  fmt.Sprintf("extent %s has no inode reference", key),
 				Ino:     ino,
+				DiskOff: ext.DiskOff,
+				Length:  ext.Length,
 				Key:     key,
 				AutoFix: true,
 			})

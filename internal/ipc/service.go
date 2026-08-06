@@ -66,6 +66,12 @@ func (s *Service) SetWAL(w *wal.WAL) {
 	s.wal = w
 }
 
+// Allocator returns this node's block allocator, so background passes (the
+// scrubber's orphan reclamation) can return disk ranges to it.
+func (s *Service) Allocator() *arena.Allocator {
+	return s.alloc
+}
+
 func (s *Service) FreeBlock(diskOff, length uint64) {
 	s.alloc.Free(diskOff, length)
 }

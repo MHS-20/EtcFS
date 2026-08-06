@@ -188,6 +188,10 @@ func main() {
 
 	// Start background scrubber (checks every 30s)
 	scrubber := scrub.New(store, cfg.NodeID, 30*time.Second, log)
+	// Without this the scrubber deletes an unlinked file's dangling extent
+	// records but never returns their blocks, so disk space leaks on every
+	// deletion.
+	scrubber.SetReclaimer(svc.Allocator())
 	go scrubber.Run(ctx)
 
 	// Start background compactor (checks hourly)
