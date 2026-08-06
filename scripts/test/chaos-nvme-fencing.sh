@@ -21,6 +21,12 @@
 #       and becomes writable again
 #   R8  a volume detach/reattach cycle does not silently leave a node
 #       registered-but-unable-to-write, nor writable-but-unregistered
+#   R9  a confirmed preempt is exactly the invariant-4 proof arena
+#       reclamation needs (docs/TODO-hardening.md § 6): once R3-R5 confirm
+#       n1 is preempted AND fenced, pkg/fencing.Controller must release its
+#       arena — this is the one fencing mode where that reclaim is safe to
+#       fire, unlike the docker/single-signal case chaos-arena-reclaim.sh's
+#       R4 covers.
 #
 # This is AWS-only and cannot be moved to Docker: loopback devices support no
 # NVMe reservation commands at all. It is the only script that exercises
@@ -98,6 +104,16 @@ gen_val() {
         2>/dev/null | tr -d '[:space:]'
 }
 
+# arena_id <node_key> — this node's arena:<node_key> record, decoded from the
+# 8-byte big-endian value, queried via n2 (never partitioned here) for the
+# same reason gen_val is. "none" if no record.
+arena_id() {
+    timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$N2" \
+        "/usr/local/bin/etcdctl --endpoints=http://$P1_PRIV:2379,http://$P2_PRIV:2379,http://$P3_PRIV:2379 get arena:$1 --print-value-only --hex" \
+        2>/dev/null | tr -d '"\\x' | tr -d '\n' |
+        awk '{ if (length($0)) print strtonum("0x" $0); else print "none" }'
+}
+
 if ! provision_cluster; then
     log "FATAL: provision failed"
     teardown_cluster
@@ -150,6 +166,9 @@ else
     bad "concurrent active/active writes under WEAR failed"
     teardown_cluster; exit 1
 fi
+
+ARENA1_BEFORE=$(arena_id n1)
+log "n1 owns arena $ARENA1_BEFORE before partition (checked for R9's reclaim-after-fence assertion)"
 
 log "======== Partitioning n1 from etcd peers (n2, n3) via iptables ========"
 # SG swaps do not sever established connections; iptables does. Same technique
@@ -232,6 +251,37 @@ if [[ "$PREEMPTED" -eq 1 && -n "$GEN1" && "$GEN1" != "0" ]]; then
     ok "device-enforced fencing held: preempt confirmed AND generation bumped, in that order"
 else
     bad "fencing did not complete: preempted=$PREEMPTED gen=$GEN1"
+fi
+
+log "======== R9: confirmed preempt lets the controller reclaim n1's arena ========"
+if [[ "$ARENA1_BEFORE" == "none" ]]; then
+    bad "n1 had no arena before the fence — R2's baseline write should have given it one, cannot test reclaim"
+else
+    # pkg/fencing.Controller reclaims the arena synchronously inside fenceNode,
+    # right after the generation bump — TestController_ReclaimsArenaAfterConfirmedFence
+    # (pkg/fencing/controller_integration_test.go) proves this completes in
+    # well under a second against real etcd. A per-iteration ssh+etcdctl poll
+    # here adds enough of its own round-trip jitter to be an unreliable clock
+    # for something that fast, so this checks both keys in one ssh call after
+    # a fixed settle instead of racing a loop against the network.
+    sleep 10
+    STATE=$(timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$N2" \
+        "ETCDCTL_ENDPOINTS=http://$P1_PRIV:2379,http://$P2_PRIV:2379,http://$P3_PRIV:2379; \
+         echo ARENA=\$(/usr/local/bin/etcdctl --endpoints=\$ETCDCTL_ENDPOINTS get arena:n1 --print-value-only --hex); \
+         echo FREE=\$(/usr/local/bin/etcdctl --endpoints=\$ETCDCTL_ENDPOINTS get free_arena:$ARENA1_BEFORE --print-value-only)" \
+        2>/dev/null)
+    log "  post-fence state: $(echo "$STATE" | tr '\n' ' ')"
+
+    if grep -q '^ARENA=$' <<< "$STATE"; then
+        ok "n1's arena $ARENA1_BEFORE released (arena:n1 gone) shortly after the confirmed preempt"
+    else
+        bad "n1's arena $ARENA1_BEFORE still owned 10s after a confirmed preempt+gen bump — reclaim did not fire"
+    fi
+    if grep -q '^FREE=free$' <<< "$STATE"; then
+        ok "arena $ARENA1_BEFORE is in the free pool, reachable by the next node that needs space"
+    else
+        bad "arena $ARENA1_BEFORE not found in free_arena: pool — released from n1 but not returned to circulation"
+    fi
 fi
 
 log "======== R6: survivors unaffected ========"

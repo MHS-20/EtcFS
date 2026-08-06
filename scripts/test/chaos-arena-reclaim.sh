@@ -19,13 +19,17 @@
 #        Docker/gp3 case) has no proof the fenced node's kernel stopped
 #        writing, so its arena must NOT be reclaimed. Verifies the guard
 #        that gates reclamation on invariant 4 rather than assuming it.
+#        Docker-only: needs container-level kill/inspect that has no AWS
+#        equivalent here. R4's counterpart on AWS — arena reclaim IS safe
+#        once a NVMeFencer confirms the preempt — is R9 in
+#        chaos-nvme-fencing.sh, which has the real reservation hardware
+#        this script cannot provide.
 #
-# Docker-only. R4's counterpart on AWS (arena reclaim IS safe once a
-# NVMeFencer confirms the preempt) is R9 in chaos-nvme-fencing.sh, since it
-# needs the real reservation hardware this script cannot provide.
+# R1/R2/R3 are mode-agnostic (writef/readf/add_node/remove_node/etcdctl_on
+# all abstract over docker vs ssh in chaos-lib.sh) and run on both.
 #
 # Usage:
-#   ./chaos-arena-reclaim.sh docker [scenario|all]
+#   ./chaos-arena-reclaim.sh docker|aws [scenario|all]
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -35,7 +39,7 @@ PASS=0; FAIL=0
 
 MODE="${1:-docker}"
 SCENARIO="${2:-all}"
-[[ "$MODE" == "docker" ]] || { echo "usage: $0 docker [scenario|all]  (aws counterpart: chaos-nvme-fencing.sh R9)"; exit 1; }
+[[ "$MODE" == "docker" || "$MODE" == "aws" ]] || { echo "usage: $0 docker|aws [scenario|all]"; exit 1; }
 
 log() { echo "[$(date +%H:%M:%S)] $1" | tee -a "$REPORT_DIR/chaos.log"; }
 logerr() {
@@ -183,6 +187,11 @@ scenario_r3() {
 
 scenario_r4() {
     log "======== R4: single-signal fence leaves the arena leaked (no proof of quiescence) ========"
+
+    if [[ "$MODE" != "docker" ]]; then
+        log "  skipped: R4 needs docker kill/inspect, not available in $MODE mode. See chaos-nvme-fencing.sh R9 for the AWS counterpart."
+        return
+    fi
 
     local node4; node4=$(add_node 4)
     if [[ -z "$node4" ]]; then fail "node4 failed to join — cannot run R4"; return; fi

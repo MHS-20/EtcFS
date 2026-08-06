@@ -314,3 +314,52 @@ func TestController_WatchPathFencesWithoutARecordedIntent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), gen)
 }
+
+// A confirmed device fence must reclaim the fenced node's arena, and must do
+// so as part of fenceNode itself — not eventually, via the sweep or anything
+// else. See docs/TODO-hardening.md § 6: reclaim is gated on Fencer
+// confirmation because that confirmation is the invariant-4 proof (device
+// already rejects the node's writes) that makes immediate reissue safe.
+func TestController_ReclaimsArenaAfterConfirmedFence(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	t.Cleanup(func() {
+		store.Client().Delete(ctx, metadata.PrefixArena, clientv3.WithPrefix())
+		store.Client().Delete(ctx, metadata.PrefixFreeArena, clientv3.WithPrefix())
+	})
+	stub := &stubFencer{}
+	c.SetFencer(stub)
+
+	_, err := store.Put(ctx, metadata.ArenaKey("dead-node"), metadata.EncodeUint64(7))
+	require.NoError(t, err)
+
+	start := time.Now()
+	c.fenceNode(ctx, "dead-node", "i-0123456789", false)
+	elapsed := time.Since(start)
+
+	v, err := store.Get(ctx, metadata.ArenaKey("dead-node"))
+	require.NoError(t, err)
+	assert.Nil(t, v, "arena:dead-node must be gone once fenceNode returns, took %s", elapsed)
+
+	free, err := store.Get(ctx, metadata.FreeArenaKey(7))
+	require.NoError(t, err)
+	assert.NotNil(t, free, "arena 7 must be in the free pool once fenceNode returns")
+}
+
+// Single-signal mode (no Fencer) has no proof the fenced node's kernel
+// stopped writing, so its arena must be left alone.
+func TestController_DoesNotReclaimArenaWithoutFencer(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	t.Cleanup(func() {
+		store.Client().Delete(ctx, metadata.PrefixArena, clientv3.WithPrefix())
+		store.Client().Delete(ctx, metadata.PrefixFreeArena, clientv3.WithPrefix())
+	})
+
+	_, err := store.Put(ctx, metadata.ArenaKey("dead-node"), metadata.EncodeUint64(7))
+	require.NoError(t, err)
+
+	c.fenceNode(ctx, "dead-node", "i-0123456789", false)
+
+	v, err := store.Get(ctx, metadata.ArenaKey("dead-node"))
+	require.NoError(t, err)
+	assert.NotNil(t, v, "arena:dead-node must survive a single-signal fence — no severance proof exists")
+}
