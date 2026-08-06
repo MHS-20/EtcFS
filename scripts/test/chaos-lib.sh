@@ -294,14 +294,22 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         [[ -n "$dev" ]] || dev=/dev/nvme1n1
         runcmd60 "$1" "
           sudo killall -9 etcfuse-meta etcfuse 2>/dev/null
-          sudo umount -l /mnt/etcfuse 2>/dev/null
           sleep 1
+          # Plain umount, not -l: the server holding /dev/fuse is already
+          # dead (killed above), so the mount is no longer busy and a normal
+          # unmount clears it immediately. -l detaches from the namespace but
+          # defers the actual teardown, which raced the fresh mount attempt
+          # right after it and produced an FS session the kernel considered
+          # aborted (ECONNABORTED on the first I/O through the new daemon).
+          # Retried because the kernel can take a moment past the kill to let
+          # go of the fd.
+          for k in \$(seq 1 5); do sudo umount /mnt/etcfuse 2>/dev/null && break; sleep 1; done
           sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
           sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s --block-device=$dev --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
           for k in \$(seq 1 10); do [ -S /tmp/etcfuse.sock ] && break; sleep 1; done
           sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
-          for k in \$(seq 1 20); do sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0; sleep 1; done
-          echo FAIL
+          for k in \$(seq 1 30); do sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0; sleep 1; done
+          echo 'FAIL'; echo '--- meta.log tail ---'; sudo tail -15 /tmp/meta.log 2>/dev/null; echo '--- fuse.log tail ---'; sudo tail -15 /tmp/fuse.log 2>/dev/null
         "
     }
 

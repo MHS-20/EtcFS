@@ -312,7 +312,15 @@ else
     bad "n1 did not re-register after restart — a rejoined node would be silently unable to write"
 fi
 
-if writef "$N1" "post-rejoin" "nvme-rejoin.txt" && [[ -n "$(readf "$N2" "nvme-rejoin.txt")" ]]; then
+# check_mount first: writef's "cat > /mnt/etcfuse/<file>" succeeds even with
+# nothing mounted there — /mnt/etcfuse is a real directory, so an unmounted
+# write silently lands on n1's local root filesystem instead of failing, and
+# the readf-on-N2 half then reports a misleading "n1 could not write" when
+# the real problem is n1 never remounted at all. Failing fast on that here
+# points at the actual fault (see restart_daemons(n1) output above) instead.
+if ! check_mount "$N1"; then
+    bad "n1's FUSE mount did not come back after restart — see restart_daemons(n1) output above"
+elif writef "$N1" "post-rejoin" "nvme-rejoin.txt" && [[ -n "$(readf "$N2" "nvme-rejoin.txt")" ]]; then
     ok "n1 is writable again after rejoin, and its writes are visible cluster-wide"
 else
     bad "n1 could not write after rejoining"
