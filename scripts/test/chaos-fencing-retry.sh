@@ -62,24 +62,6 @@ gen_val()          { etcdctl_on get "gen:$1" --print-value-only 2>/dev/null | tr
 fence_pending_val() { etcdctl_on get "fence_pending:$1" --print-value-only 2>/dev/null | tr -d '[:space:]'; }
 fence_claim_present() { etcdctl_on get "fence_claim:$1" --print-value-only 2>/dev/null | grep -qv '^$'; }
 
-# writef_retry — the docker single-node compose stack shares one 1GiB
-# loopback file across all three nodes and is rebuilt fresh on every
-# provision_cluster call in this script; back-to-back scenario runs on a
-# loaded dev host observed a transient "no space left on device" on the very
-# first write immediately after `docker compose up --build`, unrelated to
-# EtcFS's own arena accounting (nothing about it appears in the meta daemon
-# logs — the write never reaches the arena allocator). Retrying tolerates
-# that startup jitter without masking a real fencing failure, which would
-# fail every attempt, not just the first.
-writef_retry() {
-    local node="$1" content="$2" name="$3" attempt
-    for attempt in 1 2 3; do
-        writef "$node" "$content" "$name" && return 0
-        sleep 5
-    done
-    return 1
-}
-
 # sweepInterval in pkg/fencing/controller.go is 30s; wait a full cycle plus
 # margin for the sweep to have actually ticked and completed.
 wait_sweep() { sleep 40; }
@@ -174,9 +156,18 @@ run_r2() {
 # ============================================================
 run_r3_docker() {
     log "======== R3: real node death, watch-path fence, exactly-once + clean keys ========"
-    etcdctl_on del "gen:n1" >/dev/null 2>&1
+    # Deliberately NOT deleting gen:n1 to get a clean baseline. n1 is still
+    # live here, and WithGenerationGuard compares that key's VALUE — a value
+    # comparison against a missing key always evaluates false, so removing it
+    # rejects every guarded write from n1 as ErrFenced, which allocInode
+    # surfaces to FUSE as -ENOSPC. That is what "no space left on device" on
+    # the baseline write meant when this script first deleted the key; it was
+    # the script fencing the node it was about to test, not a disk problem.
+    # Read the baseline instead and assert the delta.
+    local gen_before; gen_before=$(gen_val n1); gen_before=${gen_before:-0}
+    log "  gen:n1 before the kill: $gen_before"
 
-    if writef_retry "$N1" "pre-kill" "retry-r3.txt" && [[ -n "$(readf "$N2" retry-r3.txt)" ]]; then
+    if writef "$N1" "pre-kill" "retry-r3.txt" && [[ -n "$(readf "$N2" retry-r3.txt)" ]]; then
         ok "baseline write on n1, visible from n2"
     else
         bad "baseline write failed"; return
@@ -189,20 +180,20 @@ run_r3_docker() {
     # docker (no EBS/NVMe device to confirm against) — bound generously.
     local deadline=90 waited=0 gen=""
     while [[ "$waited" -lt "$deadline" ]]; do
-        gen=$(gen_val n1)
-        [[ -n "$gen" && "$gen" != "0" ]] && break
+        gen=$(gen_val n1); gen=${gen:-0}
+        [[ "$gen" -gt "$gen_before" ]] && break
         sleep 5; waited=$((waited+5))
     done
 
-    if [[ -n "$gen" && "$gen" != "0" ]]; then
-        ok "gen:n1 bumped to $gen after ~${waited}s (watch-path fence)"
+    if [[ "$gen" -gt "$gen_before" ]]; then
+        ok "gen:n1 bumped $gen_before -> $gen after ~${waited}s (watch-path fence)"
     else
-        bad "gen:n1 never bumped after ${deadline}s"
+        bad "gen:n1 never bumped past $gen_before after ${deadline}s (still $gen)"
     fi
-    if [[ "$gen" == "1" ]]; then
-        ok "fenced exactly once (gen=1, not higher — no duplicate bump from a second controller)"
+    if [[ "$gen" -eq $((gen_before + 1)) ]]; then
+        ok "fenced exactly once (one bump from $gen_before, no duplicate from a second controller)"
     else
-        bad "gen:n1=$gen — expected exactly 1, duplicate fencing or stale state"
+        bad "gen:n1=$gen — expected exactly $((gen_before + 1)), duplicate fencing"
     fi
 
     local pending; pending=$(fence_pending_val n1)
@@ -228,9 +219,18 @@ run_r3_docker() {
 
 run_r3_aws() {
     log "======== R3: real node death, watch-path fence, exactly-once + clean keys ========"
-    etcdctl_on del "gen:n1" >/dev/null 2>&1
+    # Deliberately NOT deleting gen:n1 to get a clean baseline. n1 is still
+    # live here, and WithGenerationGuard compares that key's VALUE — a value
+    # comparison against a missing key always evaluates false, so removing it
+    # rejects every guarded write from n1 as ErrFenced, which allocInode
+    # surfaces to FUSE as -ENOSPC. That is what "no space left on device" on
+    # the baseline write meant when this script first deleted the key; it was
+    # the script fencing the node it was about to test, not a disk problem.
+    # Read the baseline instead and assert the delta.
+    local gen_before; gen_before=$(gen_val n1); gen_before=${gen_before:-0}
+    log "  gen:n1 before the kill: $gen_before"
 
-    if writef_retry "$N1" "pre-kill" "retry-r3.txt" && [[ -n "$(readf "$N2" retry-r3.txt)" ]]; then
+    if writef "$N1" "pre-kill" "retry-r3.txt" && [[ -n "$(readf "$N2" retry-r3.txt)" ]]; then
         ok "baseline write on n1, visible from n2"
     else
         bad "baseline write failed"; return
@@ -241,20 +241,20 @@ run_r3_aws() {
 
     local deadline=150 waited=0 gen=""
     while [[ "$waited" -lt "$deadline" ]]; do
-        gen=$(gen_val n1)
-        [[ -n "$gen" && "$gen" != "0" ]] && break
+        gen=$(gen_val n1); gen=${gen:-0}
+        [[ "$gen" -gt "$gen_before" ]] && break
         sleep 5; waited=$((waited+5))
     done
 
-    if [[ -n "$gen" && "$gen" != "0" ]]; then
-        ok "gen:n1 bumped to $gen after ~${waited}s (watch-path fence)"
+    if [[ "$gen" -gt "$gen_before" ]]; then
+        ok "gen:n1 bumped $gen_before -> $gen after ~${waited}s (watch-path fence)"
     else
-        bad "gen:n1 never bumped after ${deadline}s"
+        bad "gen:n1 never bumped past $gen_before after ${deadline}s (still $gen)"
     fi
-    if [[ "$gen" == "1" ]]; then
-        ok "fenced exactly once (gen=1, not higher)"
+    if [[ "$gen" -eq $((gen_before + 1)) ]]; then
+        ok "fenced exactly once (one bump from $gen_before)"
     else
-        bad "gen:n1=$gen — expected exactly 1"
+        bad "gen:n1=$gen — expected exactly $((gen_before + 1))"
     fi
 
     local pending; pending=$(fence_pending_val n1)
@@ -281,10 +281,14 @@ run_r4_aws() {
     vol_id=$(jq -r '.volume_id' "$PROJECT_ROOT/$STATE_FILE")
     inst1=$(jq -r '.compute_instance_ids[0]' "$PROJECT_ROOT/$STATE_FILE")
 
-    etcdctl_on del "gen:n1" >/dev/null 2>&1
+    # See run_r3_*: gen:n1 must NOT be deleted while n1 is live, or n1's own
+    # guarded writes fail as ErrFenced (surfacing as -ENOSPC) before the test
+    # even starts. Baseline the value and assert the delta instead.
     etcdctl_on del "fence_pending:n1" >/dev/null 2>&1
+    local gen_before; gen_before=$(gen_val n1); gen_before=${gen_before:-0}
+    log "  gen:n1 before the deny: $gen_before"
 
-    if writef_retry "$N1" "pre-deny" "retry-r4.txt" && [[ -n "$(readf "$N2" retry-r4.txt)" ]]; then
+    if writef "$N1" "pre-deny" "retry-r4.txt" && [[ -n "$(readf "$N2" retry-r4.txt)" ]]; then
         ok "baseline write on n1, visible from n2"
     else
         bad "baseline write failed"; return
@@ -341,11 +345,11 @@ EOF
     # before checking — PollTimeout in EBSDetacher plus the DetachVolume call
     # itself denied outright, so this should be fast, but leave margin.
     sleep 20
-    gen=$(gen_val n1)
-    if [[ -z "$gen" || "$gen" == "0" ]]; then
-        ok "generation NOT bumped while detach is denied (gen='$gen') — failure did not get papered over"
+    gen=$(gen_val n1); gen=${gen:-0}
+    if [[ "$gen" -eq "$gen_before" ]]; then
+        ok "generation NOT bumped while detach is denied (still $gen) — failure did not get papered over"
     else
-        bad "generation bumped to $gen despite denied detach — dual confirmation was bypassed"
+        bad "generation bumped $gen_before -> $gen despite denied detach — dual confirmation was bypassed"
     fi
 
     log "  restoring ec2:DetachVolume permission..."
@@ -359,15 +363,15 @@ EOF
     # AWS API round trip.
     deadline=150; waited=0
     while [[ "$waited" -lt "$deadline" ]]; do
-        gen=$(gen_val n1)
-        [[ -n "$gen" && "$gen" != "0" ]] && break
+        gen=$(gen_val n1); gen=${gen:-0}
+        [[ "$gen" -gt "$gen_before" ]] && break
         sleep 10; waited=$((waited+10))
     done
 
-    if [[ -n "$gen" && "$gen" != "0" ]]; then
-        ok "sweep completed the fence after permission was restored (gen=$gen, ~${waited}s after restore)"
+    if [[ "$gen" -gt "$gen_before" ]]; then
+        ok "sweep completed the fence after permission was restored ($gen_before -> $gen, ~${waited}s after restore)"
     else
-        bad "sweep never completed the fence after ${deadline}s post-restore"
+        bad "sweep never completed the fence after ${deadline}s post-restore (still $gen)"
     fi
     pending=$(fence_pending_val n1)
     [[ -z "$pending" ]] && ok "fence_pending:n1 cleared" || bad "fence_pending:n1 still present ('$pending')"
