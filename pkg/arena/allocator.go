@@ -56,7 +56,7 @@ func NewAllocator(nodeID string, store *metadata.Store) *Allocator {
 // AcquireArena reserves a new arena from the global pool via etcd.
 // The arena is leased exclusively to this node.
 func (a *Allocator) AcquireArena(ctx context.Context) (*Arena, error) {
-	arenaID, err := a.allocateArenaID(ctx)
+	arenaID, reused, err := a.allocateArenaID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("acquire arena: %w", err)
 	}
@@ -78,6 +78,20 @@ func (a *Allocator) AcquireArena(ctx context.Context) (*Arena, error) {
 		bitmap:    make([]uint64, BlocksPerArena/64),
 	}
 
+	// A recycled arena is not an empty one.  A node that departs or is fenced
+	// returns its arena with its files' extents still live in it, so a fresh
+	// all-zero bitmap here would let Allocate hand out blocks that another
+	// inode's data already occupies — the same silent overwrite the arena
+	// scheme exists to prevent, just deferred to the next owner.  Only a
+	// never-issued arena is safe to assume empty.
+	if reused {
+		extents, err := a.store.AllExtents(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("acquire arena %d: read live extents: %w", arenaID, err)
+		}
+		markLiveExtents(free, extents)
+	}
+
 	a.mu.Lock()
 	a.arenas = append(a.arenas, free)
 	a.mu.Unlock()
@@ -85,9 +99,22 @@ func (a *Allocator) AcquireArena(ctx context.Context) (*Arena, error) {
 	return free, nil
 }
 
-// allocateArenaID reserves the next arena ID via etcd CAS.
-func (a *Allocator) allocateArenaID(ctx context.Context) (uint64, error) {
-	return a.store.NextCounter(ctx, metadata.PrefixArenaLog, 0)
+// allocateArenaID obtains an arena ID, preferring one already returned to the
+// global free pool over extending the device with a brand-new arena, and
+// reports which of the two it was.
+//
+// Preferring the pool is what makes reclamation mean anything: the arena
+// counter only ever grows, so without a claim here a freed arena's space is
+// never handed out again and the free_arena: keys accumulate as a record of
+// space nobody uses.  A failed claim is not fatal — falling through to a new
+// arena costs device space but always works, whereas failing the write that
+// triggered this would surface an etcd hiccup as an I/O error.
+func (a *Allocator) allocateArenaID(ctx context.Context) (id uint64, reused bool, err error) {
+	if id, ok, cerr := a.store.ClaimFreeArena(ctx); cerr == nil && ok {
+		return id, true, nil
+	}
+	id, err = a.store.NextCounter(ctx, metadata.PrefixArenaLog, 0)
+	return id, false, err
 }
 
 // Allocate finds and marks a contiguous range of blocks as allocated.
@@ -177,18 +204,25 @@ func (a *Allocator) Reconstruct(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, ext := range extents {
-		for _, free := range a.arenas {
-			if ext.WithinDisk(free.DiskStart, free.DiskEnd) {
-				start := (ext.DiskOff - free.DiskStart) / BlockSize
-				blocks := (ext.Length + BlockSize - 1) / BlockSize
-				for i := uint64(0); i < blocks && start+i < BlocksPerArena; i++ {
-					free.markAllocated(start + i)
-				}
-			}
-		}
+	for _, free := range a.arenas {
+		markLiveExtents(free, extents)
 	}
 	return nil
+}
+
+// markLiveExtents marks every block covered by an extent inside ar as
+// allocated, ignoring extents that live in another arena.
+func markLiveExtents(ar *Arena, extents []metadata.Extent) {
+	for _, ext := range extents {
+		if !ext.WithinDisk(ar.DiskStart, ar.DiskEnd) {
+			continue
+		}
+		start := (ext.DiskOff - ar.DiskStart) / BlockSize
+		blocks := (ext.Length + BlockSize - 1) / BlockSize
+		for i := uint64(0); i < blocks && start+i < BlocksPerArena; i++ {
+			ar.markAllocated(start + i)
+		}
+	}
 }
 
 // existingArenaIDs returns the arenas this node owns, read from its own

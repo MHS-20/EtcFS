@@ -2,7 +2,6 @@ package compaction
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -125,8 +124,7 @@ func (c *Compactor) CompactArena(ctx context.Context, srcArenaID, dstArenaID uin
 }
 
 func (c *Compactor) markGlobalArenaAvailable(ctx context.Context, arenaID uint64) {
-	key := fmt.Sprintf("%s%d", metadata.PrefixFreeArena, arenaID)
-	_, _ = c.Store.Put(ctx, key, []byte("free"))
+	_, _ = c.Store.Put(ctx, metadata.FreeArenaKey(arenaID), []byte("free"))
 }
 
 // markGlobalArenaAcquired records that nodeID owns arenaID.

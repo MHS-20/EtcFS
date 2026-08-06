@@ -107,8 +107,7 @@ func (m *Manager) LeaveGraceful(ctx context.Context) error {
 
 func (m *Manager) releaseArena(ctx context.Context, arenaID uint64) {
 	_ = m.Store.Delete(ctx, metadata.ArenaKey(m.NodeID))
-	freeKey := fmt.Sprintf("%s%d", metadata.PrefixFreeArena, arenaID)
-	_, _ = m.Store.Put(ctx, freeKey, []byte("free"))
+	_, _ = m.Store.Put(ctx, metadata.FreeArenaKey(arenaID), []byte("free"))
 }
 
 func (m *Manager) LeaveUngraceful(ctx context.Context) {
