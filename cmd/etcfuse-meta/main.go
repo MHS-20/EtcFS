@@ -159,18 +159,28 @@ func main() {
 
 	// Start external fencing controller
 	controller := fencing.NewController(store, membership, log)
-	if cfg.EBSVolumeID != "" {
+	// Fatal rather than degrading silently in either branch: an operator who
+	// asked for device-enforced or dual-confirmed fencing and quietly got the
+	// weaker single-signal guarantee has a gap that only shows up as
+	// corruption during an incident.
+	switch {
+	case cfg.NVMeReservations:
+		fencer, ferr := fencing.NewNVMeFencer(cfg.BlockDevice, cfg.NodeID)
+		if ferr != nil {
+			log.Fatal("cannot initialise NVMe reservation fencing",
+				"device", cfg.BlockDevice, "error", ferr)
+		}
+		controller.SetFencer(fencer)
+		log.Info("external fencing: device-enforced (NVMe reservation preempt)",
+			"device", cfg.BlockDevice)
+	case cfg.EBSVolumeID != "":
 		detacher, derr := fencing.NewEBSDetacher(ctx, cfg.EBSVolumeID)
 		if derr != nil {
-			// Fatal rather than degrading silently: an operator who passed
-			// --ebs-volume-id is asking for dual-confirmed fencing, and
-			// quietly running with the weaker single-signal guarantee is the
-			// kind of gap that only shows up as corruption during an incident.
 			log.Fatal("cannot initialise EBS fencing", "volume", cfg.EBSVolumeID, "error", derr)
 		}
-		controller.SetDetacher(detacher)
+		controller.SetFencer(detacher)
 		log.Info("external fencing: dual-confirmed (EBS detach + poll)", "volume", cfg.EBSVolumeID)
-	} else {
+	default:
 		log.Warn("external fencing: single-signal (generation bump on lease expiry only); " +
 			"pass --ebs-volume-id to detach the shared volume before bumping")
 	}

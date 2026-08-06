@@ -52,15 +52,17 @@ func testController(t *testing.T, nodeID string) (*Controller, *metadata.Store, 
 	return NewController(store, mem, config.NewLogger(0)), store, context.Background()
 }
 
-// stubDetacher records what it was asked to do and fails on demand.
-type stubDetacher struct {
+// stubFencer records what it was asked to do and fails on demand.
+type stubFencer struct {
 	called     int
+	nodeID     string
 	instanceID string
 	err        error
 }
 
-func (s *stubDetacher) DetachAndConfirm(_ context.Context, instanceID string) error {
+func (s *stubFencer) Fence(_ context.Context, nodeID, instanceID string) error {
 	s.called++
+	s.nodeID = nodeID
 	s.instanceID = instanceID
 	return s.err
 }
@@ -70,12 +72,13 @@ func (s *stubDetacher) DetachAndConfirm(_ context.Context, instanceID string) er
 // node's arenas while the node might still be writing to them.
 func TestController_BumpsOnlyAfterConfirmedDetach(t *testing.T) {
 	c, store, ctx := testController(t, "controller-node")
-	stub := &stubDetacher{}
-	c.SetDetacher(stub)
+	stub := &stubFencer{}
+	c.SetFencer(stub)
 
 	c.fenceNode(ctx, "dead-node", "i-0123456789")
 
-	assert.Equal(t, 1, stub.called, "detach must be attempted")
+	assert.Equal(t, 1, stub.called, "the fence must be attempted")
+	assert.Equal(t, "dead-node", stub.nodeID)
 	assert.Equal(t, "i-0123456789", stub.instanceID)
 
 	gen, err := store.GetGeneration(ctx, "dead-node")
@@ -89,8 +92,8 @@ func TestController_BumpsOnlyAfterConfirmedDetach(t *testing.T) {
 // its arenas and locks.
 func TestController_DoesNotBumpWhenDetachFails(t *testing.T) {
 	c, store, ctx := testController(t, "controller-node")
-	stub := &stubDetacher{err: errors.New("still attached after 60s")}
-	c.SetDetacher(stub)
+	stub := &stubFencer{err: errors.New("still attached after 60s")}
+	c.SetFencer(stub)
 
 	c.fenceNode(ctx, "wedged-node", "i-0123456789")
 
@@ -104,23 +107,24 @@ func TestController_DoesNotBumpWhenDetachFails(t *testing.T) {
 
 // A node whose membership key predates instance-ID recording (rolling
 // upgrade) cannot be detached, so it must not be reported as fenced either.
+// The instance ID is the EBS path's requirement, not the controller's — an
+// NVMeFencer needs no instance at all — so the refusal now comes from the
+// detacher, and this test drives the real one to prove the controller honours
+// it.
 func TestController_DoesNotBumpWithoutInstanceID(t *testing.T) {
 	c, store, ctx := testController(t, "controller-node")
-	stub := &stubDetacher{}
-	c.SetDetacher(stub)
+	c.SetFencer(&EBSDetacher{api: &fakeEC2{}, volumeID: "vol-test"})
 
 	c.fenceNode(ctx, "legacy-node", "")
-
-	assert.Zero(t, stub.called, "cannot attempt a detach without knowing the instance")
 
 	gen, err := store.GetGeneration(ctx, "legacy-node")
 	require.NoError(t, err)
 	assert.Equal(t, uint64(0), gen)
 }
 
-// Without a detacher configured (Docker, bare metal) the controller keeps its
+// Without a fencer configured (Docker, bare metal) the controller keeps its
 // previous single-signal behaviour rather than refusing to fence at all.
-func TestController_SingleSignalWhenNoDetacher(t *testing.T) {
+func TestController_SingleSignalWhenNoFencer(t *testing.T) {
 	c, store, ctx := testController(t, "controller-node")
 
 	c.fenceNode(ctx, "plain-node", "")

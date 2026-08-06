@@ -37,6 +37,12 @@ type Config struct {
 	// default, and the only option off EC2) leaves fencing single-signal.
 	EBSVolumeID   string
 	EC2InstanceID string
+
+	// NVMeReservations selects device-enforced fencing: peers preempt an
+	// expired node's NVMe reservation key on BlockDevice, and the device
+	// itself rejects that node's writes.  Takes precedence over EBSVolumeID,
+	// which is the weaker control-plane fallback.
+	NVMeReservations bool
 }
 
 // Parse reads CLI flags and returns a Config.
@@ -75,6 +81,8 @@ func Parse() *Config {
 		"Print filesystem statistics and exit")
 	flag.StringVar(&cfg.EBSVolumeID, "ebs-volume-id", "",
 		"Shared EBS volume ID; enables dual-confirmed external fencing (detach + poll) when set")
+	flag.BoolVar(&cfg.NVMeReservations, "nvme-reservations", false,
+		"Fence peers by preempting their NVMe reservation key on --block-device (requires a device supporting NVMe reservations, e.g. an EBS io2 Multi-Attach volume)")
 	flag.StringVar(&cfg.EC2InstanceID, "ec2-instance-id", "",
 		"This node's EC2 instance ID, recorded in its membership key so peers can detach the volume when it expires")
 
@@ -85,6 +93,11 @@ func Parse() *Config {
 	if cfg.NodeID == "" {
 		hostname, _ := os.Hostname()
 		cfg.NodeID = hostname
+	}
+
+	if cfg.NVMeReservations && cfg.BlockDevice == "" {
+		fmt.Fprintln(os.Stderr, "-nvme-reservations requires -block-device")
+		os.Exit(1)
 	}
 
 	d, err := time.ParseDuration(leaseTTL)

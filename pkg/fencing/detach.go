@@ -12,25 +12,31 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
-// VolumeDetacher severs a fenced node's access to the shared block device at
-// the infrastructure layer, and confirms the severance actually took effect.
+// Fencer severs a fenced node's access to the shared block device, and
+// confirms the severance actually took effect.
 //
 // This is the half of fencing that etcd cannot provide.  A generation bump
 // stops a fenced node from *publishing* anything, but it does not stop the
-// node's kernel from continuing to issue writes to the raw device — EBS
-// Multi-Attach has no equivalent of SCSI-3 persistent reservations, so
-// nothing at the storage layer will reject them.  Detaching the volume is the
-// only mechanism that makes those writes physically impossible rather than
-// merely unreachable.
+// node's kernel from continuing to issue writes to the raw device — only
+// something outside etcd can do that.  Two implementations exist:
 //
-// Implementations must be safe to call on a node that is already detached:
+//   - NVMeFencer preempts the node's NVMe reservation key on the shared
+//     namespace.  The device itself then rejects the node's writes,
+//     synchronously.  This is the preferred mechanism on EBS io2
+//     Multi-Attach volumes, which support the reservation command set.
+//   - EBSDetacher detaches the volume via the EC2 API.  Detachment is
+//     asynchronous, so it must be polled for confirmation; it remains the
+//     fallback for volume types with no reservation support.
+//
+// Implementations must be safe to call on a node that is already severed:
 // fencing is retried, and a node can expire more than once.
-type VolumeDetacher interface {
-	// DetachAndConfirm detaches the shared volume from instanceID and blocks
-	// until the detachment is confirmed by a separate read of the volume's
-	// state, or ctx expires.  Returning nil means the instance is confirmed
-	// to no longer hold an attachment.
-	DetachAndConfirm(ctx context.Context, instanceID string) error
+type Fencer interface {
+	// Fence severs nodeID's access to the shared device and blocks until the
+	// severance is confirmed, or ctx expires.  Returning nil means the node
+	// is confirmed unable to write.  instanceID is the node's EC2 instance,
+	// used only by implementations that work through the cloud control
+	// plane.
+	Fence(ctx context.Context, nodeID, instanceID string) error
 }
 
 // ec2API is the slice of the EC2 client this package uses, extracted so tests
@@ -84,7 +90,21 @@ func NewEBSDetacher(ctx context.Context, volumeID string) (*EBSDetacher, error) 
 	}, nil
 }
 
-// DetachAndConfirm implements VolumeDetacher.
+// Fence implements Fencer.  The node ID is unused: an EBS detach is addressed
+// by instance, not by node.
+func (d *EBSDetacher) Fence(ctx context.Context, _, instanceID string) error {
+	if instanceID == "" {
+		// Not merely an empty argument: it means the expired node never
+		// recorded an instance ID in its membership key, so there is nothing
+		// to detach and no way to confirm the node has stopped writing.
+		return fmt.Errorf("detach %s: no instance ID recorded for node", d.volumeID)
+	}
+	return d.DetachAndConfirm(ctx, instanceID)
+}
+
+// DetachAndConfirm detaches the shared volume from instanceID and blocks
+// until the detachment is confirmed by a separate read of the volume's state,
+// or ctx expires.
 //
 // The two steps are deliberately distinct, and the second is the one that
 // matters.  DetachVolume merely *requests* the detachment; treating its

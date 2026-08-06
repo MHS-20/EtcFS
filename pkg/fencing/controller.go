@@ -17,29 +17,30 @@ import (
 // expired node, which prevents any stale lock grants and marks the node
 // as fenced for the scrubber.
 //
-// Fencing is dual-signalled when a VolumeDetacher is configured: the lease
-// expiry is only a suspicion, and the generation is not bumped until the
-// shared volume is *confirmed* detached from the expired node.  Without a
-// detacher the controller degrades to single-signal fencing — bumping on
-// lease expiry alone — which is correct for Docker and single-host testing
-// where there is no volume to detach, but is a weaker guarantee: it stops the
-// node publishing metadata without stopping it writing bytes.  See
-// SetDetacher.
+// Fencing is dual-signalled when a Fencer is configured: the lease expiry is
+// only a suspicion, and the generation is not bumped until the expired node
+// is *confirmed* to have lost access to the shared device — by an NVMe
+// reservation preempt (NVMeFencer) or an EBS detach (EBSDetacher).  Without a
+// Fencer the controller degrades to single-signal fencing — bumping on lease
+// expiry alone — which is correct for Docker and single-host testing where
+// there is no shared device to cut off, but is a weaker guarantee: it stops
+// the node publishing metadata without stopping it writing bytes.  See
+// SetFencer.
 type Controller struct {
 	store      *metadata.Store
 	log        *config.Logger
 	nodeID     string
 	membership *metadata.Membership // own membership for leader election
-	detacher   VolumeDetacher       // nil = single-signal fencing
+	fencer     Fencer               // nil = single-signal fencing
 
 	mu           sync.Mutex
 	activeFences map[string]time.Time // nodeID → when fence started
 }
 
-// SetDetacher enables dual-confirmed fencing.  A nil detacher (the default)
+// SetFencer enables dual-confirmed fencing.  A nil fencer (the default)
 // leaves the controller in single-signal mode.
-func (c *Controller) SetDetacher(d VolumeDetacher) {
-	c.detacher = d
+func (c *Controller) SetFencer(f Fencer) {
+	c.fencer = f
 }
 
 // NewController creates a fencing controller.
@@ -115,8 +116,8 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string) {
 
 	c.log.Info("fencing node", "node_id", nodeID, "instance_id", instanceID)
 
-	// Detach the shared volume *before* bumping the generation, and only
-	// proceed once the detachment is confirmed.
+	// Cut the node off from the device *before* bumping the generation, and
+	// only proceed once that is confirmed.
 	//
 	// The order is the entire point.  Bumping first would advertise "this
 	// node is fenced, its arenas and locks may be reclaimed" while the node
@@ -125,31 +126,26 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string) {
 	// is the arena-collision hazard in kleppmann-stale-write-analysis.md, and
 	// no guard would catch it because both nodes pass their own checks.
 	//
-	// A failed detach therefore aborts the fence rather than falling back to
-	// bumping anyway: an unfenced node the cluster believes is fenced is more
-	// dangerous than one it knows it has not fenced.
+	// A failed fence therefore aborts rather than falling back to bumping
+	// anyway: an uncut node the cluster believes is fenced is more dangerous
+	// than one it knows it has not fenced.
 	//
 	// This does NOT retry automatically. The watch that triggers fenceNode
 	// fires once, on the membership key's DELETE event; that key is already
-	// gone, so no further event exists to re-trigger on. A failed detach
+	// gone, so no further event exists to re-trigger on. A failed fence
 	// leaves the node in the limbo state external-fencing-controller.md
 	// describes — generation not bumped, requiring either the node's own
 	// self-fencing watchdog to have already stopped it, or operator
 	// intervention. No periodic reconciliation sweep exists to retry a failed
-	// detach; building one is out of scope here and is not implied by
+	// fence; building one is out of scope here and is not implied by
 	// anything above.
-	if c.detacher != nil {
-		if instanceID == "" {
-			c.log.Error("cannot fence: no instance ID recorded for node, skipping generation bump",
-				"node", nodeID)
-			return
-		}
-		if err := c.detacher.DetachAndConfirm(ctx, instanceID); err != nil {
-			c.log.Error("volume detach not confirmed, NOT bumping generation",
+	if c.fencer != nil {
+		if err := c.fencer.Fence(ctx, nodeID, instanceID); err != nil {
+			c.log.Error("device access not confirmed severed, NOT bumping generation",
 				"node", nodeID, "instance", instanceID, "error", err)
 			return
 		}
-		c.log.Info("volume detach confirmed", "node", nodeID, "instance", instanceID)
+		c.log.Info("device access severance confirmed", "node", nodeID, "instance", instanceID)
 	}
 
 	// Get current generation
