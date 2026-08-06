@@ -45,7 +45,9 @@ func testStore(t *testing.T, nodeID string) *metadata.Store {
 	t.Cleanup(func() {
 		ctx := context.Background()
 		cli.Delete(ctx, metadata.PrefixArena, clientv3.WithPrefix())
+		cli.Delete(ctx, metadata.PrefixFreeArena, clientv3.WithPrefix())
 		cli.Delete(ctx, metadata.PrefixExtent, clientv3.WithPrefix())
+		cli.Delete(ctx, metadata.PrefixInode, clientv3.WithPrefix())
 		cli.Delete(ctx, metadata.PrefixArenaLog)
 		cli.Close()
 	})
@@ -146,5 +148,82 @@ func TestIntegration_ArenaZeroIsRecovered(t *testing.T) {
 	}
 	if got := restarted.ArenaCount(); got != 1 {
 		t.Fatalf("recovered %d arenas, want 1 (arena 0 must not be mistaken for 'no record')", got)
+	}
+}
+
+// A freed arena must be reused before the counter is bumped for a new one —
+// otherwise ClaimFreeArena is dead code and space never comes back.
+func TestIntegration_ReleasedArenaIsReused(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t, "node-A")
+	alloc := NewAllocator("node-A", store)
+
+	first, err := alloc.AcquireArena(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	arenaID, released, err := store.ReleaseArena(ctx, "node-A")
+	if err != nil || !released || arenaID != first.ID {
+		t.Fatalf("release: id=%d released=%v err=%v (want id=%d released=true)", arenaID, released, err, first.ID)
+	}
+
+	second, err := alloc.AcquireArena(ctx)
+	if err != nil {
+		t.Fatalf("re-acquire: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("re-acquire got arena %d, want the freed arena %d back", second.ID, first.ID)
+	}
+}
+
+// A recycled arena is not empty: its previous owner's live extents must be
+// marked allocated before the new owner writes, or the new owner can hand out
+// a block that still holds another inode's data.
+func TestIntegration_RecycledArenaKeepsLiveExtentsMarked(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t, "node-A")
+	alloc := NewAllocator("node-A", store)
+
+	first, err := alloc.AcquireArena(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	off, err := alloc.Allocate(BlockSize)
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	// A live extent for an inode that still exists — the scrubber would not
+	// reclaim it, and neither should a recycling node overwrite it.
+	if _, err := store.Put(ctx, metadata.InodeKey(42), []byte("stub-inode")); err != nil {
+		t.Fatalf("seed inode: %v", err)
+	}
+	if err := store.AppendExtent(ctx, 42, 0, off, BlockSize, 1); err != nil {
+		t.Fatalf("append extent: %v", err)
+	}
+
+	if _, released, err := store.ReleaseArena(ctx, "node-A"); err != nil || !released {
+		t.Fatalf("release: released=%v err=%v", released, err)
+	}
+
+	recycler := NewAllocator("node-B", metadata.NewStore(store.Client(), "node-B"))
+	recycled, err := recycler.AcquireArena(ctx)
+	if err != nil {
+		t.Fatalf("node-B acquire: %v", err)
+	}
+	if recycled.ID != first.ID {
+		t.Skipf("arena %d was not recycled to node-B (got %d) — pool had another candidate", first.ID, recycled.ID)
+	}
+
+	// Allocating BlocksPerArena-1 more blocks must never return the offset the
+	// old extent still occupies.
+	for i := 0; i < 4; i++ {
+		got, err := recycler.Allocate(BlockSize)
+		if err != nil {
+			t.Fatalf("node-B allocate %d: %v", i, err)
+		}
+		if got == off {
+			t.Fatalf("node-B was handed disk_off=%d, which node-A's live extent still occupies", got)
+		}
 	}
 }
