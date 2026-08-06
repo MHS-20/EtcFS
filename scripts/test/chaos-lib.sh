@@ -248,6 +248,9 @@ else
         local etcd=$(etcd_endpoints); local tag=$(jq -r '.cluster_name' "$PROJECT_ROOT/$STATE_FILE")
         local fence_flags=""
         [[ -n "${3:-}" && -n "${4:-}" ]] && fence_flags="--ebs-volume-id=$3 --ec2-instance-id=$4"
+        # ETCFS_FENCE_MODE=nvme replaces control-plane fencing with
+        # device-enforced NVMe reservations (see chaos-nvme-fencing.sh).
+        [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" ]] && fence_flags="--nvme-reservations"
         runcmd60 "$1" "
           sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
           sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
@@ -330,6 +333,12 @@ else
             local inst_id; inst_id=$(jq -r ".compute_instance_ids[$((i-1))] // empty" "$PROJECT_ROOT/$STATE_FILE")
             local fence_flags=""
             [[ -n "$vol_id" && -n "$inst_id" ]] && fence_flags="--ebs-volume-id=$vol_id --ec2-instance-id=$inst_id"
+            # ETCFS_FENCE_MODE=nvme selects device-enforced fencing instead:
+            # peers preempt the expired node's reservation key on the shared
+            # namespace, and the device rejects its writes outright. Mutually
+            # exclusive with the EBS flags by design — the preempt is the
+            # stronger signal and needs nothing from the EC2 control plane.
+            [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" ]] && fence_flags="--nvme-reservations"
             ssh -o StrictHostKeyChecking=no ec2-user@$ip "
                 sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; sleep 1
                 sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
