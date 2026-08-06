@@ -222,15 +222,15 @@ func main() {
 		log.Fatal("IPC server failed", "error", err)
 	}
 
-	// Return this node's arena to the global pool now that it is serving
-	// nothing.  A departing node is its own proof of quiescence — the IPC
-	// server has stopped, so no further write can be issued from here — which
-	// is what a fenced node needs an external Fencer to establish.  Skipping
-	// this is what made arena space leak on every departure, graceful or not.
+	// Leave the cluster now that this node is serving nothing.  A departing
+	// node is its own proof of quiescence — the IPC server has stopped, so no
+	// further write can be issued from here — which is what a fenced node needs
+	// an external Fencer to establish.  Skipping this is what made arena space
+	// leak on every departure, graceful or not.
 	//
 	// A context of its own: ctx is already cancelled by the time this runs.
 	relCtx, relCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	arenaID, released, rerr := store.ReleaseArena(relCtx, cfg.NodeID)
+	arenaID, released, rerr := membership.Leave(relCtx, store)
 	relCancel()
 	switch {
 	case rerr != nil:

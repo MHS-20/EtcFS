@@ -130,6 +130,31 @@ func (m *Membership) grantAndRegister(ctx context.Context) (clientv3.LeaseID, er
 	return resp.ID, nil
 }
 
+// Leave takes this node out of the cluster: it returns the node's arena to the
+// global free pool, then revokes the membership lease.  It reports the released
+// arena's ID and whether a release actually happened (false when the node held
+// no arena, or when a fencing controller already released it).
+//
+// This is deliberately *not* called from Run's ctx.Done path.  Run is cancelled
+// at the start of shutdown, while the arena may only be released once the node
+// is provably serving nothing — invariant 4 of
+// docs/architecture/storage/kleppmann-stale-write-analysis.md.  Only the owner
+// of the serving path knows when that is true, so it must call Leave itself,
+// after its IPC server has stopped.  Releasing on cancellation instead would
+// hand the arena to another node while writes were still draining out of this
+// one.
+//
+// The order matters in the other direction too: the arena is released before
+// the lease is revoked, so the arena ownership record is already gone by the
+// time the membership key's deletion can wake a fencing controller.  The
+// controller's own release is CAS-guarded and simply reports "nothing
+// released" rather than racing this one.
+func (m *Membership) Leave(ctx context.Context, store *Store) (uint64, bool, error) {
+	arenaID, released, err := store.ReleaseArena(ctx, m.nodeID)
+	m.revokeLease(ctx)
+	return arenaID, released, err
+}
+
 func (m *Membership) revokeLease(ctx context.Context) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
