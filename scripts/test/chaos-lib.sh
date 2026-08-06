@@ -292,7 +292,10 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" ]] && fence_flags="--nvme-reservations"
         local dev; dev=$(resolve_block_device "$1")
         [[ -n "$dev" ]] || dev=/dev/nvme1n1
-        runcmd60 "$1" "
+        # Not runcmd60: this needs more than 60s of budget (see below) and
+        # timeout killing the remote command mid-script would also swallow
+        # the diagnostic tail this prints on failure.
+        timeout 100 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" "
           sudo killall -9 etcfuse-meta etcfuse 2>/dev/null
           sleep 1
           # Plain umount, not -l: the server holding /dev/fuse is already
@@ -306,11 +309,27 @@ for d in json.load(sys.stdin).get('blockdevices', []):
           for k in \$(seq 1 5); do sudo umount /mnt/etcfuse 2>/dev/null && break; sleep 1; done
           sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
           sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s --block-device=$dev --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
-          for k in \$(seq 1 10); do [ -S /tmp/etcfuse.sock ] && break; sleep 1; done
+          # A restart right after a partition heals (this is R7's exact
+          # case) can legitimately need this long: the node's own local etcd
+          # has to rejoin raft and the client has to reconnect and ride out a
+          # leader election before it opens the socket — observed taking
+          # ~15s in a real run (DeadlineExceeded/leader-changed retries in
+          # meta.log). etcfuse has no retry of its own on a failed connect
+          # (production relies on systemd's Restart=on-failure for that, see
+          # setup-compute.sh's unit — this raw nohup harness has no
+          # supervisor, so it must not start the client before the socket
+          # exists), so starting it early was a guaranteed, permanent
+          # failure rather than a race that sometimes wins.
+          SOCK_OK=0
+          for k in \$(seq 1 40); do [ -S /tmp/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
+          if [ \"\$SOCK_OK\" -ne 1 ]; then
+            echo 'FAIL (socket never appeared)'; echo '--- meta.log tail ---'; sudo tail -20 /tmp/meta.log 2>/dev/null
+            exit 1
+          fi
           sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
           for k in \$(seq 1 30); do sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0; sleep 1; done
           echo 'FAIL'; echo '--- meta.log tail ---'; sudo tail -15 /tmp/meta.log 2>/dev/null; echo '--- fuse.log tail ---'; sudo tail -15 /tmp/fuse.log 2>/dev/null
-        "
+        " 2>/dev/null || echo "ERR:$?"
     }
 
     provision_cluster() {

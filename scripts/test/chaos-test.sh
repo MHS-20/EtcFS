@@ -180,23 +180,36 @@ writef() {
 
 # restart_daemons <ip> <node_id> <etcd_endpoints> <cluster_tag>
 # Restarts the Go meta daemon, then the C FUSE daemon, polling for the IPC
-# socket (10s) and then the mountpoint (20s).  Echoes OK once remounted.
-# Runs under runcmd60 because those polls can legitimately take ~30s.
+# socket and then the mountpoint. Echoes OK once remounted.
+#
+# The FUSE client must not start before the socket exists: etcfuse has no
+# retry of its own on a failed connect (production relies on systemd's
+# Restart=on-failure for that; this raw nohup harness has no supervisor), so
+# starting it early is a guaranteed, permanent failure rather than a race
+# that sometimes wins — a restart called right after etcd churn (leader
+# election, reconnect) can legitimately take longer than 10s to open the
+# socket. See scripts/test/chaos-lib.sh's restart_daemons for the same fix
+# with the root cause recorded in detail.
 restart_daemons() {
-    runcmd60 "$1" "
+    timeout 100 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$1" "
       sudo killall -9 etcfuse-meta etcfuse 2>/dev/null
-      sudo umount -l /mnt/etcfuse 2>/dev/null
       sleep 1
+      for k in \$(seq 1 5); do sudo umount /mnt/etcfuse 2>/dev/null && break; sleep 1; done
       sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
       sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$3 --node-id=$2 --cluster-name=$4 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
-      for k in \$(seq 1 10); do [ -S /tmp/etcfuse.sock ] && break; sleep 1; done
+      SOCK_OK=0
+      for k in \$(seq 1 40); do [ -S /tmp/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
+      if [ \"\$SOCK_OK\" -ne 1 ]; then
+        echo 'FAIL (socket never appeared)'; echo '--- meta.log tail ---'; sudo tail -20 /tmp/meta.log 2>/dev/null
+        exit 1
+      fi
       sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
-      for k in \$(seq 1 20); do
+      for k in \$(seq 1 30); do
         sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0
         sleep 1
       done
-      echo FAIL
-    "
+      echo 'FAIL'; echo '--- fuse.log tail ---'; sudo tail -15 /tmp/fuse.log 2>/dev/null
+    " 2>/dev/null || echo "ERR:$?"
 }
 
 # dump_logs <ip> — pull the daemon logs into the chaos log.  Called whenever a
