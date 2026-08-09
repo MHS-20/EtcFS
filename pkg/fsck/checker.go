@@ -41,6 +41,7 @@ func (c *Checker) Run(ctx context.Context) []Finding {
 	c.checkNlinkConsistency(ctx)
 	c.checkExtentValidity(ctx)
 	c.checkArenaBoundaries(ctx)
+	c.checkArenaOrphans(ctx)
 
 	return c.Findings
 }
@@ -149,11 +150,70 @@ func (c *Checker) checkArenaBoundaries(ctx context.Context) {
 		})
 	}
 	for _, kv := range kvs {
-		id := decodeUint64(kv.Value)
+		node, id, ok := metadata.ParseArenaKey(string(kv.Key))
+		if !ok {
+			c.Findings = append(c.Findings, Finding{
+				Level:   "error",
+				Message: fmt.Sprintf("malformed arena ownership key %q", string(kv.Key)),
+			})
+			continue
+		}
 		if id > maxArenaID {
 			c.Findings = append(c.Findings, Finding{
 				Level:   "warning",
-				Message: fmt.Sprintf("arena %s has excessive ID %d", string(kv.Key), id),
+				Message: fmt.Sprintf("node %s holds arena %d, an excessive ID", node, id),
+			})
+		}
+	}
+}
+
+// checkArenaOrphans reports arena space no node can ever reissue.
+//
+// Every arena ID the allocator has handed out is below the arena_alloc_log
+// high-water mark, and must be either owned by a node or sitting in the free
+// pool.  An ID in neither is lost space: nothing will re-adopt it on restart
+// and nothing will claim it from the pool.  An ID in both is worse — the free
+// pool would hand a second node into a range someone still owns.
+//
+// Reported, not repaired: deciding an arena is truly unowned needs the
+// operator's knowledge of which nodes are permanently gone.
+func (c *Checker) checkArenaOrphans(ctx context.Context) {
+	// The counter holds the next unissued ID, so every arena ever handed out
+	// is below it.
+	counter, _ := c.Store.Get(ctx, metadata.PrefixArenaLog)
+	highWater := decodeUint64(counter)
+
+	owners := make(map[uint64]string)
+	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixArena)
+	for _, kv := range kvs {
+		if node, id, ok := metadata.ParseArenaKey(string(kv.Key)); ok {
+			owners[id] = node
+		}
+	}
+
+	free := make(map[uint64]bool)
+	freeKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixFreeArena)
+	for _, kv := range freeKvs {
+		id, err := strconv.ParseUint(strings.TrimPrefix(string(kv.Key), metadata.PrefixFreeArena), 10, 64)
+		if err == nil {
+			free[id] = true
+		}
+	}
+
+	for id := uint64(0); id < highWater; id++ {
+		node, owned := owners[id]
+		switch {
+		case owned && free[id]:
+			c.Findings = append(c.Findings, Finding{
+				Level: "error",
+				Message: fmt.Sprintf("arena %d is in the free pool while %s still owns it",
+					id, node),
+			})
+		case !owned && !free[id]:
+			c.Findings = append(c.Findings, Finding{
+				Level: "warning",
+				Message: fmt.Sprintf("arena %d is orphaned: owned by no node and not in the free pool",
+					id),
 			})
 		}
 	}
