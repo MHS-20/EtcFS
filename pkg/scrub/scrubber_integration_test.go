@@ -210,3 +210,104 @@ func TestIntegration_EmptiedArenaReturnsToFreePool(t *testing.T) {
 		t.Fatalf("arena %d released but never landed in the free pool", ar.ID)
 	}
 }
+
+// seedInode writes a minimal inode record with the given size.
+func seedInode(t *testing.T, store *metadata.Store, ino, size uint64) {
+	t.Helper()
+	rec := &metadata.InodeRecord{Ino: ino, Size: size, Mode: 0o100644, Nlink: 1}
+	if _, err := store.Put(context.Background(), metadata.InodeKey(ino),
+		metadata.EncodeInode(rec)); err != nil {
+		t.Fatalf("seed inode %d: %v", ino, err)
+	}
+}
+
+// A truncate issued from another node leaves the extents past EOF in place —
+// only the arena's owner may remove them, because the record is what the
+// owner's bitmap is rebuilt from.  The owner's scrub pass is what finally
+// reclaims the space, and without this check it never would: the inode is
+// alive, so the orphan check does not see these extents at all.
+func TestIntegration_ExtentsPastEOFAreReclaimedByTheOwner(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t, "node-A")
+	alloc := arena.NewAllocator("node-A", store)
+
+	if _, err := alloc.AcquireArena(ctx); err != nil {
+		t.Fatalf("acquire arena: %v", err)
+	}
+	kept := allocOne(t, alloc, "allocate kept")
+	dropped := allocOne(t, alloc, "allocate dropped")
+
+	// A two-block file, then truncated to one block by some other node: the
+	// size says 4096, but the second extent is still recorded.
+	seedInode(t, store, 77, arena.BlockSize)
+	if err := store.AppendExtent(ctx, 77, 0, kept, arena.BlockSize, 1); err != nil {
+		t.Fatalf("append kept extent: %v", err)
+	}
+	if err := store.AppendExtent(ctx, 77, arena.BlockSize, dropped, arena.BlockSize, 1); err != nil {
+		t.Fatalf("append past-EOF extent: %v", err)
+	}
+
+	s := New(store, "node-A", time.Hour, testLogger{})
+	s.SetReclaimer(alloc)
+	s.RunScrubPass(ctx)
+
+	kvs, err := store.GetPrefix(ctx, metadata.ExtentPrefix(77))
+	if err != nil {
+		t.Fatalf("get extents: %v", err)
+	}
+	if len(kvs) != 1 {
+		t.Fatalf("want only the live extent left, got %d", len(kvs))
+	}
+
+	// The reclaimed block must be handed out again, not merely unreferenced.
+	if got := allocOne(t, alloc, "allocate after reclaim"); got != dropped {
+		t.Fatalf("block %d past EOF was not returned to the free list, got %d", dropped, got)
+	}
+}
+
+// The same for an overwrite: a later extent fully covering an earlier one makes
+// the earlier one's blocks dead while the file itself lives on.
+func TestIntegration_SupersededExtentsAreReclaimedByTheOwner(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t, "node-A")
+	alloc := arena.NewAllocator("node-A", store)
+
+	if _, err := alloc.AcquireArena(ctx); err != nil {
+		t.Fatalf("acquire arena: %v", err)
+	}
+	first := allocOne(t, alloc, "allocate first write")
+	second := allocOne(t, alloc, "allocate overwrite")
+
+	seedInode(t, store, 88, arena.BlockSize)
+	if err := store.AppendExtent(ctx, 88, 0, first, arena.BlockSize, 1); err != nil {
+		t.Fatalf("append first extent: %v", err)
+	}
+	if err := store.AppendExtent(ctx, 88, 0, second, arena.BlockSize, 1); err != nil {
+		t.Fatalf("append overwriting extent: %v", err)
+	}
+
+	// Before the scrub, a read must already resolve to the newer write.
+	extents, err := store.GetExtents(ctx, 88)
+	if err != nil {
+		t.Fatalf("get extents: %v", err)
+	}
+	if extents[0].DiskOff != second {
+		t.Fatalf("read would resolve to disk_off %d, want the newer %d",
+			extents[0].DiskOff, second)
+	}
+
+	s := New(store, "node-A", time.Hour, testLogger{})
+	s.SetReclaimer(alloc)
+	s.RunScrubPass(ctx)
+
+	kvs, err := store.GetPrefix(ctx, metadata.ExtentPrefix(88))
+	if err != nil {
+		t.Fatalf("get extents: %v", err)
+	}
+	if len(kvs) != 1 {
+		t.Fatalf("want only the surviving extent, got %d", len(kvs))
+	}
+	if got := allocOne(t, alloc, "allocate after reclaim"); got != first {
+		t.Fatalf("overwritten block %d was not returned to the free list, got %d", first, got)
+	}
+}

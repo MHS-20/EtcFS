@@ -127,6 +127,7 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 
 	collisions := s.CheckExtentCollisions(ctx)
 	orphans := s.CheckOrphanExtents(ctx)
+	dead := s.CheckDeadExtents(ctx)
 	rangeV := s.CheckRangeValidity(ctx)
 	genM := s.CheckGenerationConsistency(ctx)
 	nlinkV := s.CheckNlinkConsistency(ctx)
@@ -134,6 +135,7 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	s.mu.Lock()
 	s.anomalies = append(s.anomalies, collisions...)
 	s.anomalies = append(s.anomalies, orphans...)
+	s.anomalies = append(s.anomalies, dead...)
 	s.anomalies = append(s.anomalies, rangeV...)
 	s.anomalies = append(s.anomalies, genM...)
 	s.anomalies = append(s.anomalies, nlinkV...)
@@ -146,19 +148,23 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	// still there, then its own scrub pass finds it orphaned and reclaims it.
 	// So every orphan is still covered, without a node ever deleting the record
 	// another node's bitmap is rebuilt from.
-	for _, r := range orphans {
+	reclaimable := make([]Result, 0, len(orphans)+len(dead))
+	reclaimable = append(reclaimable, orphans...)
+	reclaimable = append(reclaimable, dead...)
+
+	for _, r := range reclaimable {
 		if !r.AutoFix {
 			continue
 		}
 		if s.reclaimer == nil || !s.reclaimer.Owns(r.DiskOff) {
 			continue
 		}
-		s.log.Info("scrub auto-fix: reclaiming orphan extent", "detail", r.Detail)
+		s.log.Info("scrub auto-fix: reclaiming extent", "type", r.Type, "detail", r.Detail)
 		// Delete first: the blocks must stop being reachable through metadata
 		// before they can be handed to another allocation, or a reader
 		// resolving the extent could land on data already overwritten.
 		if err := s.store.Delete(ctx, r.Key); err != nil {
-			s.log.Error("scrub auto-fix: orphan extent not deleted, blocks not reclaimed",
+			s.log.Error("scrub auto-fix: extent not deleted, blocks not reclaimed",
 				"key", r.Key, "error", err)
 			continue
 		}
@@ -167,10 +173,11 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 		}
 	}
 
-	total := len(collisions) + len(orphans) + len(rangeV) + len(genM) + len(nlinkV)
+	total := len(collisions) + len(orphans) + len(dead) + len(rangeV) + len(genM) + len(nlinkV)
 	if total > 0 {
 		s.log.Warn("scrub found anomalies", "count", total, "collisions", len(collisions),
-			"orphans", len(orphans), "range", len(rangeV), "generation", len(genM), "nlink", len(nlinkV))
+			"orphans", len(orphans), "dead", len(dead), "range", len(rangeV),
+			"generation", len(genM), "nlink", len(nlinkV))
 	} else {
 		s.log.Info("scrub pass clean")
 	}
@@ -242,6 +249,85 @@ func (s *Scrubber) CheckOrphanExtents(ctx context.Context) []Result {
 		}
 	}
 	return results
+}
+
+// CheckDeadExtents detects extents of a *live* inode that nothing can read any
+// more: those left entirely past the file's size by a truncate, and those a
+// later write has fully covered.
+//
+// The orphan check cannot see either of them — it looks for extents whose inode
+// is gone, and here the inode is very much alive.  Without this the blocks
+// behind them stay allocated for the lifetime of the file.
+//
+// Both cases arise on the node that performed the operation as well, but that
+// node reclaims what it owns inline (see ipc.Service.dropExtent).  What reaches
+// here is the cross-node remainder: a truncate or overwrite issued from one
+// node against bytes sitting in another node's arena, which only the owner may
+// reclaim.
+func (s *Scrubber) CheckDeadExtents(ctx context.Context) []Result {
+	extKvs, err := s.store.GetPrefix(ctx, metadata.PrefixExtent)
+	if err != nil {
+		s.log.Error("scrub: cannot scan extents", "error", err)
+		return nil
+	}
+
+	sizes := make(map[uint64]uint64)
+	inodeKvs, err := s.store.GetPrefix(ctx, metadata.PrefixInode)
+	if err != nil {
+		s.log.Error("scrub: cannot scan inodes", "error", err)
+		return nil
+	}
+	for _, kv := range inodeKvs {
+		if rec := metadata.DecodeInode(kv.Value); rec != nil {
+			sizes[rec.Ino] = rec.Size
+		}
+	}
+
+	byIno := make(map[uint64][]metadata.Extent)
+	for _, ext := range metadata.DecodeExtents(extKvs) {
+		byIno[ext.Ino()] = append(byIno[ext.Ino()], ext)
+	}
+
+	var results []Result
+	for ino, extents := range byIno {
+		size, alive := sizes[ino]
+		if !alive {
+			continue // no inode: the orphan check owns this one
+		}
+		for _, ext := range extents {
+			reason := deadReason(ext, size, extents)
+			if reason == "" {
+				continue
+			}
+			results = append(results, Result{
+				Type:    "dead",
+				Detail:  fmt.Sprintf("extent %s is unreachable: %s", ext.Key, reason),
+				Ino:     ino,
+				DiskOff: ext.DiskOff,
+				Length:  ext.Length,
+				Key:     ext.Key,
+				AutoFix: true,
+			})
+		}
+	}
+	return results
+}
+
+// deadReason explains why ext can no longer be read, or "" if it still can.
+//
+// An extent only partly past the end of the file is left alone: trimming it is
+// a rewrite rather than a delete, and the surviving head is still live data.
+// Its tail is reclaimed when the file is deleted or fully overwritten.
+func deadReason(ext metadata.Extent, size uint64, siblings []metadata.Extent) string {
+	if ext.LogOff >= size {
+		return fmt.Sprintf("it starts at %d, past the file size of %d", ext.LogOff, size)
+	}
+	for _, other := range siblings {
+		if other.Supersedes(ext) {
+			return fmt.Sprintf("extent %s overwrote it", other.Key)
+		}
+	}
+	return ""
 }
 
 // checkRangeValidity detects extents outside their arena range.

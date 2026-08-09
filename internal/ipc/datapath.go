@@ -130,11 +130,22 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 
 	gen := s.writeGeneration(ctx)
 
-	chunk, cherr := s.store.NextExtentChunk(ctx, ino)
-	if cherr != nil {
+	// One read of the inode's extents answers both questions this write has:
+	// which chunk number is free, and which existing extents it is about to
+	// bury.  The chunk must be one past the highest in use, not the extent
+	// count — a truncate deletes chunks from the middle, and counting would
+	// hand back a number that is still live.
+	existing, xerr := s.store.GetExtents(ctx, ino)
+	if xerr != nil {
 		freeRuns()
-		s.log.Warn("write: cannot determine extent chunk", "ino", ino, "error", cherr)
+		s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
 		return int32Resp(-5), nil
+	}
+	chunk := uint64(0)
+	for _, e := range existing {
+		if e.Chunk >= chunk {
+			chunk = e.Chunk + 1
+		}
 	}
 
 	// One extent per run, in order, so the logical range stays contiguous even
@@ -193,6 +204,18 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 
 	if s.wal != nil {
 		_ = s.wal.MarkCommitted(ino, offset)
+	}
+
+	// The write is published, so anything it fully covers is now dead.  Reclaim
+	// it here rather than leaving it all to the scrubber: an overwrite-heavy
+	// workload on one node would otherwise keep a scrub interval's worth of
+	// superseded blocks alive at all times.  Only after the commit — before it,
+	// a rejected transaction would have freed blocks the file still refers to.
+	newest := metadata.Extent{Chunk: chunk, LogOff: offset, Length: uint64(dataLen)}
+	for _, old := range existing {
+		if newest.Supersedes(old) {
+			s.dropExtent(ctx, old)
+		}
 	}
 
 	return writtenResp(uint32(dataLen)), nil
@@ -345,6 +368,12 @@ func (s *Service) readInto(dst []byte, diskOff int64) (int, error) {
 
 // truncate drops or shortens every extent of an inode that lies beyond
 // newSize, returning the freed device ranges to the arena.
+//
+// Only the extents whose device range this node owns are touched — see
+// dropExtent.  The rest are left exactly as they are, and the inode's smaller
+// size is what keeps them from being read: the kernel clamps a read to the
+// size it last saw, so bytes past EOF are unreachable whether or not an extent
+// still describes them.  Their owner's scrubber reclaims them.
 func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
 	extents, err := s.store.GetExtents(ctx, ino)
 	if err != nil {
@@ -352,20 +381,49 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
 		return
 	}
 	for _, ext := range extents {
-		switch {
-		case ext.LogOff >= newSize:
-			_ = s.store.Delete(ctx, ext.Key)
-			if s.dev != nil {
-				s.alloc.Free(ext.DiskOff, ext.Length)
-			}
-		case ext.End() > newSize:
-			keepLen := newSize - ext.LogOff
-			shortened := ext
-			shortened.Length = keepLen
-			_, _ = s.store.Put(ctx, ext.Key, []byte(shortened.Encode()))
-			if s.dev != nil {
-				s.alloc.Free(ext.DiskOff+keepLen, ext.Length-keepLen)
-			}
+		if ext.End() <= newSize {
+			continue
 		}
+		if ext.LogOff >= newSize {
+			s.dropExtent(ctx, ext)
+			continue
+		}
+		s.shortenExtent(ctx, ext, newSize-ext.LogOff)
 	}
+}
+
+// dropExtent removes an extent record and returns its blocks.
+//
+// It is a no-op for a range this node does not own.  The extent record is the
+// only durable reference the owning node's in-memory bitmap is rebuilt from, so
+// deleting it from here would strand those blocks as allocated on that node
+// until it restarted — the record has to outlive this call for its owner to
+// find it.  The owner's scrubber reclaims it instead, at the cost of a scrub
+// interval's delay.
+func (s *Service) dropExtent(ctx context.Context, ext metadata.Extent) {
+	if s.dev == nil || !s.alloc.Owns(ext.DiskOff) {
+		return
+	}
+	if err := s.store.Delete(ctx, ext.Key); err != nil {
+		s.log.Warn("cannot delete extent, blocks not reclaimed",
+			"key", ext.Key, "error", err)
+		return
+	}
+	s.alloc.Free(ext.DiskOff, ext.Length)
+}
+
+// shortenExtent trims an extent to keepLen bytes and returns the tail.
+// Owner-only, for the same reason as dropExtent.
+func (s *Service) shortenExtent(ctx context.Context, ext metadata.Extent, keepLen uint64) {
+	if s.dev == nil || !s.alloc.Owns(ext.DiskOff) {
+		return
+	}
+	shortened := ext
+	shortened.Length = keepLen
+	if _, err := s.store.Put(ctx, ext.Key, []byte(shortened.Encode())); err != nil {
+		s.log.Warn("cannot shorten extent, tail not reclaimed",
+			"key", ext.Key, "error", err)
+		return
+	}
+	s.alloc.Free(ext.DiskOff+keepLen, ext.Length-keepLen)
 }

@@ -25,6 +25,11 @@ type Extent struct {
 	// that has not been stored yet; never part of the encoded value.
 	Key string
 
+	// Chunk is the extent's chunk number, taken from Key.  Chunk numbers are
+	// handed out in ascending order, so a higher chunk covering the same
+	// logical bytes is the more recent write and the one a read must see.
+	Chunk uint64
+
 	LogOff  uint64
 	DiskOff uint64
 	Length  uint64
@@ -103,18 +108,27 @@ func DecodeExtent(key string, value []byte) (Extent, bool) {
 		}
 		fields[i] = v
 	}
+	_, chunk, _ := ParseExtentKey(key)
 	return Extent{
-		Key: key, LogOff: fields[0], DiskOff: fields[1],
+		Key: key, Chunk: chunk, LogOff: fields[0], DiskOff: fields[1],
 		Length: fields[2], Gen: fields[3],
 	}, true
 }
 
 // DecodeExtents decodes a batch of extent key/values, skipping malformed ones,
-// and returns them ordered by logical offset.
+// and returns them ordered by logical offset, most recent write first within
+// one offset.
 //
-// The ordering matters: etcd returns keys in lexicographic order, so an inode
-// with more than ten extents comes back as chunk 0, 1, 10, 11, 2, … — reading
-// that back in key order reassembles the file wrong.
+// The offset ordering matters because etcd returns keys in lexicographic order,
+// so an inode with more than ten extents comes back as chunk 0, 1, 10, 11, 2, …
+// — reading that back in key order reassembles the file wrong.
+//
+// The chunk ordering matters because a write is not an in-place update: it
+// allocates fresh blocks and appends an extent, so overwriting a range leaves
+// two extents covering it.  A reader takes the first extent that covers the
+// offset it wants, so the descending chunk order is what makes that the newer
+// one.  Sorting on offset alone left the choice to sort.Slice, which is not
+// stable — the same file could read back differently from one call to the next.
 func DecodeExtents(kvs []*mvccpb.KeyValue) []Extent {
 	extents := make([]Extent, 0, len(kvs))
 	for _, kv := range kvs {
@@ -122,8 +136,20 @@ func DecodeExtents(kvs []*mvccpb.KeyValue) []Extent {
 			extents = append(extents, e)
 		}
 	}
-	sort.Slice(extents, func(i, j int) bool { return extents[i].LogOff < extents[j].LogOff })
+	sort.Slice(extents, func(i, j int) bool {
+		if extents[i].LogOff != extents[j].LogOff {
+			return extents[i].LogOff < extents[j].LogOff
+		}
+		return extents[i].Chunk > extents[j].Chunk
+	})
 	return extents
+}
+
+// Supersedes reports whether e covers every logical byte of other and was
+// written later, which makes other's disk range dead.
+func (e Extent) Supersedes(other Extent) bool {
+	return e.Chunk > other.Chunk &&
+		e.LogOff <= other.LogOff && e.End() >= other.End()
 }
 
 // GetExtents returns all extents of an inode, ordered by logical offset.
