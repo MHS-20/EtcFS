@@ -8,7 +8,10 @@
 #   1. Terminate compute instances
 #   2. Detach + delete EBS volume
 #   3. Delete security group
-#   4. Remove state file
+#   4. Remove state file — only if every step above was confirmed, not just
+#      attempted; otherwise the state file is kept and the script exits 1,
+#      so a re-run has something to retry against instead of an orphaned
+#      resource nothing knows about anymore.
 
 set -euo pipefail
 
@@ -82,6 +85,15 @@ if [[ -n "${ALL_IDS// }" ]]; then
 fi
 
 # ---- Step 2: Delete EBS volume ----
+#
+# FAILED tracks every step that didn't confirm success. Every prior version
+# of this loop logged "deletion requested" / "deleted" unconditionally and
+# fell through to "teardown complete" on a timeout with no error at all —
+# the volume (and the security group, below) kept billing/existing while the
+# operator believed teardown had succeeded. Observed directly: a 2026-08-09
+# run left both an "available" volume and a security group behind, silently.
+
+FAILED=""
 
 if [[ -n "$VOL_ID" && "$VOL_ID" != "null" ]]; then
     log "Waiting for volume to detach..."
@@ -96,35 +108,61 @@ if [[ -n "$VOL_ID" && "$VOL_ID" != "null" ]]; then
         sleep 2
     done
 
-    aws ec2 delete-volume --volume-id "$VOL_ID" 2>/dev/null || true
-    log "Volume $VOL_ID deletion requested"
-
-    for i in $(seq 1 15); do
-        STATE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
-            --query 'Volumes[0].State' --output text 2>/dev/null || echo "deleted")
-        if [[ "$STATE" == "deleted" || "$STATE" == "None" || "$STATE" == "null" ]]; then
-            log "Volume deleted"
-            break
+    VOL_DELETED=false
+    for attempt in 1 2 3; do
+        if aws ec2 delete-volume --volume-id "$VOL_ID" 2>/dev/null; then
+            log "Volume $VOL_ID deletion requested"
+            for i in $(seq 1 15); do
+                STATE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
+                    --query 'Volumes[0].State' --output text 2>/dev/null || echo "deleted")
+                if [[ "$STATE" == "deleted" || "$STATE" == "None" || "$STATE" == "null" ]]; then
+                    log "Volume deleted"
+                    VOL_DELETED=true
+                    break
+                fi
+                sleep 2
+            done
+            [[ "$VOL_DELETED" == "true" ]] && break
+            log "  Volume delete requested but never confirmed deleted (still: $STATE), retrying..."
+        else
+            log "  Volume delete attempt $attempt failed (often means still attached), retrying in 5s..."
+            sleep 5
         fi
-        sleep 2
     done
+    if [[ "$VOL_DELETED" != "true" ]]; then
+        log "ERROR: volume $VOL_ID was not confirmed deleted — still billing, check manually"
+        FAILED="$FAILED volume:$VOL_ID"
+    fi
 fi
 
 # ---- Step 3: Delete security group ----
 
 if [[ -n "$SG_ID" && "$SG_ID" != "null" ]]; then
     log "Deleting security group $SG_ID..."
+    SG_DELETED=false
     for attempt in 1 2 3; do
         if aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null; then
             log "Security group $SG_ID deleted"
+            SG_DELETED=true
             break
         fi
         log "  SG delete attempt $attempt failed, retrying in 5s..."
         sleep 5
     done
+    if [[ "$SG_DELETED" != "true" ]]; then
+        log "ERROR: security group $SG_ID was not deleted — check manually (a lingering ENI from a just-terminated instance is the usual cause; retrying this script after a minute often clears it)"
+        FAILED="$FAILED sg:$SG_ID"
+    fi
 fi
 
-# ---- Clean up state ----
+# ---- Report ----
+
+if [[ -n "$FAILED" ]]; then
+    log ""
+    log "=== EtcFS teardown INCOMPLETE — resources still exist:$FAILED ==="
+    log "State file kept at $ETCFS_STATE so a re-run can retry these."
+    exit 1
+fi
 
 rm -f "$ETCFS_STATE"
 log ""
