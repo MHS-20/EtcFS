@@ -5,13 +5,12 @@
 #   1. Launch instance + attach shared EBS volume
 #   2. Generate TLS certs for the new node
 #   3. Add to existing etcd cluster (etcdctl member add)
-#   4. Install etcd + EtcFS daemon
-#   5. Join etcd cluster, start daemon, mount FUSE
+#   4. Install etcd + both EtcFS binaries (etcfuse-meta, etcfuse — see
+#      setup-compute.sh's header for the two-binary split)
+#   5. Join etcd cluster, start etcfuse-meta then etcfuse, mount FUSE
 #
 # The EtcFS daemon handles inode-range reservation and arena acquisition
 # automatically on first write. No manual rebalancing step needed.
-#
-# [TEMPLATE] Some sections are placeholders until the daemon binary exists.
 
 set -euo pipefail
 
@@ -123,15 +122,23 @@ log "Uploading certs and binaries..."
 scp $SSH_OPTS /tmp/ca.crt "$CERT_DIR/client.crt" "$CERT_DIR/client.key" "ec2-user@$PUB_IP:/tmp/"
 scp $SSH_OPTS /tmp/server.crt /tmp/server.key /tmp/peer.crt /tmp/peer.key "ec2-user@$PUB_IP:/tmp/"
 
-# Built for the AWS target, not the operator's local toolchain — see
-# build_etcfuse_binary in state.sh for why (libfuse3/glibc mismatch against
-# the AMI otherwise).
+# EtcFS is two binaries — etcfuse-meta (Go, all etcd ops) and etcfuse (C,
+# FUSE + block I/O, talks to etcfuse-meta over a Unix socket). Built for the
+# AWS target, not the operator's local toolchain — see build_etcfuse_binary
+# in state.sh for why (libfuse3/glibc mismatch against the AMI otherwise).
 if DAEMON_BIN=$(build_etcfuse_binary); then
     :
 else
     log "WARNING: Docker build failed, falling back to bin/etcfuse"
     DAEMON_BIN="$PROJECT_ROOT/bin/etcfuse"
 fi
+if META_BIN=$(build_etcfuse_meta_binary); then
+    :
+else
+    log "WARNING: etcfuse-meta build failed, falling back to bin/etcfuse-meta"
+    META_BIN="$PROJECT_ROOT/bin/etcfuse-meta"
+fi
+SOCKET_PATH="/run/etcfuse.sock"
 if [[ -f "$DAEMON_BIN" ]]; then
     gzip -c "$DAEMON_BIN" > /tmp/etcfuse.gz
     scp $SSH_OPTS /tmp/etcfuse.gz "ec2-user@$PUB_IP:/tmp/"
@@ -139,6 +146,14 @@ if [[ -f "$DAEMON_BIN" ]]; then
     HAS_BINARY=true
 else
     HAS_BINARY=false
+fi
+if [[ -f "$META_BIN" ]]; then
+    gzip -c "$META_BIN" > /tmp/etcfuse-meta.gz
+    scp $SSH_OPTS /tmp/etcfuse-meta.gz "ec2-user@$PUB_IP:/tmp/"
+    rm -f /tmp/etcfuse-meta.gz
+    HAS_META_BINARY=true
+else
+    HAS_META_BINARY=false
 fi
 
 rm -f /tmp/ca.crt /tmp/ca.key /tmp/server.* /tmp/peer.*
@@ -157,11 +172,16 @@ sudo mv /tmp/peer.key /etc/etcd/tls/peer-${ETCD_NAME}.key
 sudo chown -R root:root /etc/etcfuse /etc/etcd/tls
 sudo chmod 600 /etc/etcfuse/*.key /etc/etcd/tls/*.key 2>/dev/null || true
 
-# Daemon binary
+# Daemon binaries
 if $HAS_BINARY; then
     gzip -d -f /tmp/etcfuse.gz
     sudo mv /tmp/etcfuse /usr/local/bin/etcfuse
     sudo chmod 755 /usr/local/bin/etcfuse
+fi
+if $HAS_META_BINARY; then
+    gzip -d -f /tmp/etcfuse-meta.gz
+    sudo mv /tmp/etcfuse-meta /usr/local/bin/etcfuse-meta
+    sudo chmod 755 /usr/local/bin/etcfuse-meta
 fi
 
 # etcd args
@@ -210,37 +230,59 @@ WantedBy=multi-user.target
 UNIT
 SETUP
 
-# ---- Step 9: Create EtcFS daemon systemd unit + start ----
-log "Creating EtcFS daemon systemd unit..."
+# ---- Step 9: Create EtcFS daemon systemd units + start ----
+log "Creating EtcFS daemon systemd units..."
 
 ETCD_ENDPOINTS=$(state_get etcd_endpoints)
 # Append new node's endpoint
 ETCD_ENDPOINTS="${ETCD_ENDPOINTS},https://${PRIV_IP}:2379"
+NODE_ID="${CLUSTER}-node-${NEW_NODE_NUM}"
 
-$SSH_CMD "ec2-user@$PUB_IP" "sudo tee /etc/systemd/system/etcfuse.service" <<DAEMONUNIT
+# See setup-compute.sh for why the split: etcfuse-meta owns every etcd/cert/
+# lease-ttl flag, etcfuse only talks FUSE + raw block I/O to it over
+# $SOCKET_PATH. No --peer-url/--initial-cluster/--mount-point/--az/
+# --heartbeat-interval flag exists on either binary.
+$SSH_CMD "ec2-user@$PUB_IP" "sudo tee /etc/systemd/system/etcfuse-meta.service" <<METAUNIT
 [Unit]
-Description=EtcFS FUSE Daemon
+Description=EtcFS metadata backend (Go)
 After=network-online.target etcd.service
 Wants=network-online.target etcd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/etcfuse \\
-  --node-id=${CLUSTER}-node-${NEW_NODE_NUM} \\
+ExecStart=/usr/local/bin/etcfuse-meta \\
+  --listen=${SOCKET_PATH} \\
+  --node-id=${NODE_ID} \\
   --etcd-endpoints=${ETCD_ENDPOINTS} \\
   --etcd-cert=/etc/etcfuse/client.crt \\
   --etcd-key=/etc/etcfuse/client.key \\
   --etcd-ca=/etc/etcfuse/ca.crt \\
-  --etcd-name=${ETCD_NAME} \\
-  --peer-url=${PEER_URL} \\
-  --initial-cluster=${INITIAL_CLUSTER} \\
-  --volume-id=${VOL} \\
-  --block-device=/dev/nvme1n1 \\
-  --mount-point=${FUSE_MOUNTPOINT} \\
   --cluster-name=${CLUSTER} \\
-  --az=${AZ} \\
-  --lease-ttl=${LEASH_TTL} \\
-  --heartbeat-interval=${HEARTBEAT_INTERVAL}
+  --lease-ttl=${LEASH_TTL}s \\
+  --block-device=/dev/nvme1n1
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+METAUNIT
+
+$SSH_CMD "ec2-user@$PUB_IP" "sudo tee /etc/systemd/system/etcfuse.service" <<DAEMONUNIT
+[Unit]
+Description=EtcFS FUSE frontend (C)
+After=network-online.target etcfuse-meta.service
+Wants=network-online.target etcfuse-meta.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p ${FUSE_MOUNTPOINT}
+ExecStart=/usr/local/bin/etcfuse \\
+  --socket=${SOCKET_PATH} \\
+  --volume-id=${VOL} \\
+  --node-id=${NODE_ID} \\
+  --log-level=2 \\
+  ${FUSE_MOUNTPOINT}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -250,7 +292,7 @@ WantedBy=multi-user.target
 DAEMONUNIT
 
 $SSH_CMD "ec2-user@$PUB_IP" "sudo systemctl daemon-reload"
-$SSH_CMD "ec2-user@$PUB_IP" "sudo systemctl enable etcd etcfuse"
+$SSH_CMD "ec2-user@$PUB_IP" "sudo systemctl enable etcd etcfuse-meta etcfuse"
 
 # ---- Step 10: Start etcd + daemon ----
 log "Starting etcd on new node..."
@@ -264,20 +306,21 @@ log "etcd healthy on new node"
 # Give etcd membership time to propagate
 sleep 3
 
-if $HAS_BINARY; then
-    log "Starting EtcFS daemon..."
-    $SSH_CMD "ec2-user@$PUB_IP" "
-sudo mkdir -p $FUSE_MOUNTPOINT
-sudo systemctl start etcfuse
-"
+if $HAS_BINARY && $HAS_META_BINARY; then
+    log "Starting EtcFS daemons (etcfuse-meta, then etcfuse)..."
+    $SSH_CMD "ec2-user@$PUB_IP" "sudo mkdir -p $FUSE_MOUNTPOINT && sudo systemctl start etcfuse-meta"
+    sleep 3
+    $SSH_CMD "ec2-user@$PUB_IP" "sudo systemctl start etcfuse"
     if ! wait_for_daemon_ready "$PUB_IP" 60 2; then
-        log "ERROR: EtcFS daemon did not become ready on new node"
+        log "ERROR: EtcFS daemons did not become ready on new node"
+        $SSH_CMD "ec2-user@$PUB_IP" "sudo journalctl -u etcfuse-meta --no-pager -n 30" || true
+        $SSH_CMD "ec2-user@$PUB_IP" "sudo journalctl -u etcfuse --no-pager -n 30" || true
         exit 1
     fi
     log "EtcFS FUSE mounted at $FUSE_MOUNTPOINT on new node"
     $SSH_CMD "ec2-user@$PUB_IP" "df -h $FUSE_MOUNTPOINT"
 else
-    log "  (no daemon binary — skipping FUSE start)"
+    log "  (missing binary — skipping daemon start)"
 fi
 
 # ---- Done ----

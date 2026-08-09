@@ -203,6 +203,20 @@ build_etcfuse_binary() {
     echo "$out"
 }
 
+# build_etcfuse_meta_binary — build cmd/etcfuse-meta for the AWS target and
+# print the path to the resulting binary.
+#
+# Unlike etcfuse, this is CGO_ENABLED=0 pure Go (see
+# deploy/docker/Dockerfile.etcfuse-meta) — a linux/amd64 cross-build is
+# statically linked and portable to any glibc/musl target as-is, so no
+# Docker step is needed to match the AMI the way build_etcfuse_binary's is.
+build_etcfuse_meta_binary() {
+    local out="$PROJECT_ROOT/bin/etcfuse-meta.aws-linux-amd64"
+    (cd "$PROJECT_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+        go build -ldflags="-s -w" -o "$out" ./cmd/etcfuse-meta) >&2 || return 1
+    echo "$out"
+}
+
 # ---- SSH / health-check helpers ----
 
 wait_for_ssh() {
@@ -296,16 +310,28 @@ wait_for_fuse_mount() {
 
 # wait_for_daemon_ready <ip> [max_retries] [delay_secs]
 # Waits for the EtcFS FUSE daemon to be fully ready:
-#   1. systemd unit is active (process running)
-#   2. local etcd is healthy
-#   3. FUSE mount is present and responsive
+#   1. etcfuse-meta systemd unit is active (process running)
+#   2. etcfuse (C, FUSE frontend) systemd unit is active
+#   3. local etcd is healthy
+#   4. FUSE mount is present and responsive
 wait_for_daemon_ready() {
     local ip="$1"
     local max_retries="${2:-60}"
     local delay="${3:-2}"
     local i=0
     while [[ $i -lt $max_retries ]]; do
-        # 1. systemd unit active
+        # 1. etcfuse-meta active — etcfuse (below) can never become ready
+        # without it, since it's the only thing that talks to etcd; checking
+        # it separately turns "stuck waiting" into a clear failure signal.
+        local meta_active
+        meta_active=$(ssh $SSH_OPTS "ec2-user@${ip}" "systemctl is-active etcfuse-meta 2>/dev/null || true" 2>/dev/null)
+        if [[ "$meta_active" != "active" ]]; then
+            i=$((i + 1))
+            sleep "$delay"
+            continue
+        fi
+
+        # 2. etcfuse (C daemon) systemd unit active
         local active
         active=$(ssh $SSH_OPTS "ec2-user@${ip}" "systemctl is-active etcfuse 2>/dev/null || true" 2>/dev/null)
         if [[ "$active" != "active" ]]; then
@@ -314,7 +340,7 @@ wait_for_daemon_ready() {
             continue
         fi
 
-        # 2. etcd healthy
+        # 3. etcd healthy
         local etcd_ok
         etcd_ok=$(ssh $SSH_OPTS "ec2-user@${ip}" \
             "sudo ETCDCTL_API=3 etcdctl \
@@ -329,7 +355,7 @@ wait_for_daemon_ready() {
             continue
         fi
 
-        # 3. FUSE mount responsive
+        # 4. FUSE mount responsive
         if ! ssh $SSH_OPTS "ec2-user@${ip}" "test -d $FUSE_MOUNTPOINT && ls $FUSE_MOUNTPOINT >/dev/null 2>&1" 2>/dev/null; then
             i=$((i + 1))
             sleep "$delay"
