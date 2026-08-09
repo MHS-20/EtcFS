@@ -14,27 +14,27 @@ import (
 
 // opcodes matching pkg/fuse/ops.c
 const (
-	ipcOpLookup      = 1
-	ipcOpGetattr     = 2
-	ipcOpReaddir     = 3
-	ipcOpReadlink    = 4
-	ipcOpCreate      = 5
-	ipcOpMkdir       = 6
-	ipcOpUnlink      = 7
-	ipcOpRmdir       = 8
-	ipcOpRename      = 9
-	ipcOpSymlink     = 10
-	ipcOpLink        = 11
-	ipcOpSetattr     = 12
-	ipcOpOpen        = 13
-	ipcOpRelease     = 14
-	ipcOpOpendir     = 15
-	ipcOpReleasedir  = 16
-	ipcOpStatfs      = 17
-	ipcOpAlloc       = 18
-	ipcOpCommit      = 19
-	ipcOpGetlk       = 27
-	ipcOpSetlk       = 28
+	ipcOpLookup     = 1
+	ipcOpGetattr    = 2
+	ipcOpReaddir    = 3
+	ipcOpReadlink   = 4
+	ipcOpCreate     = 5
+	ipcOpMkdir      = 6
+	ipcOpUnlink     = 7
+	ipcOpRmdir      = 8
+	ipcOpRename     = 9
+	ipcOpSymlink    = 10
+	ipcOpLink       = 11
+	ipcOpSetattr    = 12
+	ipcOpOpen       = 13
+	ipcOpRelease    = 14
+	ipcOpOpendir    = 15
+	ipcOpReleasedir = 16
+	ipcOpStatfs     = 17
+	ipcOpAlloc      = 18
+	ipcOpCommit     = 19
+	// 27 and 28 were GETLK/SETLK, removed so the kernel handles fcntl() locks
+	// locally; not reused, so an old C daemon's lock request fails loudly.
 	ipcOpRead        = 22
 	ipcOpWrite       = 23
 	ipcOpFsync       = 24
@@ -252,11 +252,7 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 		return s.handleReaddirPlus(ctx, payload)
 	case ipcOpRead:
 		return s.handleRead(ctx, payload)
-	case ipcOpGetlk:
-		return s.handleGetlk(ctx, payload)
-	case ipcOpSetlk:
-		return s.handleSetlk(ctx, payload)
-	// Write operations (Phase 3)
+	// Write operations
 	case ipcOpCreate:
 		return s.handleCreate(ctx, payload)
 	case ipcOpMkdir:

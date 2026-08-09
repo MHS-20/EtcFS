@@ -476,42 +476,14 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 // conflict instead would be worse than useless — SETLK cannot grant a lock it
 // does not track, so every caller would spin on EAGAIN forever.
 
-// POSIX lock types, from <fcntl.h>.
-const (
-	fRdlck = 0
-	fWrlck = 1
-	fUnlck = 2
-)
-
-// GETLK payload: [u64:ino][u64:start][u64:len][u32:type][u32:pid]
-// Response: [i32:error][u64:start][u64:len][u32:type][u32:pid]
-func (s *Service) handleGetlk(_ context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 32 {
-		return int32Resp(-22), nil
-	}
-	_, rest := readU64(payload) // ino
-	start, rest := readU64(rest)
-	length, rest := readU64(rest)
-	_, rest = readU32(rest) // requested type
-	pid, _ := readU32(rest)
-
-	var b buf
-	b.w32(0)
-	b.w64(start)
-	b.w64(length)
-	b.w32(fUnlck) // range reported free
-	b.w32(pid)
-	return b.b, nil
-}
-
-// SETLK payload: [u64:ino][u64:start][u64:len][u32:type][u32:pid][u32:sleep]
-// Response: [i32:error]
-func (s *Service) handleSetlk(_ context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 36 {
-		return int32Resp(-22), nil
-	}
-	return okResp(), nil
-}
+// GETLK and SETLK are deliberately not handled here, and the C daemon does not
+// implement the matching FUSE operations.  libfuse's contract is that "if the
+// locking methods are not implemented, the kernel will still allow file locking
+// to work locally" — implementing them takes that job away from the kernel, so
+// answering "always free / always granted" left fcntl() locks excluding nothing
+// at all, not even between two processes on one node.  Leaving them unwired
+// gives fcntl() the same node-local-correct behavior flock() already has.
+// See docs/architecture/metadata/posix-lock-operations.md.
 
 // allocInode reserves an inode number from etcd.
 //

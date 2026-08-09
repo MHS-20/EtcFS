@@ -201,6 +201,13 @@ func main() {
 	}
 	go controller.Run(ctx)
 
+	// POSIX fcntl/flock locks are node-local: GETLK always reports the range
+	// free and SETLK always grants (internal/ipc/handlers.go).  Warned at
+	// startup because a workload relying on cross-node locking gets no other
+	// signal — the calls succeed, they simply exclude nothing on other nodes.
+	log.Warn("POSIX file locks (fcntl/flock) are enforced within this node only, NOT across the " +
+		"cluster; see docs/architecture/metadata/posix-lock-operations.md")
+
 	// Start background scrubber (checks every 30s)
 	scrubber := scrub.New(store, cfg.NodeID, 30*time.Second, log)
 	// Without this the scrubber deletes an unlinked file's dangling extent

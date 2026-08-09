@@ -2,7 +2,7 @@
 
 ## State
 
-**Implemented and under hardening.** Go + C codebase, `make` build, Go test suite, chaos/stress harness against real AWS infra. Phases 0–6 are built; Phase 11 hardening is in progress.
+**Implemented and under hardening.** Go + C codebase, `make` build, Go test suite, chaos/stress harness against real AWS infra.
 
 Layout: `cmd/etcfuse` (C FUSE daemon) · `cmd/etcfuse-meta` (Go metadata daemon) · `pkg/{metadata,fencing,blockio,arena,scrub,compaction,wal,walgo,fuse,block}` · `internal/{ipc,config}` · `test/harness` (Go, mock-store + simulator) · `scripts/{infra,test}` (AWS provisioning + chaos).
 

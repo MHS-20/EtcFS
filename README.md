@@ -4,7 +4,7 @@
 
 A cluster filesystem where **etcd/Raft is the only source of durable truth**, and a shared raw block device (e.g. AWS EBS Multi-Attach) holds nothing but file bytes. No on-disk filesystem format, no kernel module, no bespoke distributed lock manager — a userspace FUSE daemon on each node presents POSIX semantics, backed by etcd for everything structural (namespace, inode metadata, locks, allocation) and direct block I/O for file content.
 
-Status: implemented and under hardening (Phases 0–6 built, Phase 11 hardening in progress). See [State](#state) below before relying on this for real data.
+Status: implemented and under hardening. See [State](#state) below before relying on this for real data.
 
 ## Table of contents
 

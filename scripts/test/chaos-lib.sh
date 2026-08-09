@@ -12,6 +12,12 @@
 # it. Keep the three together when adding a new call site.
 COMPOSE="docker compose -f $PROJECT_ROOT/deploy/docker/docker-compose.yml"
 
+# CHAOS_LEASE_TTL overrides the --lease-ttl every daemon launches with (default
+# 10s everywhere below). Self-fence lands 2-3x this value (pkg/fencing/
+# watchdog.go), so a scenario that needs to observe behavior *before* self-fence
+# widens this instead of racing the default window.
+CHAOS_LEASE_TTL="${CHAOS_LEASE_TTL:-10s}"
+
 if [[ "$MODE" == "docker" ]]; then
     N1=etcfs-fuse1; N2=etcfs-fuse2; N3=etcfs-fuse3
     M1=etcfs-meta1; M2=etcfs-meta2; M3=etcfs-meta3
@@ -147,7 +153,7 @@ if [[ "$MODE" == "docker" ]]; then
         docker run -d --name "etcfs-meta$id" --network docker_etcfuse-net \
             -v "docker_block_data:/block-device" -v "etcfuse-meta${id}-sock:/var/run" "$META_IMG" \
             --listen=/var/run/etcfuse.sock --etcd-endpoints="$endpoints" --node-id="n$id" \
-            --cluster-name=docker-chaos --lease-ttl=10s --block-device=/block-device/etcfuse.img --log-level=1 >/dev/null
+            --cluster-name=docker-chaos --lease-ttl=$CHAOS_LEASE_TTL --block-device=/block-device/etcfuse.img --log-level=1 >/dev/null
 
         sleep 2
         docker run -d --name "etcfs-fuse$id" --network docker_etcfuse-net --privileged --device /dev/fuse \
@@ -318,7 +324,7 @@ for d in json.load(sys.stdin).get('blockdevices', []):
           # go of the fd.
           for k in \$(seq 1 5); do sudo umount /mnt/etcfuse 2>/dev/null && break; sleep 1; done
           sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
-          sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
+          sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=$CHAOS_LEASE_TTL $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
           # A restart right after a partition heals (this is R7's exact
           # case) can legitimately need this long: the node's own local etcd
           # has to rejoin raft and the client has to reconnect and ride out a
@@ -432,7 +438,7 @@ for d in json.load(sys.stdin).get('blockdevices', []):
                 sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
                 sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
                     --etcd-endpoints=$ETCD --node-id=n$i --cluster-name=$TAG \
-                    --lease-ttl=10s $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
+                    --lease-ttl=$CHAOS_LEASE_TTL $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
                 sleep 4
                 sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock \
                     --node-id=n$i --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
@@ -578,7 +584,7 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@"$pub" "
             sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
                 --etcd-endpoints=$endpoints --node-id=n$id --cluster-name=$TAG \
-                --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 \
+                --lease-ttl=$CHAOS_LEASE_TTL --block-device=/dev/nvme1n1 --log-level=1 \
                 --ebs-volume-id=$vol_id --ec2-instance-id=$inst > /tmp/meta.log 2>&1 &
             sleep 4
             sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock \

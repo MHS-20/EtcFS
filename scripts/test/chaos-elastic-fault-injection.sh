@@ -5,7 +5,7 @@
 # ownership are all in flux during a join/leave — the most likely place for
 # a fencing or allocator bug to hide, and untested until now.
 #
-# Four scenarios, run in sequence against one 3-node base cluster (each
+# Five scenarios, run in sequence against one 3-node base cluster (each
 # fully cleans up its own extra node before the next starts, so node id 4
 # is reused throughout):
 #
@@ -23,18 +23,22 @@
 #   FJ4  Kill a SURVIVING node's daemons while a different node is mid-join,
 #        then let the survivor recover. Assert the join still completes and
 #        the survivor rejoins cleanly (quorum stress).
+#   FJ5  Partition a joined node from etcd (lease TTL widened to 120s so
+#        self-fencing can't race the probe) and assert its FUSE ops bound at
+#        internal/ipc/retry.go's requestTimeout (10s), with the daemon
+#        confirmed alive before and after — see TODO-hardening.md item 7.
 #
 # This script does NOT reuse add_node/remove_node's internals for FJ1 — the
 # whole point is to stop mid-sequence, which a black-box function call
 # cannot do. FJ1's docker/aws partial_join_* functions below are a
 # deliberate, commented duplication of add_node's first half (etcd member +
-# meta daemon), stopping short of starting the FUSE container/process. FJ2
-# and FJ4 reuse add_node/remove_node from chaos-lib.sh unmodified, since
+# meta daemon), stopping short of starting the FUSE container/process. FJ2,
+# FJ4, and FJ5 reuse add_node/remove_node from chaos-lib.sh unmodified, since
 # their fault lands before/after the join rather than inside it.
 #
 # Usage:
-#   ./chaos-elastic-fault-injection.sh docker [FJ1|FJ2|FJ3|FJ4|all]
-#   ./chaos-elastic-fault-injection.sh aws    [FJ1|FJ2|FJ3|FJ4|all]
+#   ./chaos-elastic-fault-injection.sh docker [FJ1|FJ2|FJ3|FJ4|FJ5|all]
+#   ./chaos-elastic-fault-injection.sh aws    [FJ1|FJ2|FJ3|FJ4|FJ5|all]
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -44,7 +48,7 @@ PASS=0; FAIL=0
 
 MODE="${1:-}"
 SCENARIO="${2:-all}"
-[[ "$MODE" == "docker" || "$MODE" == "aws" ]] || { echo "usage: $0 docker|aws [FJ1|FJ2|FJ3|FJ4|all]"; exit 1; }
+[[ "$MODE" == "docker" || "$MODE" == "aws" ]] || { echo "usage: $0 docker|aws [FJ1|FJ2|FJ3|FJ4|FJ5|all]"; exit 1; }
 
 log() { echo "[$(date +%H:%M:%S)] $1" | tee -a "$REPORT_DIR/chaos.log"; }
 logerr() {
@@ -257,7 +261,9 @@ run_fj1() {
 }
 
 # ============================================================
-# FJ2: partition the joining node from etcd right after it mounts.
+# Shared node4 partition/heal/liveness helpers — FJ2 and FJ5 both sever
+# node4 from etcd and watch its meta daemon; factored here so the fault
+# injection itself only exists once.
 #
 # History worth keeping: this scenario originally partitioned on AWS by
 # swapping the instance's security group (the technique chaos-test.sh's
@@ -270,6 +276,89 @@ run_fj1() {
 # blind spot; it only asserts survivors keep working, never that the
 # partitioned node's own operations are blocked, so it would not surface it.
 # ============================================================
+
+# node4_meta_alive — true if node4's meta daemon process is still running.
+node4_meta_alive() {
+    if [[ "$MODE" == "docker" ]]; then
+        [[ "$(docker inspect etcfs-meta4 --format '{{.State.Status}}' 2>/dev/null)" == "running" ]]
+    else
+        local alive; alive=$(runcmd "$(node_pub 4)" "pgrep -x etcfuse-meta >/dev/null && echo ALIVE || echo GONE")
+        [[ "$alive" == *ALIVE* ]]
+    fi
+}
+
+# partition_node4 <node4_addr> — cuts node4 off from etcd (docker: detach
+# its network; aws: iptables DROP on 2379/2380 to each peer) and asserts the
+# cut actually took effect.
+partition_node4() {
+    local node4="$1"
+    log "  partitioning node4 from etcd (lease_ttl=$CHAOS_LEASE_TTL)..."
+    if [[ "$MODE" == "docker" ]]; then
+        docker network disconnect docker_etcfuse-net etcfs-meta4 2>/dev/null
+        return
+    fi
+
+    # iptables on the instance, NOT a security-group swap.
+    #
+    # SG swaps do not sever already-established connections — AWS security
+    # groups are stateful and only evaluate NEW connection attempts against
+    # the changed rules, so a daemon whose etcd connection predates the swap
+    # keeps using it and is never actually partitioned. That produced a
+    # false "fencing failed" result on a previous run of this scenario;
+    # confirmed by direct testing (a fresh etcdctl correctly saw "unhealthy
+    # cluster" post-swap while the daemon's existing connection kept
+    # working). iptables filters every packet, established or not, so it is
+    # a genuine cut. Same technique as scripts/test/isolate-node.sh.
+    #
+    # Port 22 is deliberately left open so the harness can still reach the
+    # node to observe it; only etcd's client (2379) and peer (2380) ports
+    # are dropped, in both directions.
+    # Amazon Linux 2023 does not ship the iptables CLI in the base AMI, and
+    # add_node's setup only installs fuse3/gcc — so install it here if
+    # absent. nftables is the AL2023 default backend; the iptables package
+    # provides the iptables-nft shim that drives it.
+    local ipt_setup
+    ipt_setup=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$node4" \
+        "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -3; command -v iptables || echo NO_IPTABLES" 2>&1)
+    log "  iptables availability on node4: $(echo "$ipt_setup" | tr '\n' ' ' | cut -c1-160)"
+
+    # Do NOT use runcmd here: it redirects stderr to /dev/null, which hid
+    # the reason these rules failed on a previous run (only "ERR:1" was
+    # visible). Capture stderr so a failure is diagnosable from the log.
+    local peer ipt_out ipt_rc
+    for peer in "$P1" "$P2" "$P3"; do
+        ipt_out=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$node4" "
+            set -e
+            sudo iptables -A OUTPUT -p tcp -d $peer --dport 2379 -j DROP
+            sudo iptables -A OUTPUT -p tcp -d $peer --dport 2380 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $peer --sport 2379 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $peer --sport 2380 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $peer --dport 2379 -j DROP
+            sudo iptables -A INPUT  -p tcp -s $peer --dport 2380 -j DROP
+        " 2>&1); ipt_rc=$?
+        echo "iptables peer=$peer rc=$ipt_rc out=$ipt_out" >> "$REPORT_DIR/chaos.log"
+        [[ "$ipt_rc" -ne 0 ]] && logerr "  iptables rules for peer $peer FAILED rc=$ipt_rc: $(echo "$ipt_out" | tr '\n' ' ' | cut -c1-200)"
+    done
+    # Verify the cut actually took effect rather than assuming it did — this
+    # check is what would have caught the SG-statefulness problem.
+    local probe
+    probe=$(runcmd "$node4" "timeout 5 curl -s -o /dev/null -w '%{http_code}' http://$P1:2379/health 2>&1; echo rc=\$?")
+    if [[ "$probe" == *"rc=0"* && "$probe" != *"000"* ]]; then
+        bad "partition did not take effect — node4 still reached etcd at $P1 (probe=$probe)"
+    else
+        log "  partition verified: node4 cannot reach etcd (probe=$probe)"
+    fi
+}
+
+# heal_node4 — reverses partition_node4.
+heal_node4() {
+    if [[ "$MODE" == "docker" ]]; then
+        docker network connect docker_etcfuse-net etcfs-meta4 2>/dev/null
+    else
+        runcmd "$(node_pub 4)" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >>"$REPORT_DIR/chaos.log" 2>&1
+    fi
+}
+
 run_fj2() {
     log "======== FJ2: partition joining node from etcd post-join ========"
     check_mount "$N1" || { bad "baseline mount not ready"; return; }
@@ -278,61 +367,7 @@ run_fj2() {
     if [[ -z "$node4" ]]; then bad "node4 failed to join at all — cannot run FJ2"; return; fi
     ok "node4 joined normally ($node4)"
 
-    log "  partitioning node4 from etcd (lease_ttl=10s, self-fence margin ~20s)..."
-    if [[ "$MODE" == "docker" ]]; then
-        docker network disconnect docker_etcfuse-net etcfs-meta4 2>/dev/null
-    else
-        # iptables on the instance, NOT a security-group swap.
-        #
-        # SG swaps do not sever already-established connections — AWS security
-        # groups are stateful and only evaluate NEW connection attempts against
-        # the changed rules, so a daemon whose etcd connection predates the swap
-        # keeps using it and is never actually partitioned. That produced a
-        # false "fencing failed" result on a previous run of this scenario;
-        # confirmed by direct testing (a fresh etcdctl correctly saw "unhealthy
-        # cluster" post-swap while the daemon's existing connection kept
-        # working). iptables filters every packet, established or not, so it is
-        # a genuine cut. Same technique as scripts/test/isolate-node.sh.
-        #
-        # Port 22 is deliberately left open so the harness can still reach the
-        # node to observe it; only etcd's client (2379) and peer (2380) ports
-        # are dropped, in both directions.
-        # Amazon Linux 2023 does not ship the iptables CLI in the base AMI, and
-        # add_node's setup only installs fuse3/gcc — so install it here if
-        # absent. nftables is the AL2023 default backend; the iptables package
-        # provides the iptables-nft shim that drives it.
-        local ipt_setup
-        ipt_setup=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$node4" \
-            "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -3; command -v iptables || echo NO_IPTABLES" 2>&1)
-        log "  iptables availability on node4: $(echo "$ipt_setup" | tr '\n' ' ' | cut -c1-160)"
-
-        # Do NOT use runcmd here: it redirects stderr to /dev/null, which hid
-        # the reason these rules failed on a previous run (only "ERR:1" was
-        # visible). Capture stderr so a failure is diagnosable from the log.
-        local peer ipt_out ipt_rc
-        for peer in "$P1" "$P2" "$P3"; do
-            ipt_out=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$node4" "
-                set -e
-                sudo iptables -A OUTPUT -p tcp -d $peer --dport 2379 -j DROP
-                sudo iptables -A OUTPUT -p tcp -d $peer --dport 2380 -j DROP
-                sudo iptables -A INPUT  -p tcp -s $peer --sport 2379 -j DROP
-                sudo iptables -A INPUT  -p tcp -s $peer --sport 2380 -j DROP
-                sudo iptables -A INPUT  -p tcp -s $peer --dport 2379 -j DROP
-                sudo iptables -A INPUT  -p tcp -s $peer --dport 2380 -j DROP
-            " 2>&1); ipt_rc=$?
-            echo "iptables peer=$peer rc=$ipt_rc out=$ipt_out" >> "$REPORT_DIR/chaos.log"
-            [[ "$ipt_rc" -ne 0 ]] && logerr "  iptables rules for peer $peer FAILED rc=$ipt_rc: $(echo "$ipt_out" | tr '\n' ' ' | cut -c1-200)"
-        done
-        # Verify the cut actually took effect rather than assuming it did —
-        # this check is what would have caught the SG-statefulness problem.
-        local probe
-        probe=$(runcmd "$node4" "timeout 5 curl -s -o /dev/null -w '%{http_code}' http://$P1:2379/health 2>&1; echo rc=\$?")
-        if [[ "$probe" == *"rc=0"* && "$probe" != *"000"* ]]; then
-            bad "partition did not take effect — node4 still reached etcd at $P1 (probe=$probe)"
-        else
-            log "  partition verified: node4 cannot reach etcd (probe=$probe)"
-        fi
-    fi
+    partition_node4 "$node4"
 
     # Watch the META daemon, not the FUSE mount.
     #
@@ -353,14 +388,7 @@ run_fj2() {
     local fence_deadline=45 fence_waited=0 fenced=0
     log "  waiting up to ${fence_deadline}s for the meta daemon to self-fence..."
     while [[ "$fence_waited" -lt "$fence_deadline" ]]; do
-        if [[ "$MODE" == "docker" ]]; then
-            [[ "$(docker inspect etcfs-meta4 --format '{{.State.Status}}' 2>/dev/null)" != "running" ]] && { fenced=1; break; }
-        else
-            # No container to inspect on AWS — check the process directly.
-            local alive
-            alive=$(runcmd "$(node_pub 4)" "pgrep -x etcfuse-meta >/dev/null && echo ALIVE || echo GONE")
-            [[ "$alive" == *GONE* ]] && { fenced=1; break; }
-        fi
+        node4_meta_alive || { fenced=1; break; }
         sleep 5; fence_waited=$((fence_waited+5))
     done
 
@@ -436,15 +464,11 @@ run_fj2() {
     fi
 
     log "  cleanup: removing node4 (bounded — node4 itself may be wedged)..."
-    if [[ "$MODE" == "docker" ]]; then
-        docker network connect docker_etcfuse-net etcfs-meta4 2>/dev/null
-    else
-        # Flush the DROP rules added above. The node may have self-fenced
-        # (os.Exit(77)) by now, which is fine — this only touches the kernel's
-        # firewall, not the daemon, and the instance is terminated moments
-        # later by remove_node anyway.
-        runcmd "$node4" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >>"$REPORT_DIR/chaos.log" 2>&1
-    fi
+    # The node may have self-fenced (os.Exit(77)) by now, which is fine —
+    # heal_node4 only touches the kernel firewall / docker network, not the
+    # daemon, and the instance is terminated moments later by remove_node
+    # anyway.
+    heal_node4
     remove_node 4 &
     local rm_pid=$! rm_waited=0 rm_ok=0
     while [[ "$rm_waited" -lt 90 ]]; do
@@ -586,6 +610,98 @@ run_fj4() {
 }
 
 # ============================================================
+# FJ5: partition a joined node from etcd and prove that FUSE ops on it
+# return within `requestTimeout` (internal/ipc/retry.go, 10s) rather than
+# hanging until self-fencing kills the daemon out from under them.
+#
+# FJ2 partitions node4 too, but by the time it probes, self-fencing has
+# already exited the daemon (fence window ~20-33s at the default 10s lease
+# TTL, tighter than requestTimeout's own 10s) — so a fast rc there proves
+# "the process is dead," not "the request was bounded." This scenario widens
+# the lease TTL to CHAOS_LEASE_TTL=120s for node4's join only, pushing the
+# self-fence window out to ~4-6 minutes, and probes well inside that window
+# with the daemon confirmed alive both before and after — the only way to
+# attribute the bound to requestTimeout rather than to the daemon dying.
+# ============================================================
+
+# timed_probe4 <docker_cmd> <aws_cmd> — runs the mode-appropriate cmd on
+# node4 (bounded 30s), echoes "<elapsed_seconds> <rc>". 124 is timeout's own
+# "still running" rc. Separate commands per mode because AWS writes need
+# `sudo tee` (same reason FJ2's write probe does) while docker exec runs as
+# root already.
+timed_probe4() {
+    local docker_cmd="$1" aws_cmd="$2" t0 t1 rc=0
+    t0=$(date +%s)
+    if [[ "$MODE" == "docker" ]]; then
+        timeout 30 docker exec etcfs-fuse4 sh -c "$docker_cmd" >/dev/null 2>&1 || rc=$?
+    else
+        timeout 30 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -q ec2-user@"$(node_pub 4)" \
+            "$aws_cmd" >/dev/null 2>&1 || rc=$?
+    fi
+    t1=$(date +%s)
+    echo "$((t1 - t0)) $rc"
+}
+
+run_fj5() {
+    log "======== FJ5: partitioned node's ops are bounded by requestTimeout, not self-fence ========"
+    check_mount "$N1" || { bad "baseline mount not ready"; return; }
+
+    # `local` shadows CHAOS_LEASE_TTL for the rest of this function only
+    # (bash scopes locals dynamically to everything it calls), so add_node
+    # picks up 120s here without touching any other scenario's default.
+    local CHAOS_LEASE_TTL=120s
+    local node4; node4=$(add_node 4)
+    if [[ -z "$node4" ]]; then bad "node4 failed to join at all — cannot run FJ5"; return; fi
+    ok "node4 joined normally with a 120s lease TTL ($node4)"
+
+    partition_node4 "$node4"
+
+    if node4_meta_alive; then
+        ok "node4's meta daemon still alive right after partition (precondition for this scenario)"
+    else
+        bad "node4's meta daemon already gone right after partition — self-fence raced the probe, widen CHAOS_LEASE_TTL further"
+        heal_node4; remove_node 4; return
+    fi
+
+    # requestTimeout (internal/ipc/retry.go) bounds every FUSE op's etcd work
+    # at 10s. 15s gives margin for ssh/docker-exec overhead without coming
+    # close to the ~240-360s fence window above.
+    local bound=15
+    local dt rc
+
+    assert_bounded4() {
+        local label="$1" dt="$2" rc="$3"
+        log "  $label on partitioned node4: ${dt}s, rc=$rc"
+        if [[ "$rc" -eq 124 || "$dt" -gt "$bound" ]]; then
+            bad "$label on partitioned node4 took ${dt}s (rc=$rc) — did not bound at requestTimeout"
+        elif [[ "$rc" -eq 0 ]]; then
+            bad "$label on partitioned node4 returned success — should have been rejected while cut off from etcd"
+        else
+            ok "$label on partitioned node4 bounded to ${dt}s (rc=$rc)"
+        fi
+    }
+
+    read -r dt rc <<< "$(timed_probe4 "echo probe > /mnt/etcfuse/fj5-probe.txt" "echo probe | sudo tee /mnt/etcfuse/fj5-probe.txt")"
+    assert_bounded4 "write" "$dt" "$rc"
+
+    read -r dt rc <<< "$(timed_probe4 "stat /mnt/etcfuse" "stat /mnt/etcfuse")"
+    assert_bounded4 "getattr" "$dt" "$rc"
+
+    read -r dt rc <<< "$(timed_probe4 "ls /mnt/etcfuse" "ls /mnt/etcfuse")"
+    assert_bounded4 "readdir" "$dt" "$rc"
+
+    if node4_meta_alive; then
+        ok "node4's meta daemon still alive after the probes — bound is attributable to requestTimeout, not to the daemon dying"
+    else
+        bad "node4's meta daemon died during the probe window — self-fence fired before requestTimeout could be isolated as the cause"
+    fi
+
+    heal_node4
+    remove_node 4
+    sleep 3
+}
+
+# ============================================================
 # MAIN
 # ============================================================
 if ! provision_cluster; then
@@ -601,7 +717,8 @@ case "$SCENARIO" in
     FJ2) run_fj2 ;;
     FJ3) run_fj3 ;;
     FJ4) run_fj4 ;;
-    all) run_fj1; run_fj2; run_fj3; run_fj4 ;;
+    FJ5) run_fj5 ;;
+    all) run_fj1; run_fj2; run_fj3; run_fj4; run_fj5 ;;
     *) log "unknown scenario: $SCENARIO" ;;
 esac
 

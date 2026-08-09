@@ -44,8 +44,6 @@
 #define IPC_OP_FSYNC       24
 #define IPC_OP_MKNOD       25
 #define IPC_OP_FLUSH       26
-#define IPC_OP_GETLK       27
-#define IPC_OP_SETLK       28
 #define IPC_OP_READDIRPLUS 29
 
 #define MAX_NAME_LEN 255
@@ -884,73 +882,6 @@ static void ec_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     fuse_reply_buf(req, (const char *) (resp + pos), dataLen);
     free(resp);
 }
-static void ec_getlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct flock *lock)
-{
-    (void) fi;
-    uint8_t payload[48];
-    uint32_t off = 0;
-    off += wb_u64(payload + off, ino);
-    off += wb_u64(payload + off, (uint64_t) lock->l_start);
-    off += wb_u64(payload + off, (uint64_t) lock->l_len);
-    off += wb_u32(payload + off, (uint32_t) lock->l_type);
-    off += wb_u32(payload + off, (uint32_t) lock->l_pid);
-
-    uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_GETLK, payload, off, &resp, &rlen) < 0) {
-        struct flock lk = *lock;
-        lk.l_type = F_UNLCK;
-        fuse_reply_lock(req, &lk);
-        return;
-    }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
-    if (e != 0) {
-        struct flock lk = *lock;
-        lk.l_type = F_UNLCK;
-        fuse_reply_lock(req, &lk);
-        free(resp);
-        return;
-    }
-    uint64_t lstart = rb_u64(resp, &pos);
-    uint64_t llen = rb_u64(resp, &pos);
-    uint32_t ltype = rb_u32(resp, &pos);
-    uint32_t lpid = rb_u32(resp, &pos);
-    free(resp);
-    struct flock lk;
-    lk.l_type = (short) ltype;
-    lk.l_whence = SEEK_SET;
-    lk.l_start = (off_t) lstart;
-    lk.l_len = (off_t) llen;
-    lk.l_pid = (pid_t) lpid;
-    fuse_reply_lock(req, &lk);
-}
-static void ec_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct flock *lock,
-                     int sleep)
-{
-    (void) fi;
-    uint8_t payload[48];
-    uint32_t off = 0;
-    off += wb_u64(payload + off, ino);
-    off += wb_u64(payload + off, (uint64_t) lock->l_start);
-    off += wb_u64(payload + off, (uint64_t) lock->l_len);
-    off += wb_u32(payload + off, (uint32_t) lock->l_type);
-    off += wb_u32(payload + off, (uint32_t) lock->l_pid);
-    off += wb_u32(payload + off, (uint32_t) sleep);
-
-    uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_SETLK, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
-    int32_t e = 0;
-    if (rlen >= 4)
-        e = (int32_t) ((uint32_t) resp[0] << 24 | (uint32_t) resp[1] << 16 |
-                       (uint32_t) resp[2] << 8 | (uint32_t) resp[3]);
-    free(resp);
-    fuse_reply_err(req, e != 0 ? -e : 0);
-}
 static void ec_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t length,
                          struct fuse_file_info *fi)
 {
@@ -992,8 +923,13 @@ struct fuse_lowlevel_ops *etcfs_fuse_ops(void)
     ops.fsync = ec_fsync;
     ops.fsyncdir = ec_fsyncdir;
     ops.read = ec_read;
-    ops.getlk = ec_getlk;
-    ops.setlk = ec_setlk;
     ops.fallocate = ec_fallocate;
+    /* getlk/setlk are deliberately left unset. libfuse: "if the locking
+     * methods are not implemented, the kernel will still allow file locking
+     * to work locally." Implementing them takes that job away from the
+     * kernel, and the daemon granted every request, so fcntl() locks
+     * excluded nothing -- not even two processes on the same node. Unset,
+     * fcntl() gets the node-local enforcement flock() already had.
+     * See docs/architecture/metadata/posix-lock-operations.md. */
     return &ops;
 }
