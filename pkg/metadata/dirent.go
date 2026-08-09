@@ -220,47 +220,50 @@ func (s *Store) AtomicCreateDir(ctx context.Context, parent uint64, name string,
 	return rec, nil
 }
 
-// AtomicUnlink removes a directory entry and decrements the inode's nlink.
-// If nlink reaches 0, the inode is also deleted.
-// All in one atomic transaction.
+// AtomicUnlink removes a directory entry and drops one reference to the inode
+// it named, deleting the inode once nothing points at it.
+//
+// The transaction is pinned to both records as they were read: the dirent still
+// naming this inode, and the inode still holding the link count the new one was
+// computed from. Without the second, two concurrent unlinks of two names for
+// one inode each read nlink=2, each write nlink=1, and the inode is never
+// freed. Losing either comparison is contention, so the work is redone against
+// fresh state rather than reported as a failure.
 func (s *Store) AtomicUnlink(ctx context.Context, parent uint64, name string) error {
-	// First, find the inode
-	ino, err := s.LookupDirent(ctx, parent, name)
-	if err != nil {
-		return fmt.Errorf("atomic unlink %d/%q: %w", parent, name, err)
-	}
-	if ino == 0 {
-		return fmt.Errorf("atomic unlink %d/%q: not found", parent, name)
-	}
+	return retryCAS(ctx, fmt.Sprintf("atomic unlink %d/%q", parent, name), func() (bool, error) {
+		fail := func(format string, args ...any) (bool, error) {
+			prefix := fmt.Sprintf("atomic unlink %d/%q: ", parent, name)
+			return false, fmt.Errorf(prefix+format, args...)
+		}
 
-	rec, err := s.GetInode(ctx, ino)
-	if err != nil || rec == nil {
-		return fmt.Errorf("atomic unlink %d/%q: inode %d not found", parent, name, ino)
-	}
+		direntKey := DirentKey(parent, name)
+		direntKvs, _, err := s.GetRevision(ctx, direntKey)
+		if err != nil {
+			return fail("%w", err)
+		}
+		if len(direntKvs) == 0 {
+			return fail("%w", ErrNotFound)
+		}
+		ino := DecodeUint64(direntKvs[0].Value)
 
-	cmps := []clientv3.Cmp{
-		clientv3.Compare(clientv3.CreateRevision(DirentKey(parent, name)), ">", 0),
-	}
+		rec, rev, err := s.GetInodeRev(ctx, ino)
+		if err != nil {
+			return fail("%w", err)
+		}
+		if rec == nil {
+			return fail("inode %d not found (%w)", ino, ErrNotFound)
+		}
 
-	thenOps := []clientv3.Op{
-		DeleteDirent(parent, name),
-	}
-
-	rec.Nlink--
-	if rec.Nlink > 0 {
-		thenOps = append(thenOps, clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec))))
-	} else {
-		thenOps = append(thenOps, clientv3.OpDelete(InodeKey(ino)))
-	}
-
-	ok, err := s.Txn(ctx, cmps, thenOps, nil)
-	if err != nil {
-		return fmt.Errorf("atomic unlink %d/%q: %w", parent, name, err)
-	}
-	if !ok {
-		return fmt.Errorf("atomic unlink %d/%q: entry removed by concurrent operation", parent, name)
-	}
-	return nil
+		cmps := []clientv3.Cmp{
+			clientv3.Compare(clientv3.ModRevision(direntKey), "=", direntKvs[0].ModRevision),
+			InodeUnchanged(ino, rev),
+		}
+		ops := []clientv3.Op{
+			DeleteDirent(parent, name),
+			s.unlinkInodeOp(rec),
+		}
+		return s.Txn(ctx, cmps, ops, nil)
+	})
 }
 
 // AtomicRename moves ino from oldParent/oldName to newParent/newName in a
@@ -341,7 +344,7 @@ func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName stri
 	cmps = append(cmps, clientv3.Compare(clientv3.ModRevision(targetKey), "=", targetKvs[0].ModRevision))
 
 	victimIno := DecodeUint64(targetKvs[0].Value)
-	victim, err := s.GetInode(ctx, victimIno)
+	victim, victimRev, err := s.GetInodeRev(ctx, victimIno)
 	if err != nil {
 		return fail("read target inode: %w", err)
 	}
@@ -362,6 +365,10 @@ func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName stri
 				return fail("target directory is not empty (%w)", ErrNotEmpty)
 			}
 		}
+		// Pinned like the dirent above: the link count written below is
+		// computed from this record, so a concurrent change to it has to abort
+		// the rename rather than be overwritten by it.
+		cmps = append(cmps, InodeUnchanged(victimIno, victimRev))
 		ops = append(ops, s.unlinkInodeOp(victim))
 	}
 

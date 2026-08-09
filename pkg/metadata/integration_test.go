@@ -1220,3 +1220,148 @@ func TestIntegration_RefusedLockLeavesNothingBehind(t *testing.T) {
 
 	require.NoError(t, writer.ReleaseLock(ctx, ino, lease))
 }
+
+// ---- lost-update protection on nlink ----
+
+// Concurrent hard links to one inode must all be counted. Before the inode was
+// pinned to the revision it was read at, the transaction only proved the record
+// existed, so every writer read the same count and the last one to commit
+// silently erased the rest.
+func TestIntegration_ConcurrentHardLinksAllCount(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent, ino, links = 9300, 9301, 16
+
+	_, err := s.AtomicCreateDir(ctx, RootIno, "nlink-race", parent, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateFile(ctx, parent, "target", ino, ModeFile|0644, 1000, 1000)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, links)
+	for i := 0; i < links; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if lerr := s.IncrementNlink(ctx, ino); lerr != nil {
+				errs <- lerr
+				return
+			}
+			errs <- s.CreateDirent(ctx, parent, fmt.Sprintf("link-%d", i), ino)
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		require.NoError(t, e)
+	}
+
+	rec, err := s.GetInode(ctx, ino)
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	assert.EqualValues(t, 1+links, rec.Nlink, "every concurrent link must be counted")
+
+	entries, err := s.ListDirents(ctx, parent)
+	require.NoError(t, err)
+	assert.Len(t, entries, 1+links, "and every name must exist")
+}
+
+// The mirror case: concurrent unlinks of many names for one inode must land on
+// exactly zero and delete it. Each used to read the same count and write the
+// same lower value, leaving the inode referenced by nothing but never freed.
+func TestIntegration_ConcurrentUnlinksReachZeroAndFreeTheInode(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent, ino, names = 9400, 9401, 12
+
+	_, err := s.AtomicCreateDir(ctx, RootIno, "unlink-race", parent, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateFile(ctx, parent, "name-0", ino, ModeFile|0644, 1000, 1000)
+	require.NoError(t, err)
+	for i := 1; i < names; i++ {
+		require.NoError(t, s.IncrementNlink(ctx, ino))
+		require.NoError(t, s.CreateDirent(ctx, parent, fmt.Sprintf("name-%d", i), ino))
+	}
+
+	rec, err := s.GetInode(ctx, ino)
+	require.NoError(t, err)
+	require.EqualValues(t, names, rec.Nlink)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, names)
+	for i := 0; i < names; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- s.AtomicUnlink(ctx, parent, fmt.Sprintf("name-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		require.NoError(t, e)
+	}
+
+	rec, err = s.GetInode(ctx, ino)
+	require.NoError(t, err)
+	assert.Nil(t, rec, "the inode must be deleted once the last name is gone")
+
+	entries, err := s.ListDirents(ctx, parent)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+// A rename replacing a target reads that target's link count before writing it
+// back, so it has to abort if the count moves underneath it.
+func TestIntegration_RenameOverTargetPinsTheVictimInode(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent, srcIno, victimIno = 9500, 9501, 9502
+
+	_, err := s.AtomicCreateDir(ctx, RootIno, "rename-pin", parent, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateFile(ctx, parent, "src", srcIno, ModeFile|0644, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateFile(ctx, parent, "victim", victimIno, ModeFile|0644, 1000, 1000)
+	require.NoError(t, err)
+
+	// Racing hard links against the replacement: whichever order they land in,
+	// the victim's count must stay consistent with the names pointing at it.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var renameErr error
+	go func() {
+		defer wg.Done()
+		renameErr = s.AtomicRename(ctx, parent, "src", parent, "victim", srcIno, 0)
+	}()
+	go func() {
+		defer wg.Done()
+		if lerr := s.IncrementNlink(ctx, victimIno); lerr == nil {
+			_ = s.CreateDirent(ctx, parent, "victim-link", victimIno)
+		}
+	}()
+	wg.Wait()
+
+	if renameErr != nil {
+		// Aborting is the correct outcome when the victim moved first.
+		assert.ErrorIs(t, renameErr, ErrConflict)
+		return
+	}
+
+	// The rename won. Its own name now resolves to the source, and the victim
+	// survives only if the concurrent link got in first.
+	got, err := s.LookupDirent(ctx, parent, "victim")
+	require.NoError(t, err)
+	assert.EqualValues(t, srcIno, got)
+
+	victim, err := s.GetInode(ctx, victimIno)
+	require.NoError(t, err)
+	linked, err := s.LookupDirent(ctx, parent, "victim-link")
+	require.NoError(t, err)
+	if linked == 0 {
+		assert.Nil(t, victim, "no surviving name, so the inode must be gone")
+	} else {
+		require.NotNil(t, victim, "a surviving name means the inode must remain")
+		assert.EqualValues(t, 1, victim.Nlink)
+	}
+}

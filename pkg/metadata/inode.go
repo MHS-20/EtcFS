@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -129,49 +130,133 @@ func (s *Store) DeleteInode(ctx context.Context, ino uint64) error {
 	return nil
 }
 
+// GetInodeRev retrieves an inode record together with the revision it was last
+// written at, which a later transaction compares against to prove the record
+// has not changed in between.  Returns a nil record if the inode is gone.
+func (s *Store) GetInodeRev(ctx context.Context, ino uint64) (*InodeRecord, int64, error) {
+	kvs, _, err := s.GetRevision(ctx, InodeKey(ino))
+	if err != nil {
+		return nil, 0, fmt.Errorf("get inode %d: %w", ino, err)
+	}
+	if len(kvs) == 0 {
+		return nil, 0, nil
+	}
+	return DecodeInode(kvs[0].Value), kvs[0].ModRevision, nil
+}
+
+// InodeUnchanged compares an inode against the revision it was read at.
+//
+// Every read-modify-write of an inode record has to carry this. Without it a
+// transaction only proves the inode exists, not that it still holds the value
+// the new one was computed from, so two concurrent updates each read the same
+// record and the second silently overwrites the first.
+func InodeUnchanged(ino uint64, modRev int64) clientv3.Cmp {
+	return clientv3.Compare(clientv3.ModRevision(InodeKey(ino)), "=", modRev)
+}
+
+// casAttempts bounds a read-modify-write retry. Losing the comparison means
+// something changed underneath, so the work is redone against fresh state; the
+// bound keeps sustained contention from spinning forever.
+const casAttempts = 20
+
+// retryCAS runs attempt until it commits. attempt reports false when its
+// comparisons did not hold, which is contention rather than failure.
+func retryCAS(ctx context.Context, what string, attempt func() (bool, error)) error {
+	for i := 0; i < casAttempts; i++ {
+		ok, err := attempt()
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if err := casBackoff(ctx, i); err != nil {
+			return fmt.Errorf("%s: %w", what, err)
+		}
+	}
+	return fmt.Errorf("%s: contended beyond %d attempts (%w)", what, casAttempts, ErrConflict)
+}
+
+// casBackoff pauses before redoing a contended attempt.
+//
+// The jitter is what makes the retry converge: callers that lost the same race
+// started their retry at the same moment, so a fixed delay puts them back in
+// lockstep to collide again on the next tick. Sixteen concurrent hard links to
+// one inode exhausted the whole attempt budget that way.
+//
+// The wait honours ctx, so a caller whose deadline has already passed stops
+// here instead of sitting out the full delay first.
+func casBackoff(ctx context.Context, attempt int) error {
+	const maxDelay = 200 * time.Millisecond
+	delay := time.Duration(1<<attempt) * time.Millisecond
+	if delay > maxDelay || delay <= 0 {
+		delay = maxDelay
+	}
+	delay = delay/2 + time.Duration(rand.Int63n(int64(delay/2)+1))
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // IncrementNlink atomically increments the nlink counter on an inode.
 // Used when creating a hard link.
 func (s *Store) IncrementNlink(ctx context.Context, ino uint64) error {
-	rec, err := s.GetInode(ctx, ino)
-	if err != nil || rec == nil {
-		return fmt.Errorf("increment nlink %d: %w", ino, err)
-	}
-	rec.Nlink++
-	return s.putInodeWithCAS(ctx, rec)
+	return retryCAS(ctx, fmt.Sprintf("increment nlink %d", ino), func() (bool, error) {
+		rec, rev, err := s.GetInodeRev(ctx, ino)
+		if err != nil {
+			return false, fmt.Errorf("increment nlink %d: %w", ino, err)
+		}
+		if rec == nil {
+			return false, fmt.Errorf("increment nlink %d: %w", ino, ErrNotFound)
+		}
+		rec.Nlink++
+		return s.putInodeCAS(ctx, rec, rev)
+	})
 }
 
 // DecrementNlink atomically decrements the nlink counter.
 // Used when removing a directory entry (unlink, rmdir, rename target).
 // Returns true if nlink reached zero (inode should be deleted).
 func (s *Store) DecrementNlink(ctx context.Context, ino uint64) (bool, error) {
-	rec, err := s.GetInode(ctx, ino)
-	if err != nil || rec == nil {
-		return false, fmt.Errorf("decrement nlink %d: %w", ino, err)
-	}
-	if rec.Nlink == 0 {
-		return false, fmt.Errorf("decrement nlink %d: already zero", ino)
-	}
-	rec.Nlink--
-	zero := rec.Nlink == 0
-
-	if err := s.putInodeWithCAS(ctx, rec); err != nil {
+	var zero bool
+	err := retryCAS(ctx, fmt.Sprintf("decrement nlink %d", ino), func() (bool, error) {
+		rec, rev, err := s.GetInodeRev(ctx, ino)
+		if err != nil {
+			return false, fmt.Errorf("decrement nlink %d: %w", ino, err)
+		}
+		if rec == nil {
+			return false, fmt.Errorf("decrement nlink %d: %w", ino, ErrNotFound)
+		}
+		if rec.Nlink == 0 {
+			return false, fmt.Errorf("decrement nlink %d: already zero", ino)
+		}
+		rec.Nlink--
+		zero = rec.Nlink == 0
+		return s.putInodeCAS(ctx, rec, rev)
+	})
+	if err != nil {
 		return false, err
 	}
 	return zero, nil
 }
 
-func (s *Store) putInodeWithCAS(ctx context.Context, rec *InodeRecord) error {
+// putInodeCAS writes an inode record only if it still stands at modRev,
+// reporting false when it does not.
+func (s *Store) putInodeCAS(ctx context.Context, rec *InodeRecord, modRev int64) (bool, error) {
 	key := InodeKey(rec.Ino)
-	value := EncodeInode(rec)
-	cmp := clientv3.Compare(clientv3.CreateRevision(key), ">", 0) // must exist
-	ok, err := s.Txn(ctx, []clientv3.Cmp{cmp}, []clientv3.Op{clientv3.OpPut(key, string(value))}, nil)
+	ok, err := s.Txn(ctx,
+		[]clientv3.Cmp{InodeUnchanged(rec.Ino, modRev)},
+		[]clientv3.Op{clientv3.OpPut(key, string(EncodeInode(rec)))}, nil)
 	if err != nil {
-		return fmt.Errorf("put inode %d: %w", rec.Ino, err)
+		return false, fmt.Errorf("put inode %d: %w", rec.Ino, err)
 	}
-	if !ok {
-		return fmt.Errorf("put inode %d: not found", rec.Ino)
-	}
-	return nil
+	return ok, nil
 }
 
 // ---- serialisation ----
