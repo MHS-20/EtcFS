@@ -123,9 +123,15 @@ log "Uploading certs and binaries..."
 scp $SSH_OPTS /tmp/ca.crt "$CERT_DIR/client.crt" "$CERT_DIR/client.key" "ec2-user@$PUB_IP:/tmp/"
 scp $SSH_OPTS /tmp/server.crt /tmp/server.key /tmp/peer.crt /tmp/peer.key "ec2-user@$PUB_IP:/tmp/"
 
-# [TEMPLATE] Upload daemon binary if it exists
-DAEMON_BIN="$PROJECT_ROOT/target/release/etcfuse"
-[[ -f "$DAEMON_BIN" ]] || DAEMON_BIN="$PROJECT_ROOT/bin/etcfuse"
+# Built for the AWS target, not the operator's local toolchain — see
+# build_etcfuse_binary in state.sh for why (libfuse3/glibc mismatch against
+# the AMI otherwise).
+if DAEMON_BIN=$(build_etcfuse_binary); then
+    :
+else
+    log "WARNING: Docker build failed, falling back to bin/etcfuse"
+    DAEMON_BIN="$PROJECT_ROOT/bin/etcfuse"
+fi
 if [[ -f "$DAEMON_BIN" ]]; then
     gzip -c "$DAEMON_BIN" > /tmp/etcfuse.gz
     scp $SSH_OPTS /tmp/etcfuse.gz "ec2-user@$PUB_IP:/tmp/"

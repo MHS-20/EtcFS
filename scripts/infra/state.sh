@@ -175,6 +175,34 @@ get_instance_state() {
         --query 'Reservations[0].Instances[0].State.Name' --output text
 }
 
+# ---- Daemon build ----
+
+# build_etcfuse_binary — build cmd/etcfuse for the AWS target and print the
+# path to the resulting binary.
+#
+# Built via deploy/docker/Dockerfile.etcfuse (amazonlinux:2023, same base as
+# the AMI resolved by discover_ami), not the caller's local toolchain. A
+# binary built on the operator's machine links whatever libfuse3/glibc happen
+# to be installed there, which routinely does not match the target AMI's
+# package versions — observed 2026-08-09 as `error while loading shared
+# libraries: libfuse3.so.4`, the AMI's fuse3-libs providing only .so.3. The
+# Docker build already targets the right base image; this reuses it instead
+# of re-deriving the compatible toolchain by hand.
+#
+# Output path is separate from bin/etcfuse (the Makefile's local-build
+# target) so this never clobbers a binary someone built for local/Docker-
+# compose use.
+build_etcfuse_binary() {
+    local out="$PROJECT_ROOT/bin/etcfuse.aws-linux-amd64"
+    docker build -q -f "$PROJECT_ROOT/deploy/docker/Dockerfile.etcfuse" \
+        -t etcfuse-aws-build "$PROJECT_ROOT" >&2 || return 1
+    local cid
+    cid=$(docker create etcfuse-aws-build) || return 1
+    docker cp "$cid:/usr/local/bin/etcfuse" "$out" >&2 || { docker rm "$cid" >/dev/null; return 1; }
+    docker rm "$cid" >/dev/null
+    echo "$out"
+}
+
 # ---- SSH / health-check helpers ----
 
 wait_for_ssh() {

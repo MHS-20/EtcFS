@@ -143,22 +143,13 @@ for i in "${!COMPUTE_PRIV_IPS[@]}"; do
 done
 log "Initial cluster: $INITIAL_CLUSTER"
 
-# [TEMPLATE] Build EtcFS FUSE daemon locally.
-# When implementation exists, replace this section with the actual build command.
-# For now, we check for a pre-built binary or skip.
-log "=== EtcFS daemon (template — binary not built yet) ==="
-DAEMON_BIN="$PROJECT_ROOT/target/release/etcfuse"
-if [[ -f "$DAEMON_BIN" ]]; then
-    log "Using pre-built binary: $DAEMON_BIN"
-elif [[ -f "$PROJECT_ROOT/bin/etcfuse" ]]; then
-    DAEMON_BIN="$PROJECT_ROOT/bin/etcfuse"
-    log "Using pre-built binary: $DAEMON_BIN"
+log "=== EtcFS daemon build ==="
+if DAEMON_BIN=$(build_etcfuse_binary); then
+    log "Built for AWS target (amazonlinux:2023 base): $DAEMON_BIN"
 else
-    log "NOTE: EtcFS daemon binary not found at $DAEMON_BIN."
-    log "      This is expected during design phase."
-    log "      Build command will go here (e.g. 'cargo build --release' or 'go build')."
-    log "      When binary exists, the deploy section below will push it to nodes."
+    log "WARNING: Docker build failed, falling back to bin/etcfuse — likely a libfuse/glibc mismatch against the AMI, see build_etcfuse_binary in state.sh"
     DAEMON_BIN=""
+    [[ -f "$PROJECT_ROOT/bin/etcfuse" ]] && DAEMON_BIN="$PROJECT_ROOT/bin/etcfuse"
 fi
 
 # ---- Setup each node ----
