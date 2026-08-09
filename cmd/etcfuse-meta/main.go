@@ -62,6 +62,21 @@ func main() {
 	log.Info("node", "id", cfg.NodeID)
 	log.Info("lease", "ttl", cfg.LeaseTTL)
 
+	// Resolve before anything opens the device — both the data path and the
+	// NVMe fencer must agree on which device this volume is right now, and a
+	// stale path from a previous attachment would point at the wrong disk.
+	// Fatal rather than falling back to --block-device: the fallback is what
+	// silently opens someone else's volume.
+	if cfg.VolumeID != "" {
+		path, rerr := blockio.ResolvePath(cfg.VolumeID)
+		if rerr != nil {
+			log.Fatal("cannot resolve volume to a block device",
+				"volume_id", cfg.VolumeID, "error", rerr)
+		}
+		log.Info("volume resolved", "volume_id", cfg.VolumeID, "path", path)
+		cfg.BlockDevice = path
+	}
+
 	// Connect to etcd with aggressive failover
 	etcdCli, err := clientv3.New(clientv3.Config{
 		Endpoints:            cfg.EtcdEndpoints,

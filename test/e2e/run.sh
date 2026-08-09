@@ -16,8 +16,8 @@ DOCKER_DIR="$PROJECT_ROOT/deploy/docker"
 PASS=0; FAIL=0
 
 log()  { echo "[$(date +%T)] $*"; }
-pass() { echo "  ✓ $1"; ((PASS++)); }
-fail() { echo "  ✗ $1"; ((FAIL++)); }
+pass() { echo "  ✓ $1"; PASS=$((PASS + 1)); }
+fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 
 cleanup() {
     log "Cleaning up..."

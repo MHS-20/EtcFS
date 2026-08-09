@@ -328,7 +328,7 @@ ExecStart=/usr/local/bin/etcfuse-meta \\
   --etcd-ca=/etc/etcfuse/ca.crt \\
   --cluster-name=${CLUSTER} \\
   --lease-ttl=${LEASH_TTL}s \\
-  --block-device=/dev/nvme1n1
+  --volume-id=${VOL_ID}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -338,9 +338,8 @@ WantedBy=multi-user.target
 METAUNIT
 
     # etcfuse: FUSE kernel protocol + raw block I/O only. --volume-id here is
-    # the same raw device etcfuse-meta's --block-device points at — both
-    # binaries open it directly, one for O_DIRECT data I/O, one for fencing
-    # operations. Depends on etcfuse-meta, not etcd: it never talks to etcd
+    # the same shared volume etcfuse-meta's --volume-id names — both binaries
+    # open it directly, one for O_DIRECT data I/O, one for fencing operations. Depends on etcfuse-meta, not etcd: it never talks to etcd
     # itself, only to etcfuse-meta over $SOCKET_PATH.
     $SSH_CMD "ec2-user@$ip" "sudo tee /etc/systemd/system/etcfuse.service" <<DAEMONUNIT
 [Unit]

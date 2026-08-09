@@ -290,8 +290,18 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         # ETCFS_FENCE_MODE=nvme replaces control-plane fencing with
         # device-enforced NVMe reservations (see chaos-nvme-fencing.sh).
         [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" ]] && fence_flags="--nvme-reservations"
-        local dev; dev=$(resolve_block_device "$1")
-        [[ -n "$dev" ]] || dev=/dev/nvme1n1
+        # nvme mode: let the daemon resolve --volume-id itself (see the
+        # matching change in provision_cluster) instead of this harness
+        # pre-resolving the path — this is the code path under test.
+        local dev_flag
+        if [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" ]]; then
+            local vol_id; vol_id=$(jq -r '.volume_id // empty' "$PROJECT_ROOT/$STATE_FILE")
+            dev_flag="--volume-id=$vol_id"
+        else
+            local dev; dev=$(resolve_block_device "$1")
+            [[ -n "$dev" ]] || dev=/dev/nvme1n1
+            dev_flag="--block-device=$dev"
+        fi
         # Not runcmd60: this needs more than 60s of budget (see below) and
         # timeout killing the remote command mid-script would also swallow
         # the diagnostic tail this prints on failure.
@@ -308,7 +318,7 @@ for d in json.load(sys.stdin).get('blockdevices', []):
           # go of the fd.
           for k in \$(seq 1 5); do sudo umount /mnt/etcfuse 2>/dev/null && break; sleep 1; done
           sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
-          sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s --block-device=$dev --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
+          sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=10s $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
           # A restart right after a partition heals (this is R7's exact
           # case) can legitimately need this long: the node's own local etcd
           # has to rejoin raft and the client has to reconnect and ride out a
@@ -410,12 +420,19 @@ for d in json.load(sys.stdin).get('blockdevices', []):
             # exclusive with the EBS flags by design — the preempt is the
             # stronger signal and needs nothing from the EC2 control plane.
             [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" ]] && fence_flags="--nvme-reservations"
+            # nvme mode passes --volume-id and lets the daemon itself resolve
+            # the current device path (pkg/blockio.ResolvePath) instead of a
+            # fixed /dev/nvme1n1 — this is the production code path
+            # docs/TODO-hardening.md § 10 covers; other modes keep the fixed
+            # guess since they never detach/reattach.
+            local dev_flag="--block-device=/dev/nvme1n1"
+            [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" && -n "$vol_id" ]] && dev_flag="--volume-id=$vol_id"
             ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip "
                 sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; sleep 1
                 sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
                 sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
                     --etcd-endpoints=$ETCD --node-id=n$i --cluster-name=$TAG \
-                    --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
+                    --lease-ttl=10s $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
                 sleep 4
                 sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock \
                     --node-id=n$i --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &

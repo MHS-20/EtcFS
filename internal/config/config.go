@@ -27,9 +27,15 @@ type Config struct {
 	LogLevel      int
 	ShowVersion   bool
 	BlockDevice   string
-	MetricsAddr   string
-	RunFsck       bool
-	RunInfo       bool
+
+	// VolumeID identifies the shared data volume by its cloud volume ID.  When
+	// set it takes precedence over BlockDevice, whose literal path does not
+	// survive a detach/reattach cycle: the path is re-derived from the volume's
+	// serial on every start.
+	VolumeID    string
+	MetricsAddr string
+	RunFsck     bool
+	RunInfo     bool
 
 	// External fencing (AWS). When EBSVolumeID is set the fencing controller
 	// detaches the shared volume from an expired node and waits for the
@@ -72,7 +78,9 @@ func Parse() *Config {
 		"Log level: 0=error, 1=info, 2=debug")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "Show version and exit")
 	flag.StringVar(&cfg.BlockDevice, "block-device", "",
-		"Block device path for data I/O (e.g., /dev/nvme1n1)")
+		"Block device path for data I/O (e.g., /dev/nvme1n1); prefer --volume-id, which survives a detach/reattach")
+	flag.StringVar(&cfg.VolumeID, "volume-id", "",
+		"Cloud volume ID of the shared data volume (e.g., vol-0abcdef1234567890); its device path is resolved at every start and overrides --block-device")
 	flag.StringVar(&cfg.MetricsAddr, "metrics-addr", "",
 		"Prometheus metrics HTTP listen address (e.g., :9090)")
 	flag.BoolVar(&cfg.RunFsck, "fsck", false,
@@ -95,8 +103,8 @@ func Parse() *Config {
 		cfg.NodeID = hostname
 	}
 
-	if cfg.NVMeReservations && cfg.BlockDevice == "" {
-		fmt.Fprintln(os.Stderr, "-nvme-reservations requires -block-device")
+	if cfg.NVMeReservations && cfg.BlockDevice == "" && cfg.VolumeID == "" {
+		fmt.Fprintln(os.Stderr, "-nvme-reservations requires -volume-id or -block-device")
 		os.Exit(1)
 	}
 
