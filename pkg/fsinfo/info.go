@@ -3,10 +3,10 @@ package fsinfo
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 
+	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
@@ -57,19 +57,45 @@ func Collect(ctx context.Context, store MetadataStore) (*Info, error) {
 	lockKvs, _ := store.GetPrefix(ctx, "lock:")
 	info.TotalLocks = uint64(len(lockKvs))
 
-	arenaKvs, _ := store.GetPrefix(ctx, "arena:")
+	arenaKvs, _ := store.GetPrefix(ctx, metadata.PrefixArena)
 	info.ArenaCount = uint64(len(arenaKvs))
-
-	for _, kv := range arenaKvs {
-		node := strings.TrimPrefix(string(kv.Key), "arena:")
-		freeKvs, _ := store.GetPrefix(ctx, metadata.PrefixFreeArena)
-		info.ArenaUtilization[node] = float64(len(freeKvs))
-	}
+	info.ArenaUtilization = arenaUtilization(arenaKvs, metadata.DecodeExtents(extKvs))
 
 	memKvs, _ := store.GetPrefix(ctx, "membership:")
 	info.MemberCount = uint64(len(memKvs))
 
 	return info, nil
+}
+
+// arenaUtilization reports, per node, the fraction of the space in the arenas
+// it owns that live extents occupy.
+//
+// Which arena an extent belongs to follows from its offset alone: arenas are
+// fixed-size and laid out back to back from offset 0, the same mapping
+// pkg/arena uses to derive DiskStart from an arena ID.
+func arenaUtilization(arenaKvs []*mvccpb.KeyValue, extents []metadata.Extent) map[string]float64 {
+	usedBlocks := make(map[uint64]uint64)
+	for _, ext := range extents {
+		id := ext.DiskOff / arena.ArenaSizeBytes
+		usedBlocks[id] += (ext.Length + arena.BlockSize - 1) / arena.BlockSize
+	}
+
+	used := make(map[string]uint64)
+	owned := make(map[string]uint64)
+	for _, kv := range arenaKvs {
+		node, id, ok := metadata.ParseArenaKey(string(kv.Key))
+		if !ok {
+			continue
+		}
+		owned[node]++
+		used[node] += usedBlocks[id]
+	}
+
+	util := make(map[string]float64, len(owned))
+	for node, count := range owned {
+		util[node] = float64(used[node]) / float64(count*arena.BlocksPerArena)
+	}
+	return util
 }
 
 func (i *Info) String() string {
