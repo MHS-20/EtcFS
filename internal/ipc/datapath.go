@@ -309,53 +309,43 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		return gerr
 	})
 	s.log.Debug("READ extents", "ino", ino, "count", len(extents))
-	if len(extents) == 0 {
-		return dataResp(nil), nil
-	}
 
+	// The buffer starts zeroed, so a hole costs nothing: only the ranges an
+	// extent actually covers are filled in, and the rest reads back as the
+	// zeroes a sparse file is supposed to return.
 	data, free := s.ioBuffer(int(size))
 	defer free()
 	data = data[:size]
 
-	bytesRead := uint32(0)
-	rem := size
-
+	// Extents arrive ordered by logical offset, newest first where two cover
+	// the same one, so walking forward and taking the first extent that reaches
+	// the cursor resolves an overwrite to the later write.
+	reqEnd := offset + uint64(size)
+	pos := offset
 	for _, ext := range extents {
-		eStart, eEnd := ext.LogOff, ext.End()
-
-		// Sparse region before this extent: leave the buffer zeroed and skip
-		// past the hole.
-		if offset >= eEnd || offset+uint64(rem) <= eStart {
-			if offset < eStart && offset+uint64(rem) > eStart {
-				gapLen := min(eStart-offset, uint64(rem))
-				bytesRead += uint32(gapLen)
-				rem -= uint32(gapLen)
-				offset += gapLen
-			}
-			continue
-		}
-
-		readStart := uint64(0)
-		if offset > eStart {
-			readStart = offset - eStart
-		}
-		readLen := min(ext.Length-readStart, uint64(rem))
-
-		dst := data[bytesRead : bytesRead+uint32(readLen)]
-		n, err := s.readInto(dst, int64(ext.DiskOff+readStart))
-		if err != nil {
+		if pos >= reqEnd || ext.LogOff >= reqEnd {
 			break
 		}
-
-		bytesRead += uint32(n)
-		rem -= uint32(readLen)
-		if rem == 0 {
-			break
+		if ext.End() <= pos {
+			continue // already behind the cursor, or buried by a newer extent
 		}
-		offset = eStart + readLen
+		if ext.LogOff > pos {
+			pos = ext.LogOff // hole: the buffer is already zero across it
+		}
+
+		within := pos - ext.LogOff
+		n := min(ext.Length-within, reqEnd-pos)
+		if _, err := s.readInto(data[pos-offset:pos-offset+n], int64(ext.DiskOff+within)); err != nil {
+			s.log.Warn("read: block device read failed", "ino", ino, "error", err)
+			return int32Resp(-5), nil
+		}
+		pos += n
 	}
 
-	return dataResp(data[:bytesRead]), nil
+	// The whole requested range is returned, holes included.  The kernel has
+	// already clamped the request to the size it last saw, so there is nothing
+	// past the end of the file in it to over-report.
+	return dataResp(data), nil
 }
 
 // readInto fills dst from the device at diskOff, bouncing through an aligned

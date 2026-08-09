@@ -677,16 +677,26 @@ static void ec_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t siz
     fuse_reply_write(req, (size_t) written);
 }
 
+/* Every field SETATTR can change goes over the wire; to_set says which of them
+ * the kernel actually means.  Sending only st_size is what made chmod, chown
+ * and utimensat succeed while changing nothing. */
 static void ec_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set,
                        struct fuse_file_info *fi)
 {
-    uint8_t payload[20 + 84];
+    uint8_t payload[64];
     uint32_t off = 0;
     off += wb_u64(payload + off, ino);
     off += wb_u64(payload + off, (fi ? fi->fh : 0));
     off += wb_u32(payload + off, (uint32_t) to_set);
     off += wb_u64(payload + off, (uint64_t) attr->st_size);
-    (void) attr;
+    off += wb_u32(payload + off, (uint32_t) attr->st_mode);
+    off += wb_u32(payload + off, (uint32_t) attr->st_uid);
+    off += wb_u32(payload + off, (uint32_t) attr->st_gid);
+    /* Only whole seconds are stored, so the nanosecond halves are dropped
+     * here rather than sent and discarded on the other side. */
+    off += wb_u64(payload + off, (uint64_t) attr->st_atime);
+    off += wb_u64(payload + off, (uint64_t) attr->st_mtime);
+    off += wb_u64(payload + off, (uint64_t) attr->st_ctime);
 
     uint8_t *resp;
     uint32_t rlen;

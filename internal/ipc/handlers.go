@@ -3,6 +3,9 @@ package ipc
 import (
 	"context"
 	"errors"
+	"time"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -342,33 +345,103 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 	return okResp(), nil
 }
 
-// TRUNCATE (= setattr with size change) — handled by setattr
-// SETATTR payload: [u64:ino][u64:fh][u32:valid][u64:size]
+// SETATTR payload:
+//
+//	[u64:ino][u64:fh][u32:valid][u64:size][u32:mode][u32:uid][u32:gid]
+//	[u64:atime][u64:mtime][u64:ctime]
+//
 // Response: [i32:error][attr:84][u32:attr_timeout]
-const fattrSize = 1 << 3
+//
+// valid is the kernel's FUSE_SET_ATTR_* mask saying which of those fields it
+// actually means; the rest carry whatever the caller's struct stat happened to
+// hold and must be ignored.
+const (
+	fattrMode     = 1 << 0
+	fattrUID      = 1 << 1
+	fattrGID      = 1 << 2
+	fattrSize     = 1 << 3
+	fattrAtime    = 1 << 4
+	fattrMtime    = 1 << 5
+	fattrAtimeNow = 1 << 7
+	fattrMtimeNow = 1 << 8
+	fattrCtime    = 1 << 10
+)
+
+const setattrPayloadLen = 8 + 8 + 4 + 8 + 4 + 4 + 4 + 8 + 8 + 8
 
 func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 28 {
+	if len(payload) < setattrPayloadLen {
 		return int32Resp(-22), nil
 	}
 	ino, rest := readU64(payload)
-	_, rest = readU64(rest)
+	_, rest = readU64(rest) // fh
 	valid, rest := readU32(rest)
-	newSize, _ := readU64(rest)
+	newSize, rest := readU64(rest)
+	mode, rest := readU32(rest)
+	uid, rest := readU32(rest)
+	gid, rest := readU32(rest)
+	atime, rest := readU64(rest)
+	mtime, rest := readU64(rest)
+	ctime, _ := readU64(rest)
 
-	rec, err := s.store.GetInode(ctx, ino)
+	rec, rev, err := s.store.GetInodeRev(ctx, ino)
 	if err != nil || rec == nil {
 		return int32Resp(-2), nil
 	}
 
+	// Shrinking releases the extents past the new end, and that runs before the
+	// size is published: metadata-then-data, so no reader can still resolve a
+	// range whose blocks have already gone back to the arena.
 	if valid&fattrSize != 0 && newSize < rec.Size {
 		s.truncate(ctx, ino, newSize)
+	}
+
+	now := time.Now()
+	if valid&fattrSize != 0 {
 		rec.Size = newSize
-		if _, err := s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec)); err != nil {
-			// Previously discarded.  A fenced node must not report a truncate
-			// as successful when the size update was rejected.
-			return int32Resp(errnoFor(err, -5)), nil
-		}
+	}
+	if valid&fattrMode != 0 {
+		// The kernel sends a whole st_mode, but chmod may not change what kind
+		// of file this is.  Keeping the stored type bits is what stops a chmod
+		// on a symlink or a device node quietly turning it into something else.
+		rec.Mode = (rec.Mode & metadata.S_IFMT) | (mode &^ metadata.S_IFMT)
+	}
+	if valid&fattrUID != 0 {
+		rec.UID = uid
+	}
+	if valid&fattrGID != 0 {
+		rec.GID = gid
+	}
+	if valid&fattrAtime != 0 {
+		rec.Atime = time.Unix(int64(atime), 0)
+	}
+	if valid&fattrMtime != 0 {
+		rec.Mtime = time.Unix(int64(mtime), 0)
+	}
+	if valid&fattrCtime != 0 {
+		rec.Ctime = time.Unix(int64(ctime), 0)
+	}
+	if valid&fattrAtimeNow != 0 {
+		rec.Atime = now
+	}
+	if valid&fattrMtimeNow != 0 {
+		rec.Mtime = now
+	}
+	// Any attribute change is a status change.
+	if valid&(fattrMode|fattrUID|fattrGID|fattrSize) != 0 && valid&fattrCtime == 0 {
+		rec.Ctime = now
+	}
+
+	// Pinned to the revision the record was read at, so a concurrent update to
+	// a different field is not silently overwritten by this one.
+	ok, err := s.store.Txn(ctx,
+		[]clientv3.Cmp{metadata.InodeUnchanged(ino, rev)},
+		[]clientv3.Op{clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(rec)))}, nil)
+	if err != nil {
+		return int32Resp(errnoFor(err, -5)), nil
+	}
+	if !ok {
+		return int32Resp(-11), nil // EAGAIN: the inode moved, let the kernel retry
 	}
 
 	return attrResp(rec), nil
