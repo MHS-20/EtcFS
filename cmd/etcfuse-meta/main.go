@@ -215,6 +215,11 @@ func main() {
 	scrubber.SetReclaimer(svc.Allocator())
 	go scrubber.Run(ctx)
 
+	// Return arenas this node has emptied to the global free pool.  Without
+	// this a node keeps every arena it ever acquired, so space freed by deletes
+	// and truncates stays reserved to this node and no peer can ever use it.
+	go svc.Allocator().ReapEmptyArenas(ctx, time.Minute)
+
 	// Start Prometheus metrics server if configured
 	if cfg.MetricsAddr != "" {
 		reg := metrics.NewRegistry()

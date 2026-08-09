@@ -16,6 +16,7 @@ package arena
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -25,6 +26,21 @@ import (
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
+
+// allocOne reserves a single block and returns its device offset.  Allocate
+// answers with runs because a request may be spread over several; a one-block
+// request never is, so these tests can keep asserting on one offset.
+func allocOne(t *testing.T, a *Allocator, what string) uint64 {
+	t.Helper()
+	runs, err := a.Allocate(BlockSize)
+	if err != nil {
+		t.Fatalf("%s: %v", what, err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("%s: one block came back as %d runs", what, len(runs))
+	}
+	return runs[0].DiskOff
+}
 
 func testStore(t *testing.T, nodeID string) *metadata.Store {
 	t.Helper()
@@ -98,10 +114,7 @@ func TestIntegration_ReconstructDoesNotAdoptForeignArenas(t *testing.T) {
 	}
 
 	// The offsets node-A hands out must stay outside node-B's byte range.
-	off, err := restartedA.Allocate(BlockSize)
-	if err != nil {
-		t.Fatalf("node-A allocate after restart: %v", err)
-	}
+	off := allocOne(t, restartedA, "node-A allocate after restart")
 	if off >= arenaB.DiskStart && off < arenaB.DiskEnd {
 		t.Fatalf("node-A allocated disk offset %d inside node-B's arena [%d,%d)",
 			off, arenaB.DiskStart, arenaB.DiskEnd)
@@ -260,10 +273,7 @@ func TestIntegration_RecycledArenaKeepsLiveExtentsMarked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	off, err := alloc.Allocate(BlockSize)
-	if err != nil {
-		t.Fatalf("allocate: %v", err)
-	}
+	off := allocOne(t, alloc, "allocate")
 	// A live extent for an inode that still exists — the scrubber would not
 	// reclaim it, and neither should a recycling node overwrite it.
 	if _, err := store.Put(ctx, metadata.InodeKey(42), []byte("stub-inode")); err != nil {
@@ -289,10 +299,7 @@ func TestIntegration_RecycledArenaKeepsLiveExtentsMarked(t *testing.T) {
 	// Allocating BlocksPerArena-1 more blocks must never return the offset the
 	// old extent still occupies.
 	for i := 0; i < 4; i++ {
-		got, err := recycler.Allocate(BlockSize)
-		if err != nil {
-			t.Fatalf("node-B allocate %d: %v", i, err)
-		}
+		got := allocOne(t, recycler, fmt.Sprintf("node-B allocate %d", i))
 		if got == off {
 			t.Fatalf("node-B was handed disk_off=%d, which node-A's live extent still occupies", got)
 		}

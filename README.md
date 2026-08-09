@@ -45,7 +45,7 @@ Each node runs two cooperating processes, not one monolith:
 │  - mounts the filesystem │                            │  - arena allocator        │
 └─────────────────────────┘                            │  - O_DIRECT block I/O     │
                                                           │  - membership/fencing     │
-                                                          │  - scrubber, compactor    │
+                                                          │  - scrubber               │
                                                           └──────────────────────────┘
                                                                        │
                                                           ┌────────────┴────────────┐
@@ -64,7 +64,7 @@ Four logical subsystems live inside the Go daemon:
 1. **Metadata client** (`pkg/metadata`) — inode table, directory entries, locks, allocator state, all as etcd transactions.
 2. **Data engine** (`pkg/blockio`, `pkg/arena`, `pkg/walgo`) — O_DIRECT `pread`/`pwrite` against the shared block device at extents handed down by the metadata layer, plus a small local write-ahead buffer for crash-safety ordering.
 3. **Membership/fencing agent** (`pkg/membership`, `pkg/fencing`) — etcd lease heartbeat, watches on cluster membership, self-fencing watchdog, coordination with an external fencing controller.
-4. **Continuous verification** (`pkg/scrub`, `pkg/compaction`, `pkg/fsck`) — background scrubbing of etcd metadata against actual disk state, arena compaction, offline consistency checking.
+4. **Continuous verification** (`pkg/scrub`, `pkg/fsck`) — background scrubbing of etcd metadata against actual disk state, orphaned-block reclamation, offline consistency checking.
 
 ## Metadata model
 
@@ -97,13 +97,15 @@ Inode numbers do **not** follow that pattern. They come from a single global cou
 
 ## Data path and crash consistency
 
-File growth: the node writes data into free space in its own arena, **then** commits the updated extent list to `inode:<ino>` in etcd — data-then-metadata, in that order. An extent is only "real" once etcd has durably recorded it as part of the file; a crash between the data write and the metadata commit leaves orphaned-but-harmless bytes, reclaimed later by compaction, never a file referencing data that was never actually written.
+File growth: the node writes data into free space in its own arena, **then** commits the updated extent list to `inode:<ino>` in etcd — data-then-metadata, in that order. An extent is only "real" once etcd has durably recorded it as part of the file; a crash between the data write and the metadata commit leaves orphaned-but-harmless bytes, reclaimed on the next restart, never a file referencing data that was never actually written.
 
 Truncate is the mirror: commit the new, smaller extent list to etcd **first**, then treat the freed range as reclaimable — metadata-then-data, because here the risk being avoided is the opposite one: a reader must never see a shrunk file whose blocks were already reused for something else.
 
 Reads and writes to already-allocated extents go straight to the block device via O_DIRECT at the offsets in the current inode record — no etcd round trip on the hot path.
 
-**Fragmentation and compaction.** Deletes and truncates free ranges within a node's arena without compacting the device, so fragmentation accumulates like any log-structured allocator. A background compaction process (`pkg/compaction`), run per-arena when its live-data ratio falls below a threshold, copies live extents into a fresh arena, atomically updates affected files' extent lists (batched transactions), and returns the old arena to the free pool — throttled to avoid contending with foreground I/O. Orphaned extents from a crash between data-write and metadata-commit are swept up by the same pass once a grace period has elapsed.
+**Fragmentation and space reclamation.** Deletes and truncates free ranges within a node's arena, so free space fragments like any log-structured allocator. There is no defragmentation pass, because a file is a list of extents and its bytes never had to be contiguous: an allocation that cannot be met from a single free run is simply spread over several, one extent each, and only fails when the node's arenas genuinely cannot cover it. Nor is there a seek-locality argument to recover — the shared device is NVMe or EBS, where random access costs about what sequential access costs.
+
+Reclamation runs at two granularities. Within an arena, the scrubber returns the blocks of orphaned extents to the owning node's free list, which is what makes deletion actually give back space. Whole arenas emptied by deletes and truncates go back to the global free pool on a background sweep, so space stops being reserved to a node that is no longer using it — a node's own arenas are otherwise only released when it departs or is fenced.
 
 ## Locking
 

@@ -62,10 +62,23 @@ func testStore(t *testing.T, nodeID string) *metadata.Store {
 	return metadata.NewStore(cli, nodeID)
 }
 
+// allocOne reserves a single block and returns its device offset.  Allocate
+// answers with runs because a request may be spread over several; a one-block
+// request never is.
+func allocOne(t *testing.T, a *arena.Allocator, what string) uint64 {
+	t.Helper()
+	runs, err := a.Allocate(arena.BlockSize)
+	if err != nil {
+		t.Fatalf("%s: %v", what, err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("%s: one block came back as %d runs", what, len(runs))
+	}
+	return runs[0].DiskOff
+}
+
 // Deleting an unlinked file's dangling extent key must also return its
-// blocks to the allocator — otherwise disk space leaks on every deletion,
-// which is the hotter of the two paths item 6 closes (see
-// docs/TODO-hardening.md § 6).
+// blocks to the allocator — otherwise disk space leaks on every deletion.
 func TestIntegration_OrphanReclaimReturnsBlocksToAllocator(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t, "node-A")
@@ -74,10 +87,7 @@ func TestIntegration_OrphanReclaimReturnsBlocksToAllocator(t *testing.T) {
 	if _, err := alloc.AcquireArena(ctx); err != nil {
 		t.Fatalf("acquire arena: %v", err)
 	}
-	off, err := alloc.Allocate(arena.BlockSize)
-	if err != nil {
-		t.Fatalf("allocate: %v", err)
-	}
+	off := allocOne(t, alloc, "allocate")
 	// No inode record for ino 99 — this is what makes the extent an orphan:
 	// AtomicUnlink already removed it, but the extent key survived.
 	if err := store.AppendExtent(ctx, 99, 0, off, arena.BlockSize, 1); err != nil {
@@ -97,10 +107,7 @@ func TestIntegration_OrphanReclaimReturnsBlocksToAllocator(t *testing.T) {
 
 	// The freed block must be reachable by a fresh allocation, not just
 	// unmarked — Free and Allocate share one bitmap.
-	got, err := alloc.Allocate(arena.BlockSize)
-	if err != nil {
-		t.Fatalf("allocate after reclaim: %v", err)
-	}
+	got := allocOne(t, alloc, "allocate after reclaim")
 	if got != off {
 		t.Fatalf("reclaimed block %d not reissued, got %d instead", off, got)
 	}
@@ -114,32 +121,92 @@ func TestIntegration_OrphanReclaimReturnsBlocksToAllocator(t *testing.T) {
 	}
 }
 
-// Without a Reclaimer the scrubber must still clean up the metadata — the
-// block leak is the documented degraded behaviour, not a crash.
-func TestIntegration_OrphanReclaimWithoutReclaimerStillDeletesKey(t *testing.T) {
+// A node that owns no arena must leave the orphan alone rather than delete it.
+//
+// The extent record is the only thing the owning node's in-memory bitmap is
+// rebuilt from, so deleting it from here would strand those blocks as allocated
+// on that node until it restarted.  Reporting without reclaiming is the correct
+// degraded behaviour; the owner's own pass does the cleanup.
+func TestIntegration_OrphanInForeignArenaIsReportedNotDeleted(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t, "node-A")
-	alloc := arena.NewAllocator("node-A", store)
+	owner := arena.NewAllocator("node-A", store)
 
-	if _, err := alloc.AcquireArena(ctx); err != nil {
+	if _, err := owner.AcquireArena(ctx); err != nil {
 		t.Fatalf("acquire arena: %v", err)
 	}
-	off, err := alloc.Allocate(arena.BlockSize)
-	if err != nil {
-		t.Fatalf("allocate: %v", err)
-	}
+	off := allocOne(t, owner, "allocate")
 	if err := store.AppendExtent(ctx, 99, 0, off, arena.BlockSize, 1); err != nil {
 		t.Fatalf("append orphan extent: %v", err)
 	}
 
-	s := New(store, "node-A", time.Hour, testLogger{})
+	// node-B holds no arena, so the range belongs to a peer as far as it knows.
+	bystander := arena.NewAllocator("node-B", metadata.NewStore(store.Client(), "node-B"))
+	s := New(store, "node-B", time.Hour, testLogger{})
+	s.SetReclaimer(bystander)
 	s.RunScrubPass(ctx)
 
 	kvs, err := store.GetPrefix(ctx, metadata.PrefixExtent)
 	if err != nil {
 		t.Fatalf("get extents: %v", err)
 	}
-	if len(kvs) != 0 {
-		t.Fatalf("orphan extent key not deleted without a reclaimer, %d remain", len(kvs))
+	if len(kvs) != 1 {
+		t.Fatalf("orphan extent in another node's arena was deleted, %d remain", len(kvs))
+	}
+
+	anomalies := s.Anomalies()
+	if len(anomalies) == 0 {
+		t.Fatal("orphan in another node's arena was not reported at all")
+	}
+}
+
+// An arena emptied by deletion must go back to the global pool, or the space
+// stays reserved to this node for as long as the process lives.
+func TestIntegration_EmptiedArenaReturnsToFreePool(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t, "node-A")
+	alloc := arena.NewAllocator("node-A", store)
+
+	ar, err := alloc.AcquireArena(ctx)
+	if err != nil {
+		t.Fatalf("acquire arena: %v", err)
+	}
+	off := allocOne(t, alloc, "allocate")
+
+	// Still in use: nothing to release yet.
+	released, err := alloc.ReleaseEmptyArenas(ctx)
+	if err != nil {
+		t.Fatalf("release with a live block: %v", err)
+	}
+	if len(released) != 0 {
+		t.Fatalf("arena released while a block was still allocated: %v", released)
+	}
+
+	alloc.Free(off, arena.BlockSize)
+
+	released, err = alloc.ReleaseEmptyArenas(ctx)
+	if err != nil {
+		t.Fatalf("release after free: %v", err)
+	}
+	if len(released) != 1 || released[0] != ar.ID {
+		t.Fatalf("emptied arena %d not released, got %v", ar.ID, released)
+	}
+	if alloc.ArenaCount() != 0 {
+		t.Fatalf("released arena still in the local free list (%d remain)", alloc.ArenaCount())
+	}
+
+	owner, err := store.Get(ctx, metadata.ArenaOwnerKey("node-A", ar.ID))
+	if err != nil {
+		t.Fatalf("read ownership: %v", err)
+	}
+	if owner != nil {
+		t.Fatal("ownership record survived the release")
+	}
+	free, err := store.Get(ctx, metadata.FreeArenaKey(ar.ID))
+	if err != nil {
+		t.Fatalf("read free pool: %v", err)
+	}
+	if free == nil {
+		t.Fatalf("arena %d released but never landed in the free pool", ar.ID)
 	}
 }

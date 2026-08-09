@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/bits"
 	"sync"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
@@ -141,43 +142,100 @@ func (a *Allocator) allocateArenaID(ctx context.Context) (id uint64, reused bool
 	return id, false, err
 }
 
-// Allocate finds and marks a contiguous range of blocks as allocated.
-// Returns the byte offset on the block device.
-func (a *Allocator) Allocate(size uint64) (diskOff uint64, err error) {
-	blocks := (size + BlockSize - 1) / BlockSize
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	for _, free := range a.arenas {
-		start := free.findContiguous(blocks)
-		if start < BlocksPerArena {
-			// Mark blocks as allocated
-			for i := uint64(0); i < blocks; i++ {
-				free.markAllocated(start + i)
-			}
-			return free.DiskStart + start*BlockSize, nil
-		}
-	}
-	return 0, fmt.Errorf("no arena has %d contiguous free blocks", blocks)
+// Run is one contiguous span of device bytes handed out by the allocator.
+// Length is always a whole number of blocks; the caller trims the final run's
+// extent to the length of the data it actually holds.
+type Run struct {
+	DiskOff uint64
+	Length  uint64
 }
 
-// Free marks a range of blocks as free.
-func (a *Allocator) Free(diskOff uint64, size uint64) {
-	blocks := (size + BlockSize - 1) / BlockSize
+// Allocate reserves size bytes and returns the runs backing them, in order.
+//
+// A file is a list of extents, so its data does not have to be contiguous on
+// the device.  Allocation therefore fills from as many runs as it takes rather
+// than failing when no single run is large enough — free space that is merely
+// fragmented is still usable space, and refusing it would push the write onto a
+// fresh arena and grow the device for room that was already there.
+//
+// It fails only when the arenas this node holds genuinely cannot cover the
+// request, which is the caller's signal to acquire another arena.
+func (a *Allocator) Allocate(size uint64) ([]Run, error) {
+	want := (size + BlockSize - 1) / BlockSize
+	if want == 0 {
+		return nil, nil
+	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	for _, free := range a.arenas {
-		if diskOff >= free.DiskStart && diskOff < free.DiskEnd {
-			start := (diskOff - free.DiskStart) / BlockSize
+	var runs []Run
+	got := uint64(0)
+	for _, ar := range a.arenas {
+		for got < want {
+			start, length := ar.findRun(want - got)
+			if length == 0 {
+				break
+			}
+			for i := uint64(0); i < length; i++ {
+				ar.markAllocated(start + i)
+			}
+			runs = append(runs, Run{
+				DiskOff: ar.DiskStart + start*BlockSize,
+				Length:  length * BlockSize,
+			})
+			got += length
+		}
+		if got == want {
+			return runs, nil
+		}
+	}
+
+	// Undo the partial reservation: leaving it marked would leak every block
+	// taken on the way to discovering the request could not be met.
+	for _, r := range runs {
+		a.freeLocked(r.DiskOff, r.Length)
+	}
+	return nil, fmt.Errorf("no arena has %d free blocks", want)
+}
+
+// Free marks a range of blocks as free.  A range outside every arena this node
+// owns is ignored: the free list is per-process, so only the owner can return
+// its own space.
+func (a *Allocator) Free(diskOff uint64, size uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.freeLocked(diskOff, size)
+}
+
+func (a *Allocator) freeLocked(diskOff uint64, size uint64) {
+	blocks := (size + BlockSize - 1) / BlockSize
+	for _, ar := range a.arenas {
+		if diskOff >= ar.DiskStart && diskOff < ar.DiskEnd {
+			start := (diskOff - ar.DiskStart) / BlockSize
 			for i := uint64(0); i < blocks && start+i < BlocksPerArena; i++ {
-				free.markFree(start + i)
+				ar.markFree(start + i)
 			}
 			return
 		}
 	}
+}
+
+// Owns reports whether diskOff falls inside an arena this node currently holds.
+//
+// The scrubber asks before reclaiming an orphaned extent: deleting the extent
+// record of a range owned by a *live peer* would strip the only reference that
+// peer's in-memory bitmap is rebuilt from, so those blocks would stay marked
+// allocated there until it restarts.
+func (a *Allocator) Owns(diskOff uint64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, ar := range a.arenas {
+		if diskOff >= ar.DiskStart && diskOff < ar.DiskEnd {
+			return true
+		}
+	}
+	return false
 }
 
 // LiveRatio returns the fraction of allocated blocks across all arenas.
@@ -287,25 +345,102 @@ func (a *Allocator) ArenaCount() int {
 	return len(a.arenas)
 }
 
-// ---- bitmap operations ----
-
-func (ar *Arena) findContiguous(blocks uint64) uint64 {
-	count := uint64(0)
-	start := uint64(0)
-	for i := uint64(0); i < BlocksPerArena; i++ {
-		if ar.isFree(i) {
-			if count == 0 {
-				start = i
-			}
-			count++
-			if count >= blocks {
-				return start
-			}
-		} else {
-			count = 0
+// ReapEmptyArenas periodically returns emptied arenas to the global free pool.
+// Blocks until ctx is cancelled.
+func (a *Allocator) ReapEmptyArenas(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, _ = a.ReleaseEmptyArenas(ctx)
 		}
 	}
-	return BlocksPerArena
+}
+
+// ReleaseEmptyArenas returns every arena this node has emptied to the global
+// free pool, reporting the arenas actually released.
+//
+// Deletes and truncates free blocks inside an arena, but the arena itself stays
+// this node's until it is handed back, and only departure and fencing ever did
+// that.  A long-lived node therefore accumulated arenas it no longer used, and
+// that space was reserved to it until the process exited — reclaimable in
+// principle, unusable by any peer in practice.
+//
+// The arena is detached from the local free list *before* the etcd release, so
+// no allocation can land in a range that is on its way to another node, and
+// reattached if the release does not go through.  The reverse order would open
+// exactly the two-writers-one-range window the arena scheme exists to close.
+func (a *Allocator) ReleaseEmptyArenas(ctx context.Context) ([]uint64, error) {
+	a.mu.Lock()
+	var empty []*Arena
+	kept := a.arenas[:0]
+	for _, ar := range a.arenas {
+		if ar.isEmpty() {
+			empty = append(empty, ar)
+			continue
+		}
+		kept = append(kept, ar)
+	}
+	a.arenas = kept
+	a.mu.Unlock()
+
+	released := make([]uint64, 0, len(empty))
+	for _, ar := range empty {
+		ok, err := a.store.ReleaseArenaID(ctx, a.nodeID, ar.ID)
+		if err != nil || !ok {
+			a.mu.Lock()
+			a.arenas = append(a.arenas, ar)
+			a.mu.Unlock()
+			if err != nil {
+				return released, fmt.Errorf("release empty arena %d: %w", ar.ID, err)
+			}
+			continue
+		}
+		released = append(released, ar.ID)
+	}
+	return released, nil
+}
+
+// ---- bitmap operations ----
+
+// findRun returns the first free run of blocks, at most max long.  A length of
+// 0 means the arena has no free block left.
+//
+// ponytail: linear bit scan from block 0, so a nearly-full arena costs a full
+// sweep per call.  Skipping fully-allocated words keeps that tolerable; switch
+// to a free-list or a rotating start hint if allocation ever shows up in a
+// profile.
+func (ar *Arena) findRun(max uint64) (start, length uint64) {
+	for i := uint64(0); i < BlocksPerArena; {
+		if ar.bitmap[i/64] == ^uint64(0) {
+			i = (i/64 + 1) * 64 // whole word allocated
+			continue
+		}
+		if !ar.isFree(i) {
+			i++
+			continue
+		}
+		start = i
+		for length < max && i < BlocksPerArena && ar.isFree(i) {
+			length++
+			i++
+		}
+		return start, length
+	}
+	return 0, 0
+}
+
+// isEmpty reports whether the arena holds no allocated block.
+func (ar *Arena) isEmpty() bool {
+	for _, word := range ar.bitmap {
+		if word != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (ar *Arena) isFree(block uint64) bool {

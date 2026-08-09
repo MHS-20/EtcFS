@@ -6,6 +6,7 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 	wal "github.com/MHS-20/EtcFS/pkg/walgo"
@@ -100,87 +101,91 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	}
 	defer release()
 
-	diskOff, err := s.allocateBlocks(ctx, uint64(dataLen))
+	runs, err := s.allocateBlocks(ctx, uint64(dataLen))
 	if err != nil {
 		s.log.Warn("write: cannot allocate blocks", "ino", ino, "error", err)
 		return int32Resp(-28), nil
 	}
+	freeRuns := func() {
+		for _, r := range runs {
+			s.alloc.Free(r.DiskOff, r.Length)
+		}
+	}
 
-	// Under O_DIRECT the payload has to be copied into a sector-aligned
-	// buffer; the extra tail bytes past dataLen are written but never
-	// referenced by the extent.
+	// Every run starts and ends on a block boundary, so a single buffer padded
+	// out to whole blocks can be sliced per run and still satisfy O_DIRECT.
+	// The padding past dataLen is written but never referenced by an extent.
+	padded := (dataLen + arena.BlockSize - 1) / arena.BlockSize * arena.BlockSize
 	writeData := data
-	if !s.directSafe(data) {
-		aligned, free := s.ioBuffer(dataLen)
+	if padded != dataLen || !s.directSafe(data) {
+		aligned, free := s.ioBuffer(padded)
 		defer free()
 		if !s.directSafe(aligned) {
-			s.alloc.Free(diskOff, uint64(dataLen))
+			freeRuns()
 			return int32Resp(-12), nil // ENOMEM
 		}
 		copy(aligned, data)
-		writeData = aligned
+		writeData = aligned[:padded]
 	}
-
-	n, werr := s.dev.WriteAt(writeData, int64(diskOff))
-	if werr != nil {
-		s.alloc.Free(diskOff, uint64(dataLen))
-		s.log.Warn("write: block device write failed", "error", werr)
-		return int32Resp(-5), nil
-	}
-
-	_ = s.dev.FlushDevice()
 
 	gen := s.writeGeneration(ctx)
 
-	if s.wal != nil {
-		_ = s.wal.Append(&wal.Entry{
-			Ino:        ino,
-			LogicalOff: offset,
-			DiskOff:    diskOff,
-			Length:     uint64(dataLen),
-			Generation: gen,
-		})
-	}
-
-	if err := s.dev.SyncRange(int64(diskOff), int64(n)); err != nil {
-		s.log.Warn("write: sync failed", "error", err)
-	}
-
-	// Read the range straight back.  The bytes are discarded: the point is the
-	// round trip to the device, which is what makes the write visible to the
-	// other attachers of an EBS Multi-Attach volume.
-	readback, freeReadback := s.ioBuffer(dataLen)
-	_, _ = s.dev.ReadAt(readback, int64(diskOff))
-	freeReadback()
-
 	chunk, cherr := s.store.NextExtentChunk(ctx, ino)
 	if cherr != nil {
-		s.alloc.Free(diskOff, uint64(dataLen))
+		freeRuns()
 		s.log.Warn("write: cannot determine extent chunk", "ino", ino, "error", cherr)
 		return int32Resp(-5), nil
 	}
-	ext := metadata.Extent{
-		LogOff: offset, DiskOff: diskOff, Length: uint64(dataLen), Gen: gen,
+
+	// One extent per run, in order, so the logical range stays contiguous even
+	// though the device ranges behind it are not.
+	ops := make([]clientv3.Op, 0, len(runs)+1)
+	end := offset
+	pos := uint64(0)
+	for _, r := range runs {
+		if werr := s.writeRun(writeData[pos:pos+r.Length], r.DiskOff); werr != nil {
+			freeRuns()
+			s.log.Warn("write: block device write failed", "error", werr)
+			return int32Resp(-5), nil
+		}
+
+		// The final run is padded; its extent covers only the real bytes.
+		extLen := min(r.Length, uint64(dataLen)-pos)
+		ext := metadata.Extent{
+			LogOff: offset + pos, DiskOff: r.DiskOff, Length: extLen, Gen: gen,
+		}
+		if s.wal != nil {
+			_ = s.wal.Append(&wal.Entry{
+				Ino:        ino,
+				LogicalOff: ext.LogOff,
+				DiskOff:    r.DiskOff,
+				Length:     extLen,
+				Generation: gen,
+			})
+		}
+		ops = append(ops, clientv3.OpPut(metadata.ExtentKey(ino, chunk), ext.Encode()))
+		chunk++
+		end = ext.End()
+		pos += r.Length
 	}
 
-	// Commit the extent and any size change together, guarded by this node's
+	// Commit every extent and any size change together, guarded by this node's
 	// fencing generation.  Data is already durable on the device; if the guard
 	// rejects the commit the bytes stay unreferenced and the blocks go back to
 	// the arena.
-	ops := []clientv3.Op{clientv3.OpPut(metadata.ExtentKey(ino, chunk), ext.Encode())}
-	if newEnd := ext.End(); newEnd > rec.Size {
-		rec.Size = newEnd
+	if end > rec.Size {
+		rec.Size = end
 		ops = append(ops, clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(rec))))
 	}
 
 	committed, cerr := s.commitGuarded(ops)
 	if cerr != nil {
-		s.alloc.Free(diskOff, uint64(dataLen))
+		freeRuns()
 		s.log.Warn("write: metadata commit failed", "ino", ino, "error", cerr)
 		return int32Resp(-5), nil
 	}
 	if !committed {
-		s.alloc.Free(diskOff, uint64(dataLen))
+		freeRuns()
 		s.log.Error("write: rejected, node has been fenced",
 			"ino", ino, "start_generation", s.startGen)
 		return int32Resp(-5), nil
@@ -193,16 +198,39 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	return writtenResp(uint32(dataLen)), nil
 }
 
+// writeRun puts one run on the device and makes it visible to the volume's
+// other attachers.
+//
+// The readback is not a verification — the bytes are discarded.  It is the
+// round trip that publishes the write to the other attachers of an EBS
+// Multi-Attach volume.
+func (s *Service) writeRun(buf []byte, diskOff uint64) error {
+	n, err := s.dev.WriteAt(buf, int64(diskOff))
+	if err != nil {
+		return err
+	}
+
+	_ = s.dev.FlushDevice()
+	if err := s.dev.SyncRange(int64(diskOff), int64(n)); err != nil {
+		s.log.Warn("write: sync failed", "error", err)
+	}
+
+	readback, freeReadback := s.ioBuffer(len(buf))
+	_, _ = s.dev.ReadAt(readback, int64(diskOff))
+	freeReadback()
+	return nil
+}
+
 // allocateBlocks reserves device space, expanding into a fresh arena if the
 // arenas this node already holds cannot satisfy the request.
-func (s *Service) allocateBlocks(ctx context.Context, size uint64) (uint64, error) {
+func (s *Service) allocateBlocks(ctx context.Context, size uint64) ([]arena.Run, error) {
 	if s.alloc.ArenaCount() > 0 {
-		if diskOff, err := s.alloc.Allocate(size); err == nil {
-			return diskOff, nil
+		if runs, err := s.alloc.Allocate(size); err == nil {
+			return runs, nil
 		}
 	}
 	if _, err := s.alloc.AcquireArena(ctx); err != nil {
-		return 0, err
+		return nil, err
 	}
 	return s.alloc.Allocate(size)
 }

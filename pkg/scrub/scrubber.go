@@ -60,19 +60,18 @@ type Scrubber struct {
 	totalChecked int64
 }
 
-// Reclaimer returns a disk range to the block allocator.  Implemented by
-// pkg/arena.Allocator, whose Free ignores ranges outside the arenas this node
-// owns — the free list is per-process and in-memory, so a node can only
-// reclaim its own space.  Ranges belonging to another node's arena stay
-// allocated until that node scrubs, or until the arena is compacted.
+// Reclaimer returns a disk range to the block allocator, and reports which
+// ranges this node is entitled to reclaim.  Implemented by pkg/arena.Allocator.
 //
-// ponytail: in-memory reclamation only, so a range freed here is lost again on
-// restart (Reconstruct rebuilds the bitmap from live extents, which no longer
-// include the deleted file, so the space does come back — but only for arenas
-// this node re-acquires).  Move to a durable free list if reclamation needs to
-// be visible cluster-wide.
+// Owns is what keeps reclamation from leaking across nodes.  The free list is
+// per-process and in-memory, so an orphaned extent inside a peer's arena has to
+// be left to that peer: deleting the extent record here would remove the only
+// reference its bitmap is rebuilt from, and those blocks would stay marked
+// allocated there until the peer restarts.  Each node reclaims its own arenas,
+// and every arena has exactly one owner, so every orphan is still covered.
 type Reclaimer interface {
 	Free(diskOff, size uint64)
+	Owns(diskOff uint64) bool
 }
 
 // Logger is the logging interface used by the scrubber.
@@ -141,8 +140,17 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	s.totalChecked++
 	s.mu.Unlock()
 
+	// Reclaim only what this node owns.  An orphan in a peer's arena is that
+	// peer's to clean up, and one in a free-pool arena is cleaned up by whoever
+	// claims it next — the claimer marks it live from the extent record that is
+	// still there, then its own scrub pass finds it orphaned and reclaims it.
+	// So every orphan is still covered, without a node ever deleting the record
+	// another node's bitmap is rebuilt from.
 	for _, r := range orphans {
 		if !r.AutoFix {
+			continue
+		}
+		if s.reclaimer == nil || !s.reclaimer.Owns(r.DiskOff) {
 			continue
 		}
 		s.log.Info("scrub auto-fix: reclaiming orphan extent", "detail", r.Detail)
@@ -154,7 +162,7 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 				"key", r.Key, "error", err)
 			continue
 		}
-		if s.reclaimer != nil && r.Length > 0 {
+		if r.Length > 0 {
 			s.reclaimer.Free(r.DiskOff, r.Length)
 		}
 	}
