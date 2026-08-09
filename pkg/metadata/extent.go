@@ -39,8 +39,6 @@ type Extent struct {
 	// would have to claim the piece is newer than the extent it was cut from,
 	// and it would then win over a genuinely newer extent overlapping it.
 	//
-	// A value written before this field existed decodes with Seq set to Chunk,
-	// which is exactly the order those records were written in.
 	Seq uint64
 
 	LogOff  uint64
@@ -89,9 +87,6 @@ func InoFromExtentKey(key string) uint64 {
 }
 
 // Encode renders the extent in its stored form.  Key is not part of the value.
-//
-// Seq is appended last so a reader of the older four-field form keeps finding
-// every field it knows at the position it expects.
 func (e Extent) Encode() string {
 	return fmt.Sprintf("%d,%d,%d,%d,%d", e.LogOff, e.DiskOff, e.Length, e.Gen, e.Seq)
 }
@@ -109,16 +104,11 @@ func (e Extent) WithinDisk(start, end uint64) bool {
 }
 
 // DecodeExtent parses a stored extent key/value pair.  Returns ok=false unless
-// the value is four or five comma-separated integers, so a corrupt record is
-// skipped rather than silently read as a zero-length extent at disk offset 0.
-//
-// The four-field form predates the sequence number.  Those records were written
-// one per chunk in ascending order, so the chunk number *is* their sequence, and
-// adopting it keeps them ordered against each other and against anything written
-// since.
+// the value is five comma-separated integers, so a corrupt record is skipped
+// rather than silently read as a zero-length extent at disk offset 0.
 func DecodeExtent(key string, value []byte) (Extent, bool) {
 	parts := strings.Split(string(value), ",")
-	if len(parts) != 4 && len(parts) != 5 {
+	if len(parts) != 5 {
 		return Extent{}, false
 	}
 	var fields [5]uint64
@@ -130,12 +120,8 @@ func DecodeExtent(key string, value []byte) (Extent, bool) {
 		fields[i] = v
 	}
 	_, chunk, _ := ParseExtentKey(key)
-	seq := chunk
-	if len(parts) == 5 {
-		seq = fields[4]
-	}
 	return Extent{
-		Key: key, Chunk: chunk, Seq: seq, LogOff: fields[0], DiskOff: fields[1],
+		Key: key, Chunk: chunk, Seq: fields[4], LogOff: fields[0], DiskOff: fields[1],
 		Length: fields[2], Gen: fields[3],
 	}, true
 }

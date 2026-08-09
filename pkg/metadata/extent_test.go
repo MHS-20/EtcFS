@@ -18,7 +18,7 @@ func TestExtentRoundTrip(t *testing.T) {
 }
 
 func TestDecodeExtentRejectsGarbage(t *testing.T) {
-	for _, v := range []string{"", "1,2,3", "1,2,3,4,5,6", "1,2,3,x", "-1,2,3,4", "1,2,3,4,x"} {
+	for _, v := range []string{"", "1,2,3", "1,2,3,4", "1,2,3,4,5,6", "1,2,3,4,x", "-1,2,3,4,5"} {
 		if _, ok := DecodeExtent("extent:1/0", []byte(v)); ok {
 			t.Errorf("accepted malformed value %q", v)
 		}
@@ -40,10 +40,10 @@ func TestParseExtentKey(t *testing.T) {
 // lexicographically (chunk 10 sorts before chunk 2).
 func TestDecodeExtentsSortsByLogicalOffset(t *testing.T) {
 	kvs := []*mvccpb.KeyValue{
-		{Key: []byte("extent:1/0"), Value: []byte("0,0,4096,1")},
-		{Key: []byte("extent:1/1"), Value: []byte("4096,4096,4096,1")},
-		{Key: []byte("extent:1/10"), Value: []byte("40960,40960,4096,1")},
-		{Key: []byte("extent:1/2"), Value: []byte("8192,8192,4096,1")},
+		{Key: []byte("extent:1/0"), Value: []byte("0,0,4096,1,0")},
+		{Key: []byte("extent:1/1"), Value: []byte("4096,4096,4096,1,1")},
+		{Key: []byte("extent:1/10"), Value: []byte("40960,40960,4096,1,10")},
+		{Key: []byte("extent:1/2"), Value: []byte("8192,8192,4096,1,2")},
 		{Key: []byte("extent:1/bad"), Value: []byte("nonsense")},
 	}
 	got := DecodeExtents(kvs)
@@ -59,8 +59,8 @@ func TestDecodeExtentsSortsByLogicalOffset(t *testing.T) {
 
 // A write allocates fresh blocks and appends an extent, so overwriting a range
 // leaves two extents covering it.  A reader takes the first one that covers the
-// offset it wants, so the newer — higher chunk — has to sort first, and has to
-// do so deterministically: sort.Slice is not stable, and ordering on offset
+// offset it wants, so the newer — higher sequence — has to sort first, and has
+// to do so deterministically: sort.Slice is not stable, and ordering on offset
 // alone let the same file read back differently from one call to the next.
 func TestDecodeExtentsPutsTheNewestWriteFirst(t *testing.T) {
 	kvs := []*mvccpb.KeyValue{
@@ -248,30 +248,6 @@ func sameExtent(a, b *Extent) bool {
 	}
 	return a.LogOff == b.LogOff && a.DiskOff == b.DiskOff &&
 		a.Length == b.Length && a.Gen == b.Gen && a.Seq == b.Seq
-}
-
-// Records written before the sequence field existed carry only four values.
-// They were appended one per chunk in ascending order, so the chunk number is
-// their sequence, and adopting it keeps them ordered against each other and
-// against anything written since.
-func TestDecodeExtentAdoptsChunkAsSequenceForLegacyValues(t *testing.T) {
-	got, ok := DecodeExtent("extent:1/6", []byte("0,4096,4096,2"))
-	if !ok {
-		t.Fatal("four-field value rejected")
-	}
-	if got.Seq != 6 {
-		t.Errorf("legacy sequence = %d, want the chunk number 6", got.Seq)
-	}
-
-	// A mixed inode — one legacy record, one written since — still orders the
-	// newer write ahead of the older one.
-	kvs := []*mvccpb.KeyValue{
-		{Key: []byte("extent:1/6"), Value: []byte("0,4096,4096,2")},
-		{Key: []byte("extent:1/7"), Value: []byte("0,8192,4096,2,7")},
-	}
-	if first := DecodeExtents(kvs)[0]; first.Seq != 7 {
-		t.Errorf("read resolves to sequence %d, want the newer 7", first.Seq)
-	}
 }
 
 // The reason the sequence lives in the value: both halves of a split have to

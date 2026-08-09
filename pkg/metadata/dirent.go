@@ -263,32 +263,181 @@ func (s *Store) AtomicUnlink(ctx context.Context, parent uint64, name string) er
 	return nil
 }
 
-// AtomicRename atomically renames a file within the same directory.
-// old and new must be in the same parent directory.
-// If the new name already exists, the transaction succeeds with RENAME_NOREPLACE check.
+// AtomicRename moves ino from oldParent/oldName to newParent/newName in a
+// single etcd transaction.
+//
+// POSIX requires the rename to replace an existing target, and replacing it is
+// an unlink: the target's nlink drops, and its inode record goes with it at
+// zero.  Leaving that out is what orphaned the replaced file — its inode and
+// every extent behind it stayed in etcd, reachable by nothing.
+//
+// flags carries RENAME_NOREPLACE and RENAME_EXCHANGE.  Exchange is rejected
+// rather than approximated: an ordinary rename deletes the source and
+// overwrites the target, which is data loss for a caller that asked for the two
+// names to swap.
 func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName string, newParent uint64, newName string, ino uint64, flags uint32) error {
+	fail := func(format string, args ...any) error {
+		prefix := fmt.Sprintf("atomic rename %d/%q → %d/%q: ", oldParent, oldName, newParent, newName)
+		return fmt.Errorf(prefix+format, args...)
+	}
+
+	if flags&RenameExchange != 0 {
+		return fail("RENAME_EXCHANGE is not implemented (%w)", ErrInvalid)
+	}
+
+	// A dirent whose inode is missing is already corrupt, and fsck reports it.
+	// Renaming it is still allowed: moving a broken pointer breaks nothing
+	// further, and refusing would take away the obvious way to clear it.  Its
+	// type is unknown, so the directory checks below simply do not apply.
+	src, err := s.GetInode(ctx, ino)
+	if err != nil {
+		return fail("%w", err)
+	}
+	srcIsDir := src != nil && src.Mode&S_IFMT == ModeDir
+
+	// A directory moved beneath itself detaches its whole subtree: the entries
+	// still exist, but no path from the root reaches them, and no later
+	// operation can tell that from ordinary data.
+	if srcIsDir {
+		under, aerr := s.isDescendant(ctx, newParent, ino)
+		if aerr != nil {
+			return fail("%w", aerr)
+		}
+		if newParent == ino || under {
+			return fail("destination is inside the directory being moved (%w)", ErrInvalid)
+		}
+	}
+
 	cmps := []clientv3.Cmp{
-		clientv3.Compare(clientv3.CreateRevision(DirentKey(oldParent, oldName)), ">", 0), // old must exist
+		clientv3.Compare(clientv3.CreateRevision(DirentKey(oldParent, oldName)), ">", 0),
 	}
-
-	if flags&RenameNoReplace != 0 {
-		cmps = append(cmps,
-			clientv3.Compare(clientv3.CreateRevision(DirentKey(newParent, newName)), "=", 0)) // new must not exist
-	}
-
-	thenOps := []clientv3.Op{
+	ops := []clientv3.Op{
 		DeleteDirent(oldParent, oldName),
 		PutDirent(newParent, newName, ino),
 	}
 
-	ok, err := s.Txn(ctx, cmps, thenOps, nil)
+	targetKey := DirentKey(newParent, newName)
+	targetKvs, _, err := s.GetRevision(ctx, targetKey)
 	if err != nil {
-		return fmt.Errorf("atomic rename %d/%q → %d/%q: %w", oldParent, oldName, newParent, newName, err)
+		return fail("read target: %w", err)
 	}
-	if !ok {
-		return fmt.Errorf("atomic rename %d/%q → %d/%q: source missing or target exists", oldParent, oldName, newParent, newName)
+
+	if len(targetKvs) == 0 {
+		// Nothing there now, and nothing may appear before the commit lands.
+		cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(targetKey), "=", 0))
+		if err := s.commitRename(ctx, cmps, ops); err != nil {
+			return fail("%w", err)
+		}
+		return nil
+	}
+
+	if flags&RenameNoReplace != 0 {
+		return fail("target exists (%w)", ErrExists)
+	}
+
+	// Pin the target to the revision the checks below are about to read, so a
+	// concurrent write to that name aborts this rename instead of being
+	// silently replaced by it.
+	cmps = append(cmps, clientv3.Compare(clientv3.ModRevision(targetKey), "=", targetKvs[0].ModRevision))
+
+	victimIno := DecodeUint64(targetKvs[0].Value)
+	victim, err := s.GetInode(ctx, victimIno)
+	if err != nil {
+		return fail("read target inode: %w", err)
+	}
+	if victim != nil {
+		victimIsDir := victim.Mode&S_IFMT == ModeDir
+		switch {
+		case srcIsDir && !victimIsDir:
+			return fail("cannot replace a file with a directory (%w)", ErrNotDir)
+		case !srcIsDir && victimIsDir:
+			return fail("cannot replace a directory with a file (%w)", ErrIsDir)
+		}
+		if victimIsDir {
+			entries, lerr := s.ListDirents(ctx, victimIno)
+			if lerr != nil {
+				return fail("list target: %w", lerr)
+			}
+			if len(entries) > 0 {
+				return fail("target directory is not empty (%w)", ErrNotEmpty)
+			}
+		}
+		ops = append(ops, s.unlinkInodeOp(victim))
+	}
+
+	if err := s.commitRename(ctx, cmps, ops); err != nil {
+		return fail("%w", err)
 	}
 	return nil
+}
+
+// unlinkInodeOp is the write that drops one reference to rec: a smaller nlink,
+// or the inode's removal once nothing points at it any more.
+//
+// The extents of a removed inode are deliberately left behind.  They become
+// orphans, which the scrubber reclaims on the node that owns their arena — the
+// only node that may, since its in-memory free list is rebuilt from exactly
+// those records.
+func (s *Store) unlinkInodeOp(rec *InodeRecord) clientv3.Op {
+	if rec.Nlink > 1 {
+		reduced := *rec
+		reduced.Nlink--
+		return clientv3.OpPut(InodeKey(rec.Ino), string(EncodeInode(&reduced)))
+	}
+	return clientv3.OpDelete(InodeKey(rec.Ino))
+}
+
+func (s *Store) commitRename(ctx context.Context, cmps []clientv3.Cmp, ops []clientv3.Op) error {
+	ok, err := s.Txn(ctx, cmps, ops, nil)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("source or target changed under the rename (%w)", ErrConflict)
+	}
+	return nil
+}
+
+// isDescendant reports whether ino is anywhere beneath ancestor in the
+// namespace.
+//
+// Inodes record no parent, so the only way up the tree is a reverse index built
+// from the dirent values.  One prefix scan is enough, and this runs only when a
+// *directory* is being renamed, which is rare — a per-inode parent pointer
+// would be a second source of truth to keep consistent for no benefit at this
+// scale.
+//
+// The walk is bounded by the number of directories it has seen: a namespace
+// that already contains a cycle would otherwise spin here forever.
+func (s *Store) isDescendant(ctx context.Context, ino, ancestor uint64) (bool, error) {
+	if ino == ancestor {
+		return true, nil
+	}
+
+	kvs, err := s.GetPrefix(ctx, PrefixDirent)
+	if err != nil {
+		return false, fmt.Errorf("build parent index: %w", err)
+	}
+	parent := make(map[uint64]uint64, len(kvs))
+	for _, kv := range kvs {
+		p, _, ok := ParseDirentKey(string(kv.Key))
+		if !ok {
+			continue
+		}
+		parent[DecodeUint64(kv.Value)] = p
+	}
+
+	for step := 0; step <= len(parent); step++ {
+		next, ok := parent[ino]
+		if !ok {
+			return false, nil // reached the root, or an unparented inode
+		}
+		if next == ancestor {
+			return true, nil
+		}
+		ino = next
+	}
+	return false, fmt.Errorf("parent chain from %d does not terminate", ino)
 }
 
 // AtomicRmRf recursively deletes a directory tree by deleting the dirent prefix

@@ -40,6 +40,21 @@ var ErrFenced = fmt.Errorf("node is fenced")
 // unguarded mutation is exactly what the guard exists to prevent.
 var ErrGuardUnavailable = fmt.Errorf("fencing guard unavailable")
 
+// Namespace errors, each mapping to the errno POSIX names for the situation.
+var (
+	// ErrNotEmpty: a directory that still has entries cannot be replaced.
+	ErrNotEmpty = fmt.Errorf("directory not empty")
+	// ErrNotDir: a directory can only be renamed over another directory.
+	ErrNotDir = fmt.Errorf("not a directory")
+	// ErrIsDir: a non-directory cannot be renamed over a directory.
+	ErrIsDir = fmt.Errorf("is a directory")
+	// ErrInvalid: the operation is rejected on its own terms — an unsupported
+	// flag, or a directory rename that would detach a subtree into a cycle.
+	ErrInvalid = fmt.Errorf("invalid argument")
+	// ErrNotFound: the name or inode the operation names does not exist.
+	ErrNotFound = fmt.Errorf("not found")
+)
+
 // AcquireLock attempts to acquire a lock on an inode.
 //
 // For exclusive locks: CAS — succeed only if no lock key exists.

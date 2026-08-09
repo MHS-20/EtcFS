@@ -18,8 +18,21 @@ import (
 // fuzz log, and misleads anyone reading the mount's errors during an incident.
 // Anything else keeps the caller's ordinary errno.
 func errnoFor(err error, fallback int32) int32 {
-	if errors.Is(err, metadata.ErrFenced) || errors.Is(err, metadata.ErrGuardUnavailable) {
+	switch {
+	case errors.Is(err, metadata.ErrFenced), errors.Is(err, metadata.ErrGuardUnavailable):
 		return -5 // EIO
+	case errors.Is(err, metadata.ErrExists):
+		return -17 // EEXIST
+	case errors.Is(err, metadata.ErrNotFound):
+		return -2 // ENOENT
+	case errors.Is(err, metadata.ErrNotDir):
+		return -20 // ENOTDIR
+	case errors.Is(err, metadata.ErrIsDir):
+		return -21 // EISDIR
+	case errors.Is(err, metadata.ErrInvalid):
+		return -22 // EINVAL
+	case errors.Is(err, metadata.ErrNotEmpty):
+		return -39 // ENOTEMPTY
 	}
 	return fallback
 }

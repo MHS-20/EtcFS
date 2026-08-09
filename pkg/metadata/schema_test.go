@@ -80,3 +80,22 @@ func TestDeleteDirentPrefixOp(t *testing.T) {
 	assert.Equal(t, "dirent:1/", string(op.KeyBytes()))
 	assert.True(t, op.IsDelete())
 }
+
+func TestParseDirentKey(t *testing.T) {
+	parent, name, ok := ParseDirentKey("dirent:42/report.txt")
+	if !ok || parent != 42 || name != "report.txt" {
+		t.Fatalf("got %d/%q ok=%v", parent, name, ok)
+	}
+
+	// A name is everything after the first slash, so one containing a slash of
+	// its own still parses — the parent is never ambiguous.
+	if _, name, ok := ParseDirentKey("dirent:7/a/b"); !ok || name != "a/b" {
+		t.Errorf("nested name: got %q ok=%v", name, ok)
+	}
+
+	for _, k := range []string{"inode:9", "dirent:9", "dirent:x/name", ""} {
+		if _, _, ok := ParseDirentKey(k); ok {
+			t.Errorf("accepted malformed key %q", k)
+		}
+	}
+}

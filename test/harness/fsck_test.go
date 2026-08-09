@@ -69,7 +69,7 @@ func TestFsck_OrphanExtentDetected(t *testing.T) {
 
 	// Create extent with no inode reference
 	extKey := "extent:99999/0"
-	extVal := "0,8192,4096,1"
+	extVal := "0,8192,4096,1,0"
 	_, _ = cluster.Store.Put(ctx, extKey, []byte(extVal))
 
 	chk := fsck.New(cluster.Store)

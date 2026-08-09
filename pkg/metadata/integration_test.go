@@ -924,3 +924,144 @@ func TestIntegration_DeepMkdir(t *testing.T) {
 
 	assert.Equal(t, uint64(3715), nextIno)
 }
+
+// ---- rename over an existing target ----
+
+// renameFixture seeds a parent directory holding one file per name given.
+func renameFixture(t *testing.T, s *Store, parent uint64, names ...string) map[string]uint64 {
+	t.Helper()
+	ctx := context.Background()
+	inos := make(map[string]uint64, len(names))
+	for i, name := range names {
+		ino := parent*1000 + uint64(i) + 1
+		_, err := s.AtomicCreateFile(ctx, parent, name, ino, ModeFile|0644, 1000, 1000)
+		require.NoError(t, err, "seed %s", name)
+		inos[name] = ino
+	}
+	return inos
+}
+
+// Replacing a name is an unlink of whatever was there. Leaving that out is what
+// orphaned the target: its inode stayed in etcd with nothing pointing at it.
+func TestIntegration_RenameOverFileUnlinksTheTarget(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent = 8100
+
+	inos := renameFixture(t, s, parent, "src", "victim")
+
+	require.NoError(t, s.AtomicRename(ctx, parent, "src", parent, "victim", inos["src"], 0))
+
+	got, err := s.LookupDirent(ctx, parent, "victim")
+	require.NoError(t, err)
+	assert.Equal(t, inos["src"], got, "the name must now resolve to the source inode")
+
+	gone, err := s.LookupDirent(ctx, parent, "src")
+	require.NoError(t, err)
+	assert.Zero(t, gone, "the source name must be gone")
+
+	victim, err := s.GetInode(ctx, inos["victim"])
+	require.NoError(t, err)
+	assert.Nil(t, victim, "the replaced inode must be deleted, not orphaned")
+}
+
+// A replaced file with another link left keeps its inode; only the count drops.
+func TestIntegration_RenameOverHardlinkedFileOnlyDropsNlink(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent = 8200
+
+	inos := renameFixture(t, s, parent, "src", "victim")
+	require.NoError(t, s.IncrementNlink(ctx, inos["victim"]))
+	require.NoError(t, s.CreateDirent(ctx, parent, "victim-link", inos["victim"]))
+
+	require.NoError(t, s.AtomicRename(ctx, parent, "src", parent, "victim", inos["src"], 0))
+
+	victim, err := s.GetInode(ctx, inos["victim"])
+	require.NoError(t, err)
+	require.NotNil(t, victim, "an inode with a surviving link must not be deleted")
+	assert.EqualValues(t, 1, victim.Nlink)
+}
+
+func TestIntegration_RenameRejectsUnsupportedAndIllegalCases(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent = 8300
+
+	inos := renameFixture(t, s, parent, "src", "taken")
+
+	// Exchange is not implemented, and must not silently degrade to a rename
+	// that deletes the source and overwrites the target.
+	err := s.AtomicRename(ctx, parent, "src", parent, "taken", inos["src"], RenameExchange)
+	assert.ErrorIs(t, err, ErrInvalid)
+
+	err = s.AtomicRename(ctx, parent, "src", parent, "taken", inos["src"], RenameNoReplace)
+	assert.ErrorIs(t, err, ErrExists)
+
+	// Both names survive an aborted rename.
+	for _, name := range []string{"src", "taken"} {
+		got, lerr := s.LookupDirent(ctx, parent, name)
+		require.NoError(t, lerr)
+		assert.NotZero(t, got, "%s must survive the rejected rename", name)
+	}
+
+	// A file may not replace a directory, nor a directory a file.
+	const dirIno = 8399
+	_, err = s.AtomicCreateDir(ctx, parent, "adir", dirIno, 0755, 1000, 1000)
+	require.NoError(t, err)
+
+	err = s.AtomicRename(ctx, parent, "src", parent, "adir", inos["src"], 0)
+	assert.ErrorIs(t, err, ErrIsDir)
+
+	err = s.AtomicRename(ctx, parent, "adir", parent, "src", dirIno, 0)
+	assert.ErrorIs(t, err, ErrNotDir)
+}
+
+func TestIntegration_RenameRejectsNonEmptyDirectoryTarget(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent, srcDir, dstDir = 8400, 8401, 8402
+
+	_, err := s.AtomicCreateDir(ctx, parent, "src", srcDir, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateDir(ctx, parent, "dst", dstDir, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateFile(ctx, dstDir, "occupant", 8403, ModeFile|0644, 1000, 1000)
+	require.NoError(t, err)
+
+	err = s.AtomicRename(ctx, parent, "src", parent, "dst", srcDir, 0)
+	assert.ErrorIs(t, err, ErrNotEmpty)
+
+	// Emptying it makes the same rename legal.
+	require.NoError(t, s.AtomicUnlink(ctx, dstDir, "occupant"))
+	require.NoError(t, s.AtomicRename(ctx, parent, "src", parent, "dst", srcDir, 0))
+}
+
+// Moving a directory beneath itself detaches its whole subtree: the entries
+// remain, but no path from the root reaches them.
+func TestIntegration_RenameRejectsDirectoryIntoItsOwnSubtree(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent, top, mid, deep = 8500, 8501, 8502, 8503
+
+	_, err := s.AtomicCreateDir(ctx, parent, "top", top, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateDir(ctx, top, "mid", mid, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateDir(ctx, mid, "deep", deep, 0755, 1000, 1000)
+	require.NoError(t, err)
+
+	// Directly into its own child, and into a grandchild.
+	assert.ErrorIs(t, s.AtomicRename(ctx, parent, "top", top, "loop", top, 0), ErrInvalid)
+	assert.ErrorIs(t, s.AtomicRename(ctx, parent, "top", deep, "loop", top, 0), ErrInvalid)
+
+	// The directory is still where it was.
+	got, err := s.LookupDirent(ctx, parent, "top")
+	require.NoError(t, err)
+	assert.EqualValues(t, top, got)
+
+	// Moving a *sibling* subtree in is fine — it is not an ancestor of itself.
+	_, err = s.AtomicCreateDir(ctx, parent, "other", 8504, 0755, 1000, 1000)
+	require.NoError(t, err)
+	assert.NoError(t, s.AtomicRename(ctx, parent, "other", deep, "other", 8504, 0))
+}

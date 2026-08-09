@@ -8,7 +8,7 @@
 //	lock:<ino>                    → serialised LockRecord
 //	arena:<node_id>/<arena_id>    → <arena_id> (uint64, big-endian)
 //	free_arena:<arena_id>         → arena returned to the global pool
-//	extent:<ino>/<chunk>          → <log_off>,<disk_off>,<length>,<generation>
+//	extent:<ino>/<chunk>          → <log_off>,<disk_off>,<length>,<generation>,<sequence>
 //	arena_alloc_log               → append-only allocation log key
 //	membership:<node_id>          → lease-backed liveness key
 //	gen:<node_id>                 → fencing generation counter
@@ -121,6 +121,28 @@ func DirentKey(parent uint64, name string) string {
 
 func DirentPrefix(parent uint64) string {
 	return fmt.Sprintf("%s%d/", PrefixDirent, parent)
+}
+
+// ParseDirentKey splits a dirent key back into its parent inode and name.
+// Returns ok=false for a key that is not a well-formed dirent key.
+//
+// A name may contain any byte but '/' and NUL, and the parent is everything
+// before the first '/', so the split is unambiguous even for a name that itself
+// contains a slash-like sequence.
+func ParseDirentKey(key string) (parent uint64, name string, ok bool) {
+	rest, found := strings.CutPrefix(key, PrefixDirent)
+	if !found {
+		return 0, "", false
+	}
+	parentStr, name, found := strings.Cut(rest, "/")
+	if !found {
+		return 0, "", false
+	}
+	parent, err := strconv.ParseUint(parentStr, 10, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	return parent, name, true
 }
 
 func LockKey(ino uint64) string {
