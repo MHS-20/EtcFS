@@ -4,7 +4,7 @@
 
 **Implemented and under hardening.** Go + C codebase, `make` build, Go test suite, chaos/stress harness against real AWS infra.
 
-Layout: `cmd/etcfuse` (C FUSE daemon) · `cmd/etcfuse-meta` (Go metadata daemon) · `pkg/{metadata,fencing,blockio,arena,scrub,compaction,wal,walgo,fuse,block}` · `internal/{ipc,config}` · `test/harness` (Go, mock-store + simulator) · `scripts/{infra,test}` (AWS provisioning + chaos).
+Layout: `cmd/etcfuse` (C FUSE daemon) · `cmd/etcfuse-meta` (Go metadata daemon) · `pkg/{metadata,fencing,blockio,arena,scrub,walgo,fuse,block}` · `internal/{ipc,config}` · `test/harness` (Go, mock-store + simulator) · `scripts/{infra,test}` (AWS provisioning + chaos).
 
 The two daemons talk over a hand-rolled length-prefixed binary protocol on a Unix socket (`internal/ipc/socket.go`). There is no gRPC/protobuf anywhere in the wire path — an earlier `proto/ipc.proto` sketch was removed as dead weight.
 

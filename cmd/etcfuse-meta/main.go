@@ -36,7 +36,6 @@ import (
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/internal/ipc"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
-	"github.com/MHS-20/EtcFS/pkg/compaction"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/fsck"
 	"github.com/MHS-20/EtcFS/pkg/fsinfo"
@@ -215,10 +214,6 @@ func main() {
 	// deletion.
 	scrubber.SetReclaimer(svc.Allocator())
 	go scrubber.Run(ctx)
-
-	// Start background compactor (checks hourly)
-	comp := compaction.New(store, cfg.NodeID)
-	go comp.Run(ctx, time.Hour)
 
 	// Start Prometheus metrics server if configured
 	if cfg.MetricsAddr != "" {

@@ -137,7 +137,7 @@ func (s *Store) GetExtents(ctx context.Context, ino uint64) ([]Extent, error) {
 
 // AllExtents returns every extent in the filesystem, ordered by logical
 // offset within no particular inode.  Used by the whole-filesystem scanners
-// (fsck, scrubber, compactor, arena reconstruction).
+// (fsck, scrubber, arena reconstruction).
 func (s *Store) AllExtents(ctx context.Context) ([]Extent, error) {
 	kvs, err := s.GetPrefix(ctx, PrefixExtent)
 	if err != nil {
