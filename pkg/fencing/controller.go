@@ -234,13 +234,13 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, f
 	// bytes, and handing its arena to a live node would put both of them in
 	// the same range.  Leaking the arena is the correct trade there.
 	if c.fencer != nil {
-		arenaID, released, err := c.store.ReleaseArena(ctx, nodeID)
+		released, err := c.store.ReleaseArena(ctx, nodeID)
 		switch {
 		case err != nil:
-			c.log.Warn("fenced node's arena not reclaimed, its space stays leaked",
-				"node", nodeID, "error", err)
-		case released:
-			c.log.Info("reclaimed fenced node's arena", "node", nodeID, "arena", arenaID)
+			c.log.Warn("fenced node's arenas not all reclaimed, that space stays leaked",
+				"node", nodeID, "reclaimed", released, "error", err)
+		case len(released) > 0:
+			c.log.Info("reclaimed fenced node's arenas", "node", nodeID, "arenas", released)
 		}
 	}
 

@@ -230,14 +230,14 @@ func main() {
 	//
 	// A context of its own: ctx is already cancelled by the time this runs.
 	relCtx, relCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	arenaID, released, rerr := membership.Leave(relCtx, store)
+	released, rerr := membership.Leave(relCtx, store)
 	relCancel()
 	switch {
 	case rerr != nil:
-		log.Warn("arena not released on shutdown, its space stays leaked",
-			"node", cfg.NodeID, "error", rerr)
-	case released:
-		log.Info("released arena on shutdown", "node", cfg.NodeID, "arena", arenaID)
+		log.Warn("arenas not all released on shutdown, that space stays leaked",
+			"node", cfg.NodeID, "released", released, "error", rerr)
+	case len(released) > 0:
+		log.Info("released arenas on shutdown", "node", cfg.NodeID, "arenas", released)
 	}
 
 	log.Info("etcfuse-meta stopped")

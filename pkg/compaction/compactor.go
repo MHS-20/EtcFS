@@ -2,8 +2,6 @@ package compaction
 
 import (
 	"context"
-	"strconv"
-	"strings"
 	"time"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
@@ -44,7 +42,10 @@ func (c *Compactor) NeedsCompaction(ctx context.Context) (bool, []uint64) {
 
 	var compactable []uint64
 	for _, kv := range arenas {
-		arenaID := c.arenaIDFromKey(string(kv.Key))
+		_, arenaID, ok := metadata.ParseArenaKey(string(kv.Key))
+		if !ok {
+			continue
+		}
 		usage := c.arenaUsage(ctx, arenaID)
 		if usage < c.Ratio {
 			compactable = append(compactable, arenaID)
@@ -123,8 +124,32 @@ func (c *Compactor) CompactArena(ctx context.Context, srcArenaID, dstArenaID uin
 	return remapped, nil
 }
 
+// markGlobalArenaAvailable returns an evacuated arena to the global pool.
+//
+// The owner's record is dropped in the same transaction as the free_arena:
+// entry: an arena listed as free while still recorded as owned would be handed
+// to a second node, which is the two-writers-one-range case the arena scheme
+// exists to prevent.
 func (c *Compactor) markGlobalArenaAvailable(ctx context.Context, arenaID uint64) {
-	_, _ = c.Store.Put(ctx, metadata.FreeArenaKey(arenaID), []byte("free"))
+	ops := []clientv3.Op{clientv3.OpPut(metadata.FreeArenaKey(arenaID), "free")}
+	if owner, ok := c.ownerKeyOf(ctx, arenaID); ok {
+		ops = append(ops, clientv3.OpDelete(owner))
+	}
+	_, _ = c.Store.Txn(ctx, nil, ops, nil)
+}
+
+// ownerKeyOf finds the ownership record for arenaID, if any node holds it.
+func (c *Compactor) ownerKeyOf(ctx context.Context, arenaID uint64) (string, bool) {
+	kvs, err := c.Store.GetPrefix(ctx, metadata.PrefixArena)
+	if err != nil {
+		return "", false
+	}
+	for _, kv := range kvs {
+		if _, id, ok := metadata.ParseArenaKey(string(kv.Key)); ok && id == arenaID {
+			return string(kv.Key), true
+		}
+	}
+	return "", false
 }
 
 // markGlobalArenaAcquired records that nodeID owns arenaID.
@@ -133,8 +158,7 @@ func (c *Compactor) markGlobalArenaAvailable(ctx context.Context, arenaID uint64
 // and that the allocator reads back on restart: an ASCII form here decodes to
 // arena 0, which would hand the node an arena it does not own.
 func (c *Compactor) markGlobalArenaAcquired(ctx context.Context, arenaID uint64, nodeID string) {
-	key := metadata.ArenaKey(nodeID)
-	_, _ = c.Store.Put(ctx, key, metadata.EncodeUint64(arenaID))
+	_, _ = c.Store.Put(ctx, metadata.ArenaOwnerKey(nodeID, arenaID), metadata.EncodeUint64(arenaID))
 }
 
 // extentsIn returns every extent lying entirely within the device byte range
@@ -148,12 +172,6 @@ func (c *Compactor) extentsIn(ctx context.Context, diskStart, diskEnd uint64) []
 		}
 	}
 	return in
-}
-
-func (c *Compactor) arenaIDFromKey(key string) uint64 {
-	trimmed := strings.TrimPrefix(key, metadata.PrefixArena)
-	id, _ := strconv.ParseUint(trimmed, 10, 64)
-	return id
 }
 
 func (c *Compactor) ArenaLiveExtents(ctx context.Context, arenaID uint64) int {

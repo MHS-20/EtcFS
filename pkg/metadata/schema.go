@@ -6,7 +6,7 @@
 //	inode:<ino>                   → serialised InodeRecord
 //	dirent:<parent_ino>/<name>    → <ino> (uint64, big-endian)
 //	lock:<ino>                    → serialised LockRecord
-//	arena:<node_id>               → serialised ArenaRecord
+//	arena:<node_id>/<arena_id>    → <arena_id> (uint64, big-endian)
 //	free_arena:<arena_id>         → arena returned to the global pool
 //	extent:<ino>/<chunk>          → <log_off>,<disk_off>,<length>,<generation>
 //	arena_alloc_log               → append-only allocation log key
@@ -22,6 +22,8 @@ package metadata
 import (
 	"encoding/binary"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -83,14 +85,6 @@ type LockRecord struct {
 	Holders []string `json:"holders"`
 }
 
-// ArenaRecord is the serialised value stored at arena:<node_id>.
-type ArenaRecord struct {
-	NodeID    string
-	DiskStart uint64
-	DiskEnd   uint64
-	FreeList  []uint64 // sorted offsets of free blocks within the arena
-}
-
 // MembershipRecord holds per-node liveness metadata.
 type MembershipRecord struct {
 	NodeID      string
@@ -133,8 +127,40 @@ func LockKey(ino uint64) string {
 	return fmt.Sprintf("%s%d", PrefixLock, ino)
 }
 
-func ArenaKey(nodeID string) string {
-	return fmt.Sprintf("%s%s", PrefixArena, nodeID)
+// ArenaOwnerKey names the record proving nodeID owns arenaID.
+//
+// One key per arena, not one per node: a node acquires a further arena
+// whenever its current ones cannot satisfy a write, and a single
+// arena:<node_id> record would be overwritten by that second acquisition,
+// leaving the first arena owned by nobody — never re-adopted on restart and
+// never returned to the free pool.
+func ArenaOwnerKey(nodeID string, arenaID uint64) string {
+	return fmt.Sprintf("%s%s/%d", PrefixArena, nodeID, arenaID)
+}
+
+// ArenaNodePrefix scans every arena owned by one node.
+func ArenaNodePrefix(nodeID string) string {
+	return fmt.Sprintf("%s%s/", PrefixArena, nodeID)
+}
+
+// ParseArenaKey splits an ownership key back into its node and arena.
+//
+// Split on the last "/" so a node ID containing one still parses; ok is false
+// for any key that is not an ownership record.
+func ParseArenaKey(key string) (nodeID string, arenaID uint64, ok bool) {
+	rest, found := strings.CutPrefix(key, PrefixArena)
+	if !found {
+		return "", 0, false
+	}
+	slash := strings.LastIndex(rest, "/")
+	if slash < 1 {
+		return "", 0, false
+	}
+	id, err := strconv.ParseUint(rest[slash+1:], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return rest[:slash], id, true
 }
 
 func MembershipKey(nodeID string) string {

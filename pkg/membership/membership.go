@@ -34,8 +34,13 @@ func (m *Manager) Join(ctx context.Context) error {
 	_ = m.registerMembership(ctx)
 
 	arenas, _ := m.Store.GetPrefix(ctx, metadata.PrefixArena)
+	seen := make(map[string]bool)
 	for _, kv := range arenas {
-		node := string(kv.Key[len(metadata.PrefixArena):])
+		node, _, ok := metadata.ParseArenaKey(string(kv.Key))
+		if !ok || seen[node] {
+			continue
+		}
+		seen[node] = true
 		m.registerRecognition(ctx, node)
 	}
 
@@ -80,7 +85,7 @@ func (m *Manager) AcquireArena(ctx context.Context) error {
 			return txErr
 		}
 		if ok {
-			arenaKey := metadata.ArenaKey(m.NodeID)
+			arenaKey := metadata.ArenaOwnerKey(m.NodeID, current)
 			_, _ = m.Store.Put(ctx, arenaKey, metadata.EncodeUint64(current))
 			return nil
 		}
@@ -89,25 +94,28 @@ func (m *Manager) AcquireArena(ctx context.Context) error {
 }
 
 func (m *Manager) LeaveGraceful(ctx context.Context) error {
-	arenas, _ := m.Store.GetPrefix(ctx, metadata.PrefixArena)
-	var toRelease []uint64
+	arenas, _ := m.Store.GetPrefix(ctx, metadata.ArenaNodePrefix(m.NodeID))
 	for _, kv := range arenas {
-		arenaKey := string(kv.Key)
-		if arenaKey == metadata.ArenaKey(m.NodeID) {
-			id := metadata.DecodeUint64(kv.Value)
-			toRelease = append(toRelease, id)
+		_, id, ok := metadata.ParseArenaKey(string(kv.Key))
+		if !ok {
+			continue
 		}
-	}
-	for _, id := range toRelease {
-		m.releaseArena(ctx, id)
+		m.releaseArena(ctx, string(kv.Key), id)
 	}
 	_ = m.Store.Delete(ctx, metadata.MembershipKey(m.NodeID))
 	return nil
 }
 
-func (m *Manager) releaseArena(ctx context.Context, arenaID uint64) {
-	_ = m.Store.Delete(ctx, metadata.ArenaKey(m.NodeID))
-	_, _ = m.Store.Put(ctx, metadata.FreeArenaKey(arenaID), []byte("free"))
+// releaseArena hands one arena back to the global pool.
+//
+// Both halves in one transaction: a crash between a separate delete and put
+// would leave the arena owned by nobody and listed as free by nobody, which is
+// space no node can ever reissue.
+func (m *Manager) releaseArena(ctx context.Context, ownerKey string, arenaID uint64) {
+	_, _ = m.Store.Txn(ctx, nil, []clientv3.Op{
+		clientv3.OpDelete(ownerKey),
+		clientv3.OpPut(metadata.FreeArenaKey(arenaID), "free"),
+	}, nil)
 }
 
 func (m *Manager) LeaveUngraceful(ctx context.Context) {
@@ -137,18 +145,13 @@ func (m *Manager) LeaveUngraceful(ctx context.Context) {
 // level. That gap is unchanged by this guard; see
 // docs/TODO-hardening.md § 6 (arena reclamation, invariant 4).
 func (m *Manager) RebalanceArena(ctx context.Context, fromNode, toNode string, arenaID uint64) error {
-	fromKey := metadata.ArenaKey(fromNode)
+	fromKey := metadata.ArenaOwnerKey(fromNode, arenaID)
 	fromVal, err := m.Store.Get(ctx, fromKey)
 	if err != nil {
 		return fmt.Errorf("rebalance arena %d: read %s: %w", arenaID, fromNode, err)
 	}
 	if fromVal == nil {
-		return fmt.Errorf("rebalance arena %d: source node %s has no arena registered", arenaID, fromNode)
-	}
-	existingID := metadata.DecodeUint64(fromVal)
-	if existingID != arenaID {
-		return fmt.Errorf("rebalance arena %d: source arena ID mismatch, node %s actually holds %d",
-			arenaID, fromNode, existingID)
+		return fmt.Errorf("rebalance arena %d: source node %s does not hold it", arenaID, fromNode)
 	}
 
 	genVal, err := m.Store.Get(ctx, metadata.GenKey(fromNode))
@@ -177,7 +180,7 @@ func (m *Manager) RebalanceArena(ctx context.Context, fromNode, toNode string, a
 	cmps := []clientv3.Cmp{
 		clientv3.Compare(clientv3.Value(fromKey), "=", string(metadata.EncodeUint64(arenaID))),
 	}
-	toKey := metadata.ArenaKey(toNode)
+	toKey := metadata.ArenaOwnerKey(toNode, arenaID)
 	ops := []clientv3.Op{
 		clientv3.OpDelete(fromKey),
 		clientv3.OpPut(toKey, string(metadata.EncodeUint64(arenaID))),
@@ -198,10 +201,6 @@ func (m *Manager) IsMember(ctx context.Context, nodeID string) bool {
 }
 
 func (m *Manager) ArenaCount(ctx context.Context, nodeID string) int {
-	key := metadata.ArenaKey(nodeID)
-	val, _ := m.Store.Get(ctx, key)
-	if val == nil {
-		return 0
-	}
-	return 1
+	kvs, _ := m.Store.GetPrefix(ctx, metadata.ArenaNodePrefix(nodeID))
+	return len(kvs)
 }

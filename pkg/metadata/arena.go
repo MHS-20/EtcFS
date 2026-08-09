@@ -10,7 +10,7 @@ import (
 
 // Arena pool keys.
 //
-//	arena:<node_id>      = <arena_id>   the arena a node currently owns
+//	arena:<node_id>/<arena_id>          an arena a node currently owns
 //	free_arena:<arena_id>               an arena returned to the global pool
 //
 // An arena in the free pool has no owner, so a node may claim it without
@@ -24,14 +24,19 @@ func FreeArenaKey(arenaID uint64) string {
 	return fmt.Sprintf("%s%d", PrefixFreeArena, arenaID)
 }
 
-// ReleaseArena returns nodeID's arena to the global free pool, reporting the
-// arena released and whether there was one.
+// ReleaseArena returns every arena nodeID owns to the global free pool,
+// reporting the arenas actually released.
 //
-// The move is a single transaction guarded on the ownership record's current
-// value: a node that has already been given a different arena (by the
-// compactor, or by re-acquiring after a restart) must not have that newer
-// arena freed by a release racing on stale state.  A node with no ownership
-// record has nothing to release, which is the normal case for a node that
+// All of them, not just one: a node acquires a further arena whenever its
+// current ones fill up, so releasing a single record on departure or fencing
+// would strand the rest — owned by a node that is gone, and never reissued.
+//
+// One transaction per arena rather than one for all of them.  Each is guarded
+// on that record's current value, so an arena the compactor moves concurrently
+// fails its own CAS without aborting the release of the others; a partial
+// release is recoverable (the leftovers are released on the next attempt, and
+// fsck reports them meanwhile), a wholesale abort is not.  A node with no
+// ownership records has nothing to release, the normal case for a node that
 // never wrote anything.
 //
 // Written raw rather than through the generation guard because the caller is
@@ -39,26 +44,33 @@ func FreeArenaKey(arenaID uint64) string {
 // controller whose write was rejected on the fenced node's behalf could never
 // reclaim anything.  Releasing an arena is safe on a fenced node by
 // definition: its device access has already been confirmed severed.
-func (s *Store) ReleaseArena(ctx context.Context, nodeID string) (uint64, bool, error) {
-	key := ArenaKey(nodeID)
-	v, err := s.Get(ctx, key)
+func (s *Store) ReleaseArena(ctx context.Context, nodeID string) ([]uint64, error) {
+	kvs, err := s.GetPrefix(ctx, ArenaNodePrefix(nodeID))
 	if err != nil {
-		return 0, false, fmt.Errorf("release arena of %s: %w", nodeID, err)
+		return nil, fmt.Errorf("release arenas of %s: %w", nodeID, err)
 	}
-	if len(v) != 8 {
-		return 0, false, nil
+
+	var released []uint64
+	for _, kv := range kvs {
+		_, arenaID, ok := ParseArenaKey(string(kv.Key))
+		if !ok {
+			continue
+		}
+		key := string(kv.Key)
+		won, err := s.txnRaw(ctx,
+			[]clientv3.Cmp{clientv3.Compare(clientv3.Value(key), "=", string(kv.Value))},
+			[]clientv3.Op{
+				clientv3.OpDelete(key),
+				clientv3.OpPut(FreeArenaKey(arenaID), "free"),
+			}, nil)
+		if err != nil {
+			return released, fmt.Errorf("release arena %d of %s: %w", arenaID, nodeID, err)
+		}
+		if won {
+			released = append(released, arenaID)
+		}
 	}
-	arenaID := DecodeUint64(v)
-	ok, err := s.txnRaw(ctx,
-		[]clientv3.Cmp{clientv3.Compare(clientv3.Value(key), "=", string(v))},
-		[]clientv3.Op{
-			clientv3.OpDelete(key),
-			clientv3.OpPut(FreeArenaKey(arenaID), "free"),
-		}, nil)
-	if err != nil {
-		return 0, false, fmt.Errorf("release arena %d of %s: %w", arenaID, nodeID, err)
-	}
-	return arenaID, ok, nil
+	return released, nil
 }
 
 // ClaimFreeArena takes one arena out of the global free pool, reporting the
