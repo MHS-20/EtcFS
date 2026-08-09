@@ -70,3 +70,24 @@ func TestDeadReasonKeepsPartiallyOverwrittenExtent(t *testing.T) {
 		t.Errorf("partly overwritten extent reported dead: %s", r)
 	}
 }
+
+// A directory's link count is fixed rather than counted: it has exactly one
+// dirent pointing at it, but carries 2 for its own ".". Counting dirents
+// instead would report every directory in the filesystem as inconsistent.
+func TestExpectedNlink(t *testing.T) {
+	dir := &metadata.InodeRecord{Mode: metadata.ModeDir | 0755, Nlink: 2}
+	if got := expectedNlink(dir, 1); got != 2 {
+		t.Errorf("directory with one dirent: expected %d, want 2", got)
+	}
+	if got := expectedNlink(dir, 0); got != 2 {
+		t.Errorf("root directory with no dirent: expected %d, want 2", got)
+	}
+
+	file := &metadata.InodeRecord{Mode: metadata.ModeFile | 0644, Nlink: 3}
+	if got := expectedNlink(file, 3); got != 3 {
+		t.Errorf("hard-linked file: expected %d, want its 3 dirents", got)
+	}
+	if got := expectedNlink(file, 0); got != 0 {
+		t.Errorf("unlinked file: expected %d, want 0", got)
+	}
+}

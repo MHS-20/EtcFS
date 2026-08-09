@@ -143,7 +143,7 @@ func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string
 		Size:    0,
 		Blocks:  0,
 		Mode:    mode,
-		Nlink:   1, // regular file starts with 1 link
+		Nlink:   InitialNlink(mode),
 		UID:     uid,
 		GID:     gid,
 		Blksize: 4096,
@@ -191,7 +191,7 @@ func (s *Store) AtomicCreateDir(ctx context.Context, parent uint64, name string,
 		Size:    4096,
 		Blocks:  0,
 		Mode:    mode | ModeDir,
-		Nlink:   2, // . and ..
+		Nlink:   InitialNlink(mode | ModeDir),
 		UID:     uid,
 		GID:     gid,
 		Blksize: 4096,

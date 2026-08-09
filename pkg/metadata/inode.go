@@ -15,6 +15,19 @@ import (
 // being current.  A stale generation (self-fenced or externally fenced)
 // causes the transaction to fail.
 
+// InitialNlink is the link count an inode of the given mode starts with: two
+// for a directory, which is referred to both by its own "." and by its entry in
+// its parent, and one for everything else.
+//
+// The caller creating the directory entry is what makes that count true, so a
+// record stored without one is inconsistent from the moment it is written.
+func InitialNlink(mode uint32) uint32 {
+	if mode&S_IFMT == ModeDir {
+		return 2
+	}
+	return 1
+}
+
 // CreateInode creates a new inode record in etcd.
 // The caller must have already reserved an inode number.
 // Returns the inode record on success.
@@ -26,7 +39,7 @@ func (s *Store) CreateInode(ctx context.Context, ino uint64, mode uint32, uid, g
 		Size:    0,
 		Blocks:  0,
 		Mode:    mode,
-		Nlink:   (mode >> 12) & 1, // 1 for directories (they start with . and ..)
+		Nlink:   InitialNlink(mode),
 		UID:     uid,
 		GID:     gid,
 		Rdev:    0,

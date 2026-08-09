@@ -81,7 +81,7 @@ func (c *Checker) checkInodesDecodable(ctx context.Context) {
 }
 
 func (c *Checker) checkDirentsReferenced(ctx context.Context) {
-	kvs, _ := c.Store.GetPrefix(ctx, "dirent:")
+	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixDirent)
 	seenInos := c.collectInodeSet(ctx)
 	for _, kv := range kvs {
 		ino := decodeUint64(kv.Value)
@@ -99,7 +99,7 @@ func (c *Checker) checkDirentsReferenced(ctx context.Context) {
 
 func (c *Checker) checkNlinkConsistency(ctx context.Context) {
 	refCount := make(map[uint64]uint32)
-	direntKvs, _ := c.Store.GetPrefix(ctx, "dirent:")
+	direntKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixDirent)
 	for _, kv := range direntKvs {
 		ino := decodeUint64(kv.Value)
 		if ino != 0 {
@@ -107,15 +107,25 @@ func (c *Checker) checkNlinkConsistency(ctx context.Context) {
 		}
 	}
 
-	inodeKvs, _ := c.Store.GetPrefix(ctx, "inode:")
+	inodeKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixInode)
 	for _, kv := range inodeKvs {
+		rec := metadata.DecodeInode(kv.Value)
+		if rec == nil {
+			continue
+		}
 		ino := inoFromKey(string(kv.Key))
-		nlink := nlinkFromValue(kv.Value)
-		if nlink != refCount[ino] {
+		// A directory's count is fixed, not counted: directories cannot be
+		// hard-linked, and this filesystem does not model the ".." link a
+		// subdirectory contributes to its parent.
+		expected := refCount[ino]
+		if rec.Mode&metadata.S_IFMT == metadata.ModeDir {
+			expected = metadata.InitialNlink(rec.Mode)
+		}
+		if rec.Nlink != expected {
 			c.Findings = append(c.Findings, Finding{
 				Level: "warning",
-				Message: fmt.Sprintf("nlink mismatch: ino=%d nlink=%d dirents=%d",
-					ino, nlink, refCount[ino]),
+				Message: fmt.Sprintf("nlink mismatch: ino=%d nlink=%d expected=%d",
+					ino, rec.Nlink, expected),
 			})
 		}
 	}
@@ -238,14 +248,6 @@ func inoFromKey(key string) uint64 {
 	trimmed := strings.TrimPrefix(key, metadata.PrefixInode)
 	ino, _ := strconv.ParseUint(trimmed, 10, 64)
 	return ino
-}
-
-func nlinkFromValue(val []byte) uint32 {
-	rec := metadata.DecodeInode(val)
-	if rec == nil {
-		return 0
-	}
-	return rec.Nlink
 }
 
 func decodeUint64(b []byte) uint64 {

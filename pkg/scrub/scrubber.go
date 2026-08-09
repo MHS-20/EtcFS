@@ -406,7 +406,7 @@ func (s *Scrubber) CheckNlinkConsistency(ctx context.Context) []Result {
 		if rec == nil {
 			continue
 		}
-		expected := refCount[rec.Ino]
+		expected := expectedNlink(rec, refCount[rec.Ino])
 		if rec.Nlink != expected {
 			results = append(results, Result{
 				Type:   "nlink",
@@ -416,6 +416,21 @@ func (s *Scrubber) CheckNlinkConsistency(ctx context.Context) []Result {
 		}
 	}
 	return results
+}
+
+// expectedNlink is the link count an inode should carry given how many dirents
+// point at it.
+//
+// For a directory the answer is fixed rather than counted. Directories cannot
+// be hard-linked, and this filesystem does not model the ".." link each
+// subdirectory would contribute to its parent, so every directory keeps the
+// count it was created with — counting dirents instead would flag every
+// directory in the filesystem.
+func expectedNlink(rec *metadata.InodeRecord, dirents uint32) uint32 {
+	if rec.Mode&metadata.S_IFMT == metadata.ModeDir {
+		return metadata.InitialNlink(rec.Mode)
+	}
+	return dirents
 }
 
 // Stats returns scrub statistics.

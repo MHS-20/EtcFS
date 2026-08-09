@@ -574,6 +574,15 @@ func TestIntegration_InodeCRUD(t *testing.T) {
 	_, err = store.CreateInode(ctx, 42, 0644, 1000, 1000)
 	assert.Error(t, err)
 
+	// A new inode starts with one link, so deleting it outright is refused —
+	// the caller has to drop the reference first.
+	assert.EqualValues(t, 1, rec.Nlink)
+	assert.Error(t, store.DeleteInode(ctx, 42), "an inode with a link must not be deletable")
+
+	zero, err := store.DecrementNlink(ctx, 42)
+	require.NoError(t, err)
+	assert.True(t, zero, "the last link is gone")
+
 	// Delete
 	err = store.DeleteInode(ctx, 42)
 	require.NoError(t, err)
@@ -1064,4 +1073,54 @@ func TestIntegration_RenameRejectsDirectoryIntoItsOwnSubtree(t *testing.T) {
 	_, err = s.AtomicCreateDir(ctx, parent, "other", 8504, 0755, 1000, 1000)
 	require.NoError(t, err)
 	assert.NoError(t, s.AtomicRename(ctx, parent, "other", deep, "other", 8504, 0))
+}
+
+// ---- initial link counts ----
+
+// A dirent points at every inode these paths create, so each must be stored
+// with a link count that says so. Symlinks, device nodes and hardlink targets
+// all go through CreateInode, which used to write 0.
+func TestIntegration_CreatedInodesCarryTheirLinkCount(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent = 9100
+
+	_, err := s.AtomicCreateDir(ctx, RootIno, "nlink-parent", parent, 0755, 1000, 1000)
+	require.NoError(t, err)
+
+	cases := []struct {
+		name  string
+		ino   uint64
+		mode  uint32
+		nlink uint32
+	}{
+		{"symlink", 9101, ModeSymlink | 0777, 1},
+		{"chardev", 9102, 0020000 | 0644, 1},
+		{"regular", 9103, ModeFile | 0644, 1},
+		{"subdir", 9104, ModeDir | 0755, 2},
+	}
+	for _, c := range cases {
+		_, cerr := s.CreateInode(ctx, c.ino, c.mode, 1000, 1000)
+		require.NoError(t, cerr, c.name)
+		require.NoError(t, s.CreateDirent(ctx, parent, c.name, c.ino))
+
+		rec, gerr := s.GetInode(ctx, c.ino)
+		require.NoError(t, gerr, c.name)
+		require.NotNil(t, rec, c.name)
+		assert.Equal(t, c.nlink, rec.Nlink, "%s link count", c.name)
+	}
+
+	// A hard link raises the count, and unlinking one name lowers it again
+	// without removing the inode.
+	require.NoError(t, s.IncrementNlink(ctx, 9103))
+	require.NoError(t, s.CreateDirent(ctx, parent, "regular-link", 9103))
+	rec, err := s.GetInode(ctx, 9103)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, rec.Nlink)
+
+	require.NoError(t, s.AtomicUnlink(ctx, parent, "regular-link"))
+	rec, err = s.GetInode(ctx, 9103)
+	require.NoError(t, err)
+	require.NotNil(t, rec, "an inode with a surviving link must not be deleted")
+	assert.EqualValues(t, 1, rec.Nlink)
 }

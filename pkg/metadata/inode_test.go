@@ -72,3 +72,29 @@ func TestExtractNameFromKey(t *testing.T) {
 	assert.Equal(t, "file.txt", extractNameFromKey("dirent:42/file.txt", 42))
 	assert.Equal(t, "nested/path", extractNameFromKey("dirent:100/nested/path", 100))
 }
+
+// Every inode is written with a link count that matches the entry pointing at
+// it. The old formula, (mode>>12)&1, returned 0 for directories, regular files
+// and symlinks alike — only FIFOs came out right — so every symlink, device
+// node and hardlink target was stored as if nothing referenced it.
+func TestInitialNlink(t *testing.T) {
+	cases := []struct {
+		name string
+		mode uint32
+		want uint32
+	}{
+		{"directory", ModeDir | 0755, 2},
+		{"regular file", ModeFile | 0644, 1},
+		{"symlink", ModeSymlink | 0777, 1},
+		{"fifo", 0010000 | 0644, 1},
+		{"character device", 0020000 | 0644, 1},
+		{"block device", 0060000 | 0644, 1},
+		{"socket", 0140000 | 0644, 1},
+		{"mode with no type bits", 0644, 1},
+	}
+	for _, c := range cases {
+		if got := InitialNlink(c.mode); got != c.want {
+			t.Errorf("%s: InitialNlink(%#o) = %d, want %d", c.name, c.mode, got, c.want)
+		}
+	}
+}
