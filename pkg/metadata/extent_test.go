@@ -103,3 +103,147 @@ func TestSupersedes(t *testing.T) {
 		}
 	}
 }
+
+// SplitAround decides what survives an overwrite, and every case has a way to
+// go wrong: dropping live bytes, or handing back blocks that still hold them.
+func TestSplitAround(t *testing.T) {
+	// One extent, four blocks, at a block-aligned device offset.
+	old := Extent{
+		Key: ExtentKey(1, 3), Chunk: 3,
+		LogOff: 8192, DiskOff: 1 << 30, Length: 4 * BlockSize, Gen: 2,
+	}
+
+	type want struct {
+		head, tail *Extent
+	}
+	at := func(logOff, diskOff, length uint64) *Extent {
+		return &Extent{LogOff: logOff, DiskOff: diskOff, Length: length, Gen: old.Gen}
+	}
+
+	cases := []struct {
+		name       string
+		start, end uint64
+		want       want
+	}{
+		{
+			"covered entirely",
+			old.LogOff, old.End(),
+			want{nil, nil},
+		},
+		{
+			"covered from beyond both ends",
+			0, ^uint64(0),
+			want{nil, nil},
+		},
+		{
+			"tail overwritten, head survives",
+			old.LogOff + BlockSize, old.End(),
+			want{at(old.LogOff, old.DiskOff, BlockSize), nil},
+		},
+		{
+			"head overwritten, tail survives and stays block-aligned",
+			0, old.LogOff + BlockSize,
+			want{nil, at(old.LogOff+BlockSize, old.DiskOff+BlockSize, 3*BlockSize)},
+		},
+		{
+			"middle overwritten, both survive",
+			old.LogOff + BlockSize, old.LogOff + 2*BlockSize,
+			want{
+				at(old.LogOff, old.DiskOff, BlockSize),
+				at(old.LogOff+2*BlockSize, old.DiskOff+2*BlockSize, 2*BlockSize),
+			},
+		},
+	}
+
+	for _, c := range cases {
+		head, tail := SplitAround(old, c.start, c.end)
+		if !sameExtent(head, c.want.head) {
+			t.Errorf("%s: head = %v, want %v", c.name, head, c.want.head)
+		}
+		if !sameExtent(tail, c.want.tail) {
+			t.Errorf("%s: tail = %v, want %v", c.name, tail, c.want.tail)
+		}
+	}
+}
+
+// The surviving tail's device offset has to stay block-aligned, because a read
+// reaches it through O_DIRECT, where the offset must be sector-aligned.  The
+// rounding that guarantees that must go *down*: rounding up would leave the
+// bytes between the write's end and the tail's start described by no extent at
+// all, and they would read back as zeroes.
+func TestSplitAroundRoundsTheTailDownToABlock(t *testing.T) {
+	old := Extent{LogOff: 0, DiskOff: 1 << 30, Length: 4 * BlockSize, Gen: 1}
+
+	// A write ending one byte into the second block.
+	_, tail := SplitAround(old, 0, BlockSize+1)
+	if tail == nil {
+		t.Fatal("no tail survived a write covering only the first block and a byte")
+	}
+	if tail.DiskOff%BlockSize != 0 {
+		t.Errorf("tail disk offset %d is not block-aligned", tail.DiskOff)
+	}
+	if tail.LogOff > BlockSize+1 {
+		t.Errorf("tail starts at %d, past the write's end — the gap would read as zeroes",
+			tail.LogOff)
+	}
+	if tail.LogOff+tail.Length != old.End() {
+		t.Errorf("tail ends at %d, want %d", tail.LogOff+tail.Length, old.End())
+	}
+}
+
+// A write covering less than one whole block at the front cannot give anything
+// back, and must not pretend otherwise.
+func TestSplitAroundKeepsEverythingForASubBlockWrite(t *testing.T) {
+	old := Extent{LogOff: 0, DiskOff: 1 << 30, Length: 2 * BlockSize, Gen: 1}
+
+	head, tail := SplitAround(old, 0, 100)
+	if head != nil {
+		t.Errorf("head appeared for a write starting at the extent's own start: %v", head)
+	}
+	if tail == nil || tail.LogOff != old.LogOff || tail.Length != old.Length {
+		t.Fatalf("tail = %v, want the extent unchanged", tail)
+	}
+	if _, length := CoveredBlocks(old, head, tail); length != 0 {
+		t.Errorf("freed %d bytes from a sub-block overwrite", length)
+	}
+}
+
+// CoveredBlocks must never hand back a block a survivor still reads from.
+func TestCoveredBlocksNeverFreesALiveBlock(t *testing.T) {
+	old := Extent{LogOff: 0, DiskOff: 1 << 30, Length: 4 * BlockSize, Gen: 1}
+
+	// Head keeps one byte, so it still owns the whole first block.
+	head := &Extent{LogOff: 0, DiskOff: old.DiskOff, Length: 1}
+	off, length := CoveredBlocks(old, head, nil)
+	if off != old.DiskOff+BlockSize {
+		t.Errorf("freed range starts at %d, inside the head's own block (want %d)",
+			off, old.DiskOff+BlockSize)
+	}
+	if length != 3*BlockSize {
+		t.Errorf("freed %d bytes, want %d", length, 3*BlockSize)
+	}
+
+	// Whole extent dead: every block it owned comes back, padding included.
+	off, length = CoveredBlocks(old, nil, nil)
+	if off != old.DiskOff || length != 4*BlockSize {
+		t.Errorf("full reclaim gave back %d bytes at %d, want %d at %d",
+			length, off, 4*BlockSize, old.DiskOff)
+	}
+
+	// A trailing partial block belongs to the extent, so it is reclaimable too.
+	ragged := Extent{LogOff: 0, DiskOff: old.DiskOff, Length: BlockSize + 10}
+	if _, length = CoveredBlocks(ragged, nil, nil); length != 2*BlockSize {
+		t.Errorf("ragged extent gave back %d bytes, want %d", length, 2*BlockSize)
+	}
+}
+
+func sameExtent(a, b *Extent) bool {
+	switch {
+	case a == nil && b == nil:
+		return true
+	case a == nil || b == nil:
+		return false
+	}
+	return a.LogOff == b.LogOff && a.DiskOff == b.DiskOff &&
+		a.Length == b.Length && a.Gen == b.Gen
+}

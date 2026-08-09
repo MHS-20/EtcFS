@@ -206,15 +206,16 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		_ = s.wal.MarkCommitted(ino, offset)
 	}
 
-	// The write is published, so anything it fully covers is now dead.  Reclaim
-	// it here rather than leaving it all to the scrubber: an overwrite-heavy
-	// workload on one node would otherwise keep a scrub interval's worth of
-	// superseded blocks alive at all times.  Only after the commit — before it,
-	// a rejected transaction would have freed blocks the file still refers to.
-	newest := metadata.Extent{Chunk: chunk, LogOff: offset, Length: uint64(dataLen)}
+	// The write is published, so whatever it covers is now unreadable through
+	// the extents that held it.  Reclaim here rather than leaving it all to the
+	// scrubber: an overwrite-heavy workload on one node would otherwise keep a
+	// scrub interval's worth of buried blocks alive at all times.
+	//
+	// Only after the commit — before it, a transaction the generation guard
+	// rejects would have freed blocks the file still refers to.
 	for _, old := range existing {
-		if newest.Supersedes(old) {
-			s.dropExtent(ctx, old)
+		if old.LogOff < end && offset < old.End() {
+			s.reclaimCovered(ctx, old, offset, end)
 		}
 	}
 
@@ -366,14 +367,10 @@ func (s *Service) readInto(dst []byte, diskOff int64) (int, error) {
 	return copy(dst, bounce), nil
 }
 
-// truncate drops or shortens every extent of an inode that lies beyond
-// newSize, returning the freed device ranges to the arena.
+// truncate reclaims every extent of an inode that lies beyond newSize.
 //
-// Only the extents whose device range this node owns are touched — see
-// dropExtent.  The rest are left exactly as they are, and the inode's smaller
-// size is what keeps them from being read: the kernel clamps a read to the
-// size it last saw, so bytes past EOF are unreachable whether or not an extent
-// still describes them.  Their owner's scrubber reclaims them.
+// A truncate is the same operation as an overwrite of everything from newSize
+// to the end of the address space, so it goes through the same path.
 func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
 	extents, err := s.store.GetExtents(ctx, ino)
 	if err != nil {
@@ -381,49 +378,69 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
 		return
 	}
 	for _, ext := range extents {
-		if ext.End() <= newSize {
-			continue
+		if ext.End() > newSize {
+			s.reclaimCovered(ctx, ext, newSize, ^uint64(0))
 		}
-		if ext.LogOff >= newSize {
-			s.dropExtent(ctx, ext)
-			continue
-		}
-		s.shortenExtent(ctx, ext, newSize-ext.LogOff)
 	}
 }
 
-// dropExtent removes an extent record and returns its blocks.
+// reclaimCovered rewrites old to the part a write over [start, end) leaves
+// readable, and returns the blocks it gives up to the arena.
 //
 // It is a no-op for a range this node does not own.  The extent record is the
 // only durable reference the owning node's in-memory bitmap is rebuilt from, so
-// deleting it from here would strand those blocks as allocated on that node
+// rewriting it from here would strand those blocks as allocated on that node
 // until it restarted — the record has to outlive this call for its owner to
 // find it.  The owner's scrubber reclaims it instead, at the cost of a scrub
 // interval's delay.
-func (s *Service) dropExtent(ctx context.Context, ext metadata.Extent) {
-	if s.dev == nil || !s.alloc.Owns(ext.DiskOff) {
+//
+// A write landing strictly inside old would leave *two* readable pieces, and
+// the second one needs a record of its own.  That record cannot be written
+// correctly: recency is carried by the chunk number in the key, so a new key
+// would claim the piece is newer than the extent it was cut from, and it would
+// then win over any genuinely newer extent overlapping it — which is reachable,
+// because extents in another node's arena are never trimmed and so do overlap.
+// Such a write is left to bury the extent without reclaiming it; the read stays
+// correct either way, since the write's own chunk is the higher one.
+//
+// Metadata first, then the free: a reader resolving the old record must never
+// be sent to blocks that have already been handed to another allocation.
+func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent, start, end uint64) {
+	if s.dev == nil || !s.alloc.Owns(old.DiskOff) {
 		return
 	}
-	if err := s.store.Delete(ctx, ext.Key); err != nil {
-		s.log.Warn("cannot delete extent, blocks not reclaimed",
-			"key", ext.Key, "error", err)
-		return
-	}
-	s.alloc.Free(ext.DiskOff, ext.Length)
-}
 
-// shortenExtent trims an extent to keepLen bytes and returns the tail.
-// Owner-only, for the same reason as dropExtent.
-func (s *Service) shortenExtent(ctx context.Context, ext metadata.Extent, keepLen uint64) {
-	if s.dev == nil || !s.alloc.Owns(ext.DiskOff) {
+	head, tail := metadata.SplitAround(old, start, end)
+	if head != nil && tail != nil {
+		return // covered in the middle, see above
+	}
+	// The write covered less than a whole block at the front of old, so the
+	// split snapped back to where it began and there is nothing to give back.
+	if tail != nil && tail.LogOff == old.LogOff {
 		return
 	}
-	shortened := ext
-	shortened.Length = keepLen
-	if _, err := s.store.Put(ctx, ext.Key, []byte(shortened.Encode())); err != nil {
-		s.log.Warn("cannot shorten extent, tail not reclaimed",
-			"key", ext.Key, "error", err)
+
+	survivor := head
+	if survivor == nil {
+		survivor = tail
+	}
+
+	// The survivor keeps old's key, and with it old's chunk number.  That is
+	// what leaves the overwriting extent the newer of the two wherever they
+	// still overlap, so a read resolves to the write and not to what it buried.
+	if survivor == nil {
+		if err := s.store.Delete(ctx, old.Key); err != nil {
+			s.log.Warn("cannot delete covered extent, blocks not reclaimed",
+				"key", old.Key, "error", err)
+			return
+		}
+	} else if _, err := s.store.Put(ctx, old.Key, []byte(survivor.Encode())); err != nil {
+		s.log.Warn("cannot trim covered extent, blocks not reclaimed",
+			"key", old.Key, "error", err)
 		return
 	}
-	s.alloc.Free(ext.DiskOff+keepLen, ext.Length-keepLen)
+
+	if off, length := metadata.CoveredBlocks(old, head, tail); length > 0 {
+		s.alloc.Free(off, length)
+	}
 }

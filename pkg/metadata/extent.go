@@ -152,6 +152,74 @@ func (e Extent) Supersedes(other Extent) bool {
 		e.LogOff <= other.LogOff && e.End() >= other.End()
 }
 
+// BlockSize is the granularity at which device space is allocated and freed.
+// Extents describe byte ranges, but the space behind them is only ever handed
+// out and returned in whole blocks, so any range an extent gives up has to be
+// snapped to these boundaries before it can be reused.
+const BlockSize = 4096
+
+// SplitAround returns the parts of old that a write covering [start, end)
+// leaves readable.  A nil head and a nil tail mean the write buries old
+// entirely.
+//
+// Both survivors keep a block-aligned device offset, because a read has to be
+// able to reach them under O_DIRECT, where the offset must be sector-aligned.
+// For the head that is free — it starts where old did.  The tail is what
+// constrains the split: its device offset advances by however many bytes the
+// write covered, so that distance is rounded *down* to a block boundary.
+//
+// Rounding down means the tail keeps a few bytes the write also covers.  That
+// is the safe direction and costs at most one block: the overlap resolves to
+// the newer write, because the tail keeps the original extent's chunk number
+// and the write's is higher.  Rounding up would be a data loss — the bytes
+// between the write's end and the tail's start would be described by no extent
+// at all and would read back as zeroes.
+func SplitAround(old Extent, start, end uint64) (head, tail *Extent) {
+	if start > old.LogOff {
+		head = &Extent{
+			LogOff:  old.LogOff,
+			DiskOff: old.DiskOff,
+			Length:  start - old.LogOff,
+			Gen:     old.Gen,
+		}
+	}
+	if end < old.End() {
+		skip := (end - old.LogOff) / BlockSize * BlockSize
+		tail = &Extent{
+			LogOff:  old.LogOff + skip,
+			DiskOff: old.DiskOff + skip,
+			Length:  old.Length - skip,
+			Gen:     old.Gen,
+		}
+	}
+	return head, tail
+}
+
+// CoveredBlocks returns the device range old gives up once it has been split
+// into head and tail, as a whole number of blocks.  A zero length means the
+// split freed nothing.
+//
+// The head's own last block is kept even when it is only partly used: the live
+// bytes of the head share it, and blocks are the unit of reuse.  The tail's
+// first block is likewise the boundary on the other side.
+func CoveredBlocks(old Extent, head, tail *Extent) (diskOff, length uint64) {
+	first := uint64(0)
+	if head != nil {
+		first = blocksFor(head.Length)
+	}
+	last := blocksFor(old.Length)
+	if tail != nil {
+		last = (tail.DiskOff - old.DiskOff) / BlockSize
+	}
+	if last <= first {
+		return 0, 0
+	}
+	return old.DiskOff + first*BlockSize, (last - first) * BlockSize
+}
+
+// blocksFor returns the number of whole blocks needed to hold n bytes.
+func blocksFor(n uint64) uint64 { return (n + BlockSize - 1) / BlockSize }
+
 // GetExtents returns all extents of an inode, ordered by logical offset.
 func (s *Store) GetExtents(ctx context.Context, ino uint64) ([]Extent, error) {
 	kvs, err := s.GetPrefix(ctx, ExtentPrefix(ino))

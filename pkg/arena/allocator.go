@@ -24,8 +24,10 @@ import (
 // ArenaSizeBytes is the default arena size (1 GiB).
 const ArenaSizeBytes = 1 << 30
 
-// BlockSize is the allocation granularity within an arena (4 KiB).
-const BlockSize = 4096
+// BlockSize is the allocation granularity within an arena (4 KiB).  Defined by
+// the metadata layer, which needs it to snap a split extent's surviving parts
+// to boundaries this allocator can hand back out.
+const BlockSize = metadata.BlockSize
 
 // BlocksPerArena is the number of allocatable blocks per arena.
 const BlocksPerArena = ArenaSizeBytes / BlockSize
