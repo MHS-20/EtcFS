@@ -130,21 +130,24 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 
 	gen := s.writeGeneration(ctx)
 
-	// One read of the inode's extents answers both questions this write has:
-	// which chunk number is free, and which existing extents it is about to
-	// bury.  The chunk must be one past the highest in use, not the extent
-	// count — a truncate deletes chunks from the middle, and counting would
-	// hand back a number that is still live.
+	// One read of the inode's extents answers every question this write has:
+	// which chunk numbers are free, what sequence it takes, and which existing
+	// extents it is about to bury.  Both counters run one past the highest in
+	// use rather than off the extent count — a truncate deletes records from
+	// the middle, and counting would hand back a number that is still live.
 	existing, xerr := s.store.GetExtents(ctx, ino)
 	if xerr != nil {
 		freeRuns()
 		s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
 		return int32Resp(-5), nil
 	}
-	chunk := uint64(0)
+	chunk, seq := uint64(0), uint64(0)
 	for _, e := range existing {
 		if e.Chunk >= chunk {
 			chunk = e.Chunk + 1
+		}
+		if e.Seq >= seq {
+			seq = e.Seq + 1
 		}
 	}
 
@@ -162,8 +165,12 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 
 		// The final run is padded; its extent covers only the real bytes.
 		extLen := min(r.Length, uint64(dataLen)-pos)
+		// Every run of one write shares a sequence: they are one write, and
+		// they cover disjoint logical ranges, so nothing needs to order them
+		// against each other.
 		ext := metadata.Extent{
-			LogOff: offset + pos, DiskOff: r.DiskOff, Length: extLen, Gen: gen,
+			LogOff: offset + pos, DiskOff: r.DiskOff, Length: extLen,
+			Gen: gen, Seq: seq,
 		}
 		if s.wal != nil {
 			_ = s.wal.Append(&wal.Entry{
@@ -215,7 +222,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	// rejects would have freed blocks the file still refers to.
 	for _, old := range existing {
 		if old.LogOff < end && offset < old.End() {
-			s.reclaimCovered(ctx, old, offset, end)
+			s.reclaimCovered(ctx, old, offset, end, &chunk)
 		}
 	}
 
@@ -377,9 +384,15 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
 		s.log.Warn("truncate: cannot read extents", "ino", ino, "error", err)
 		return
 	}
+	chunk := uint64(0)
+	for _, e := range extents {
+		if e.Chunk >= chunk {
+			chunk = e.Chunk + 1
+		}
+	}
 	for _, ext := range extents {
 		if ext.End() > newSize {
-			s.reclaimCovered(ctx, ext, newSize, ^uint64(0))
+			s.reclaimCovered(ctx, ext, newSize, ^uint64(0), &chunk)
 		}
 	}
 }
@@ -394,50 +407,62 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
 // find it.  The owner's scrubber reclaims it instead, at the cost of a scrub
 // interval's delay.
 //
-// A write landing strictly inside old would leave *two* readable pieces, and
-// the second one needs a record of its own.  That record cannot be written
-// correctly: recency is carried by the chunk number in the key, so a new key
-// would claim the piece is newer than the extent it was cut from, and it would
-// then win over any genuinely newer extent overlapping it — which is reachable,
-// because extents in another node's arena are never trimmed and so do overlap.
-// Such a write is left to bury the extent without reclaiming it; the read stays
-// correct either way, since the write's own chunk is the higher one.
+// A write landing strictly inside old leaves two readable pieces, so the second
+// one is written under a fresh key from nextChunk, which is advanced.  Both
+// pieces carry old's sequence number, which is what keeps them as old as the
+// extent they were cut from: the key says only which record this is, never how
+// recent it is, so neither piece can outrank a genuinely newer extent
+// overlapping it.
 //
 // Metadata first, then the free: a reader resolving the old record must never
 // be sent to blocks that have already been handed to another allocation.
-func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent, start, end uint64) {
+func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
+	start, end uint64, nextChunk *uint64) {
+
 	if s.dev == nil || !s.alloc.Owns(old.DiskOff) {
 		return
 	}
 
 	head, tail := metadata.SplitAround(old, start, end)
-	if head != nil && tail != nil {
-		return // covered in the middle, see above
-	}
+
 	// The write covered less than a whole block at the front of old, so the
 	// split snapped back to where it began and there is nothing to give back.
-	if tail != nil && tail.LogOff == old.LogOff {
+	if head == nil && tail != nil && tail.LogOff == old.LogOff {
 		return
 	}
 
-	survivor := head
-	if survivor == nil {
-		survivor = tail
-	}
-
-	// The survivor keeps old's key, and with it old's chunk number.  That is
-	// what leaves the overwriting extent the newer of the two wherever they
-	// still overlap, so a read resolves to the write and not to what it buried.
-	if survivor == nil {
+	switch {
+	case head == nil && tail == nil:
 		if err := s.store.Delete(ctx, old.Key); err != nil {
 			s.log.Warn("cannot delete covered extent, blocks not reclaimed",
 				"key", old.Key, "error", err)
 			return
 		}
-	} else if _, err := s.store.Put(ctx, old.Key, []byte(survivor.Encode())); err != nil {
-		s.log.Warn("cannot trim covered extent, blocks not reclaimed",
-			"key", old.Key, "error", err)
-		return
+
+	case head != nil && tail != nil:
+		// One transaction: a crash between the two puts would leave the middle
+		// described twice, once by each half of a record that no longer exists.
+		ops := []clientv3.Op{
+			clientv3.OpPut(old.Key, head.Encode()),
+			clientv3.OpPut(metadata.ExtentKey(old.Ino(), *nextChunk), tail.Encode()),
+		}
+		if ok, err := s.store.Txn(ctx, nil, ops, nil); err != nil || !ok {
+			s.log.Warn("cannot split covered extent, blocks not reclaimed",
+				"key", old.Key, "committed", ok, "error", err)
+			return
+		}
+		*nextChunk++
+
+	default:
+		survivor := head
+		if survivor == nil {
+			survivor = tail
+		}
+		if _, err := s.store.Put(ctx, old.Key, []byte(survivor.Encode())); err != nil {
+			s.log.Warn("cannot trim covered extent, blocks not reclaimed",
+				"key", old.Key, "error", err)
+			return
+		}
 	}
 
 	if off, length := metadata.CoveredBlocks(old, head, tail); length > 0 {

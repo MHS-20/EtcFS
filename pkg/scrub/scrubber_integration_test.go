@@ -311,3 +311,75 @@ func TestIntegration_SupersededExtentsAreReclaimedByTheOwner(t *testing.T) {
 		t.Fatalf("overwritten block %d was not returned to the free list, got %d", first, got)
 	}
 }
+
+// A middle split writes two records and must not resurrect the buried middle.
+// Both halves carry the parent's sequence, so a later write covering either of
+// them still outranks it — which is what makes the split safe to do at all.
+func TestIntegration_MiddleSplitHalvesKeepTheParentSequence(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t, "node-A")
+
+	const bs = arena.BlockSize
+	parent := metadata.Extent{
+		Key: metadata.ExtentKey(55, 0), Chunk: 0, Seq: 0,
+		LogOff: 0, DiskOff: 4 << 30, Length: 4 * bs, Gen: 1,
+	}
+	head, tail := metadata.SplitAround(parent, bs, 2*bs)
+	if head == nil || tail == nil {
+		t.Fatalf("middle split produced head=%v tail=%v", head, tail)
+	}
+
+	// Store them as the write path would: head under the parent's key, tail
+	// under a fresh one, and the overwriting extent under another.
+	writer := metadata.Extent{LogOff: bs, DiskOff: 5 << 30, Length: bs, Gen: 1, Seq: 1}
+	for key, ext := range map[string]metadata.Extent{
+		parent.Key:                *head,
+		metadata.ExtentKey(55, 9): *tail,
+		metadata.ExtentKey(55, 1): writer,
+	} {
+		if _, err := store.Put(ctx, key, []byte(ext.Encode())); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	got, err := store.GetExtents(ctx, 55)
+	if err != nil {
+		t.Fatalf("get extents: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 extents, got %d", len(got))
+	}
+
+	// Reading each region must land on the right extent: the head and tail for
+	// the bytes they still own, and the overwriting write for the middle.
+	for _, c := range []struct {
+		at      uint64
+		diskOff uint64
+		what    string
+	}{
+		{0, head.DiskOff, "head"},
+		{bs, writer.DiskOff, "overwritten middle"},
+		{2 * bs, tail.DiskOff, "tail"},
+	} {
+		var resolved *metadata.Extent
+		for i := range got {
+			if got[i].LogOff <= c.at && c.at < got[i].End() {
+				resolved = &got[i]
+				break
+			}
+		}
+		if resolved == nil {
+			t.Errorf("%s: offset %d covered by no extent", c.what, c.at)
+			continue
+		}
+		if resolved.DiskOff != c.diskOff {
+			t.Errorf("%s: offset %d resolves to disk_off %d, want %d",
+				c.what, c.at, resolved.DiskOff, c.diskOff)
+		}
+	}
+
+	// The tail's fresh key must not have made it look newer than the write.
+	if tail.Seq != parent.Seq {
+		t.Errorf("tail sequence %d, want the parent's %d", tail.Seq, parent.Seq)
+	}
+}

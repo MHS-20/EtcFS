@@ -7,7 +7,7 @@ import (
 )
 
 func TestExtentRoundTrip(t *testing.T) {
-	e := Extent{Key: ExtentKey(42, 7), Chunk: 7, LogOff: 4096, DiskOff: 1 << 30, Length: 512, Gen: 3}
+	e := Extent{Key: ExtentKey(42, 7), Chunk: 7, Seq: 5, LogOff: 4096, DiskOff: 1 << 30, Length: 512, Gen: 3}
 	got, ok := DecodeExtent(e.Key, []byte(e.Encode()))
 	if !ok || got != e {
 		t.Fatalf("round trip: got %+v ok=%v, want %+v", got, ok, e)
@@ -18,7 +18,7 @@ func TestExtentRoundTrip(t *testing.T) {
 }
 
 func TestDecodeExtentRejectsGarbage(t *testing.T) {
-	for _, v := range []string{"", "1,2,3", "1,2,3,4,5", "1,2,3,x", "-1,2,3,4"} {
+	for _, v := range []string{"", "1,2,3", "1,2,3,4,5,6", "1,2,3,x", "-1,2,3,4", "1,2,3,4,x"} {
 		if _, ok := DecodeExtent("extent:1/0", []byte(v)); ok {
 			t.Errorf("accepted malformed value %q", v)
 		}
@@ -64,14 +64,14 @@ func TestDecodeExtentsSortsByLogicalOffset(t *testing.T) {
 // alone let the same file read back differently from one call to the next.
 func TestDecodeExtentsPutsTheNewestWriteFirst(t *testing.T) {
 	kvs := []*mvccpb.KeyValue{
-		{Key: []byte("extent:1/0"), Value: []byte("0,4096,4096,1")},
-		{Key: []byte("extent:1/7"), Value: []byte("0,8192,4096,1")},
-		{Key: []byte("extent:1/3"), Value: []byte("0,12288,4096,1")},
+		{Key: []byte("extent:1/0"), Value: []byte("0,4096,4096,1,2")},
+		{Key: []byte("extent:1/7"), Value: []byte("0,8192,4096,1,9")},
+		{Key: []byte("extent:1/3"), Value: []byte("0,12288,4096,1,5")},
 	}
 	for i := 0; i < 32; i++ {
 		got := DecodeExtents(kvs)
-		if got[0].Chunk != 7 {
-			t.Fatalf("chunk %d sorted ahead of the newer chunk 7", got[0].Chunk)
+		if got[0].Seq != 9 {
+			t.Fatalf("sequence %d sorted ahead of the newer sequence 9", got[0].Seq)
 		}
 		if got[0].DiskOff != 8192 {
 			t.Fatalf("reader would land on disk_off %d, want 8192", got[0].DiskOff)
@@ -80,8 +80,10 @@ func TestDecodeExtentsPutsTheNewestWriteFirst(t *testing.T) {
 }
 
 func TestSupersedes(t *testing.T) {
-	at := func(chunk, logOff, length uint64) Extent {
-		return Extent{Key: ExtentKey(1, chunk), Chunk: chunk, LogOff: logOff, Length: length}
+	// Recency comes from Seq, never from the key — the whole point of storing it
+	// in the value, so a split can hand both halves their parent's.
+	at := func(seq, logOff, length uint64) Extent {
+		return Extent{Key: ExtentKey(1, seq), Chunk: seq, Seq: seq, LogOff: logOff, Length: length}
 	}
 
 	cases := []struct {
@@ -89,10 +91,10 @@ func TestSupersedes(t *testing.T) {
 		newer, old Extent
 		want       bool
 	}{
-		{"same range, later chunk", at(2, 0, 4096), at(1, 0, 4096), true},
-		{"wider range, later chunk", at(2, 0, 8192), at(1, 4096, 4096), true},
-		{"same range, earlier chunk", at(1, 0, 4096), at(2, 0, 4096), false},
-		{"same chunk", at(1, 0, 4096), at(1, 0, 4096), false},
+		{"same range, later write", at(2, 0, 4096), at(1, 0, 4096), true},
+		{"wider range, later write", at(2, 0, 8192), at(1, 4096, 4096), true},
+		{"same range, earlier write", at(1, 0, 4096), at(2, 0, 4096), false},
+		{"same write", at(1, 0, 4096), at(1, 0, 4096), false},
 		{"covers only the head", at(2, 0, 4096), at(1, 0, 8192), false},
 		{"covers only the tail", at(2, 4096, 4096), at(1, 0, 8192), false},
 		{"disjoint", at(2, 8192, 4096), at(1, 0, 4096), false},
@@ -109,7 +111,7 @@ func TestSupersedes(t *testing.T) {
 func TestSplitAround(t *testing.T) {
 	// One extent, four blocks, at a block-aligned device offset.
 	old := Extent{
-		Key: ExtentKey(1, 3), Chunk: 3,
+		Key: ExtentKey(1, 3), Chunk: 3, Seq: 11,
 		LogOff: 8192, DiskOff: 1 << 30, Length: 4 * BlockSize, Gen: 2,
 	}
 
@@ -117,7 +119,7 @@ func TestSplitAround(t *testing.T) {
 		head, tail *Extent
 	}
 	at := func(logOff, diskOff, length uint64) *Extent {
-		return &Extent{LogOff: logOff, DiskOff: diskOff, Length: length, Gen: old.Gen}
+		return &Extent{LogOff: logOff, DiskOff: diskOff, Length: length, Gen: old.Gen, Seq: old.Seq}
 	}
 
 	cases := []struct {
@@ -245,5 +247,74 @@ func sameExtent(a, b *Extent) bool {
 		return false
 	}
 	return a.LogOff == b.LogOff && a.DiskOff == b.DiskOff &&
-		a.Length == b.Length && a.Gen == b.Gen
+		a.Length == b.Length && a.Gen == b.Gen && a.Seq == b.Seq
+}
+
+// Records written before the sequence field existed carry only four values.
+// They were appended one per chunk in ascending order, so the chunk number is
+// their sequence, and adopting it keeps them ordered against each other and
+// against anything written since.
+func TestDecodeExtentAdoptsChunkAsSequenceForLegacyValues(t *testing.T) {
+	got, ok := DecodeExtent("extent:1/6", []byte("0,4096,4096,2"))
+	if !ok {
+		t.Fatal("four-field value rejected")
+	}
+	if got.Seq != 6 {
+		t.Errorf("legacy sequence = %d, want the chunk number 6", got.Seq)
+	}
+
+	// A mixed inode — one legacy record, one written since — still orders the
+	// newer write ahead of the older one.
+	kvs := []*mvccpb.KeyValue{
+		{Key: []byte("extent:1/6"), Value: []byte("0,4096,4096,2")},
+		{Key: []byte("extent:1/7"), Value: []byte("0,8192,4096,2,7")},
+	}
+	if first := DecodeExtents(kvs)[0]; first.Seq != 7 {
+		t.Errorf("read resolves to sequence %d, want the newer 7", first.Seq)
+	}
+}
+
+// The reason the sequence lives in the value: both halves of a split have to
+// stay exactly as old as the extent they were cut from. If a half were ranked
+// by its own key it would outrank a genuinely newer extent overlapping it, and
+// a read would resolve to the bytes that newer write replaced.
+func TestSplitPiecesDoNotOutrankANewerExtent(t *testing.T) {
+	// An old extent, and a newer one from another node covering its second half.
+	old := Extent{Key: ExtentKey(1, 0), Chunk: 0, Seq: 0,
+		LogOff: 0, DiskOff: 1 << 30, Length: 4 * BlockSize, Gen: 1}
+	foreign := Extent{Key: ExtentKey(1, 1), Chunk: 1, Seq: 1,
+		LogOff: 2 * BlockSize, DiskOff: 1 << 31, Length: 2 * BlockSize, Gen: 1}
+
+	// A third write lands in the middle of old and splits it. The tail piece
+	// gets a fresh key — chunk 9, higher than anything — but keeps old's rank.
+	_, tail := SplitAround(old, BlockSize, 2*BlockSize)
+	if tail == nil {
+		t.Fatal("no tail survived a middle split")
+	}
+	tail.Key, tail.Chunk = ExtentKey(1, 9), 9
+
+	if tail.Seq != old.Seq {
+		t.Fatalf("tail sequence = %d, want the parent's %d", tail.Seq, old.Seq)
+	}
+	if tail.Supersedes(foreign) {
+		t.Error("a split piece outranked a newer extent it overlaps")
+	}
+	if !foreign.Supersedes(*tail) {
+		// Only meaningful where foreign actually covers the tail.
+		if foreign.LogOff <= tail.LogOff && foreign.End() >= tail.End() {
+			t.Error("the newer extent lost to a split piece it covers")
+		}
+	}
+
+	// And the read order agrees. Both cover the same bytes, and a reader takes
+	// the first extent it finds covering the offset it wants, so the newer one
+	// has to come first despite its lower chunk number.
+	got := DecodeExtents([]*mvccpb.KeyValue{
+		{Key: []byte(tail.Key), Value: []byte(tail.Encode())},
+		{Key: []byte(foreign.Key), Value: []byte(foreign.Encode())},
+	})
+	if got[0].LogOff != foreign.LogOff || got[0].Seq != foreign.Seq {
+		t.Errorf("read resolves offset %d to sequence %d, want the newer %d",
+			got[0].LogOff, got[0].Seq, foreign.Seq)
+	}
 }

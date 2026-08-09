@@ -6,13 +6,14 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
-func ext(chunk, logOff, length uint64) metadata.Extent {
+func ext(seq, logOff, length uint64) metadata.Extent {
 	return metadata.Extent{
-		Key:   metadata.ExtentKey(1, chunk),
-		Chunk: chunk,
+		Key:   metadata.ExtentKey(1, seq),
+		Chunk: seq,
+		Seq:   seq,
 		// Disk offsets do not matter to deadReason; keep them distinct so a
 		// mix-up shows up as a failure rather than a coincidence.
-		DiskOff: chunk * length,
+		DiskOff: seq * length,
 		LogOff:  logOff,
 		Length:  length,
 	}

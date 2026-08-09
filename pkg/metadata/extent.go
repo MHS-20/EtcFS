@@ -25,10 +25,23 @@ type Extent struct {
 	// that has not been stored yet; never part of the encoded value.
 	Key string
 
-	// Chunk is the extent's chunk number, taken from Key.  Chunk numbers are
-	// handed out in ascending order, so a higher chunk covering the same
-	// logical bytes is the more recent write and the one a read must see.
+	// Chunk is the extent's chunk number, taken from Key.  It makes the key
+	// unique within an inode and nothing more; it does not order writes.
 	Chunk uint64
+
+	// Seq orders writes to the same logical bytes: of two extents covering a
+	// range, the one with the higher Seq is the later write, and the one a read
+	// must resolve to.
+	//
+	// It is stored in the value rather than derived from the key because
+	// splitting an extent has to produce two records that are both *as old as
+	// their parent*.  A key-derived order cannot express that — a second key
+	// would have to claim the piece is newer than the extent it was cut from,
+	// and it would then win over a genuinely newer extent overlapping it.
+	//
+	// A value written before this field existed decodes with Seq set to Chunk,
+	// which is exactly the order those records were written in.
+	Seq uint64
 
 	LogOff  uint64
 	DiskOff uint64
@@ -76,8 +89,11 @@ func InoFromExtentKey(key string) uint64 {
 }
 
 // Encode renders the extent in its stored form.  Key is not part of the value.
+//
+// Seq is appended last so a reader of the older four-field form keeps finding
+// every field it knows at the position it expects.
 func (e Extent) Encode() string {
-	return fmt.Sprintf("%d,%d,%d,%d", e.LogOff, e.DiskOff, e.Length, e.Gen)
+	return fmt.Sprintf("%d,%d,%d,%d,%d", e.LogOff, e.DiskOff, e.Length, e.Gen, e.Seq)
 }
 
 // Ino returns the inode the extent belongs to, derived from its key.
@@ -92,15 +108,20 @@ func (e Extent) WithinDisk(start, end uint64) bool {
 	return e.DiskOff >= start && e.DiskOff+e.Length <= end
 }
 
-// DecodeExtent parses a stored extent key/value pair.  Returns ok=false if the
-// value is not four comma-separated integers, so a corrupt record is skipped
-// rather than silently read as a zero-length extent at disk offset 0.
+// DecodeExtent parses a stored extent key/value pair.  Returns ok=false unless
+// the value is four or five comma-separated integers, so a corrupt record is
+// skipped rather than silently read as a zero-length extent at disk offset 0.
+//
+// The four-field form predates the sequence number.  Those records were written
+// one per chunk in ascending order, so the chunk number *is* their sequence, and
+// adopting it keeps them ordered against each other and against anything written
+// since.
 func DecodeExtent(key string, value []byte) (Extent, bool) {
 	parts := strings.Split(string(value), ",")
-	if len(parts) != 4 {
+	if len(parts) != 4 && len(parts) != 5 {
 		return Extent{}, false
 	}
-	var fields [4]uint64
+	var fields [5]uint64
 	for i, p := range parts {
 		v, err := strconv.ParseUint(p, 10, 64)
 		if err != nil {
@@ -109,8 +130,12 @@ func DecodeExtent(key string, value []byte) (Extent, bool) {
 		fields[i] = v
 	}
 	_, chunk, _ := ParseExtentKey(key)
+	seq := chunk
+	if len(parts) == 5 {
+		seq = fields[4]
+	}
 	return Extent{
-		Key: key, Chunk: chunk, LogOff: fields[0], DiskOff: fields[1],
+		Key: key, Chunk: chunk, Seq: seq, LogOff: fields[0], DiskOff: fields[1],
 		Length: fields[2], Gen: fields[3],
 	}, true
 }
@@ -123,12 +148,16 @@ func DecodeExtent(key string, value []byte) (Extent, bool) {
 // so an inode with more than ten extents comes back as chunk 0, 1, 10, 11, 2, …
 // — reading that back in key order reassembles the file wrong.
 //
-// The chunk ordering matters because a write is not an in-place update: it
+// The sequence ordering matters because a write is not an in-place update: it
 // allocates fresh blocks and appends an extent, so overwriting a range leaves
 // two extents covering it.  A reader takes the first extent that covers the
-// offset it wants, so the descending chunk order is what makes that the newer
+// offset it wants, so the descending sequence order is what makes that the newer
 // one.  Sorting on offset alone left the choice to sort.Slice, which is not
 // stable — the same file could read back differently from one call to the next.
+//
+// Chunk breaks the remaining tie.  Two extents can share a sequence — the two
+// halves of a split both keep their parent's — but only ever over disjoint
+// logical ranges, so the tiebreak is there for determinism, not for meaning.
 func DecodeExtents(kvs []*mvccpb.KeyValue) []Extent {
 	extents := make([]Extent, 0, len(kvs))
 	for _, kv := range kvs {
@@ -140,6 +169,9 @@ func DecodeExtents(kvs []*mvccpb.KeyValue) []Extent {
 		if extents[i].LogOff != extents[j].LogOff {
 			return extents[i].LogOff < extents[j].LogOff
 		}
+		if extents[i].Seq != extents[j].Seq {
+			return extents[i].Seq > extents[j].Seq
+		}
 		return extents[i].Chunk > extents[j].Chunk
 	})
 	return extents
@@ -148,7 +180,7 @@ func DecodeExtents(kvs []*mvccpb.KeyValue) []Extent {
 // Supersedes reports whether e covers every logical byte of other and was
 // written later, which makes other's disk range dead.
 func (e Extent) Supersedes(other Extent) bool {
-	return e.Chunk > other.Chunk &&
+	return e.Seq > other.Seq &&
 		e.LogOff <= other.LogOff && e.End() >= other.End()
 }
 
@@ -181,6 +213,7 @@ func SplitAround(old Extent, start, end uint64) (head, tail *Extent) {
 			DiskOff: old.DiskOff,
 			Length:  start - old.LogOff,
 			Gen:     old.Gen,
+			Seq:     old.Seq,
 		}
 	}
 	if end < old.End() {
@@ -190,6 +223,7 @@ func SplitAround(old Extent, start, end uint64) (head, tail *Extent) {
 			DiskOff: old.DiskOff + skip,
 			Length:  old.Length - skip,
 			Gen:     old.Gen,
+			Seq:     old.Seq,
 		}
 	}
 	return head, tail
@@ -267,7 +301,7 @@ func (s *Store) AppendExtent(ctx context.Context, ino, logicalOff, diskOff, leng
 	if err != nil {
 		return err
 	}
-	ext := Extent{LogOff: logicalOff, DiskOff: diskOff, Length: length, Gen: generation}
+	ext := Extent{LogOff: logicalOff, DiskOff: diskOff, Length: length, Gen: generation, Seq: chunk}
 	if _, err := s.Put(ctx, ExtentKey(ino, chunk), []byte(ext.Encode())); err != nil {
 		return fmt.Errorf("append extent ino %d: %w", ino, err)
 	}
