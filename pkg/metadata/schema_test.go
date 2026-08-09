@@ -25,8 +25,33 @@ func TestLockKey(t *testing.T) {
 	assert.Equal(t, "lock:99", LockKey(99))
 }
 
-func TestArenaKey(t *testing.T) {
-	assert.Equal(t, "arena:node-1", ArenaKey("node-1"))
+func TestArenaOwnerKey(t *testing.T) {
+	assert.Equal(t, "arena:node-1/7", ArenaOwnerKey("node-1", 7))
+}
+
+func TestArenaNodePrefix(t *testing.T) {
+	assert.Equal(t, "arena:node-1/", ArenaNodePrefix("node-1"))
+}
+
+func TestParseArenaKey(t *testing.T) {
+	node, id, ok := ParseArenaKey("arena:node-1/7")
+	assert.True(t, ok)
+	assert.Equal(t, "node-1", node)
+	assert.Equal(t, uint64(7), id)
+
+	node, id, ok = ParseArenaKey("arena:etcfuse-node-3/42")
+	assert.True(t, ok)
+	assert.Equal(t, "etcfuse-node-3", node)
+	assert.Equal(t, uint64(42), id)
+
+	_, _, ok = ParseArenaKey("arena:node-1")
+	assert.False(t, ok, "no arena ID")
+
+	_, _, ok = ParseArenaKey("free_arena:7")
+	assert.False(t, ok, "wrong prefix")
+
+	_, _, ok = ParseArenaKey("arena:node-1/notanumber")
+	assert.False(t, ok, "non-numeric arena ID")
 }
 
 func TestMembershipKey(t *testing.T) {

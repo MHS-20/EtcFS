@@ -329,16 +329,16 @@ func TestController_ReclaimsArenaAfterConfirmedFence(t *testing.T) {
 	stub := &stubFencer{}
 	c.SetFencer(stub)
 
-	_, err := store.Put(ctx, metadata.ArenaKey("dead-node"), metadata.EncodeUint64(7))
+	_, err := store.Put(ctx, metadata.ArenaOwnerKey("dead-node", 7), metadata.EncodeUint64(7))
 	require.NoError(t, err)
 
 	start := time.Now()
 	c.fenceNode(ctx, "dead-node", "i-0123456789", false)
 	elapsed := time.Since(start)
 
-	v, err := store.Get(ctx, metadata.ArenaKey("dead-node"))
+	v, err := store.Get(ctx, metadata.ArenaOwnerKey("dead-node", 7))
 	require.NoError(t, err)
-	assert.Nil(t, v, "arena:dead-node must be gone once fenceNode returns, took %s", elapsed)
+	assert.Nil(t, v, "arena:dead-node/7 must be gone once fenceNode returns, took %s", elapsed)
 
 	free, err := store.Get(ctx, metadata.FreeArenaKey(7))
 	require.NoError(t, err)
@@ -354,12 +354,12 @@ func TestController_DoesNotReclaimArenaWithoutFencer(t *testing.T) {
 		store.Client().Delete(ctx, metadata.PrefixFreeArena, clientv3.WithPrefix())
 	})
 
-	_, err := store.Put(ctx, metadata.ArenaKey("dead-node"), metadata.EncodeUint64(7))
+	_, err := store.Put(ctx, metadata.ArenaOwnerKey("dead-node", 7), metadata.EncodeUint64(7))
 	require.NoError(t, err)
 
 	c.fenceNode(ctx, "dead-node", "i-0123456789", false)
 
-	v, err := store.Get(ctx, metadata.ArenaKey("dead-node"))
+	v, err := store.Get(ctx, metadata.ArenaOwnerKey("dead-node", 7))
 	require.NoError(t, err)
-	assert.NotNil(t, v, "arena:dead-node must survive a single-signal fence — no severance proof exists")
+	assert.NotNil(t, v, "arena:dead-node/7 must survive a single-signal fence — no severance proof exists")
 }

@@ -108,13 +108,84 @@ func TestIntegration_ReconstructDoesNotAdoptForeignArenas(t *testing.T) {
 	}
 }
 
+// A node holding several arenas must recover all of them after a restart, not
+// just the last one acquired. Before arena:<node_id>/<arena_id> replaced the
+// single arena:<node_id> record, the second AcquireArena silently overwrote
+// the first record and its arena was never re-adopted — a permanent leak on
+// any node writing more than one arena's worth of data.
+func TestIntegration_ReconstructRecoversAllOwnedArenas(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t, "node-A")
+	alloc := NewAllocator("node-A", store)
+
+	first, err := alloc.AcquireArena(ctx)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	second, err := alloc.AcquireArena(ctx)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("acquired the same arena twice: %d", first.ID)
+	}
+
+	restarted := NewAllocator("node-A", store)
+	if err := restarted.Reconstruct(ctx); err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	if got := restarted.ArenaCount(); got != 2 {
+		t.Fatalf("recovered %d arenas after restart, want 2 (arenas %d and %d)", got, first.ID, second.ID)
+	}
+	seen := map[uint64]bool{}
+	for _, ar := range restarted.arenas {
+		seen[ar.ID] = true
+	}
+	if !seen[first.ID] || !seen[second.ID] {
+		t.Fatalf("recovered arenas %v, want both %d and %d", seen, first.ID, second.ID)
+	}
+}
+
+// ReleaseArena must return every arena a node owns, not just one — the same
+// leak as above but on the release path (node leave or fencing reclaim).
+func TestIntegration_ReleaseArenaReleasesAllOwned(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t, "node-A")
+	alloc := NewAllocator("node-A", store)
+
+	first, err := alloc.AcquireArena(ctx)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	second, err := alloc.AcquireArena(ctx)
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+
+	released, err := store.ReleaseArena(ctx, "node-A")
+	if err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if len(released) != 2 {
+		t.Fatalf("released %v, want both %d and %d", released, first.ID, second.ID)
+	}
+
+	restarted := NewAllocator("node-A", store)
+	if err := restarted.Reconstruct(ctx); err != nil {
+		t.Fatalf("reconstruct after release: %v", err)
+	}
+	if got := restarted.ArenaCount(); got != 0 {
+		t.Fatalf("node-A recovered %d arenas after releasing all of them, want 0", got)
+	}
+}
+
 // A malformed ownership record must not be read as arena 0, which the node
 // probably does not own.  Compaction used to write an ASCII "id=%d" value here.
 func TestIntegration_MalformedArenaRecordIsIgnored(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t, "node-A")
 
-	if _, err := store.Put(ctx, metadata.ArenaKey("node-A"), []byte("id=7")); err != nil {
+	if _, err := store.Put(ctx, metadata.ArenaOwnerKey("node-A", 7), []byte("id=7")); err != nil {
 		t.Fatalf("seed malformed record: %v", err)
 	}
 
@@ -163,9 +234,9 @@ func TestIntegration_ReleasedArenaIsReused(t *testing.T) {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	arenaID, released, err := store.ReleaseArena(ctx, "node-A")
-	if err != nil || !released || arenaID != first.ID {
-		t.Fatalf("release: id=%d released=%v err=%v (want id=%d released=true)", arenaID, released, err, first.ID)
+	released, err := store.ReleaseArena(ctx, "node-A")
+	if err != nil || len(released) != 1 || released[0] != first.ID {
+		t.Fatalf("release: released=%v err=%v (want [%d])", released, err, first.ID)
 	}
 
 	second, err := alloc.AcquireArena(ctx)
@@ -202,7 +273,7 @@ func TestIntegration_RecycledArenaKeepsLiveExtentsMarked(t *testing.T) {
 		t.Fatalf("append extent: %v", err)
 	}
 
-	if _, released, err := store.ReleaseArena(ctx, "node-A"); err != nil || !released {
+	if released, err := store.ReleaseArena(ctx, "node-A"); err != nil || len(released) != 1 {
 		t.Fatalf("release: released=%v err=%v", released, err)
 	}
 

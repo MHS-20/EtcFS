@@ -14,8 +14,19 @@ import (
 )
 
 func registerArena(ctx context.Context, store *MockStore, arenaID uint64) {
-	key := fmt.Sprintf("arena:%d", arenaID)
+	key := metadata.ArenaOwnerKey(fmt.Sprintf("preexisting-%d", arenaID), arenaID)
 	_, _ = store.Put(ctx, key, metadata.EncodeUint64(arenaID))
+}
+
+// nodeArena returns the key and value of the single arena a node holds under
+// the new arena:<node_id>/<arena_id> layout — every test here joins a node
+// exactly once, so it never holds more than one.
+func nodeArena(ctx context.Context, store *MockStore, nodeID string) (key string, val []byte) {
+	kvs, _ := store.GetPrefix(ctx, metadata.ArenaNodePrefix(nodeID))
+	if len(kvs) == 0 {
+		return "", nil
+	}
+	return string(kvs[0].Key), kvs[0].Value
 }
 
 // ---- C10.5: Elastic join — new node ----
@@ -36,8 +47,7 @@ func TestElastic_JoinNewNode(t *testing.T) {
 	assert.NotNil(t, memVal)
 
 	// Verify arena was acquired for node-3
-	arenaKey := metadata.ArenaKey("node-3")
-	arenaVal, _ := store.Get(ctx, arenaKey)
+	_, arenaVal := nodeArena(ctx, store, "node-3")
 	assert.NotNil(t, arenaVal)
 
 	// Existing nodes should be unaffected
@@ -79,8 +89,7 @@ func TestElastic_LeaveGraceful(t *testing.T) {
 	_ = mgr.Join(ctx)
 	require.True(t, mgr.IsMember(ctx, "node-exit"))
 
-	arenaKey := metadata.ArenaKey("node-exit")
-	arenaVal, _ := store.Get(ctx, arenaKey)
+	_, arenaVal := nodeArena(ctx, store, "node-exit")
 	assert.NotNil(t, arenaVal)
 
 	err := mgr.LeaveGraceful(ctx)
@@ -88,7 +97,7 @@ func TestElastic_LeaveGraceful(t *testing.T) {
 
 	assert.False(t, mgr.IsMember(ctx, "node-exit"))
 
-	arenaVal, _ = store.Get(ctx, arenaKey)
+	_, arenaVal = nodeArena(ctx, store, "node-exit")
 	assert.Nil(t, arenaVal, "arena should be released")
 
 	assert.Zero(t, cluster.checkAllInvariants())
@@ -105,14 +114,13 @@ func TestElastic_LeaveUngraceful(t *testing.T) {
 	_ = mgr.Join(ctx)
 	require.True(t, mgr.IsMember(ctx, "node-killed"))
 
-	arenaKey := metadata.ArenaKey("node-killed")
-	arenaVal, _ := store.Get(ctx, arenaKey)
+	_, arenaVal := nodeArena(ctx, store, "node-killed")
 	assert.NotNil(t, arenaVal)
 
 	mgr.LeaveUngraceful(ctx)
 
 	assert.False(t, mgr.IsMember(ctx, "node-killed"))
-	arenaVal, _ = store.Get(ctx, arenaKey)
+	_, arenaVal = nodeArena(ctx, store, "node-killed")
 	assert.Nil(t, arenaVal)
 
 	assert.Zero(t, cluster.checkAllInvariants())
@@ -131,11 +139,11 @@ func TestElastic_RebalanceArena(t *testing.T) {
 	mgrB := membership.New(store, "node-B")
 	_ = mgrB.Join(ctx)
 
-	arenaAVal, _ := store.Get(ctx, metadata.ArenaKey("node-A"))
+	_, arenaAVal := nodeArena(ctx, store, "node-A")
 	require.NotNil(t, arenaAVal)
 	arenaAID := metadata.DecodeUint64(arenaAVal)
 
-	arenaBVal, _ := store.Get(ctx, metadata.ArenaKey("node-B"))
+	_, arenaBVal := nodeArena(ctx, store, "node-B")
 	require.NotNil(t, arenaBVal)
 
 	// RebalanceArena requires the source to already be fenced (see the
@@ -148,10 +156,10 @@ func TestElastic_RebalanceArena(t *testing.T) {
 	err = mgrA.RebalanceArena(ctx, "node-A", "node-B", arenaAID)
 	require.NoError(t, err)
 
-	arenaAValAfter, _ := store.Get(ctx, metadata.ArenaKey("node-A"))
+	_, arenaAValAfter := nodeArena(ctx, store, "node-A")
 	assert.Nil(t, arenaAValAfter)
 
-	arenaBValAfter, _ := store.Get(ctx, metadata.ArenaKey("node-B"))
+	_, arenaBValAfter := nodeArena(ctx, store, "node-B")
 	assert.Equal(t, arenaAID, metadata.DecodeUint64(arenaBValAfter))
 
 	assert.Zero(t, cluster.checkAllInvariants())
@@ -175,7 +183,7 @@ func TestElastic_RebalanceArenaRejectsUnfencedSource(t *testing.T) {
 	mgrB := membership.New(store, "target-node")
 	require.NoError(t, mgrB.Join(ctx))
 
-	arenaVal, _ := store.Get(ctx, metadata.ArenaKey("live-node"))
+	_, arenaVal := nodeArena(ctx, store, "live-node")
 	require.NotNil(t, arenaVal)
 	arenaID := metadata.DecodeUint64(arenaVal)
 
@@ -185,7 +193,7 @@ func TestElastic_RebalanceArenaRejectsUnfencedSource(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not been fenced")
 
-	stillThere, _ := store.Get(ctx, metadata.ArenaKey("live-node"))
+	_, stillThere := nodeArena(ctx, store, "live-node")
 	assert.Equal(t, arenaVal, stillThere, "arena must be untouched after a rejected rebalance")
 
 	assert.Zero(t, cluster.checkAllInvariants())
@@ -211,7 +219,7 @@ func TestElastic_ArenaPoolContention(t *testing.T) {
 			mgr := membership.New(store, nodeID)
 			_ = mgr.Join(ctx)
 
-			arenaVal, _ := store.Get(ctx, metadata.ArenaKey(nodeID))
+			_, arenaVal := nodeArena(ctx, store, nodeID)
 			if arenaVal != nil {
 				mu.Lock()
 				arenas[nodeID] = metadata.DecodeUint64(arenaVal)
@@ -296,7 +304,7 @@ func TestElastic_ConcurrentJoin(t *testing.T) {
 
 			joinErr := mgr.Join(ctx)
 
-			arenaVal, _ := store.Get(ctx, metadata.ArenaKey(nodeID))
+			_, arenaVal := nodeArena(ctx, store, nodeID)
 			var arena uint64
 			if arenaVal != nil {
 				arena = metadata.DecodeUint64(arenaVal)
@@ -330,7 +338,7 @@ func TestElastic_RebalanceIdempotent(t *testing.T) {
 	mgrB := membership.New(store, "dst")
 	_ = mgrB.Join(ctx)
 
-	arenaAVal, _ := store.Get(ctx, metadata.ArenaKey("src"))
+	_, arenaAVal := nodeArena(ctx, store, "src")
 	arenaAID := metadata.DecodeUint64(arenaAVal)
 
 	_, err := store.BumpGeneration(ctx, "src", 0)
@@ -343,7 +351,7 @@ func TestElastic_RebalanceIdempotent(t *testing.T) {
 	// (its generation only ever increases, so it stays fenced).
 	err = mgrA.RebalanceArena(ctx, "src", "dst", arenaAID)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "no arena registered")
+	assert.Contains(t, err.Error(), "does not hold it")
 
 	assert.Zero(t, cluster.checkAllInvariants())
 }
@@ -380,7 +388,7 @@ func TestElastic_JoinInterruptedBeforeArena(t *testing.T) {
 
 	// The crash happens here — no AcquireArena call ever happens.
 
-	arenaVal, _ := store.Get(ctx, metadata.ArenaKey(nodeID))
+	_, arenaVal := nodeArena(ctx, store, nodeID)
 	assert.Nil(t, arenaVal, "a node that never reached its first write must not hold an arena")
 
 	// The rest of the cluster must be completely unaffected: another node
@@ -415,8 +423,7 @@ func TestElastic_GenerationBumpDuringGracefulLeave(t *testing.T) {
 	mgr := membership.New(store, nodeID)
 	require.NoError(t, mgr.Join(ctx))
 
-	arenaKey := metadata.ArenaKey(nodeID)
-	arenaVal, _ := store.Get(ctx, arenaKey)
+	_, arenaVal := nodeArena(ctx, store, nodeID)
 	require.NotNil(t, arenaVal, "node must hold an arena before it can leave")
 
 	// Fencing controller bumps the generation mid-leave.
@@ -427,7 +434,7 @@ func TestElastic_GenerationBumpDuringGracefulLeave(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.False(t, mgr.IsMember(ctx, nodeID), "membership key must be gone after leave")
-	arenaVal, _ = store.Get(ctx, arenaKey)
+	_, arenaVal = nodeArena(ctx, store, nodeID)
 	assert.Nil(t, arenaVal, "arena must not be orphaned — released back to the free pool")
 
 	assert.Zero(t, cluster.checkAllInvariants())
