@@ -47,13 +47,19 @@ func (c *Cluster) FreshListDir(ctx context.Context, parent uint64) []string {
 	return names
 }
 
+// harnessLockKey is a single fixed holder key, standing in for the real lock
+// API: these tests only need one contended key, not the shared/exclusive
+// bookkeeping metadata.AcquireLock provides.
+func harnessLockKey(ino uint64) string {
+	return metadata.LockKey(ino, metadata.LockExclusive, 0)
+}
+
 func (c *Cluster) tryAcquireLock(ctx context.Context, ino uint64) bool {
-	key := metadata.LockKey(ino)
-	return c.Store.CASPut(ctx, key, []byte("locked"))
+	return c.Store.CASPut(ctx, harnessLockKey(ino), []byte("locked"))
 }
 
 func (c *Cluster) releaseLock(ctx context.Context, ino uint64) {
-	_ = c.Store.Delete(ctx, metadata.LockKey(ino))
+	_ = c.Store.Delete(ctx, harnessLockKey(ino))
 }
 
 func (c *Cluster) createDirIfMissing(ctx context.Context, parent uint64, name string, ino uint64) {

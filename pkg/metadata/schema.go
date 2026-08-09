@@ -5,7 +5,7 @@
 //
 //	inode:<ino>                   → serialised InodeRecord
 //	dirent:<parent_ino>/<name>    → <ino> (uint64, big-endian)
-//	lock:<ino>                    → serialised LockRecord
+//	lock:<ino>/<mode>/<lease_id>  → holder's node ID, one key per holder
 //	arena:<node_id>/<arena_id>    → <arena_id> (uint64, big-endian)
 //	free_arena:<arena_id>         → arena returned to the global pool
 //	extent:<ino>/<chunk>          → <log_off>,<disk_off>,<length>,<generation>,<sequence>
@@ -79,18 +79,24 @@ type InodeRecord struct {
 	// to stay under the 1.5 MiB etcd value limit.
 }
 
-// LockRecord is the serialised value stored at lock:<ino>.
+// LockRecord is the lock state of one inode, assembled from its holder keys.
 type LockRecord struct {
-	Mode    string   `json:"mode"` // "shared" or "exclusive"
-	Holders []string `json:"holders"`
+	Mode    string   // "shared" or "exclusive"
+	Holders []string // node IDs currently holding it
 }
 
-// MembershipRecord holds per-node liveness metadata.
+// MembershipRecord is the JSON value stored at membership:<node_id>.
+//
+// InstanceID is the cloud instance backing the node, recorded so the fencing
+// controller can detach the shared volume from a node that has already expired
+// and can no longer be asked.  It is empty off a cloud instance, and absent
+// entirely from a record written by an older node — external fencing then
+// degrades to a generation bump without a detach.
 type MembershipRecord struct {
-	NodeID      string
-	ClusterName string
-	JoinedAt    time.Time
-	Address     string
+	NodeID     string    `json:"node_id"`
+	Cluster    string    `json:"cluster"`
+	JoinedAt   time.Time `json:"joined_at"`
+	InstanceID string    `json:"instance_id"`
 }
 
 // Inode mode constants matching Linux stat.h
@@ -145,8 +151,46 @@ func ParseDirentKey(key string) (parent uint64, name string, ok bool) {
 	return parent, name, true
 }
 
-func LockKey(ino uint64) string {
-	return fmt.Sprintf("%s%d", PrefixLock, ino)
+// Lock keys.
+//
+// One key per holder, with the mode in the key rather than the value:
+//
+//	lock:<ino>/<mode>/<lease_id>
+//
+// A shared lock has many holders at once, so a single key cannot represent it —
+// the key carries the lease that backs it, and revoking one holder's lease would
+// drop the lock for every other holder.  A key each fixes that, and putting the
+// mode in the key lets a transaction ask "is any writer holding this?" as a
+// range comparison, with no value to parse.
+func LockKey(ino uint64, mode LockMode, leaseID int64) string {
+	return fmt.Sprintf("%s%d/%s/%d", PrefixLock, ino, mode, leaseID)
+}
+
+// LockPrefix covers every holder of an inode's lock, in any mode.
+func LockPrefix(ino uint64) string {
+	return fmt.Sprintf("%s%d/", PrefixLock, ino)
+}
+
+// LockModePrefix covers every holder of one mode.
+func LockModePrefix(ino uint64, mode LockMode) string {
+	return fmt.Sprintf("%s%d/%s/", PrefixLock, ino, mode)
+}
+
+// ParseLockKey returns the mode a lock key was taken in.
+func ParseLockKey(key string, ino uint64) (mode LockMode, ok bool) {
+	rest, found := strings.CutPrefix(key, LockPrefix(ino))
+	if !found {
+		return "", false
+	}
+	modeStr, _, found := strings.Cut(rest, "/")
+	if !found {
+		return "", false
+	}
+	switch LockMode(modeStr) {
+	case LockShared, LockExclusive:
+		return LockMode(modeStr), true
+	}
+	return "", false
 }
 
 // ArenaOwnerKey names the record proving nodeID owns arenaID.

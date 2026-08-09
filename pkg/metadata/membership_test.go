@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -56,4 +57,38 @@ func TestMembership_IsAlive_ExplicitlyDead(t *testing.T) {
 		lastAlive: time.Now(),
 	}
 	assert.False(t, m.IsAlive(), "an explicitly cleared alive flag wins over a recent keepalive")
+}
+
+// The fencing controller reads instance_id out of a departed node's last
+// membership value, so every shape that value can take has to be handled
+// without failing — the node is already gone and cannot be asked again.
+func TestInstanceIDFromMembershipHandlesEveryShape(t *testing.T) {
+	full, err := json.Marshal(MembershipRecord{
+		NodeID: "n1", Cluster: "etcfuse", JoinedAt: time.Now().UTC(), InstanceID: "i-abc123",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if got := InstanceIDFromMembership(full); got != "i-abc123" {
+		t.Errorf("full record: got %q, want i-abc123", got)
+	}
+
+	cases := map[string]string{
+		"no instance_id field":  `{"node_id":"n1","cluster":"etcfuse"}`,
+		"empty instance_id":     `{"node_id":"n1","instance_id":""}`,
+		"not JSON at all":       `n1`,
+		"truncated":             `{"node_id":"n1","instance_`,
+		"empty value":           ``,
+		"instance_id not first": `{"cluster":"c","instance_id":"i-xyz"}`,
+	}
+	for name, value := range cases {
+		got := InstanceIDFromMembership([]byte(value))
+		want := ""
+		if name == "instance_id not first" {
+			want = "i-xyz"
+		}
+		if got != want {
+			t.Errorf("%s: got %q, want %q", name, got, want)
+		}
+	}
 }

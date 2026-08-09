@@ -2,8 +2,8 @@ package metadata
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -112,10 +112,18 @@ func (m *Membership) grantAndRegister(ctx context.Context) (clientv3.LeaseID, er
 	m.mu.Lock()
 	instanceID := m.instanceID
 	m.mu.Unlock()
-	value := fmt.Sprintf(`{"node_id":"%s","cluster":"%s","joined_at":"%s","instance_id":"%s"}`,
-		m.nodeID, m.cluster, time.Now().UTC().Format(time.RFC3339), instanceID)
+	value, err := json.Marshal(MembershipRecord{
+		NodeID:     m.nodeID,
+		Cluster:    m.cluster,
+		JoinedAt:   time.Now().UTC(),
+		InstanceID: instanceID,
+	})
+	if err != nil {
+		_, _ = m.client.Revoke(ctx, resp.ID)
+		return 0, fmt.Errorf("membership: encode record: %w", err)
+	}
 
-	_, err = m.client.Put(ctx, MembershipKey(m.nodeID), value, clientv3.WithLease(resp.ID))
+	_, err = m.client.Put(ctx, MembershipKey(m.nodeID), string(value), clientv3.WithLease(resp.ID))
 	if err != nil {
 		_, _ = m.client.Revoke(ctx, resp.ID)
 		return 0, fmt.Errorf("membership: put key: %w", err)
@@ -226,22 +234,13 @@ func (m *Membership) LeaseTTL() time.Duration {
 
 // InstanceIDFromMembership extracts instance_id from a membership key's value.
 //
-// The value is hand-rolled JSON (see grantAndRegister), so this is a
-// deliberately narrow scan rather than a full unmarshal: it must not fail or
-// panic on a value written by an older node that has no instance_id field at
-// all, which is exactly the case during a rolling upgrade.  A missing field
-// yields "", and the caller treats that as "cannot detach".
+// A record that is unreadable, or that has no instance_id at all, yields "" —
+// the caller treats that as "cannot detach" rather than as an error, because
+// the node whose value this is has already expired and cannot be asked again.
 func InstanceIDFromMembership(value []byte) string {
-	const key = `"instance_id":"`
-	s := string(value)
-	i := strings.Index(s, key)
-	if i < 0 {
+	var rec MembershipRecord
+	if err := json.Unmarshal(value, &rec); err != nil {
 		return ""
 	}
-	rest := s[i+len(key):]
-	j := strings.Index(rest, `"`)
-	if j < 0 {
-		return ""
-	}
-	return rest[:j]
+	return rec.InstanceID
 }

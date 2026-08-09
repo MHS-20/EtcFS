@@ -55,61 +55,44 @@ var (
 	ErrNotFound = fmt.Errorf("not found")
 )
 
-// AcquireLock attempts to acquire a lock on an inode.
+// AcquireLock takes a lock on an inode and returns the lease backing it.
 //
-// For exclusive locks: CAS — succeed only if no lock key exists.
-// For shared locks:   CAS — succeed if no exclusive lock exists.
+// An exclusive lock is blocked by any holder.  A shared lock is blocked only by
+// an exclusive one, so any number of readers hold it at once — each under its
+// own key and its own lease, which is what lets one of them release without
+// dropping the lock for the rest.
 //
-// Returns the lease ID that backs the lock and a keepalive channel.
-// The caller must receive from keepaliveCh to keep the lock alive.
+// The caller must receive from the returned keepalive channel to keep the lock
+// alive.
 //
 // ctx bounds the acquisition RPCs only.  It deliberately does not bound the
 // keepalive stream — see the comment at the KeepAlive call below — so a
 // caller may pass a context with a deadline without the resulting lock
 // quietly expiring once that deadline passes.
 func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl time.Duration) (clientv3.LeaseID, <-chan *clientv3.LeaseKeepAliveResponse, error) {
+	if mode != LockShared && mode != LockExclusive {
+		return 0, nil, fmt.Errorf("acquire lock ino %d: unknown mode %q (%w)", ino, mode, ErrInvalid)
+	}
+
 	leaseID, err := s.GrantLease(ctx, ttl)
 	if err != nil {
 		return 0, nil, fmt.Errorf("acquire lock ino %d: grant lease: %w", ino, err)
 	}
 
-	value := fmt.Sprintf(`{"mode":"%s","holders":["%s"]}`, mode, s.nodeID)
-
-	var cmps []clientv3.Cmp
-
-	switch mode {
-	case LockExclusive:
-		cmps = []clientv3.Cmp{
-			clientv3.Compare(clientv3.CreateRevision(LockKey(ino)), "=", 0),
-		}
-	case LockShared:
-		existing, _ := s.GetLockInfo(ctx, ino)
-		if existing != nil && existing.Mode == string(LockShared) {
-			existingVal, _ := s.Get(ctx, LockKey(ino))
-			existing.Holders = append(existing.Holders, s.nodeID)
-			holdersJSON := ""
-			for j, h := range existing.Holders {
-				if j > 0 {
-					holdersJSON += ","
-				}
-				holdersJSON += `"` + h + `"`
-			}
-			value = fmt.Sprintf(`{"mode":"%s","holders":[%s]}`, LockShared, holdersJSON)
-			if existingVal != nil {
-				cmps = []clientv3.Cmp{
-					clientv3.Compare(clientv3.Value(LockKey(ino)), "=", string(existingVal)),
-				}
-			}
-		} else {
-			cmps = []clientv3.Cmp{
-				clientv3.Compare(clientv3.CreateRevision(LockKey(ino)), "=", 0),
-			}
-		}
+	// The range that must be empty for this acquisition to be allowed.  Etcd
+	// evaluates a comparison over a range as "true for every key in it", and an
+	// empty range is vacuously true — so this reads as "no blocking holder
+	// exists", decided atomically with the write below rather than in a
+	// separate round trip that a competing acquire could slip through.
+	blocked := LockPrefix(ino)
+	if mode == LockShared {
+		blocked = LockModePrefix(ino, LockExclusive)
 	}
+	cmp := clientv3.Compare(clientv3.CreateRevision(blocked), "=", 0).WithPrefix()
 
-	op := clientv3.OpPut(LockKey(ino), value, clientv3.WithLease(leaseID))
+	op := clientv3.OpPut(LockKey(ino, mode, int64(leaseID)), s.nodeID, clientv3.WithLease(leaseID))
 
-	ok, err := s.Txn(ctx, cmps, []clientv3.Op{op}, nil)
+	ok, err := s.Txn(ctx, []clientv3.Cmp{cmp}, []clientv3.Op{op}, nil)
 	if err != nil {
 		_ = s.RevokeLease(ctx, leaseID)
 		return 0, nil, fmt.Errorf("acquire lock ino %d: %w", ino, err)
@@ -134,7 +117,10 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 	return leaseID, keepCh, nil
 }
 
-// ReleaseLock releases a lock on an inode.
+// ReleaseLock drops one holder's lock.
+//
+// Revoking the lease deletes that holder's key and only that key, so a shared
+// lock survives with its remaining holders.
 func (s *Store) ReleaseLock(ctx context.Context, ino uint64, leaseID clientv3.LeaseID) error {
 	if err := s.RevokeLease(ctx, leaseID); err != nil {
 		return fmt.Errorf("release lock ino %d: %w", ino, err)
@@ -142,37 +128,38 @@ func (s *Store) ReleaseLock(ctx context.Context, ino uint64, leaseID clientv3.Le
 	return nil
 }
 
-// GetLockInfo returns the current lock state for an inode.
-// Returns nil if no lock is held.
+// GetLockInfo returns the current lock state for an inode, or nil if it is
+// unlocked.  A single exclusive holder makes the whole lock exclusive.
 func (s *Store) GetLockInfo(ctx context.Context, ino uint64) (*LockRecord, error) {
-	value, err := s.Get(ctx, LockKey(ino))
+	kvs, err := s.GetPrefix(ctx, LockPrefix(ino))
 	if err != nil {
 		return nil, fmt.Errorf("get lock ino %d: %w", ino, err)
 	}
-	if value == nil {
+	if len(kvs) == 0 {
 		return nil, nil
 	}
 
-	// Simple JSON parsing — full struct in Phase 3.
-	var rec LockRecord
-	_, _ = fmt.Sscanf(string(value), `{"mode":"%s"}`, &rec.Mode)
-	if rec.Mode == "" {
-		rec.Mode = "unknown"
+	rec := &LockRecord{Mode: string(LockShared), Holders: make([]string, 0, len(kvs))}
+	for _, kv := range kvs {
+		if mode, ok := ParseLockKey(string(kv.Key), ino); ok && mode == LockExclusive {
+			rec.Mode = string(LockExclusive)
+		}
+		rec.Holders = append(rec.Holders, string(kv.Value))
 	}
-	return &rec, nil
+	return rec, nil
 }
 
 // IsLocked returns true if any lock is held on the inode.
 func (s *Store) IsLocked(ctx context.Context, ino uint64) (bool, error) {
-	rec, err := s.GetLockInfo(ctx, ino)
+	kvs, err := s.GetPrefix(ctx, LockPrefix(ino))
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("is locked ino %d: %w", ino, err)
 	}
-	return rec != nil, nil
+	return len(kvs) > 0, nil
 }
 
-// WatchLock watches the lock key for an inode.  Returns a channel that
-// delivers a value when the lock state changes (acquired, released, expired).
+// WatchLock watches every holder key for an inode.  The returned channel
+// delivers on any change to the lock state: acquired, released, or expired.
 func (s *Store) WatchLock(ctx context.Context, ino uint64) clientv3.WatchChan {
-	return s.Watch(ctx, LockKey(ino))
+	return s.Watch(ctx, LockPrefix(ino), clientv3.WithPrefix())
 }
