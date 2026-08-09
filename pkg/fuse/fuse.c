@@ -181,6 +181,16 @@ int etcfs_run(struct etcfs_context *ctx)
     if (fuse_opt_add_arg(&args, "etcfuse") < 0)
         return -1;
 
+    /* default_permissions hands permission checking to the kernel, which
+     * evaluates the mode, uid and gid this daemon reports against the calling
+     * process before the request is ever sent.  EtcFS deliberately implements
+     * no access checks of its own: duplicating them in the daemon would mean a
+     * second, divergent copy of rules the kernel already applies correctly. */
+    if (fuse_opt_add_arg(&args, "-o") < 0)
+        return -1;
+    if (fuse_opt_add_arg(&args, "default_permissions") < 0)
+        return -1;
+
     /* register init callback */
     ops->init = etcfs_init;
 

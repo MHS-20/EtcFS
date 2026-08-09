@@ -213,10 +213,18 @@ func (s *Service) handleStatfs(ctx context.Context, _ []byte) ([]byte, error) {
 
 // ---- write operation handlers (Phase 3) ----
 
-// CREATE payload:  [u64:parent][u32:name_len][name][u32:mode][u32:flags][u32:umask]
+// applyUmask clears the permission bits the caller's umask masks out, leaving
+// the file type alone.  The kernel does not apply it for us on a filesystem
+// that declares FUSE_DONT_MASK behaviour, and every create path needs the same
+// treatment, so it lives here rather than at four call sites.
+func applyUmask(mode, umask uint32) uint32 {
+	return mode &^ (umask & 0777)
+}
+
+// CREATE payload:  [u64:parent][u32:name_len][name][u32:mode][u32:flags][u32:umask][u32:uid][u32:gid]
 // Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 20 {
+	if len(payload) < 32 {
 		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
@@ -225,8 +233,9 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 	rest = rest[nameLen:]
 	mode, rest := readU32(rest)
 	_, rest = readU32(rest) // flags
-	umask, _ := readU32(rest)
-	_ = umask
+	umask, rest := readU32(rest)
+	uid, rest := readU32(rest)
+	gid, _ := readU32(rest)
 
 	// Reserve inode number
 	ino, err := s.allocInode(ctx)
@@ -234,7 +243,7 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(-28), nil // ENOSPC
 	}
 
-	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, mode, 1000, 1000)
+	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, applyUmask(mode, umask), uid, gid)
 	if err != nil {
 		return int32Resp(errnoFor(err, -17)), nil // EEXIST unless fenced
 	}
@@ -242,10 +251,10 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 	return entryResp(rec.Ino, rec), nil
 }
 
-// MKDIR payload:  [u64:parent][u32:name_len][name][u32:mode][u32:umask]
+// MKDIR payload:  [u64:parent][u32:name_len][name][u32:mode][u32:umask][u32:uid][u32:gid]
 // Response: same as CREATE
 func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 20 {
+	if len(payload) < 28 {
 		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
@@ -253,14 +262,16 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 	name := string(rest[:nameLen])
 	rest = rest[nameLen:]
 	mode, rest := readU32(rest)
-	_, _ = readU32(rest) // umask
+	umask, rest := readU32(rest)
+	uid, rest := readU32(rest)
+	gid, _ := readU32(rest)
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
 		return int32Resp(-28), nil
 	}
 
-	rec, err := s.store.AtomicCreateDir(ctx, parent, name, ino, mode, 1000, 1000)
+	rec, err := s.store.AtomicCreateDir(ctx, parent, name, ino, applyUmask(mode, umask), uid, gid)
 	if err != nil {
 		return int32Resp(errnoFor(err, -17)), nil
 	}
@@ -447,26 +458,30 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	return attrResp(rec), nil
 }
 
-// SYMLINK payload: [u64:parent][u32:name_len][name][u32:target_len][target]
+// SYMLINK payload: [u64:parent][u32:name_len][name][u32:target_len][target][u32:uid][u32:gid]
 // Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 20 {
+	if len(payload) < 24 {
 		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
 	nameLen, rest := readU32(rest)
 	name := string(rest[:nameLen])
 	rest = rest[nameLen:]
-	targetLen, _ := readU32(rest)
-	target := string(rest[4 : 4+targetLen])
+	targetLen, rest := readU32(rest)
+	target := string(rest[:targetLen])
+	rest = rest[targetLen:]
+	uid, rest := readU32(rest)
+	gid, _ := readU32(rest)
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
 		return int32Resp(-28), nil
 	}
 
-	// Create inode with symlink mode
-	_, err = s.store.CreateInode(ctx, ino, metadata.ModeSymlink|0777, 1000, 1000)
+	// A symlink's own mode is not meaningful and is never masked by the umask;
+	// the permissions that matter are those of the target it resolves to.
+	_, err = s.store.CreateInode(ctx, ino, metadata.ModeSymlink|0777, uid, gid)
 	if err != nil {
 		return int32Resp(errnoFor(err, -17)), nil
 	}
@@ -514,10 +529,10 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 	return entryResp(ino, rec), nil
 }
 
-// MKNOD payload: [u64:parent][u32:name_len][name][u32:mode][u32:rdev]
+// MKNOD payload: [u64:parent][u32:name_len][name][u32:mode][u32:rdev][u32:umask][u32:uid][u32:gid]
 // Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 24 {
+	if len(payload) < 32 {
 		return int32Resp(-22), nil
 	}
 	parent, rest := readU64(payload)
@@ -525,14 +540,17 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 	name := string(rest[:nameLen])
 	rest = rest[nameLen:]
 	mode, rest := readU32(rest)
-	rdev, _ := readU32(rest)
+	rdev, rest := readU32(rest)
+	umask, rest := readU32(rest)
+	uid, rest := readU32(rest)
+	gid, _ := readU32(rest)
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
 		return int32Resp(-28), nil
 	}
 
-	rec, err := s.store.CreateInode(ctx, ino, mode, 1000, 1000)
+	rec, err := s.store.CreateInode(ctx, ino, applyUmask(mode, umask), uid, gid)
 	if err != nil {
 		return int32Resp(errnoFor(err, -17)), nil
 	}

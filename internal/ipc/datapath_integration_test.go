@@ -145,11 +145,11 @@ func TestIntegration_SetattrAppliesEverySelectedField(t *testing.T) {
 	seedFile(t, store, ino, metadata.ModeFile|0644)
 
 	const (
-		wantUID              = 4242
-		wantGID              = 4343
-		wantAtime            = 1_700_000_000
-		wantMtime            = 1_700_000_500
-		selected      uint32 = fattrMode | fattrUID | fattrGID | fattrAtime | fattrMtime
+		wantUID          = 4242
+		wantGID          = 4343
+		wantAtime        = 1_700_000_000
+		wantMtime        = 1_700_000_500
+		selected  uint32 = fattrMode | fattrUID | fattrGID | fattrAtime | fattrMtime
 	)
 	mustSetattr(t, svc, setattrPayload(ino, selected,
 		999, // size is not selected and must be ignored
@@ -273,4 +273,102 @@ func readPayload(t *testing.T, resp []byte) []byte {
 	}
 	n := uint32(resp[4])<<24 | uint32(resp[5])<<16 | uint32(resp[6])<<8 | uint32(resp[7])
 	return resp[8 : 8+n]
+}
+
+// ---- caller credentials ----
+
+// Everything used to be created owned by a hardcoded uid 1000 with the umask
+// thrown away, so the filesystem had no notion of who owned what.
+func TestIntegration_CreatedFilesCarryTheCallersCredentials(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+
+	const (
+		uid   = 5150
+		gid   = 5151
+		umask = 0027
+	)
+
+	name := func(op string) []byte { return []byte(op) }
+
+	t.Run("create", func(t *testing.T) {
+		var b buf
+		b.w64(metadata.RootIno)
+		b.w32(uint32(len(name("cfile"))))
+		b.b = append(b.b, name("cfile")...)
+		b.w32(metadata.ModeFile | 0666)
+		b.w32(0) // flags
+		b.w32(umask)
+		b.w32(uid)
+		b.w32(gid)
+		assertOwned(t, svc, store, ctx, svc.handleCreate, b.b, uid, gid, 0640)
+	})
+
+	t.Run("mkdir", func(t *testing.T) {
+		var b buf
+		b.w64(metadata.RootIno)
+		b.w32(uint32(len(name("cdir"))))
+		b.b = append(b.b, name("cdir")...)
+		b.w32(0777)
+		b.w32(umask)
+		b.w32(uid)
+		b.w32(gid)
+		assertOwned(t, svc, store, ctx, svc.handleMkdir, b.b, uid, gid, 0750)
+	})
+
+	t.Run("mknod", func(t *testing.T) {
+		var b buf
+		b.w64(metadata.RootIno)
+		b.w32(uint32(len(name("cnod"))))
+		b.b = append(b.b, name("cnod")...)
+		b.w32(0666)
+		b.w32(0) // rdev
+		b.w32(umask)
+		b.w32(uid)
+		b.w32(gid)
+		assertOwned(t, svc, store, ctx, svc.handleMknod, b.b, uid, gid, 0640)
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		var b buf
+		b.w64(metadata.RootIno)
+		b.w32(uint32(len(name("clink"))))
+		b.b = append(b.b, name("clink")...)
+		b.w32(uint32(len("/some/target")))
+		b.b = append(b.b, []byte("/some/target")...)
+		b.w32(uid)
+		b.w32(gid)
+		// A symlink's own permission bits are not meaningful and the umask
+		// never applies to them.
+		assertOwned(t, svc, store, ctx, svc.handleSymlink, b.b, uid, gid, 0777)
+	})
+}
+
+// assertOwned runs a creating handler and checks the inode it produced.
+func assertOwned(t *testing.T, svc *Service, store *metadata.Store, ctx context.Context,
+	handler func(context.Context, []byte) ([]byte, error), payload []byte,
+	wantUID, wantGID, wantPerm uint32) {
+
+	t.Helper()
+	resp, err := handler(ctx, payload)
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	code := int32(uint32(resp[0])<<24 | uint32(resp[1])<<16 | uint32(resp[2])<<8 | uint32(resp[3]))
+	if code != 0 {
+		t.Fatalf("handler returned errno %d", -code)
+	}
+	ino := uint64(resp[4])<<56 | uint64(resp[5])<<48 | uint64(resp[6])<<40 | uint64(resp[7])<<32 |
+		uint64(resp[8])<<24 | uint64(resp[9])<<16 | uint64(resp[10])<<8 | uint64(resp[11])
+
+	rec, err := store.GetInode(ctx, ino)
+	if err != nil || rec == nil {
+		t.Fatalf("read back inode %d: %v", ino, err)
+	}
+	if rec.UID != wantUID || rec.GID != wantGID {
+		t.Errorf("owner = %d:%d, want %d:%d", rec.UID, rec.GID, wantUID, wantGID)
+	}
+	if got := rec.Mode & 0777; got != wantPerm {
+		t.Errorf("permissions = %#o, want %#o", got, wantPerm)
+	}
 }

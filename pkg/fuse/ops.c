@@ -47,6 +47,8 @@
 #define IPC_OP_READDIRPLUS 29
 
 #define MAX_NAME_LEN 255
+/* A symlink target is a path, not a name: bounded by PATH_MAX, not NAME_MAX. */
+#define MAX_TARGET_LEN 4095
 
 static int send_full(int fd, const void *buf, size_t len)
 {
@@ -178,6 +180,19 @@ static uint32_t wb_u32(uint8_t *buf, uint32_t v)
     buf[2] = (uint8_t) (v >> 8);
     buf[3] = (uint8_t) v;
     return 4;
+}
+
+/* wb_creds appends the caller's identity, which the backend stores as the
+ * owner of whatever it is about to create.  Every creating operation carries
+ * it; without it every file in the filesystem ends up owned by one hardcoded
+ * uid regardless of who made it. */
+static uint32_t wb_creds(uint8_t *buf, fuse_req_t req)
+{
+    const struct fuse_ctx *c = fuse_req_ctx(req);
+    uint32_t off = 0;
+    off += wb_u32(buf + off, (uint32_t) c->uid);
+    off += wb_u32(buf + off, (uint32_t) c->gid);
+    return off;
 }
 
 static void fill_stat(struct stat *st, const struct etcfs_attr *a)
@@ -492,7 +507,12 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
                       struct fuse_file_info *fi)
 {
     size_t nlen = strlen(name);
-    uint8_t payload[20 + 256];
+    if (nlen > MAX_NAME_LEN) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+    /* parent + name_len + name + mode + flags + umask + uid + gid */
+    uint8_t payload[8 + 4 + MAX_NAME_LEN + 4 * 5];
     uint32_t off = 0;
     off += wb_u64(payload + off, parent);
     off += wb_u32(payload + off, (uint32_t) nlen);
@@ -500,7 +520,8 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
     off += (uint32_t) nlen;
     off += wb_u32(payload + off, (uint32_t) mode);
     off += wb_u32(payload + off, (uint32_t) (fi ? fi->flags : 0));
-    off += wb_u32(payload + off, 022);
+    off += wb_u32(payload + off, (uint32_t) fuse_req_ctx(req)->umask);
+    off += wb_creds(payload + off, req);
 
     uint8_t *resp;
     uint32_t rlen;
@@ -534,14 +555,20 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
 static void ec_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
 {
     size_t nlen = strlen(name);
-    uint8_t payload[20 + 256];
+    if (nlen > MAX_NAME_LEN) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+    /* parent + name_len + name + mode + umask + uid + gid */
+    uint8_t payload[8 + 4 + MAX_NAME_LEN + 4 * 4];
     uint32_t off = 0;
     off += wb_u64(payload + off, parent);
     off += wb_u32(payload + off, (uint32_t) nlen);
     memcpy(payload + off, name, nlen);
     off += (uint32_t) nlen;
     off += wb_u32(payload + off, (uint32_t) mode);
-    off += wb_u32(payload + off, 022);
+    off += wb_u32(payload + off, (uint32_t) fuse_req_ctx(req)->umask);
+    off += wb_creds(payload + off, req);
 
     uint8_t *resp;
     uint32_t rlen;
@@ -571,7 +598,11 @@ static void ec_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
 static void ec_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
     size_t nlen = strlen(name);
-    uint8_t payload[12 + 256];
+    if (nlen > MAX_NAME_LEN) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+    uint8_t payload[8 + 4 + MAX_NAME_LEN];
     uint32_t off = 0;
     off += wb_u64(payload + off, parent);
     off += wb_u32(payload + off, (uint32_t) nlen);
@@ -595,7 +626,11 @@ static void ec_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 static void ec_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
     size_t nlen = strlen(name);
-    uint8_t payload[12 + 256];
+    if (nlen > MAX_NAME_LEN) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+    uint8_t payload[8 + 4 + MAX_NAME_LEN];
     uint32_t off = 0;
     off += wb_u64(payload + off, parent);
     off += wb_u32(payload + off, (uint32_t) nlen);
@@ -620,7 +655,12 @@ static void ec_rename(fuse_req_t req, fuse_ino_t old_parent, const char *old_nam
                       fuse_ino_t new_parent, const char *new_name, unsigned int flags)
 {
     size_t olen = strlen(old_name), nlen = strlen(new_name);
-    uint8_t payload[40 + 512];
+    if (olen > MAX_NAME_LEN || nlen > MAX_NAME_LEN) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+    /* old_parent + old_len + old + new_parent + new_len + new + flags */
+    uint8_t payload[8 + 4 + MAX_NAME_LEN + 8 + 4 + MAX_NAME_LEN + 4];
     uint32_t off = 0;
     off += wb_u64(payload + off, old_parent);
     off += wb_u32(payload + off, (uint32_t) olen);
@@ -723,7 +763,12 @@ static void ec_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
 static void ec_symlink(fuse_req_t req, const char *target, fuse_ino_t parent, const char *name)
 {
     size_t nlen = strlen(name), tlen = strlen(target);
-    uint8_t payload[20 + 512];
+    if (nlen > MAX_NAME_LEN || tlen > MAX_TARGET_LEN) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+    /* parent + name_len + name + target_len + target + uid + gid */
+    uint8_t payload[8 + 4 + MAX_NAME_LEN + 4 + MAX_TARGET_LEN + 4 * 2];
     uint32_t off = 0;
     off += wb_u64(payload + off, parent);
     off += wb_u32(payload + off, (uint32_t) nlen);
@@ -732,6 +777,7 @@ static void ec_symlink(fuse_req_t req, const char *target, fuse_ino_t parent, co
     off += wb_u32(payload + off, (uint32_t) tlen);
     memcpy(payload + off, target, tlen);
     off += (uint32_t) tlen;
+    off += wb_creds(payload + off, req);
 
     uint8_t *resp;
     uint32_t rlen;
@@ -761,7 +807,11 @@ static void ec_symlink(fuse_req_t req, const char *target, fuse_ino_t parent, co
 static void ec_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t new_parent, const char *new_name)
 {
     size_t nlen = strlen(new_name);
-    uint8_t payload[24 + 256];
+    if (nlen > MAX_NAME_LEN) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+    uint8_t payload[8 + 8 + 4 + MAX_NAME_LEN];
     uint32_t off = 0;
     off += wb_u64(payload + off, ino);
     off += wb_u64(payload + off, new_parent);
@@ -797,7 +847,12 @@ static void ec_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t new_parent, const
 static void ec_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev_t rdev)
 {
     size_t nlen = strlen(name);
-    uint8_t payload[24 + 256];
+    if (nlen > MAX_NAME_LEN) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+    /* parent + name_len + name + mode + rdev + umask + uid + gid */
+    uint8_t payload[8 + 4 + MAX_NAME_LEN + 4 * 5];
     uint32_t off = 0;
     off += wb_u64(payload + off, parent);
     off += wb_u32(payload + off, (uint32_t) nlen);
@@ -805,6 +860,8 @@ static void ec_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
     off += (uint32_t) nlen;
     off += wb_u32(payload + off, (uint32_t) mode);
     off += wb_u32(payload + off, (uint32_t) rdev);
+    off += wb_u32(payload + off, (uint32_t) fuse_req_ctx(req)->umask);
+    off += wb_creds(payload + off, req);
 
     uint8_t *resp;
     uint32_t rlen;
