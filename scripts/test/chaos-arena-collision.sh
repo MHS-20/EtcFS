@@ -48,13 +48,17 @@ source "$SCRIPT_DIR/chaos-lib.sh"
 # ---- helpers ----
 
 # arena_record <node_index> — the arena ID this node has recorded in etcd,
-# decoded from the 8-byte big-endian value at arena:<node_id>.
+# read from the key suffix of arena:<node_id>/<arena_id> (one key per arena
+# the node owns).  This test writes one seed file per node before checking,
+# so each node owns exactly one arena; the first match is enough.
 arena_record() {
-    # etcdctl --hex prints the value as "\x00\x00\x00\x00\x00\x00\x00\x03";
-    # strip the quotes and the \x separators, leaving bare hex digits.
-    etcdctl_on get "arena:n$1" --print-value-only --hex 2>/dev/null |
-        tr -d '"\\x' | tr -d '\n' |
-        awk '{ if (length($0)) print strtonum("0x" $0); else print "none" }'
+    local key
+    key=$(etcdctl_on get "arena:n$1/" --prefix --keys-only 2>/dev/null | head -n1)
+    if [[ -z "$key" ]]; then
+        echo "none"
+    else
+        echo "${key##*/}"
+    fi
 }
 
 # extent_offsets — every "<disk_off> <extent_key>" pair currently published.

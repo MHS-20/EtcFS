@@ -53,13 +53,19 @@ source "$SCRIPT_DIR/chaos-lib.sh"
 
 # ---- helpers ----
 
-# arena_id <node_key> — this node's arena:<node_key> record, decoded from the
-# 8-byte big-endian value, or "none" if it has no record.  Mirrors
-# arena_record() in chaos-arena-collision.sh.
+# arena_id <node_key> — the arena ID this node has recorded in etcd, read from
+# the key suffix of arena:<node_key>/<arena_id>, or "none" if it has no
+# record.  Mirrors arena_record() in chaos-arena-collision.sh.  This script's
+# scenarios acquire at most one arena per node before checking, so the first
+# match is enough.
 arena_id() {
-    etcdctl_on get "arena:$1" --print-value-only --hex 2>/dev/null |
-        tr -d '"\\x' | tr -d '\n' |
-        awk '{ if (length($0)) print strtonum("0x" $0); else print "none" }'
+    local key
+    key=$(etcdctl_on get "arena:$1/" --prefix --keys-only 2>/dev/null | head -n1)
+    if [[ -z "$key" ]]; then
+        echo "none"
+    else
+        echo "${key##*/}"
+    fi
 }
 
 # free_arenas — every arena ID currently sitting in the free_arena: pool.
