@@ -15,8 +15,9 @@ import (
 	"math/bits"
 	"sync"
 
-	"github.com/MHS-20/EtcFS/pkg/metadata"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
 // ArenaSizeBytes is the default arena size (1 GiB).
@@ -264,7 +265,7 @@ func (a *Allocator) existingArenaIDs(ctx context.Context) ([]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	var ids []uint64
+	ids := make([]uint64, 0, len(kvs))
 	for _, kv := range kvs {
 		// A record is exactly the 8-byte big-endian arena ID.  Anything else is
 		// malformed, and adopting it would mean allocating into an arena this

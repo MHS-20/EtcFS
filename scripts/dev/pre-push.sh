@@ -25,8 +25,8 @@ run_check() {
         echo -e "${GREEN}OK${NC}"
     else
         echo -e "${RED}FAIL${NC}"
-        ((failures++))
-        "$@" 2>&1 | head -20
+        failures=$((failures + 1))
+        "$@" 2>&1 | head -20 || true
         echo ""
     fi
 }

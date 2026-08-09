@@ -104,14 +104,21 @@ gen_val() {
         2>/dev/null | tr -d '[:space:]'
 }
 
-# arena_id <node_key> — this node's arena:<node_key> record, decoded from the
-# 8-byte big-endian value, queried via n2 (never partitioned here) for the
-# same reason gen_val is. "none" if no record.
+# arena_id <node_id> — the arena ID this node owns, read from the key suffix
+# of arena:<node_id>/<arena_id> (mirrors chaos-arena-reclaim.sh's arena_id),
+# queried via n2 (never partitioned here) for the same reason gen_val is.
+# "none" if no record. This script's scenarios acquire at most one arena per
+# node before checking, so the first match is enough.
 arena_id() {
-    timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$N2" \
-        "/usr/local/bin/etcdctl --endpoints=http://$P1_PRIV:2379,http://$P2_PRIV:2379,http://$P3_PRIV:2379 get arena:$1 --print-value-only --hex" \
-        2>/dev/null | tr -d '"\\x' | tr -d '\n' |
-        awk '{ if (length($0)) print strtonum("0x" $0); else print "none" }'
+    local key
+    key=$(timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$N2" \
+        "/usr/local/bin/etcdctl --endpoints=http://$P1_PRIV:2379,http://$P2_PRIV:2379,http://$P3_PRIV:2379 get 'arena:$1/' --prefix --keys-only" \
+        2>/dev/null | head -n1)
+    if [[ -z "$key" ]]; then
+        echo "none"
+    else
+        echo "${key##*/}"
+    fi
 }
 
 if ! provision_cluster; then
@@ -267,7 +274,7 @@ else
     sleep 10
     STATE=$(timeout 15 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q ec2-user@"$N2" \
         "ETCDCTL_ENDPOINTS=http://$P1_PRIV:2379,http://$P2_PRIV:2379,http://$P3_PRIV:2379; \
-         echo ARENA=\$(/usr/local/bin/etcdctl --endpoints=\$ETCDCTL_ENDPOINTS get arena:n1 --print-value-only --hex); \
+         echo ARENA=\$(/usr/local/bin/etcdctl --endpoints=\$ETCDCTL_ENDPOINTS get 'arena:n1/' --prefix --keys-only); \
          echo FREE=\$(/usr/local/bin/etcdctl --endpoints=\$ETCDCTL_ENDPOINTS get free_arena:$ARENA1_BEFORE --print-value-only)" \
         2>/dev/null)
     log "  post-fence state: $(echo "$STATE" | tr '\n' ' ')"
