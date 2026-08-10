@@ -13,7 +13,7 @@
 //
 // Run with:
 //
-//	ETCD_ENDPOINTS=http://localhost:2379 go test -tags=integration -count=1 ./internal/ipc/
+//	ETCD_ENDPOINTS=http://localhost:2379 go test -tags=integration -count=1 ./...
 package ipc
 
 import (
@@ -21,16 +21,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
-
-	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/test/etcdtest"
 )
 
 // deviceBytes is one arena plus room to grow, sparse on disk.
@@ -41,31 +39,7 @@ const deviceBytes = 2 << 30
 func newTestService(t *testing.T) (*Service, *metadata.Store) {
 	t.Helper()
 
-	endpoints := os.Getenv("ETCD_ENDPOINTS")
-	if endpoints == "" {
-		endpoints = "http://localhost:2379"
-	}
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   strings.Split(endpoints, ","),
-		DialTimeout: 5 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("cannot connect to etcd at %s: %v", endpoints, err)
-	}
-
-	for _, prefix := range []string{
-		metadata.PrefixInode, metadata.PrefixDirent, metadata.PrefixExtent,
-		metadata.PrefixArena, metadata.PrefixFreeArena, metadata.PrefixGen,
-		metadata.PrefixLock,
-	} {
-		if _, derr := cli.Delete(context.Background(), prefix, clientv3.WithPrefix()); derr != nil {
-			t.Fatalf("clear %s: %v", prefix, derr)
-		}
-	}
-	if _, derr := cli.Delete(context.Background(), metadata.PrefixArenaLog); derr != nil {
-		t.Fatalf("clear arena counter: %v", derr)
-	}
-	t.Cleanup(func() { _ = cli.Close() })
+	cli := etcdtest.Client(t)
 
 	path := filepath.Join(t.TempDir(), "device.img")
 	f, err := os.Create(path)

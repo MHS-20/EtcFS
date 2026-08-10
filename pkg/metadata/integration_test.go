@@ -9,52 +9,29 @@
 //
 // Run tests with:
 //
-//	ETCD_ENDPOINTS=http://localhost:2379 go test -tags=integration -count=1 -v ./pkg/metadata/ -run Integration
+//	ETCD_ENDPOINTS=http://localhost:2379 go test -tags=integration -count=1 ./... -run Integration
 package metadata
 
 import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/MHS-20/EtcFS/test/etcdtest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// testStore connects to etcd and returns a Store for testing.
+// testStore returns a Store on a client scoped to this test's own etcd key
+// space, so suites running in parallel cannot delete each other's records.
 func testStore(t *testing.T, nodeID string) *Store {
 	t.Helper()
-
-	endpoints := os.Getenv("ETCD_ENDPOINTS")
-	if endpoints == "" {
-		endpoints = "http://localhost:2379"
-	}
-
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   strings.Split(endpoints, ","),
-		DialTimeout: 5 * time.Second,
-	})
-	require.NoError(t, err, "cannot connect to etcd at %s — is Docker Compose running?", endpoints)
-
-	t.Cleanup(func() {
-		// Clean up test keys
-		cli.Delete(context.Background(), PrefixInode, clientv3.WithPrefix())
-		cli.Delete(context.Background(), PrefixDirent, clientv3.WithPrefix())
-		cli.Delete(context.Background(), PrefixLock, clientv3.WithPrefix())
-		cli.Delete(context.Background(), PrefixGen, clientv3.WithPrefix())
-		cli.Delete(context.Background(), PrefixArena, clientv3.WithPrefix())
-		cli.Delete(context.Background(), KeyInodeAllocCounter)
-		cli.Close()
-	})
-
-	return NewStore(cli, nodeID)
+	return NewStore(etcdtest.Client(t), nodeID)
 }
 
 // ---- C1.1: Schema validation ----
@@ -238,16 +215,9 @@ func TestIntegration_LockLeaseExpiry(t *testing.T) {
 	observer := testStore(t, "node-observer")
 	ino := uint64(200)
 
-	endpoints := os.Getenv("ETCD_ENDPOINTS")
-	if endpoints == "" {
-		endpoints = "http://localhost:2379"
-	}
-	holderCli, err := clientv3.New(clientv3.Config{
-		Endpoints:   strings.Split(endpoints, ","),
-		DialTimeout: 5 * time.Second,
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = holderCli.Close() })
+	// A client of its own, so it can be killed — but in the same test key
+	// space as the observer, or neither would see the other's keys.
+	holderCli := etcdtest.Client(t)
 	holder := NewStore(holderCli, "node-b")
 
 	leaseID, keepCh, err := holder.AcquireLock(context.Background(), ino, LockExclusive, 3*time.Second)

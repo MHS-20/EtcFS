@@ -11,20 +11,16 @@
 //
 // Run with:
 //
-//	ETCD_ENDPOINTS=http://localhost:2379 go test -tags=integration -count=1 ./pkg/arena/
+//	ETCD_ENDPOINTS=http://localhost:2379 go test -tags=integration -count=1 ./...
 package arena
 
 import (
 	"context"
 	"fmt"
-	"os"
-	"strings"
 	"testing"
-	"time"
-
-	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/test/etcdtest"
 )
 
 // allocOne reserves a single block and returns its device offset.  Allocate
@@ -44,31 +40,7 @@ func allocOne(t *testing.T, a *Allocator, what string) uint64 {
 
 func testStore(t *testing.T, nodeID string) *metadata.Store {
 	t.Helper()
-
-	endpoints := os.Getenv("ETCD_ENDPOINTS")
-	if endpoints == "" {
-		endpoints = "http://localhost:2379"
-	}
-
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   strings.Split(endpoints, ","),
-		DialTimeout: 5 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("cannot connect to etcd at %s: %v", endpoints, err)
-	}
-
-	t.Cleanup(func() {
-		ctx := context.Background()
-		cli.Delete(ctx, metadata.PrefixArena, clientv3.WithPrefix())
-		cli.Delete(ctx, metadata.PrefixFreeArena, clientv3.WithPrefix())
-		cli.Delete(ctx, metadata.PrefixExtent, clientv3.WithPrefix())
-		cli.Delete(ctx, metadata.PrefixInode, clientv3.WithPrefix())
-		cli.Delete(ctx, metadata.PrefixArenaLog)
-		cli.Close()
-	})
-
-	return metadata.NewStore(cli, nodeID)
+	return metadata.NewStore(etcdtest.Client(t), nodeID)
 }
 
 // A node must never adopt another node's arena on restart.
