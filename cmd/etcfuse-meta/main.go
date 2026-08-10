@@ -139,9 +139,18 @@ func main() {
 	svc.InstallStoreGuard()
 
 	if cfg.BlockDevice != "" {
-		dev, err := blockio.Open(cfg.BlockDevice)
+		openDevice := blockio.Open
+		if cfg.AllowBufferedIO {
+			openDevice = blockio.OpenBuffered
+		}
+		dev, err := openDevice(cfg.BlockDevice)
 		if err != nil {
 			log.Fatal("cannot open block device", "path", cfg.BlockDevice, "error", err)
+		}
+		if !dev.IsDirect() {
+			log.Warn("block device opened WITHOUT O_DIRECT: writes are served from this node's "+
+				"page cache and are not proven visible to other attachers; safe only on an "+
+				"unshared device", "path", cfg.BlockDevice)
 		}
 		defer func() { _ = dev.Close() }()
 		svc.SetBlockDevice(dev)

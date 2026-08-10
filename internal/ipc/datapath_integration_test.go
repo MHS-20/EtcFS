@@ -51,7 +51,7 @@ func newTestService(t *testing.T) (*Service, *metadata.Store) {
 	}
 	_ = f.Close()
 
-	dev, err := blockio.Open(path)
+	dev, err := blockio.OpenBuffered(path)
 	if err != nil {
 		t.Fatalf("open device: %v", err)
 	}

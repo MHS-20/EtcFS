@@ -23,10 +23,33 @@ type Device struct {
 	direct     bool
 }
 
+// Open opens the device for data I/O, requiring O_DIRECT.
+//
+// On a device attached to more than one node, buffered I/O is not a
+// degradation but a correctness change: a write lands in this node's page
+// cache, and the readback that is supposed to push it out to the other
+// attachers is served from that same cache — so the round trip proves nothing,
+// and two nodes believe they share bytes only one of them has written.
+//
+// Use OpenBuffered only where the device is not shared.
 func Open(path string) (*Device, error) {
+	return open(path, false)
+}
+
+// OpenBuffered opens the device, accepting a fall back to buffered I/O when
+// O_DIRECT is unavailable.  Correct only for a single-node mount or a
+// file-backed test device; see Open.
+func OpenBuffered(path string) (*Device, error) {
+	return open(path, true)
+}
+
+func open(path string, allowBuffered bool) (*Device, error) {
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_DIRECT, 0)
 	direct := (err == nil)
 	if err != nil {
+		if !allowBuffered {
+			return nil, fmt.Errorf("open %s with O_DIRECT: %w", path, err)
+		}
 		fd, err = syscall.Open(path, syscall.O_RDWR, 0)
 		if err != nil {
 			return nil, fmt.Errorf("open %s: %w", path, err)

@@ -18,7 +18,7 @@ func TestOpen(t *testing.T) {
 
 	require.NoError(t, os.Truncate(name, 4096))
 
-	dev, err := Open(name)
+	dev, err := OpenBuffered(name)
 	require.NoError(t, err)
 	defer dev.Close()
 
@@ -35,7 +35,7 @@ func TestReadWriteAligned(t *testing.T) {
 
 	require.NoError(t, os.Truncate(name, 4096*10))
 
-	dev, err := Open(name)
+	dev, err := OpenBuffered(name)
 	require.NoError(t, err)
 	defer dev.Close()
 
@@ -74,7 +74,7 @@ func TestSyncRange(t *testing.T) {
 
 	require.NoError(t, os.Truncate(name, 4096*10))
 
-	dev, err := Open(name)
+	dev, err := OpenBuffered(name)
 	require.NoError(t, err)
 	defer dev.Close()
 
@@ -104,10 +104,38 @@ func TestUnmapFreesBuffer(t *testing.T) {
 }
 
 func TestSectorSizeNonZero(t *testing.T) {
-	dev, err := Open("/dev/zero")
+	dev, err := OpenBuffered("/dev/zero")
 	if err != nil {
 		t.Skip("cannot open /dev/zero")
 	}
 	defer dev.Close()
 	assert.Greater(t, dev.SectorSize(), 0)
+}
+
+// Buffered I/O on a shared device is a correctness change, not a fallback: the
+// readback that is supposed to make a write visible to the other attachers is
+// served from the same page cache the write landed in. Open must therefore
+// fail rather than degrade.
+func TestOpenRefusesToFallBackToBufferedIO(t *testing.T) {
+	// tmpfs does not support O_DIRECT, which is exactly the fallback case.
+	name := "/dev/shm/etcfs-odirect-test"
+	f, err := os.Create(name)
+	if err != nil {
+		t.Skipf("no tmpfs available: %v", err)
+	}
+	_ = f.Close()
+	defer func() { _ = os.Remove(name) }()
+
+	if dev, oerr := Open(name); oerr == nil {
+		_ = dev.Close()
+		t.Skip("this filesystem supports O_DIRECT, nothing to fall back from")
+	}
+	dev, err := OpenBuffered(name)
+	if err != nil {
+		t.Fatalf("OpenBuffered: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+	if dev.IsDirect() {
+		t.Error("IsDirect reported true after a buffered fallback")
+	}
 }

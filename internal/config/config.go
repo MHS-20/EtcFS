@@ -49,6 +49,13 @@ type Config struct {
 	// itself rejects that node's writes.  Takes precedence over EBSVolumeID,
 	// which is the weaker control-plane fallback.
 	NVMeReservations bool
+
+	// AllowBufferedIO permits the data device to be opened without O_DIRECT.
+	// On a shared device that is a correctness change, not a fallback — a
+	// write served back out of this node's page cache never proves it reached
+	// the other attachers — so it is off by default and meant for single-node
+	// mounts and file-backed test devices.
+	AllowBufferedIO bool
 }
 
 // Parse reads CLI flags and returns a Config.
@@ -91,6 +98,8 @@ func Parse() *Config {
 		"Shared EBS volume ID; enables dual-confirmed external fencing (detach + poll) when set")
 	flag.BoolVar(&cfg.NVMeReservations, "nvme-reservations", false,
 		"Fence peers by preempting their NVMe reservation key on --block-device (requires a device supporting NVMe reservations, e.g. an EBS io2 Multi-Attach volume)")
+	flag.BoolVar(&cfg.AllowBufferedIO, "allow-buffered-io", false,
+		"Permit opening the data device without O_DIRECT; unsafe on a device attached to more than one node")
 	flag.StringVar(&cfg.EC2InstanceID, "ec2-instance-id", "",
 		"This node's EC2 instance ID, recorded in its membership key so peers can detach the volume when it expires")
 
