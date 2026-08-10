@@ -207,6 +207,62 @@ liveness_monitor() {
 }
 
 # ============================================================
+# Resource sampler — every 30s, records what a slow leak would show up
+# in: each meta daemon's RSS and open-fd count, and etcd's database
+# size. A fuzz run is the only thing in this repo that exercises the
+# daemons long enough for a leak to be visible at all, and a liveness
+# check cannot see one: a leaking daemon stays perfectly writable until
+# it dies.
+#
+# Growth is reported, not failed on. Over a few minutes RSS legitimately
+# rises as caches fill, so a hard threshold here would cry wolf; what is
+# worth acting on is a metric that rises at *every* sample over a long
+# run, which the summary calls out.
+# ============================================================
+SAMPLE_LOG="$REPORT_DIR/samples.log"
+: > "$SAMPLE_LOG"
+
+sample_once() {
+    local tick="$1" c rss fds db
+    for c in "$M1" "$M2" "$M3"; do
+        rss=$(docker exec "$c" sh -c "awk '/VmRSS/ {print \$2}' /proc/1/status" 2>/dev/null | tr -d ' \r')
+        fds=$(docker exec "$c" sh -c "ls /proc/1/fd 2>/dev/null | wc -l" 2>/dev/null | tr -d ' \r')
+        echo "tick=$tick container=$c rss_kb=${rss:-0} fds=${fds:-0}" >> "$SAMPLE_LOG"
+    done
+    db=$(docker exec etcfs-etcd1 etcdctl endpoint status --write-out=fields 2>/dev/null |
+        awk -F': ' '/DbSize/ {print $2; exit}' | tr -d ' \r')
+    echo "tick=$tick container=etcfs-etcd1 db_bytes=${db:-0}" >> "$SAMPLE_LOG"
+}
+
+resource_sampler() {
+    local tick=0
+    while [[ ! -f "$STOP_FILE" ]]; do
+        tick=$((tick+1))
+        sample_once "$tick"
+        sleep 30
+    done
+}
+
+# monotonic <field> <container> — prints "RISING" when a metric increased at
+# every sample, which is what a leak looks like and ordinary variation does
+# not.
+monotonic() {
+    local field="$1" container="$2"
+    awk -v f="$field" -v c="$container" '
+        $0 ~ ("container=" c) {
+            for (i = 1; i <= NF; i++)
+                if (index($i, f "=") == 1) {
+                    split($i, kv, "=")
+                    v = kv[2] + 0
+                    if (n > 0 && v <= prev) steady = 1
+                    prev = v; n++
+                }
+        }
+        END { if (n >= 5 && steady == 0) print "RISING"; }
+    ' "$SAMPLE_LOG"
+}
+
+# ============================================================
 # MAIN
 # ============================================================
 if ! provision_cluster; then
@@ -221,10 +277,11 @@ worker "$N2" 2 & W2=$!
 worker "$N3" 3 & W3=$!
 chaos_injector & CHAOSPID=$!
 liveness_monitor & LIVEPID=$!
+resource_sampler & SAMPLEPID=$!
 
 sleep "$DURATION"
 touch "$STOP_FILE"
-wait "$W1" "$W2" "$W3" "$CHAOSPID" "$LIVEPID" 2>/dev/null
+wait "$W1" "$W2" "$W3" "$CHAOSPID" "$LIVEPID" "$SAMPLEPID" 2>/dev/null
 
 log "Fuzz run complete. Final liveness check on all 3 nodes..."
 FINAL_OK=0
@@ -236,6 +293,13 @@ for node in "$N1" "$N2" "$N3"; do
         dump_logs "$node"
     fi
 done
+
+LEAKS=""
+for c in "$M1" "$M2" "$M3"; do
+    [[ -n "$(monotonic rss_kb "$c")" ]] && LEAKS="$LEAKS $c:rss"
+    [[ -n "$(monotonic fds "$c")" ]] && LEAKS="$LEAKS $c:fds"
+done
+[[ -n "$(monotonic db_bytes etcfs-etcd1)" ]] && LEAKS="$LEAKS etcd:db"
 
 teardown_cluster
 
@@ -250,6 +314,11 @@ FAULTS_TOTAL=$(grep -c 'fault:' "$CHAOS_LOG")
     echo "Faults injected: $FAULTS_TOTAL"
     echo "Max consecutive full-outage ticks: $MAX_CONSEC_DOWN (limit $OUTAGE_LIMIT)"
     echo "Final liveness: $FINAL_OK/3 nodes"
+    if [[ -n "$LEAKS" ]]; then
+        echo "Monotonic growth (possible leak):$LEAKS — see samples.log"
+    else
+        echo "Monotonic growth: none in RSS, fd count or etcd DB size"
+    fi
     if [[ "$LIVENESS_FAIL" -eq 1 || "$FINAL_OK" -lt 3 ]]; then
         echo "STATUS: FAIL — cluster did not stay alive throughout"
     else
@@ -260,6 +329,7 @@ echo "Report: $REPORT_DIR/summary.txt"
 echo "Ops log: $OP_LOG"
 echo "Chaos events: $CHAOS_LOG"
 echo "Liveness log: $LIVENESS_LOG"
+echo "Resource samples: $SAMPLE_LOG"
 
 [[ "$LIVENESS_FAIL" -eq 1 || "$FINAL_OK" -lt 3 ]] && exit 1
 exit 0
