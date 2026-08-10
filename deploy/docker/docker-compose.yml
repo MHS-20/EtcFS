@@ -32,6 +32,12 @@ services:
       - --initial-advertise-peer-urls=http://etcd1:2380
       - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
       - --initial-cluster-token=etcfuse-dev
+      # Without compaction every superseded revision is kept forever, and a
+      # filesystem writes metadata constantly: the store grows until it trips
+      # the backend quota and etcd goes read-only, which stops the mount.
+      - --auto-compaction-mode=revision
+      - --auto-compaction-retention=100000
+      - --quota-backend-bytes=8589934592
       - --initial-cluster-state=new
     volumes:
       - etcd1_data:/etcd-data
@@ -56,6 +62,12 @@ services:
       - --initial-advertise-peer-urls=http://etcd2:2380
       - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
       - --initial-cluster-token=etcfuse-dev
+      # Without compaction every superseded revision is kept forever, and a
+      # filesystem writes metadata constantly: the store grows until it trips
+      # the backend quota and etcd goes read-only, which stops the mount.
+      - --auto-compaction-mode=revision
+      - --auto-compaction-retention=100000
+      - --quota-backend-bytes=8589934592
       - --initial-cluster-state=new
     volumes:
       - etcd2_data:/etcd-data
@@ -80,6 +92,12 @@ services:
       - --initial-advertise-peer-urls=http://etcd3:2380
       - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
       - --initial-cluster-token=etcfuse-dev
+      # Without compaction every superseded revision is kept forever, and a
+      # filesystem writes metadata constantly: the store grows until it trips
+      # the backend quota and etcd goes read-only, which stops the mount.
+      - --auto-compaction-mode=revision
+      - --auto-compaction-retention=100000
+      - --quota-backend-bytes=8589934592
       - --initial-cluster-state=new
     volumes:
       - etcd3_data:/etcd-data

@@ -114,6 +114,17 @@ func (c *Controller) Run(ctx context.Context) {
 				watchCh = watch()
 				continue
 			}
+			if err := resp.Err(); err != nil {
+				// A compacted revision cannot be resumed from, and retrying it
+				// would spin.  Start again from now and let the sweep cover
+				// whatever happened in between — which is exactly what it is
+				// authoritative for.
+				c.log.Warn("fencing watch failed, restarting from the current revision",
+					"from_revision", lastRev+1, "error", err)
+				lastRev = 0
+				watchCh = watch()
+				continue
+			}
 			if resp.Header.Revision > lastRev {
 				lastRev = resp.Header.Revision
 			}

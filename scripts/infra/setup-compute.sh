@@ -388,6 +388,9 @@ sudo tee /etc/etcd/etcd.args > /dev/null <<'ARGS'
 --initial-cluster ${etcd_name}=https://${priv_ip}:2380
 --initial-cluster-state new
 --initial-cluster-token ${CLUSTER}
+--auto-compaction-mode revision
+--auto-compaction-retention 100000
+--quota-backend-bytes 8589934592
 --client-cert-auth
 --trusted-ca-file /etc/etcd/tls/ca.crt
 --cert-file /etc/etcd/tls/server-${etcd_name}.crt
@@ -470,6 +473,9 @@ sudo tee /etc/etcd/etcd.args > /dev/null <<'ARGS'
 --initial-cluster ${INITIAL_CLUSTER}
 --initial-cluster-state existing
 --initial-cluster-token ${CLUSTER}
+--auto-compaction-mode revision
+--auto-compaction-retention 100000
+--quota-backend-bytes 8589934592
 --client-cert-auth
 --trusted-ca-file /etc/etcd/tls/ca.crt
 --cert-file /etc/etcd/tls/server-${etcd_name}.crt
