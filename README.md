@@ -2,7 +2,11 @@
 
 <https://mhs-20.github.io/EtcFS/>
 
-A cluster filesystem where **etcd/Raft is the only source of durable truth**, and a shared raw block device (e.g. AWS EBS Multi-Attach) holds nothing but file bytes. No on-disk filesystem format, no kernel module, no bespoke distributed lock manager — a userspace FUSE daemon on each node presents POSIX semantics, backed by etcd for everything structural (namespace, inode metadata, locks, allocation) and direct block I/O for file content.
+**A cluster-aware filesystem for shared raw block devices — the piece AWS and Kubernetes tell you to bring yourself.**
+
+AWS EBS Multi-Attach will attach one io2 volume to sixteen instances at once. Kubernetes will hand it to you as a `ReadWriteMany` `volumeMode: Block` volume. Both then stop, and [the EBS CSI driver's documentation says why](https://github.com/kubernetes-sigs/aws-ebs-csi-driver/blob/master/docs/multi-attach.md): using it safely "requires application-level coordination (e.g. via I/O fencing)", and failure to do so "can result in data loss and silent data corruption". Put ext4 on a Multi-Attach volume and mount it twice and you will destroy it. The platform gives you the shared device and declines to make it safe.
+
+EtcFS is what goes on top. **etcd/Raft is the only source of durable truth**, and the shared device holds nothing but file bytes. No on-disk filesystem format, no kernel module, no bespoke distributed lock manager — a userspace FUSE daemon on each node presents POSIX semantics, backed by etcd for everything structural (namespace, inode metadata, locks, allocation) and direct block I/O for file content. The I/O fencing that AWS says you need is [three independent layers](#fencing-and-split-brain-avoidance), one of them enforced by the drive itself.
 
 Status: implemented and under hardening. See [State](#state) below before relying on this for real data.
 
@@ -55,14 +59,14 @@ Each node runs two cooperating processes, not one monolith:
                                                    locks, fencing)          Multi-Attach)
 ```
 
-**Why two processes, not one:** FUSE protocol handling needs timely response to kernel upcalls — a single-threaded libfuse event loop, synchronous IPC per request. Metadata and data I/O involve network round trips (etcd) and block device access with variable latency and retryable failures — goroutines, connection pools, retry logic. Splitting them means neither concern's failure/latency model contaminates the other. Full detail: [`docs/architecture/fuse-architecture.md`](docs/architecture/fuse-architecture.md).
+**Why two processes, not one:** FUSE protocol handling needs timely response to kernel upcalls — a single-threaded libfuse event loop, synchronous IPC per request. Metadata and data I/O involve network round trips (etcd) and block device access with variable latency and retryable failures — goroutines, connection pools, retry logic. Splitting them means neither concern's failure/latency model contaminates the other. Full detail: [`docs/architecture/fuse/fuse-architecture.md`](docs/architecture/fuse/fuse-architecture.md).
 
 The C daemon owns all FUSE state (session, mount, request handles); the Go daemon owns all etcd state (client connection, lease keepalives, watch channels). The wire protocol is a hand-rolled length-prefixed binary format on a Unix socket (`internal/ipc/socket.go`); there's no gRPC/protobuf in the hot path.
 
 Four logical subsystems live inside the Go daemon:
 
 1. **Metadata client** (`pkg/metadata`) — inode table, directory entries, locks, allocator state, all as etcd transactions.
-2. **Data engine** (`pkg/blockio`, `pkg/arena`, `pkg/walgo`) — O_DIRECT `pread`/`pwrite` against the shared block device at extents handed down by the metadata layer, plus a small local write-ahead buffer for crash-safety ordering.
+2. **Data engine** (`pkg/blockio`, `pkg/arena`) — O_DIRECT `pread`/`pwrite` against the shared block device at extents handed down by the metadata layer, with crash-safety supplied by write ordering rather than a local log.
 3. **Membership/fencing agent** (`pkg/membership`, `pkg/fencing`) — etcd lease heartbeat, watches on cluster membership, self-fencing watchdog, coordination with an external fencing controller.
 4. **Continuous verification** (`pkg/scrub`, `pkg/fsck`) — background scrubbing of etcd metadata against actual disk state, orphaned-block reclamation, offline consistency checking.
 
@@ -89,7 +93,7 @@ Every inode carries its own extent list — extents are only ever touched togeth
 
 Inode allocation *is* a lone global counter, and does have exactly that hot-key property — one CAS per file creation, cluster-wide. It is the known exception to the sharding principle, kept for simplicity at current scale; see [Possible future extensions](#possible-future-extensions).
 
-Note: etcd value encodings are **not uniform** — `inode_alloc_counter` and dirent values are 8-byte big-endian, `gen:<node>` is decimal ASCII, `extent:<ino>/<chunk>` is comma-separated ASCII. Match the existing encoding exactly if seeding keys by hand or via `etcdctl` (inode `1` is reserved for the FUSE root directory — see [`docs/architecture/metadata-schema.md`](docs/architecture/metadata-schema.md) § Reserved inode numbers).
+Note: etcd value encodings are **not uniform** — `inode_alloc_counter` and dirent values are 8-byte big-endian, `gen:<node>` is decimal ASCII, `extent:<ino>/<chunk>` is comma-separated ASCII. Match the existing encoding exactly if seeding keys by hand or via `etcdctl` (inode `1` is reserved for the FUSE root directory — see [`docs/architecture/metadata/metadata-schema.md`](docs/architecture/metadata/metadata-schema.md) § Reserved inode numbers).
 
 **Sharding hot structures.** Block allocation uses **arenas** — large contiguous ranges of the raw device (e.g. 1GB) leased exclusively to one node at a time via a transaction against `arena:<node_id>`. A node allocates from its own arena using a local free-list, only touching etcd to acquire or return an arena — roughly once per GB of write activity, not once per block. Infrequent coarse-grained etcd coordination, frequent fine-grained local decision-making.
 
@@ -127,7 +131,7 @@ Lease expiry tells you a node stopped renewing its lease — it does **not** tel
 
 Reclaim sequence: lease expires (suspicion) → fencing controller notified via etcd watch, races the node's own self-fencing watchdog → controller waits for dual confirmation → writes a `gen:<node_id>` epoch bump → locks/arenas previously held by that node are reassigned only after the bump, structurally enforced by requiring every lock-grant transaction to CAS against the current generation.
 
-A secondary split-brain vector — etcd's own partition behavior — already benefits from Raft without extra work: anyone partitioned from the etcd majority can't write an epoch bump or acquire a lock, since every metadata mutation is itself a quorum operation. Full detail: [`docs/architecture/fencing-generation-protocol.md`](docs/architecture/fencing-generation-protocol.md).
+A secondary split-brain vector — etcd's own partition behavior — already benefits from Raft without extra work: anyone partitioned from the etcd majority can't write an epoch bump or acquire a lock, since every metadata mutation is itself a quorum operation. Full detail: [`docs/architecture/fencing/fencing-generation-protocol.md`](docs/architecture/fencing/fencing-generation-protocol.md).
 
 ## Elasticity
 
@@ -137,15 +141,17 @@ Verified in practice: `docs/chaos-reports/2026-07-31-elastic-scale-out-in.md` �
 
 ## Journaling — what replaces it
 
-There is deliberately no on-disk journal in the ext4/GFS2 sense. **etcd's Raft log is the durable, replicated write-ahead record for all metadata** — every inode/dirent/lock mutation is committed to a replicated log before the etcd client call returns. What's built on top of that is data-path crash safety: the data-then-metadata / metadata-then-data ordering rules above, plus a **small local WAL** (`pkg/walgo`) covering only the short window between issuing a data write and committing its metadata — on restart, a node reconciles any locally-recorded in-flight writes against etcd's current state, discarding anything not reflected in a committed inode record. This is not a full filesystem journal; it never needs to be, because the durable source of truth for "did this write happen" is etcd's log, not the local WAL.
+There is deliberately no journal at all — neither an on-disk one in the ext4/GFS2 sense, nor a local write-ahead log. **etcd's Raft log is the durable, replicated write-ahead record for all metadata**: every inode/dirent/lock mutation is committed to a replicated log before the etcd client call returns. Data-path crash safety comes from the data-then-metadata / metadata-then-data ordering rules above, and nothing else is needed.
 
-Node restart is cheap versus GFS2-style recovery: reconnect to etcd, re-register membership, replay the small local WAL, resume. There's no cluster-wide recovery barrier, because no other node's metadata access was ever blocked by this node's absence — locks it held stay held (and unavailable to others) until fencing confirms it's actually gone.
+An earlier design did carry a small local WAL covering the window between issuing a data write and committing its metadata. It was removed once it became clear it earned nothing: blocks allocated but never committed are already reclaimed by arena reconstruction, which is the same work the WAL replay was doing, from a source of truth that is quorum-replicated rather than local. Deleting it took an `fsync` off every write. The reasoning is recorded in `docs/TODO.md` item 30.
+
+Node restart is therefore cheap versus GFS2-style recovery: reconnect to etcd, re-register membership, resume — no replay step. There's no cluster-wide recovery barrier, because no other node's metadata access was ever blocked by this node's absence — locks it held stay held (and unavailable to others) until fencing confirms it's actually gone.
 
 ## POSIX semantics: what's supported, what's not
 
 Supported: standard file/directory CRUD, `read`/`write`/`truncate`, `rename` (including cross-directory), hard links, symlinks, `flock`/`fcntl` byte-range and whole-file locks (data-lock class above), directory listing via `readdir`/`readdirplus`.
 
-Not supported: shared writable `mmap` across nodes (see [Locking](#locking)) — an explicit rejected case, not an ambiguous gap. Multi-node coherence for other unusual access patterns is documented per-subsystem in `docs/architecture/`; when in doubt, check [`docs/architecture/multi-node-coherence.md`](docs/architecture/multi-node-coherence.md) and [`docs/architecture/cache-coherence.md`](docs/architecture/cache-coherence.md) before assuming a POSIX guarantee holds identically to a local filesystem.
+Not supported: shared writable `mmap` across nodes (see [Locking](#locking)) — an explicit rejected case, not an ambiguous gap. Multi-node coherence for other unusual access patterns is documented per-subsystem in `docs/architecture/`; when in doubt, check [`docs/architecture/consistency/multi-node-coherence.md`](docs/architecture/consistency/multi-node-coherence.md) and [`docs/architecture/consistency/cache-coherence.md`](docs/architecture/consistency/cache-coherence.md) before assuming a POSIX guarantee holds identically to a local filesystem.
 
 ## How to use it
 
@@ -219,7 +225,7 @@ Implemented and under hardening — this is not yet a system to trust with data 
 
 ## Possible future extensions
 
-Directions that are deliberately not built yet, recorded so the reasoning isn't lost. The full list with implementation notes lives in [`docs/TODO-hardening.md`](docs/TODO-hardening.md).
+Directions that are deliberately not built yet, recorded so the reasoning isn't lost. The full tracking list lives in [`docs/TODO.md`](docs/TODO.md); larger directions — benchmarking against EBS/EFS/Lustre, TLA+ verification, the Kubernetes CSI driver — are in [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md).
 
 **Per-node inode ranges.** Inode allocation is currently a single global CAS-retried counter — one etcd round trip per file creation, from every node, against one key. Unlike arena allocation it does not shard, so contention grows with node count rather than staying flat. The obvious fix mirrors the arena allocator: reserve a block of inode numbers per node with one CAS, then hand them out from memory until exhausted, touching etcd once per N creations instead of once per creation.
 
@@ -232,7 +238,7 @@ This was in fact described in the docs as though implemented, and partial dead c
 
 Adopting ranges would also make the inode cross-check described in [`elastic-join-leave.md`](docs/architecture/cluster-ops/elastic-join-leave.md) § Interaction with the Scrubber implementable — with a global counter there are no ranges to validate against.
 
-**Other tracked directions.** Arena reclamation (nothing reuses freed arenas today, and safe reissue needs a time-bound argument that etcd state alone cannot supply); enforced cross-node POSIX locks; bounded contexts for FUSE handlers, which currently run with `context.Background()`; retrying a fenced node whose EBS detach failed or timed out, which currently has no automatic retry path and stays in a documented limbo state until an operator intervenes.
+**Other tracked directions.** Enforced cross-node POSIX locks; bounded contexts for FUSE handlers, which currently run with `context.Background()`; retrying a fenced node whose EBS detach failed or timed out, which currently has no automatic retry path and stays in a documented limbo state until an operator intervenes. Arena reclamation *is* now built — emptied arenas are returned to the global free pool by a background reaper on each node — so it is no longer on this list.
 
 Dual-confirmed external fencing (EBS detach + poll before the generation bumps) is implemented — see `pkg/fencing/detach.go` and the Fencing section above.
 

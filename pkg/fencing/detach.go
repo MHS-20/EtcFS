@@ -77,7 +77,7 @@ func NewEBSDetacher(ctx context.Context, volumeID string) (*EBSDetacher, error) 
 	// EC2 instance with no AWS_REGION set (the case here — nodes are
 	// provisioned without one) fails with "Missing Region" on every AWS call,
 	// which is exactly what happened on the first real run of this code
-	// (see docs/chaos-reports/2026-08-05-external-fencing-detach.md).
+	// against a bare EC2 instance.
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithEC2IMDSRegion())
 	if err != nil {
 		return nil, fmt.Errorf("ebs detacher: load aws config: %w", err)

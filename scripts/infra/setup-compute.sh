@@ -9,8 +9,7 @@
 # scripts/test/chaos-lib.sh's ephemeral per-run clusters both call — one
 # proven implementation instead of two that drift apart. See
 # bootstrap-cluster.sh's header for why it looks the way it does (no TLS,
-# no systemd) and docs/design-decisions.md for the bugs that approach
-# replaced.
+# no systemd) and for the bugs that approach replaced.
 #
 # Idempotent the same way bootstrap-cluster.sh is idempotent: every node is
 # always restarted as part of one fresh cluster. There is no partial state

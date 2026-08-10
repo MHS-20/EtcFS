@@ -116,8 +116,8 @@ if $QUICK; then
     exit $FAIL
 fi
 
-# ---- Tests 6-N: require EtcFS binaries (skipped in Phase 0) ----
-log "Test 6: EtcFS binaries (skipped — not yet built in Phase 0)"
+# ---- Tests 6-N: require EtcFS binaries (skipped until they're built) ----
+log "Test 6: EtcFS binaries (skipped — not yet built)"
 log "  Build with: make all"
 log "  Then re-run this test suite."
 

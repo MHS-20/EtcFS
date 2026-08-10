@@ -48,8 +48,7 @@ func testStore(t *testing.T, nodeID string) *metadata.Store {
 // This is the allocator half of the Kleppmann stale-write hazard: if
 // Reconstruct pulls in arenas owned by other nodes, two live nodes hand out
 // the same disk offset and both extent commits succeed, because neither node
-// is fenced and the generation guard has nothing to reject.  See
-// docs/architecture/kleppmann-stale-write-analysis.md.
+// is fenced and the generation guard has nothing to reject.
 func TestIntegration_ReconstructDoesNotAdoptForeignArenas(t *testing.T) {
 	ctx := context.Background()
 	storeA := testStore(t, "node-A")

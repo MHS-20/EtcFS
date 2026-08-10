@@ -1116,7 +1116,6 @@ struct fuse_lowlevel_ops *etcfs_fuse_ops(void)
      * to work locally." Implementing them takes that job away from the
      * kernel, and the daemon granted every request, so fcntl() locks
      * excluded nothing -- not even two processes on the same node. Unset,
-     * fcntl() gets the node-local enforcement flock() already had.
-     * See docs/architecture/metadata/posix-lock-operations.md. */
+     * fcntl() gets the node-local enforcement flock() already had. */
     return &ops;
 }

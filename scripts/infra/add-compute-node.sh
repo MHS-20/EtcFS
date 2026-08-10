@@ -10,7 +10,7 @@
 # member add returns. Skipping that step (starting the new member with a
 # self-assembled node list instead) is exactly the bug that made the old,
 # TLS+systemd version of this cluster's initial bootstrap never work — see
-# bootstrap-cluster.sh's header and docs/design-decisions.md.
+# bootstrap-cluster.sh's header.
 #
 # Same no-TLS, no-systemd, nohup'd-background-process model as
 # bootstrap-cluster.sh and scripts/test/chaos-lib.sh's proven AWS add_node,

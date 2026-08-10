@@ -18,7 +18,7 @@
 # daemon leaving a stale mount that made the next `mkdir -p` fail with
 # ENOTCONN, and — the one that mattered most — no `etcd member add` step
 # before starting a joining node, so a staged multi-node bootstrap could
-# never actually reach quorum. See docs/design-decisions.md.
+# never actually reach quorum.
 #
 # Sidestepping the join case entirely (every node starts as part of one
 # fresh cluster, together) removes that whole bug class rather than fixing

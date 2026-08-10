@@ -290,9 +290,9 @@ func TestController_WatchPathFencesWithoutARecordedIntent(t *testing.T) {
 
 // A confirmed device fence must reclaim the fenced node's arena, and must do
 // so as part of fenceNode itself — not eventually, via the sweep or anything
-// else. See docs/TODO-hardening.md § 6: reclaim is gated on Fencer
-// confirmation because that confirmation is the invariant-4 proof (device
-// already rejects the node's writes) that makes immediate reissue safe.
+// else. Reclaim is gated on Fencer confirmation because that confirmation is
+// the proof (device already rejects the node's writes) that makes immediate
+// reissue safe.
 func TestController_ReclaimsArenaAfterConfirmedFence(t *testing.T) {
 	c, store, ctx := testController(t, "controller-node")
 	t.Cleanup(func() {

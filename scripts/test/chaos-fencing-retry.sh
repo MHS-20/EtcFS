@@ -1,5 +1,5 @@
 #!/bin/bash
-# chaos-fencing-retry.sh — verify TODO-hardening.md item 5's reconciliation
+# chaos-fencing-retry.sh — verify the fence-intent reconciliation
 # mechanism: a durable fence intent (fence_pending:<node>) that survives a
 # failed/crashed fence attempt, a periodic sweep that retries it, and a
 # cluster-wide claim (fence_claim:<node>) that keeps two controllers from
@@ -7,27 +7,27 @@
 #
 # Four scenarios, run against one 3-node base cluster:
 #
-#   R1  Crash-recovery simulant: a fence_pending intent is left behind for a
+#   Crash-recovery simulant: a fence_pending intent is left behind for a
 #       node with no live membership key (as if a controller recorded the
 #       intent and died before finishing). Assert the sweep completes it
 #       unprompted: generation bumped, intent cleared.
-#   R2  Rejoin-drops-intent: a fence_pending intent left behind for a node
+#   Rejoin-drops-intent: a fence_pending intent left behind for a node
 #       whose membership key IS present (the node recovered before the fence
 #       finished). Assert the sweep drops the intent WITHOUT bumping the
 #       generation — fencing a live node would be a regression, not a fix.
-#   R3  Real dead node: kill a node outright, let the watch path fence it
+#   Real dead node: kill a node outright, let the watch path fence it
 #       through the normal edge-triggered path (not the sweep). Assert
 #       exactly one generation bump and that fence_pending/fence_claim are
 #       both clean afterward.
-#   R4  AWS only: force a REAL fence failure — deny ec2:DetachVolume via a
+#   AWS only: force a REAL fence failure — deny ec2:DetachVolume via a
 #       temporary IAM policy while a node is partitioned, confirm the
 #       generation stays at 0 and the intent survives, then restore the
 #       permission and assert the sweep completes the fence within one
 #       sweep interval, with no source code involved in the recovery.
 #
-# Docker mode runs R1-R3 (no EBS/NVMe device to genuinely fail against, so
-# R4 needs AWS). AWS mode runs R4 in addition to R1-R3, reusing the same
-# cluster.
+# Docker mode runs the first three scenarios (no EBS/NVMe device to
+# genuinely fail against, so the fourth needs AWS). AWS mode runs all four,
+# reusing the same cluster.
 #
 # Usage:
 #   ./chaos-fencing-retry.sh docker [R1|R2|R3|R4|all]
@@ -69,7 +69,7 @@ wait_sweep() { sleep 40; }
 should_run() { [[ "$SCENARIO" == "all" || "$SCENARIO" == "$1" ]]; }
 
 # ============================================================
-# R1 — sweep completes a fence whose intent outlived its recorder.
+# sweep completes a fence whose intent outlived its recorder.
 # ============================================================
 run_r1() {
     log "======== R1: sweep retries an orphaned fence_pending intent ========"
@@ -101,7 +101,8 @@ run_r1() {
         # the sharper of the two assertions rather than a weaker one: it proves
         # the retry loop keeps running against a fence that genuinely cannot
         # succeed, and that an unconfirmed fence is never papered over with a
-        # generation bump. Completion is asserted against real nodes in R3/R4.
+        # generation bump. Completion is asserted against real nodes in the
+        # real-dead-node and AWS-only scenarios below.
         local retries
         retries=$(runcmd "$N2" "grep -c 'retrying incomplete fence.*$node' /tmp/meta.log 2>/dev/null" 2>/dev/null | tr -d '[:space:]')
         retries=${retries:-0}
@@ -151,7 +152,7 @@ run_r1() {
 }
 
 # ============================================================
-# R2 — sweep drops an intent for a node that re-registered, without fencing
+# sweep drops an intent for a node that re-registered, without fencing
 # it.
 # ============================================================
 run_r2() {
@@ -184,7 +185,8 @@ run_r2() {
     # Deleting the membership key is itself a DELETE event, so the watch path
     # records a fresh intent for this fictional node. Left behind, it makes
     # every later sweep retry a fence that can never complete, polluting the
-    # logs R3/R4 read. Clear both, then let one sweep pass consume the race.
+    # logs later scenarios read. Clear both, then let one sweep pass consume
+    # the race.
     etcdctl_on del "membership:$node" >/dev/null 2>&1
     sleep 5
     etcdctl_on del "fence_pending:$node" >/dev/null 2>&1
@@ -192,7 +194,7 @@ run_r2() {
 }
 
 # ============================================================
-# R3 — a real dead node is fenced exactly once via the watch path, and both
+# a real dead node is fenced exactly once via the watch path, and both
 # control keys end up clean.
 # ============================================================
 run_r3_docker() {
@@ -313,14 +315,14 @@ run_r3_aws() {
 }
 
 # ============================================================
-# R4 (AWS only) — a genuinely failed fence, forced by denying
+# AWS only — a genuinely failed fence, forced by denying
 # ec2:DetachVolume, then a genuine recovery once the permission returns.
 # ============================================================
 run_r4_aws() {
-    # Targets n3, not n1. R3 kills n1's daemons and leaves its mount dead
-    # ("Transport endpoint is not connected"), so R4 cannot use n1 for its own
-    # baseline write when both run in one invocation. n3 is untouched by every
-    # preceding scenario.
+    # Targets n3, not n1. The real-dead-node scenario kills n1's daemons and
+    # leaves its mount dead ("Transport endpoint is not connected"), so this
+    # scenario can't use n1 for its own baseline write when both run in one
+    # invocation. n3 is untouched by every preceding scenario.
     log "======== R4: genuine detach failure via IAM deny, then sweep-driven recovery ========"
     local vol_id
     vol_id=$(jq -r '.volume_id' "$PROJECT_ROOT/$STATE_FILE")
@@ -329,7 +331,8 @@ run_r4_aws() {
     # guarded writes fail as ErrFenced (surfacing as -ENOSPC) before the test
     # even starts. Baseline the value and assert the delta instead.
     #
-    # Only n2's controller can fence n3 here: R3 killed n1's daemons (its etcd
+    # Only n2's controller can fence n3 here: the real-dead-node scenario
+    # killed n1's daemons (its etcd
     # keeps running, so quorum is unaffected, but its fencing controller is
     # gone). One live fencer is enough to exercise fail-then-retry.
     etcdctl_on del "fence_pending:n3" >/dev/null 2>&1

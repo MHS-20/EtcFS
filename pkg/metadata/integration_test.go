@@ -584,7 +584,7 @@ func TestIntegration_ConcurrentCreatesNoCollision(t *testing.T) {
 	assert.Len(t, entries, workers*filesPerWorker)
 }
 
-// ---- Phase 3: Write operations ----
+// ---- Write operations ----
 
 func TestIntegration_CreateFile(t *testing.T) {
 	store := testStore(t, "phase3-create")

@@ -1,40 +1,41 @@
 #!/bin/bash
 # chaos-elastic-fault-injection.sh — fault injection DURING the join/leave
-# window itself (TODO-hardening.md item 2), not on a stable cluster like
-# every other chaos-*.sh script. The membership set, quorum size, and arena
-# ownership are all in flux during a join/leave — the most likely place for
-# a fencing or allocator bug to hide, and untested until now.
+# window itself, not on a stable cluster like every other chaos-*.sh script.
+# The membership set, quorum size, and arena ownership are all in flux
+# during a join/leave — the most likely place for a fencing or allocator bug
+# to hide, and untested until now.
 #
 # Five scenarios, run in sequence against one 3-node base cluster (each
 # fully cleans up its own extra node before the next starts, so node id 4
 # is reused throughout):
 #
-#   FJ1  Kill the joining node after `etcd member add` but before the FUSE
+#   Kill the joining node after `etcd member add` but before the FUSE
 #        mount comes up. Assert the cluster stays writable and the
 #        half-joined node never held an arena.
-#   FJ2  Partition the joining node from etcd right after it mounts. Assert
+#   Partition the joining node from etcd right after it mounts. Assert
 #        it stops serving (self-fences) rather than continuing to operate
 #        in a split view.
-#   FJ3  Bump the leaving node's generation WHILE it is gracefully leaving.
+#   Bump the leaving node's generation WHILE it is gracefully leaving.
 #        Assert clean teardown afterward: no lock left referencing it, and
 #        the arena record is unchanged (arena reclamation on leave has no
 #        production implementation yet — see the comment in run_fj3 — so
 #        "unchanged" is the correct expectation, not "released").
-#   FJ4  Kill a SURVIVING node's daemons while a different node is mid-join,
+#   Kill a SURVIVING node's daemons while a different node is mid-join,
 #        then let the survivor recover. Assert the join still completes and
 #        the survivor rejoins cleanly (quorum stress).
-#   FJ5  Partition a joined node from etcd (lease TTL widened to 120s so
+#   Partition a joined node from etcd (lease TTL widened to 120s so
 #        self-fencing can't race the probe) and assert its FUSE ops bound at
 #        internal/ipc/retry.go's requestTimeout (10s), with the daemon
-#        confirmed alive before and after — see TODO-hardening.md item 7.
+#        confirmed alive before and after.
 #
-# This script does NOT reuse add_node/remove_node's internals for FJ1 — the
-# whole point is to stop mid-sequence, which a black-box function call
-# cannot do. FJ1's docker/aws partial_join_* functions below are a
-# deliberate, commented duplication of add_node's first half (etcd member +
-# meta daemon), stopping short of starting the FUSE container/process. FJ2,
-# FJ4, and FJ5 reuse add_node/remove_node from chaos-lib.sh unmodified, since
-# their fault lands before/after the join rather than inside it.
+# This script does NOT reuse add_node/remove_node's internals for the
+# kill-before-mount scenario — the whole point is to stop mid-sequence,
+# which a black-box function call cannot do. Its docker/aws
+# partial_join_* functions below are a deliberate, commented duplication of
+# add_node's first half (etcd member + meta daemon), stopping short of
+# starting the FUSE container/process. The other scenarios reuse
+# add_node/remove_node from chaos-lib.sh unmodified, since their fault lands
+# before/after the join rather than inside it.
 #
 # Usage:
 #   ./chaos-elastic-fault-injection.sh docker [FJ1|FJ2|FJ3|FJ4|FJ5|all]
@@ -69,7 +70,7 @@ gen_val()   { etcdctl_on get "gen:$1" --print-value-only 2>/dev/null | tr -d '[:
 member_id_for() { etcdctl_on member list 2>/dev/null | grep ", $1," | cut -d, -f1; }
 
 # ============================================================
-# FJ1 helpers — partial join, stopping before the FUSE mount.
+# kill-before-mount helpers — partial join, stopping before the FUSE mount.
 # Deliberate duplication of add_node's first half (see header comment).
 # ============================================================
 if [[ "$MODE" == "docker" ]]; then
@@ -221,7 +222,7 @@ cleanup_extras() {
 trap cleanup_extras EXIT
 
 # ============================================================
-# FJ1: kill the joining node between etcd member add and FUSE mount.
+# kill the joining node between etcd member add and FUSE mount.
 # ============================================================
 run_fj1() {
     log "======== FJ1: kill mid-join, before FUSE mount ========"
@@ -263,8 +264,9 @@ run_fj1() {
 }
 
 # ============================================================
-# Shared node4 partition/heal/liveness helpers — FJ2 and FJ5 both sever
-# node4 from etcd and watch its meta daemon; factored here so the fault
+# Shared node4 partition/heal/liveness helpers — the partition-mid-join and
+# partition-after-join scenarios both sever node4 from etcd and watch its
+# meta daemon; factored here so the fault
 # injection itself only exists once.
 #
 # History worth keeping: this scenario originally partitioned on AWS by
@@ -501,7 +503,7 @@ run_fj2() {
 }
 
 # ============================================================
-# FJ3: bump the leaving node's generation WHILE it leaves gracefully.
+# bump the leaving node's generation WHILE it leaves gracefully.
 # ============================================================
 run_fj3() {
     log "======== FJ3: generation bump during graceful leave ========"
@@ -553,7 +555,7 @@ run_fj3() {
 }
 
 # ============================================================
-# FJ4: kill a surviving node's daemons while a different node is mid-join.
+# kill a surviving node's daemons while a different node is mid-join.
 # ============================================================
 run_fj4() {
     log "======== FJ4: kill a survivor while a different node joins ========"
@@ -607,11 +609,11 @@ run_fj4() {
 }
 
 # ============================================================
-# FJ5: partition a joined node from etcd and prove that FUSE ops on it
+# partition a joined node from etcd and prove that FUSE ops on it
 # return within `requestTimeout` (internal/ipc/retry.go, 10s) rather than
 # hanging until self-fencing kills the daemon out from under them.
 #
-# FJ2 partitions node4 too, but by the time it probes, self-fencing has
+# The partition-mid-join scenario partitions node4 too, but by the time it probes, self-fencing has
 # already exited the daemon (fence window ~20-33s at the default 10s lease
 # TTL, tighter than requestTimeout's own 10s) — so a fast rc there proves
 # "the process is dead," not "the request was bounded." This scenario widens
@@ -624,7 +626,7 @@ run_fj4() {
 # timed_probe4 <docker_cmd> <aws_cmd> — runs the mode-appropriate cmd on
 # node4 (bounded 30s), echoes "<elapsed_seconds> <rc>". 124 is timeout's own
 # "still running" rc. Separate commands per mode because AWS writes need
-# `sudo tee` (same reason FJ2's write probe does) while docker exec runs as
+# `sudo tee` (same reason the partition-mid-join write probe does) while docker exec runs as
 # root already.
 timed_probe4() {
     local docker_cmd="$1" aws_cmd="$2" t0 t1 rc=0

@@ -8,8 +8,8 @@
 #
 # This is AWS-only. There is no EBS Multi-Attach volume to detach in Docker,
 # so the controller there always runs single-signal (no VolumeDetacher
-# configured) — that path is already covered by
-# scripts/test/chaos-elastic-fault-injection.sh's FJ2. This script is the one
+# configured) — that path is already covered by the joining-node-partition
+# scenario in chaos-elastic-fault-injection.sh. This script is the one
 # that actually exercises pkg/fencing/detach.go's EBSDetacher against a real
 # EC2 API, which nothing else does.
 #
@@ -90,8 +90,8 @@ else
 fi
 
 log "======== Partitioning n1 from etcd peers (n2, n3) via iptables ========"
-# Same technique as FJ2 / S3 (see TODO-hardening.md item 2): SG swaps do not
-# sever established connections, iptables does.
+# Same technique used elsewhere to sever a node's etcd connectivity: SG swaps
+# do not sever established connections, iptables does.
 IPT_SETUP=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q ec2-user@"$N1" \
     "command -v iptables >/dev/null 2>&1 || sudo dnf install -q -y iptables iptables-nft 2>&1 | tail -2; command -v iptables || echo NO_IPTABLES" 2>&1)
 log "  iptables on n1: $(echo "$IPT_SETUP" | tr '\n' ' ' | cut -c1-120)"

@@ -1,32 +1,34 @@
 #!/bin/bash
 # chaos-arena-reclaim.sh — arena and disk-space reclamation test.
 #
-# Covers docs/TODO-hardening.md § 6 (arena reclamation has no implementation
-# — now implemented, not yet chaos-tested until this script runs).  Two
-# distinct leaks are closed by that work and both are exercised here:
+# Arena reclamation was previously unimplemented; this script chaos-tests it
+# now that it exists.  Two distinct leaks are closed by that work and both
+# are exercised here:
 #
-#   R1 — a node's arena, leaked on every departure (graceful or fenced),
-#        now returns to the free_arena: pool and gets handed to the next
-#        node that needs space instead of the counter growing forever.
-#   R2 — a recycled arena is not assumed empty: the node that claims it
-#        rebuilds its bitmap from the live extents still in it, so writes
-#        from the new owner cannot land on blocks the previous owner's
-#        surviving files still reference.
-#   R3 — deleting a file returns its blocks to the allocator, not just its
-#        etcd metadata. This is the hotter path (every rm, not just every
-#        node departure) and was leaking independently of R1/R2.
-#   R4 — single-signal fencing (no device-enforced Fencer configured, the
-#        Docker/gp3 case) has no proof the fenced node's kernel stopped
-#        writing, so its arena must NOT be reclaimed. Verifies the guard
-#        that gates reclamation on invariant 4 rather than assuming it.
-#        Docker-only: needs container-level kill/inspect that has no AWS
-#        equivalent here. R4's counterpart on AWS — arena reclaim IS safe
-#        once a NVMeFencer confirms the preempt — is R9 in
-#        chaos-nvme-fencing.sh, which has the real reservation hardware
-#        this script cannot provide.
+#   - a node's arena, leaked on every departure (graceful or fenced),
+#     now returns to the free_arena: pool and gets handed to the next
+#     node that needs space instead of the counter growing forever.
+#   - a recycled arena is not assumed empty: the node that claims it
+#     rebuilds its bitmap from the live extents still in it, so writes
+#     from the new owner cannot land on blocks the previous owner's
+#     surviving files still reference.
+#   - deleting a file returns its blocks to the allocator, not just its
+#     etcd metadata. This is the hotter path (every rm, not just every
+#     node departure) and was leaking independently of the arena-recycling
+#     checks above.
+#   - single-signal fencing (no device-enforced Fencer configured, the
+#     Docker/gp3 case) has no proof the fenced node's kernel stopped
+#     writing, so its arena must NOT be reclaimed. Verifies the guard
+#     that gates reclamation on proof of quiescence rather than assuming it.
+#     Docker-only: needs container-level kill/inspect that has no AWS
+#     equivalent here. The AWS counterpart — arena reclaim IS safe
+#     once a NVMeFencer confirms the preempt — lives in
+#     chaos-nvme-fencing.sh, which has the real reservation hardware
+#     this script cannot provide.
 #
-# R1/R2/R3 are mode-agnostic (writef/readf/add_node/remove_node/etcdctl_on
-# all abstract over docker vs ssh in chaos-lib.sh) and run on both.
+# The arena-recycling and stale-write checks above are mode-agnostic
+# (writef/readf/add_node/remove_node/etcdctl_on all abstract over docker vs
+# ssh in chaos-lib.sh) and run on both.
 #
 # Usage:
 #   ./chaos-arena-reclaim.sh docker|aws [scenario|all]
@@ -92,7 +94,7 @@ collisions() {
     '
 }
 
-# ---- R1/R2: graceful departure frees the arena, next joiner recycles it ----
+# ---- graceful departure frees the arena, next joiner recycles it ----
 
 scenario_r1() {
     log "======== R1/R2: graceful leave frees an arena, next joiner recycles it ========"
@@ -135,7 +137,7 @@ scenario_r1() {
         pass "node5 recycled node4's freed arena $a4 instead of extending the device"
     fi
 
-    # R2: node4's original write must still be intact and node5's new write
+    # node4's original write must still be intact and node5's new write
     # must not collide with it — the recycled arena's live extent had to
     # survive the handover.
     local got; got=$(readf "$N1" "r1-seed.txt")
@@ -150,7 +152,7 @@ scenario_r1() {
     pass "recycled arena's prior live extent intact, no collision with new owner's writes"
 }
 
-# ---- R3: deleting a file returns its blocks, not just its metadata ----
+# ---- deleting a file returns its blocks, not just its metadata ----
 
 scenario_r3() {
     log "======== R3: file deletion reclaims its blocks via the scrubber ========"
@@ -189,7 +191,7 @@ scenario_r3() {
     pass "cluster kept writing through repeated create/delete cycles after reclaim"
 }
 
-# ---- R4: single-signal fencing must NOT reclaim the fenced node's arena ----
+# ---- single-signal fencing must NOT reclaim the fenced node's arena ----
 
 scenario_r4() {
     log "======== R4: single-signal fence leaves the arena leaked (no proof of quiescence) ========"

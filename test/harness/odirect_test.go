@@ -50,11 +50,11 @@ func TestODirect_AlignmentRejection(t *testing.T) {
 	assert.True(t, len(unalignedBuf)%512 != 0, "unaligned buffer size should be detected")
 }
 
-// ---- C6.3: io_uring batch I/O ----
+// ---- io_uring batch I/O ----
 
 func TestIOUring_BatchIOConcept(t *testing.T) {
 	// io_uring is a Linux kernel interface for async I/O.
-	// For Phase 6, we document the API and validate the concept.
+	// This is not yet implemented; here we document the API and validate the concept.
 	// The actual implementation is in pkg/block/block.c.
 
 	// io_uring requires:

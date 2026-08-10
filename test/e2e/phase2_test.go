@@ -1,6 +1,6 @@
 //go:build etcd
 
-// Phase 2 end-to-end test: etcd → Go backend → C FUSE daemon → read ops.
+// End-to-end test: etcd → Go backend → C FUSE daemon → read ops.
 //
 // Requires a running etcd cluster. Run with:
 //

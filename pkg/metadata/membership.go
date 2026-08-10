@@ -174,8 +174,7 @@ func (m *Membership) grantAndRegister(ctx context.Context) (clientv3.LeaseID, er
 //
 // This is deliberately *not* called from Run's ctx.Done path.  Run is cancelled
 // at the start of shutdown, while the arena may only be released once the node
-// is provably serving nothing — invariant 4 of
-// docs/architecture/storage/kleppmann-stale-write-analysis.md.  Only the owner
+// is provably serving nothing.  Only the owner
 // of the serving path knows when that is true, so it must call Leave itself,
 // after its IPC server has stopped.  Releasing on cancellation instead would
 // hand the arena to another node while writes were still draining out of this
@@ -228,8 +227,7 @@ func (m *Membership) setAlive(v bool) {
 // node believes itself alive forever, the self-fencing watchdog never fires,
 // and the node keeps serving while etcd has already handed its lease's
 // expiry to the fencing controller.  Verified: 8+ minutes partitioned with no
-// self-fence before this check existed (docs/chaos-reports/
-// 2026-08-05-fault-injection-during-join-leave.md).
+// self-fence before this check existed.
 //
 // The lease TTL is the correct threshold because it is exactly the point at
 // which etcd expires the lease after the last renewal.  The client library

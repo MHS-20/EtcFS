@@ -3,8 +3,8 @@
 #
 # Runs a battery of tests across all compute nodes after setup-compute.sh.
 # Tests POSIX filesystem operations through the FUSE mount, etcd health,
-# and cross-node visibility.  No block-device-level checks yet (those are
-# in Phase 6+ checkpoints from the implementation plan).
+# and cross-node visibility.  No block-device-level checks yet — those are
+# still future work.
 #
 # Usage:
 #   ./run-full-test.sh                    # run all tests

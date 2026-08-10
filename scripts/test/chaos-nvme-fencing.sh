@@ -9,24 +9,24 @@
 # no polling, no grace period, no residual-I/O window.
 #
 # What it asserts, in order:
-#   R1  all three nodes register their derived reservation key at startup
-#   R2  the reservation is Write Exclusive – All Registrants, and every node
-#       can write concurrently under it (this is genuine active/active)
-#   R3  a partitioned node's key is preempted by a survivor
-#   R4  the preempted node's raw device write fails at the device itself
-#       (EBADE), not merely at the metadata layer
-#   R5  the generation bump followed the confirmed preempt
-#   R6  survivors keep writing throughout
-#   R7  reservation state survives: the fenced node re-registers on restart
-#       and becomes writable again
-#   R8  a volume detach/reattach cycle does not silently leave a node
-#       registered-but-unable-to-write, nor writable-but-unregistered
-#   R9  a confirmed preempt is exactly the invariant-4 proof arena
-#       reclamation needs (docs/TODO-hardening.md § 6): once R3-R5 confirm
-#       n1 is preempted AND fenced, pkg/fencing.Controller must release its
-#       arena — this is the one fencing mode where that reclaim is safe to
-#       fire, unlike the docker/single-signal case chaos-arena-reclaim.sh's
-#       R4 covers.
+#   - all three nodes register their derived reservation key at startup
+#   - the reservation is Write Exclusive – All Registrants, and every node
+#     can write concurrently under it (this is genuine active/active)
+#   - a partitioned node's key is preempted by a survivor
+#   - the preempted node's raw device write fails at the device itself
+#     (EBADE), not merely at the metadata layer
+#   - the generation bump followed the confirmed preempt
+#   - survivors keep writing throughout
+#   - reservation state survives: the fenced node re-registers on restart
+#     and becomes writable again
+#   - a volume detach/reattach cycle does not silently leave a node
+#     registered-but-unable-to-write, nor writable-but-unregistered
+#   - a confirmed preempt is exactly the device-confirmed quiescence proof
+#     arena reclamation needs: once the partition/preempt/fence checks above
+#     confirm n1 is preempted AND fenced, pkg/fencing.Controller must release
+#     its arena — this is the one fencing mode where that reclaim is safe to
+#     fire, unlike the docker/single-signal case chaos-arena-reclaim.sh
+#     covers.
 #
 # This is AWS-only and cannot be moved to Docker: loopback devices support no
 # NVMe reservation commands at all. It is the only script that exercises
@@ -299,8 +299,8 @@ else
 fi
 
 log "======== R7: n1 rejoins — registration is re-established on restart ========"
-# The lifecycle question item 9 records: a preempted node reuses its derived
-# key rather than minting a fresh one. What makes reuse safe is that the node
+# A preempted node reuses its derived reservation key rather than minting a
+# fresh one. What makes reuse safe is that the node
 # must restart to regain access, and a restart re-reads its fencing
 # generation — the key is not what separates epochs.
 runcmd "$N1" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >/dev/null 2>&1

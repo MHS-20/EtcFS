@@ -343,8 +343,8 @@ for d in json.load(sys.stdin).get('blockdevices', []):
           for k in \$(seq 1 5); do sudo umount /mnt/etcfuse 2>/dev/null && break; sleep 1; done
           sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
           sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=$CHAOS_LEASE_TTL $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
-          # A restart right after a partition heals (this is R7's exact
-          # case) can legitimately need this long: the node's own local etcd
+          # A restart right after a partition heals can legitimately need
+          # this long: the node's own local etcd
           # has to rejoin raft and the client has to reconnect and ride out a
           # leader election before it opens the socket — observed taking
           # ~15s in a real run (DeadlineExceeded/leader-changed retries in

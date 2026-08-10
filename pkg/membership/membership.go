@@ -127,9 +127,7 @@ func (m *Manager) LeaveUngraceful(ctx context.Context) {
 // Restricted to reclaiming a FENCED node's arena — fromNode must already have
 // a bumped fencing generation (gen:<fromNode> > 0). This is not an arbitrary
 // restriction: it is the one precondition under which reassignment is
-// actually safe. Kleppmann's stale-write analysis
-// (docs/architecture/storage/kleppmann-stale-write-analysis.md § Remaining
-// Exposure) identifies moving an arena away from a live, healthy node as
+// actually safe. Moving an arena away from a live, healthy node is
 // unclosable by any guard — both the old and new owner would be unfenced, so
 // no CAS check has anything to reject, and the two could both write into the
 // same range. A fencing-generation check turns that into a closed case: once
@@ -138,12 +136,12 @@ func (m *Manager) LeaveUngraceful(ctx context.Context) {
 // *metadata.Store) already prevents it from writing anywhere, arenaID
 // included, so reassigning its arena to a live node cannot collide with it.
 //
-// This does NOT address invariant 4 from the same analysis — reissuing an
-// arena still requires no proof of quiescence beyond the generation bump,
-// which is a real signal (the fenced node cannot commit further writes) but
-// not a guarantee its kernel has stopped issuing them at the block-device
-// level. That gap is unchanged by this guard; see
-// docs/TODO-hardening.md § 6 (arena reclamation, invariant 4).
+// This does NOT provide full proof of quiescence — reissuing an arena still
+// requires no proof of quiescence beyond the generation bump, which is a
+// real signal (the fenced node cannot commit further writes) but not a
+// guarantee its kernel has stopped issuing them at the block-device level.
+// That gap is unchanged by this guard: arena reclamation still has no
+// device-confirmed quiescence check.
 func (m *Manager) RebalanceArena(ctx context.Context, fromNode, toNode string, arenaID uint64) error {
 	fromKey := metadata.ArenaOwnerKey(fromNode, arenaID)
 	fromVal, err := m.Store.Get(ctx, fromKey)

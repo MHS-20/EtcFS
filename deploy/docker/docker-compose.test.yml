@@ -1,4 +1,4 @@
-# Phase 2 end-to-end test environment.
+# End-to-end test environment.
 #
 # Usage:
 #   docker compose -f deploy/docker/docker-compose.test.yml up --build --abort-on-container-exit

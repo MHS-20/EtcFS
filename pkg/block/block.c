@@ -6,7 +6,7 @@
  * enforced at the API level — mismatched offsets/lengths/buffers return
  * -EINVAL immediately.
  *
- * Future (Phase 6): replace synchronous pread/pwrite with io_uring batched
+ * Future work: replace synchronous pread/pwrite with io_uring batched
  * I/O for lower latency and higher concurrency.
  */
 

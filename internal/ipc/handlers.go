@@ -577,7 +577,6 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 // answering "always free / always granted" left fcntl() locks excluding nothing
 // at all, not even between two processes on one node.  Leaving them unwired
 // gives fcntl() the same node-local-correct behavior flock() already has.
-// See docs/architecture/metadata/posix-lock-operations.md.
 
 // allocInode reserves an inode number from etcd.
 //

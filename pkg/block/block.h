@@ -41,9 +41,9 @@ size_t etcfs_block_get_total_sectors(const struct etcfs_block_dev *dev);
 void *etcfs_block_alloc_buffer(const struct etcfs_block_dev *dev, size_t size);
 
 /*
- * Synchronous I/O (Phase 0–5).
+ * Synchronous I/O.
  *
- * Phase 6+: these are replaced with io_uring batched submission.
+ * Future work: replace these with io_uring batched submission.
  */
 
 /* Read from a raw byte offset on the block device. */

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase 2 end-to-end test: seed etcd → start Go backend → mount FUSE → verify reads.
+# End-to-end test: seed etcd → start Go backend → mount FUSE → verify reads.
 #
 # Usage:
 #   ETCD_ENDPOINTS=http://localhost:2379 ./test/e2e/run-phase2.sh

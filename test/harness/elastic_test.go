@@ -356,19 +356,22 @@ func TestElastic_RebalanceIdempotent(t *testing.T) {
 	assert.Zero(t, cluster.checkAllInvariants())
 }
 
-// ---- Fault injection during join/leave (TODO-hardening.md item 2) ----
+// ---- Fault injection during join/leave ----
 //
 // These are the cheap, deterministic equivalent of two of the four
-// scripts/test/chaos-elastic-fault-injection.sh scenarios (FJ1, FJ3). The
-// other two (FJ2: partition mid-join, FJ4: kill a survivor while a
-// different node is mid-join) have no meaningful equivalent against
-// MockStore/membership.Manager — FJ2 needs a real self-fencing watchdog
-// process to observe, and FJ4 needs a real daemon crash affecting a real
-// FUSE mount, neither of which the harness's Join()/LeaveGraceful()
-// abstraction models. Both are chaos-script-only; see the report.
+// fault-injection scenarios exercised by the chaos scripts: killing a
+// joining node before its first write, and bumping a leaving node's
+// generation mid-leave. The other two (partitioning a joining node mid-join,
+// killing a survivor while a different node is mid-join) have no meaningful
+// equivalent against MockStore/membership.Manager — partitioning mid-join
+// needs a real self-fencing watchdog process to observe, and killing a
+// survivor needs a real daemon crash affecting a real FUSE mount, neither of
+// which the harness's Join()/LeaveGraceful() abstraction models. Both are
+// chaos-script-only.
 
-// TestElastic_JoinInterruptedBeforeArena is the harness equivalent of FJ1:
-// a node's daemon dies after registering membership but before its first
+// TestElastic_JoinInterruptedBeforeArena is the harness equivalent of the
+// join-interrupted chaos scenario: a node's daemon dies after registering
+// membership but before its first
 // write (arena acquisition is lazy — see pkg/arena/allocator.go,
 // AcquireArena is only called from handleWriteBlock, not at startup — so
 // "before FUSE mount" and "before any write" are the same instant from the
@@ -402,7 +405,8 @@ func TestElastic_JoinInterruptedBeforeArena(t *testing.T) {
 }
 
 // TestElastic_GenerationBumpDuringGracefulLeave is the harness equivalent
-// of FJ3: a node's fencing generation is bumped (as the fencing controller
+// of the generation-bump-during-leave chaos scenario: a node's fencing
+// generation is bumped (as the fencing controller
 // would on a lease expiry) while it is in the middle of leaving gracefully.
 //
 // Caveat, stated plainly: MockStore has no SetGuard/guard-enforcement

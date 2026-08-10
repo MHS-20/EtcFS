@@ -174,7 +174,7 @@ int etcfs_run(struct etcfs_context *ctx)
     if (ctx->volume_id) {
         ctx->block_fd = -1;
         struct etcfs_block_dev *block_dev = etcfs_block_open(ctx->volume_id);
-        (void) block_dev; /* Phase 0: access through ctx->block_fd when I/O is implemented */
+        (void) block_dev; /* access through ctx->block_fd when I/O is implemented */
         etcfs_log(ETCFS_LOG_WARN, "block device not available (read-only mode)");
     }
 
