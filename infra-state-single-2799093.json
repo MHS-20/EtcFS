@@ -1,0 +1,28 @@
+{
+  "cluster_name": "chaos-single-2799093",
+  "region": "eu-west-1",
+  "az": "eu-west-1a",
+  "key_name": "etcfuse-keypair",
+  "vpc_id": "vpc-be569ac7",
+  "sg_id": "sg-0552988434b3f7b44",
+  "subnet_id": "subnet-6570782d",
+  "ami_id": "ami-062a8901a5ddcf280",
+  "volume_id": "vol-0480c24c5499b1541",
+  "compute_ips": [
+    "172.31.21.170",
+    "172.31.16.185",
+    "172.31.17.219"
+  ],
+  "compute_public_ips": [
+    "18.201.146.246",
+    "54.74.163.142",
+    "3.254.59.144"
+  ],
+  "compute_instance_ids": [
+    "i-0062f61c4ce0e52aa",
+    "i-04f3a5f71007e68fa",
+    "i-05275552ad5399360"
+  ],
+  "etcd_endpoints": "https://172.31.21.170:2379,https://172.31.16.185:2379,https://172.31.17.219:2379",
+  "created_at": "2026-08-10T17:55:53+0200"
+}

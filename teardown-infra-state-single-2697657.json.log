@@ -1,0 +1,63 @@
+[16:52:47] === EtcFS Infrastructure Teardown ===
+[16:52:48] Volume:        vol-0f727b7b2b31e931c
+[16:52:48] Security Grp:  sg-0d7c9b802dc87e791
+[16:52:48] Nodes:         3
+[16:52:48] Terminating instances...
+{
+    "TerminatingInstances": [
+        {
+            "InstanceId": "i-0a087d60121eafbc5",
+            "CurrentState": {
+                "Code": 32,
+                "Name": "shutting-down"
+            },
+            "PreviousState": {
+                "Code": 16,
+                "Name": "running"
+            }
+        }
+    ]
+}
+{
+    "TerminatingInstances": [
+        {
+            "InstanceId": "i-035395e49954f5e3f",
+            "CurrentState": {
+                "Code": 32,
+                "Name": "shutting-down"
+            },
+            "PreviousState": {
+                "Code": 16,
+                "Name": "running"
+            }
+        }
+    ]
+}
+{
+    "TerminatingInstances": [
+        {
+            "InstanceId": "i-0a053ab1114a2e543",
+            "CurrentState": {
+                "Code": 32,
+                "Name": "shutting-down"
+            },
+            "PreviousState": {
+                "Code": 16,
+                "Name": "running"
+            }
+        }
+    ]
+}
+[16:52:51] Waiting for termination...
+[16:55:25] Instances terminated
+[16:55:25] Waiting for volume to detach...
+[16:55:27] Volume vol-0f727b7b2b31e931c deletion requested
+[16:55:27] Volume deleted
+[16:55:27] Deleting security group sg-0d7c9b802dc87e791...
+{
+    "Return": true,
+    "GroupId": "sg-0d7c9b802dc87e791"
+}
+[16:55:28] Security group sg-0d7c9b802dc87e791 deleted
+[16:55:28] 
+[16:55:28] === EtcFS teardown complete ===

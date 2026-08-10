@@ -394,6 +394,12 @@ EOF
         ok "fence_pending:n3 recorded (~${waited}s) — the watch path saw the expiry"
     else
         bad "fence_pending:n3 never appeared after ${deadline}s — cannot proceed with R4"
+        log "  diagnostics: membership + generation state, and n1/n2 controller logs"
+        etcdctl_on get --prefix "membership:" 2>&1 | while IFS= read -r line; do log "    [membership] $line"; done
+        etcdctl_on get --prefix "gen:" 2>&1 | while IFS= read -r line; do log "    [gen] $line"; done
+        for ip in "$N1" "$N2"; do
+            runcmd "$ip" "grep -E 'fencing|retrying|node fenced|membership' /tmp/meta.log 2>/dev/null | tail -25" 2>/dev/null | while IFS= read -r line; do log "    [$ip] $line"; done
+        done
         aws iam delete-role-policy --role-name etcfs-nodes --policy-name etcfs-deny-detach-test >/dev/null 2>&1
         runcmd "$N3" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >/dev/null 2>&1
         return
