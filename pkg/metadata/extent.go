@@ -14,9 +14,11 @@ import (
 // block device.
 //
 // Extents live under one key per extent, `extent:<ino>/<chunk>`, with the
-// value encoded as `<logical_off>,<disk_off>,<length>,<generation>`.  The
-// generation is the writer's fencing generation at commit time; the scrubber
-// cross-checks it to spot writes from a node that was fenced mid-flight.
+// value encoded as
+// `<logical_off>,<disk_off>,<length>,<generation>,<sequence>,<node>`.  The
+// generation is the writer's fencing generation at commit time and node is the
+// writer itself; the scrubber needs both, since a generation is per-node and
+// means nothing without knowing whose it is.
 //
 // This file is the single owner of that encoding.  Nothing outside it should
 // format or parse an extent key or value by hand.
@@ -40,6 +42,12 @@ type Extent struct {
 	// and it would then win over a genuinely newer extent overlapping it.
 	//
 	Seq uint64
+
+	// Node is the node ID that wrote the extent.  Without it a stamped
+	// generation cannot be compared against anything: generations are per-node,
+	// so the scrubber has no way to tell an extent written at generation 3 by a
+	// node now at 3 from one written by a node now at 7.
+	Node string
 
 	LogOff  uint64
 	DiskOff uint64
@@ -88,7 +96,7 @@ func InoFromExtentKey(key string) uint64 {
 
 // Encode renders the extent in its stored form.  Key is not part of the value.
 func (e Extent) Encode() string {
-	return fmt.Sprintf("%d,%d,%d,%d,%d", e.LogOff, e.DiskOff, e.Length, e.Gen, e.Seq)
+	return fmt.Sprintf("%d,%d,%d,%d,%d,%s", e.LogOff, e.DiskOff, e.Length, e.Gen, e.Seq, e.Node)
 }
 
 // Ino returns the inode the extent belongs to, derived from its key.
@@ -104,15 +112,19 @@ func (e Extent) WithinDisk(start, end uint64) bool {
 }
 
 // DecodeExtent parses a stored extent key/value pair.  Returns ok=false unless
-// the value is five comma-separated integers, so a corrupt record is skipped
-// rather than silently read as a zero-length extent at disk offset 0.
+// the value is five integers followed by the writer's node ID, so a corrupt
+// record is skipped rather than silently read as a zero-length extent at disk
+// offset 0.
+//
+// The node ID is taken as the whole remainder, so one containing a comma still
+// round-trips.
 func DecodeExtent(key string, value []byte) (Extent, bool) {
-	parts := strings.Split(string(value), ",")
-	if len(parts) != 5 {
+	parts := strings.SplitN(string(value), ",", 6)
+	if len(parts) != 6 {
 		return Extent{}, false
 	}
 	var fields [5]uint64
-	for i, p := range parts {
+	for i, p := range parts[:5] {
 		v, err := strconv.ParseUint(p, 10, 64)
 		if err != nil {
 			return Extent{}, false
@@ -122,7 +134,7 @@ func DecodeExtent(key string, value []byte) (Extent, bool) {
 	_, chunk, _ := ParseExtentKey(key)
 	return Extent{
 		Key: key, Chunk: chunk, Seq: fields[4], LogOff: fields[0], DiskOff: fields[1],
-		Length: fields[2], Gen: fields[3],
+		Length: fields[2], Gen: fields[3], Node: parts[5],
 	}, true
 }
 
@@ -200,6 +212,7 @@ func SplitAround(old Extent, start, end uint64) (head, tail *Extent) {
 			Length:  start - old.LogOff,
 			Gen:     old.Gen,
 			Seq:     old.Seq,
+			Node:    old.Node,
 		}
 	}
 	if end < old.End() {
@@ -210,6 +223,7 @@ func SplitAround(old Extent, start, end uint64) (head, tail *Extent) {
 			Length:  old.Length - skip,
 			Gen:     old.Gen,
 			Seq:     old.Seq,
+			Node:    old.Node,
 		}
 	}
 	return head, tail
@@ -287,7 +301,7 @@ func (s *Store) AppendExtent(ctx context.Context, ino, logicalOff, diskOff, leng
 	if err != nil {
 		return err
 	}
-	ext := Extent{LogOff: logicalOff, DiskOff: diskOff, Length: length, Gen: generation, Seq: chunk}
+	ext := Extent{LogOff: logicalOff, DiskOff: diskOff, Length: length, Gen: generation, Seq: chunk, Node: s.nodeID}
 	if _, err := s.Put(ctx, ExtentKey(ino, chunk), []byte(ext.Encode())); err != nil {
 		return fmt.Errorf("append extent ino %d: %w", ino, err)
 	}

@@ -32,8 +32,8 @@ func TestScrub_Collision(t *testing.T) {
 	ctx := t.Context()
 
 	// Two extents claiming the same disk_off
-	store.kv["extent:100/0"] = []byte("0,4096,4096,1,0")
-	store.kv["extent:200/0"] = []byte("0,4096,4096,1,0") // same disk_off!
+	store.kv["extent:100/0"] = []byte("0,4096,4096,1,0,node-A")
+	store.kv["extent:200/0"] = []byte("0,4096,4096,1,0,node-A") // same disk_off!
 
 	results := scrubber.CheckExtentCollisions(ctx)
 	require.Len(t, results, 1, "should detect one collision")
@@ -48,7 +48,7 @@ func TestScrub_RangeViolation(t *testing.T) {
 	ctx := t.Context()
 
 	// Extent far beyond arena range
-	store.kv["extent:300/0"] = []byte("0,1099511627776,4096,1,0") // 1 TB + 4096
+	store.kv["extent:300/0"] = []byte("0,1099511627776,4096,1,0,node-A") // 1 TB + 4096
 
 	results := scrubber.CheckRangeValidity(ctx)
 	assert.GreaterOrEqual(t, len(results), 1, "should detect out-of-range extent")
@@ -61,7 +61,7 @@ func TestScrub_Orphan(t *testing.T) {
 	ctx := t.Context()
 
 	// Extent exists but inode doesn't
-	store.kv["extent:999/0"] = []byte("0,8192,4096,1,0")
+	store.kv["extent:999/0"] = []byte("0,8192,4096,1,0,node-A")
 
 	results := scrubber.CheckOrphanExtents(ctx)
 	require.Len(t, results, 1, "should detect one orphan")
@@ -71,18 +71,34 @@ func TestScrub_Orphan(t *testing.T) {
 
 // ---- C8.4: Scrubber detects generation mismatch ----
 
-func TestScrub_GenerationMismatch(t *testing.T) {
+// An extent may not carry a generation its writer has never reached: every
+// commit is guarded by that generation, so one above it means the guard let
+// through a write it should have rejected.
+func TestScrub_GenerationFromTheFutureIsAnomalous(t *testing.T) {
 	scrubber, store := newTestScrubber(t)
 	ctx := t.Context()
 
-	// Set current generation
-	store.kv["gen:scrub-node"] = []byte("7")
-
-	// Extent stamped with old generation
-	store.kv["extent:400/0"] = []byte("0,16384,4096,3,0") // gen=3
+	store.kv["gen:node-A"] = []byte("3")
+	store.kv["extent:400/0"] = []byte("0,16384,4096,9,0,node-A")
 
 	results := scrubber.CheckGenerationConsistency(ctx)
 	assert.GreaterOrEqual(t, len(results), 1, "should detect generation mismatch")
+}
+
+// The false positive the check used to produce on every healthy node: an
+// extent written before its node was fenced carries the older generation, and
+// so does every extent written by every node that was never fenced at all.
+func TestScrub_ExtentsOlderThanTheirNodesFenceAreNotAnomalies(t *testing.T) {
+	scrubber, store := newTestScrubber(t)
+	ctx := t.Context()
+
+	store.kv["gen:node-A"] = []byte("7") // fenced repeatedly
+	store.kv["gen:node-B"] = []byte("0") // never fenced
+	store.kv["extent:400/0"] = []byte("0,16384,4096,3,0,node-A")
+	store.kv["extent:401/0"] = []byte("0,20480,4096,0,0,node-B")
+
+	assert.Empty(t, scrubber.CheckGenerationConsistency(ctx),
+		"extents predating a fence are ordinary data")
 }
 
 // ---- C8.5: Scrubber detects nlink mismatch ----
@@ -129,7 +145,7 @@ func TestScrub_SurviveRestart(t *testing.T) {
 	scrubber1 := scrub.New(store, "node-a", 10*time.Millisecond, testLogger{t})
 	ctx := t.Context()
 
-	store.kv["extent:700/0"] = []byte("0,28672,4096,1,0")
+	store.kv["extent:700/0"] = []byte("0,28672,4096,1,0,node-A")
 	results1 := scrubber1.CheckOrphanExtents(ctx)
 	assert.Len(t, results1, 1)
 

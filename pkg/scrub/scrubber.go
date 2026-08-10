@@ -355,9 +355,20 @@ func (s *Scrubber) CheckRangeValidity(ctx context.Context) []Result {
 	return results
 }
 
-// checkGenerationConsistency detects extents with stale fencing generations.
+// CheckGenerationConsistency detects extents stamped with a generation their
+// writer has never reached.
+//
+// The stamp is the writer's fencing generation at commit time, and every commit
+// is guarded by that generation, so an extent can never legitimately carry one
+// above its writer's current value.  One that does means the guard let a write
+// through it should have rejected, or the record was written outside the daemon.
+//
+// It deliberately does *not* flag extents stamped below the current generation.
+// Those are simply older than the node's last fence, which is what every extent
+// written before a fence looks like.  The check used to compare against the
+// maximum generation across the whole cluster, so one node ever being fenced
+// turned every extent written by every other node into an anomaly.
 func (s *Scrubber) CheckGenerationConsistency(ctx context.Context) []Result {
-	// Read all known node generations
 	nodeGens := make(map[string]uint64)
 	genKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixGen)
 	for _, kv := range genKvs {
@@ -366,28 +377,22 @@ func (s *Scrubber) CheckGenerationConsistency(ctx context.Context) []Result {
 		_, _ = fmt.Sscanf(string(kv.Value), "%d", &n)
 		nodeGens[nodeID] = n
 	}
-	maxGen := uint64(0)
-	for _, g := range nodeGens {
-		if g > maxGen {
-			maxGen = g
-		}
-	}
 
-	var results []Result
 	extKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixExtent)
+	results := make([]Result, 0, len(extKvs))
 	for _, ext := range metadata.DecodeExtents(extKvs) {
-		ino, gen := ext.Ino(), ext.Gen
-
-		if gen < maxGen {
-			results = append(results, Result{
-				Type: "generation",
-				Detail: fmt.Sprintf("extent %s stamped gen=%d, max_cluster_gen=%d",
-					ext.Key, gen, maxGen),
-				Ino:     ino,
-				DiskOff: ext.DiskOff,
-				Key:     ext.Key,
-			})
+		current, known := nodeGens[ext.Node]
+		if !known || ext.Gen <= current {
+			continue
 		}
+		results = append(results, Result{
+			Type: "generation",
+			Detail: fmt.Sprintf("extent %s stamped gen=%d, but %s has only reached %d",
+				ext.Key, ext.Gen, ext.Node, current),
+			Ino:     ext.Ino(),
+			DiskOff: ext.DiskOff,
+			Key:     ext.Key,
+		})
 	}
 	return results
 }

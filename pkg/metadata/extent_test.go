@@ -18,7 +18,7 @@ func TestExtentRoundTrip(t *testing.T) {
 }
 
 func TestDecodeExtentRejectsGarbage(t *testing.T) {
-	for _, v := range []string{"", "1,2,3", "1,2,3,4", "1,2,3,4,5,6", "1,2,3,4,x", "-1,2,3,4,5"} {
+	for _, v := range []string{"", "1,2,3", "1,2,3,4", "1,2,3,4,5", "1,2,3,4,x,node-A", "-1,2,3,4,5,node-A"} {
 		if _, ok := DecodeExtent("extent:1/0", []byte(v)); ok {
 			t.Errorf("accepted malformed value %q", v)
 		}
@@ -40,10 +40,10 @@ func TestParseExtentKey(t *testing.T) {
 // lexicographically (chunk 10 sorts before chunk 2).
 func TestDecodeExtentsSortsByLogicalOffset(t *testing.T) {
 	kvs := []*mvccpb.KeyValue{
-		{Key: []byte("extent:1/0"), Value: []byte("0,0,4096,1,0")},
-		{Key: []byte("extent:1/1"), Value: []byte("4096,4096,4096,1,1")},
-		{Key: []byte("extent:1/10"), Value: []byte("40960,40960,4096,1,10")},
-		{Key: []byte("extent:1/2"), Value: []byte("8192,8192,4096,1,2")},
+		{Key: []byte("extent:1/0"), Value: []byte("0,0,4096,1,0,node-A")},
+		{Key: []byte("extent:1/1"), Value: []byte("4096,4096,4096,1,1,node-A")},
+		{Key: []byte("extent:1/10"), Value: []byte("40960,40960,4096,1,10,node-A")},
+		{Key: []byte("extent:1/2"), Value: []byte("8192,8192,4096,1,2,node-A")},
 		{Key: []byte("extent:1/bad"), Value: []byte("nonsense")},
 	}
 	got := DecodeExtents(kvs)
@@ -64,9 +64,9 @@ func TestDecodeExtentsSortsByLogicalOffset(t *testing.T) {
 // alone let the same file read back differently from one call to the next.
 func TestDecodeExtentsPutsTheNewestWriteFirst(t *testing.T) {
 	kvs := []*mvccpb.KeyValue{
-		{Key: []byte("extent:1/0"), Value: []byte("0,4096,4096,1,2")},
-		{Key: []byte("extent:1/7"), Value: []byte("0,8192,4096,1,9")},
-		{Key: []byte("extent:1/3"), Value: []byte("0,12288,4096,1,5")},
+		{Key: []byte("extent:1/0"), Value: []byte("0,4096,4096,1,2,node-A")},
+		{Key: []byte("extent:1/7"), Value: []byte("0,8192,4096,1,9,node-A")},
+		{Key: []byte("extent:1/3"), Value: []byte("0,12288,4096,1,5,node-A")},
 	}
 	for i := 0; i < 32; i++ {
 		got := DecodeExtents(kvs)

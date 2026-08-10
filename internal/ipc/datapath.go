@@ -170,7 +170,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		// against each other.
 		ext := metadata.Extent{
 			LogOff: offset + pos, DiskOff: r.DiskOff, Length: extLen,
-			Gen: gen, Seq: seq,
+			Gen: gen, Seq: seq, Node: s.store.NodeID(),
 		}
 		if s.wal != nil {
 			_ = s.wal.Append(&wal.Entry{

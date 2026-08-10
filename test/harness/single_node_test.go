@@ -138,7 +138,7 @@ func TestSingleNode_MaxFileSize(t *testing.T) {
 	store := s.store
 	for i := 0; i < 1000; i++ {
 		extKey := fmt.Sprintf("extent:%d/%d", ino, i)
-		extVal := fmt.Sprintf("%d,%d,%d,%d,%d", i*4096, i*4096+1000000, 4096, 1, i)
+		extVal := fmt.Sprintf("%d,%d,%d,%d,%d,%s", i*4096, i*4096+1000000, 4096, 1, i, "node-A")
 		_, err := store.Put(ctx, extKey, []byte(extVal))
 		require.NoError(t, err)
 	}

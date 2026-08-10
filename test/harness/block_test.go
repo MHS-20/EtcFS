@@ -73,7 +73,7 @@ func TestBlock_DataThenMetadata(t *testing.T) {
 
 	// Step 3: Store extent mapping separately
 	extKey := fmt.Sprintf("extent:%d/0", ino)
-	extVal := fmt.Sprintf("%d,%d,%d,%d,%d", 0, diskOff, length, generation, 0)
+	extVal := fmt.Sprintf("%d,%d,%d,%d,%d,%s", 0, diskOff, length, generation, 0, "node-A")
 	_, err := store.Put(ctx, extKey, []byte(extVal))
 	require.NoError(t, err)
 
