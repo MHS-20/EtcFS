@@ -373,8 +373,8 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         rm -f "$STATE_FILE"
         go build -o "$PROJECT_ROOT/bin/etcfuse-meta" "$PROJECT_ROOT/cmd/etcfuse-meta/" 2>&1 | tail -1
         tar czf /tmp/chaos.tar.gz -C "$PROJECT_ROOT" cmd/etcfuse pkg/fuse pkg/block
-        ETCFS_STATE="$STATE_FILE" ETCFS_CLUSTER="$TAG" ETCFS_COMPUTE_NODES=3 ETCFS_INSTANCE_TYPE=t3.medium \
-          ETCFS_VOLUME_SIZE=30 bash scripts/infra/create-infra.sh 2>&1 | tail -3
+        ETCFS_STATE="$STATE_FILE" ETCFS_CLUSTER="$TAG" ETCFS_COMPUTE_NODES=3 \
+          bash scripts/infra/create-infra.sh 2>&1 | tail -3
 
         N1=$(jq -r '.compute_public_ips[0]' "$STATE_FILE")
         N2=$(jq -r '.compute_public_ips[1]' "$STATE_FILE")

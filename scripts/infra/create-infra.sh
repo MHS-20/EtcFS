@@ -14,7 +14,7 @@
 # Idempotent: skips already-created resources.
 #
 # Usage:
-#   ETCFS_COMPUTE_NODES=3 ETCFS_VOLUME_SIZE=100 ./create-infra.sh
+#   ETCFS_COMPUTE_NODES=3 ETCFS_VOLUME_SIZE=10 ./create-infra.sh
 
 set -euo pipefail
 

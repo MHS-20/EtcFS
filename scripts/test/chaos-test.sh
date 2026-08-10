@@ -43,8 +43,8 @@ provision() {
     log "  Provisioning cluster=$TAG (state=$STATE_FILE)..."
     cd "$PROJECT_ROOT" || exit
     rm -f "$STATE_FILE"
-    ETCFS_STATE="$STATE_FILE" ETCFS_CLUSTER="$TAG" ETCFS_COMPUTE_NODES=3 ETCFS_INSTANCE_TYPE=t3.medium \
-      ETCFS_VOLUME_SIZE=30 bash scripts/infra/create-infra.sh 2>&1 | tail -3
+    ETCFS_STATE="$STATE_FILE" ETCFS_CLUSTER="$TAG" ETCFS_COMPUTE_NODES=3 \
+      bash scripts/infra/create-infra.sh 2>&1 | tail -3
 
     N1=$(jq -r '.compute_public_ips[0]' "$STATE_FILE")
     N2=$(jq -r '.compute_public_ips[1]' "$STATE_FILE")
