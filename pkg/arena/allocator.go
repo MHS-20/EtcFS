@@ -39,6 +39,9 @@ type Allocator struct {
 	store  *metadata.Store
 	arenas []*Arena
 
+	// doubleFrees counts blocks freed while already free — see freeLocked.
+	doubleFrees uint64
+
 	// deviceSize bounds the arenas that may be handed out.  Zero means unknown
 	// — a metadata-only service with no device attached — and no arena is
 	// refused for size in that case.
@@ -59,6 +62,13 @@ type Arena struct {
 
 	// bitmap tracks allocated blocks.  bit=1 means allocated, bit=0 means free.
 	bitmap []uint64
+
+	// hint is where the next search starts, left where the last one finished.
+	// Without it every allocation rescanned the arena from block 0, so a
+	// nearly-full arena cost a full sweep per call and a fragmented one cost
+	// several.  It is only a hint: the search wraps, so nothing is missed if it
+	// points past free space that has since been returned.
+	hint uint64
 }
 
 // SetDeviceSize tells the allocator how large the shared device is, so it can
@@ -259,11 +269,33 @@ func (a *Allocator) freeLocked(diskOff uint64, size uint64) {
 		if diskOff >= ar.DiskStart && diskOff < ar.DiskEnd {
 			start := (diskOff - ar.DiskStart) / BlockSize
 			for i := uint64(0); i < blocks && start+i < BlocksPerArena; i++ {
+				// Freeing a block that is already free means two callers
+				// believe they own it, and the next allocation will hand a live
+				// range to a second writer.  The write path, the scrubber and
+				// the failed-allocation undo all call this, so the double free
+				// is worth naming where it happens rather than at the
+				// corruption it causes later.
+				if ar.isFree(start + i) {
+					a.doubleFrees++
+					continue
+				}
 				ar.markFree(start + i)
+			}
+			// Reuse what was just returned before sweeping forward again.
+			if start < ar.hint {
+				ar.hint = start
 			}
 			return
 		}
 	}
+}
+
+// DoubleFrees returns how many already-free blocks this allocator has been
+// asked to free.  Anything above zero is a bug in a caller.
+func (a *Allocator) DoubleFrees() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.doubleFrees
 }
 
 // Owns reports whether diskOff falls inside an arena this node currently holds.
@@ -461,7 +493,22 @@ func (a *Allocator) ReleaseEmptyArenas(ctx context.Context) ([]uint64, error) {
 // to a free-list or a rotating start hint if allocation ever shows up in a
 // profile.
 func (ar *Arena) findRun(max uint64) (start, length uint64) {
-	for i := uint64(0); i < BlocksPerArena; {
+	// Two passes: from the hint to the end, then from the start back to it, so
+	// a wrap costs no more than the single sweep this replaced.
+	if start, length = ar.findRunIn(ar.hint, BlocksPerArena, max); length > 0 {
+		ar.hint = start + length
+		return start, length
+	}
+	if start, length = ar.findRunIn(0, ar.hint, max); length > 0 {
+		ar.hint = start + length
+		return start, length
+	}
+	return 0, 0
+}
+
+// findRunIn searches [from, to) for a free run of at most max blocks.
+func (ar *Arena) findRunIn(from, to, max uint64) (start, length uint64) {
+	for i := from; i < to; {
 		if ar.bitmap[i/64] == ^uint64(0) {
 			i = (i/64 + 1) * 64 // whole word allocated
 			continue
@@ -471,7 +518,7 @@ func (ar *Arena) findRun(max uint64) (start, length uint64) {
 			continue
 		}
 		start = i
-		for length < max && i < BlocksPerArena && ar.isFree(i) {
+		for length < max && i < to && ar.isFree(i) {
 			length++
 			i++
 		}

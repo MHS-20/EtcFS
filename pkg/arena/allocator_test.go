@@ -169,3 +169,56 @@ func TestLiveRatioIsZeroWithNoArenas(t *testing.T) {
 		t.Errorf("LiveRatio with no arenas = %v, want 0", got)
 	}
 }
+
+// Freeing a block that is already free means two callers believe they own it,
+// and the next allocation hands a live range to a second writer. The write
+// path, the scrubber and the failed-allocation undo all reach this.
+func TestFreeCountsDoubleFrees(t *testing.T) {
+	a := NewAllocator("node-A", nil)
+	ar := fullArena(0)
+	a.arenas = append(a.arenas, ar)
+
+	a.Free(ar.DiskStart, BlockSize)
+	if got := a.DoubleFrees(); got != 0 {
+		t.Fatalf("freeing an allocated block counted %d double frees", got)
+	}
+	a.Free(ar.DiskStart, BlockSize)
+	if got := a.DoubleFrees(); got != 1 {
+		t.Errorf("freeing the same block twice counted %d double frees, want 1", got)
+	}
+}
+
+// Allocation used to restart its scan at block 0 every time, so a nearly-full
+// arena cost a sweep of the whole bitmap per call. The hint carries the search
+// forward, and wraps so nothing is missed.
+func TestAllocationResumesFromWhereItLeftOff(t *testing.T) {
+	ar := fullArena(0)
+	for i := uint64(0); i < 4; i++ {
+		ar.markFree(i)
+	}
+	ar.markFree(BlocksPerArena - 1)
+
+	// Each run is marked allocated as the allocator itself would.
+	take := func(max uint64) (uint64, uint64) {
+		start, length := ar.findRun(max)
+		for i := uint64(0); i < length; i++ {
+			ar.markAllocated(start + i)
+		}
+		return start, length
+	}
+
+	if start, length := take(2); start != 0 || length != 2 {
+		t.Fatalf("first run = (%d, %d), want (0, 2)", start, length)
+	}
+	if start, length := take(2); start != 2 || length != 2 {
+		t.Fatalf("second run = (%d, %d), want (2, 2)", start, length)
+	}
+	if start, length := take(1); start != BlocksPerArena-1 || length != 1 {
+		t.Fatalf("third run = (%d, %d), want the last block", start, length)
+	}
+	// Past the end, the search wraps rather than reporting the arena full.
+	ar.markFree(1)
+	if start, length := take(1); start != 1 || length != 1 {
+		t.Fatalf("wrapped run = (%d, %d), want (1, 1)", start, length)
+	}
+}
