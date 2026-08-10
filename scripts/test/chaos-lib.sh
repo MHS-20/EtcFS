@@ -139,6 +139,16 @@ if [[ "$MODE" == "docker" ]]; then
             echo "$addout" >> "$REPORT_DIR/chaos.log"
             initial_cluster=$(echo "$addout" | grep '^ETCD_INITIAL_CLUSTER=' | cut -d= -f2- | tr -d '"')
             [[ -n "$initial_cluster" ]] && break
+            # An add that succeeded but could not be read back — the cluster
+            # reported unhealthy on a later retry, say — leaves the member in
+            # place, and every retry then fails with "Peer URLs already
+            # exists".  The member list has everything the joiner needs, so
+            # rebuild the initial cluster from it rather than giving up.
+            if echo "$addout" | grep -q "Peer URLs already exists"; then
+                initial_cluster=$(docker exec etcfs-etcd1 etcdctl member list 2>/dev/null |
+                    awk -F', ' '$3 != "" && $4 != "" {print $3 "=" $4}' | paste -sd, -)
+                [[ -n "$initial_cluster" ]] && break
+            fi
             sleep 2
         done
         [[ -n "$initial_cluster" ]] || { logerr "  add_node $id: could not parse ETCD_INITIAL_CLUSTER from member add output after $attempt attempts"; return 1; }

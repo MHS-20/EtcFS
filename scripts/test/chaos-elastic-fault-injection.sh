@@ -62,7 +62,9 @@ ok()  { PASS=$((PASS+1)); log "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); log "  FAIL: $1"; }
 
 # arena_val <node_key> — raw etcd value at arena:<node>, empty if absent.
-arena_val() { etcdctl_on get "arena:$1" --print-value-only 2>/dev/null; }
+# Ownership is one key per arena — arena:<node>/<arena_id> — so a node's
+# holdings are a count over a prefix, not the value of a single key.
+arena_count() { etcdctl_on get --prefix "arena:$1/" --keys-only 2>/dev/null | grep -c "arena:$1/"; }
 gen_val()   { etcdctl_on get "gen:$1" --print-value-only 2>/dev/null | tr -d '[:space:]'; }
 member_id_for() { etcdctl_on member list 2>/dev/null | grep ", $1," | cut -d, -f1; }
 
@@ -367,6 +369,11 @@ run_fj2() {
     if [[ -z "$node4" ]]; then bad "node4 failed to join at all — cannot run FJ2"; return; fi
     ok "node4 joined normally ($node4)"
 
+    # A file to stat later.  The probe must not stat the mount root: the C
+    # daemon answers getattr for FUSE_ROOT_ID locally, without any IPC, so a
+    # partitioned node succeeds there and is right to.
+    writef "$node4" "fj5-before" "fj5-before.txt" >/dev/null 2>&1
+
     partition_node4 "$node4"
 
     # Watch the META daemon, not the FUSE mount.
@@ -505,8 +512,8 @@ run_fj3() {
 
     if ! writef "$node4" "fj3-data" "fj3-file.txt"; then bad "write from node4 failed before leave"; return; fi
 
-    local arena_before; arena_before=$(arena_val n4)
-    if [[ -z "$arena_before" ]]; then bad "node4 has no arena before it can leave (unexpected)"; return; fi
+    local arena_before; arena_before=$(arena_count n4)
+    if [[ "${arena_before:-0}" -eq 0 ]]; then bad "node4 has no arena before it can leave (unexpected)"; return; fi
 
     log "  starting graceful remove_node 4, bumping gen:n4 concurrently..."
     remove_node 4 &
@@ -518,27 +525,17 @@ run_fj3() {
     log "  bumped gen:n4 $gbefore -> $((gbefore + 1)) mid-leave"
     wait "$remove_pid"
 
-    # NOTE: production's real shutdown path (pkg/metadata.Membership.Run,
-    # what cmd/etcfuse-meta/main.go actually wires up on SIGTERM) only
-    # revokes the node's own lease-backed membership key. It never touches
-    # arena:<node_id> — that key isn't lease-bound at all (plain Put, see
-    # pkg/arena/allocator.go), and there is no code path anywhere that
-    # deletes it on departure, graceful or not. This is a pre-existing,
-    # already-documented gap (docs/architecture/storage/
-    # kleppmann-stale-write-analysis.md § Remaining Exposure: "arena space
-    # leaks on graceful leave"), not something this scenario's generation
-    # bump causes — so the correct assertion here is that the arena record
-    # is UNCHANGED by the leave, not that it's released. What the bump
-    # actually needs to prove is that remove_node's own steps (unmount,
-    # kill daemons, `member remove`) complete cleanly despite firing
-    # concurrently with a fencing event, not that arena reclamation happens
-    # (it doesn't exist yet).
+    # A graceful leave releases the node's arenas: main runs
+    # metadata.Membership.Leave after the IPC server has stopped, which is the
+    # node's own proof of quiescence.  The generation bump firing concurrently
+    # must not stop that — the release is the departing node's own work, not a
+    # fenced peer's.
     sleep 2
-    local arena_after; arena_after=$(arena_val n4)
-    if [[ "$arena_after" == "$arena_before" ]]; then
-        ok "arena:n4 unchanged by the leave (expected — no reclamation path exists yet, see comment above)"
+    local arena_after; arena_after=$(arena_count n4)
+    if [[ "${arena_after:-0}" -eq 0 ]]; then
+        ok "n4's $arena_before arena(s) released on graceful leave, despite the concurrent bump"
     else
-        bad "arena:n4 changed unexpectedly during leave: was '$arena_before', now '$arena_after'"
+        bad "n4 still owns $arena_after arena(s) after a graceful leave (was $arena_before)"
     fi
 
     local stray_locks; stray_locks=$(etcdctl_on get "lock:" --prefix --keys-only 2>/dev/null | xargs -I{} etcdctl_on get {} --print-value-only 2>/dev/null | grep -c '"n4"' || true)
@@ -654,6 +651,11 @@ run_fj5() {
     if [[ -z "$node4" ]]; then bad "node4 failed to join at all — cannot run FJ5"; return; fi
     ok "node4 joined normally with a 120s lease TTL ($node4)"
 
+    # A file to stat later.  The probe must not stat the mount root: the C
+    # daemon answers getattr for FUSE_ROOT_ID locally, without any IPC, so a
+    # partitioned node succeeds there and is right to.
+    writef "$node4" "fj5-before" "fj5-before.txt" >/dev/null 2>&1
+
     partition_node4 "$node4"
 
     if node4_meta_alive; then
@@ -684,7 +686,7 @@ run_fj5() {
     read -r dt rc <<< "$(timed_probe4 "echo probe > /mnt/etcfuse/fj5-probe.txt" "echo probe | sudo tee /mnt/etcfuse/fj5-probe.txt")"
     assert_bounded4 "write" "$dt" "$rc"
 
-    read -r dt rc <<< "$(timed_probe4 "stat /mnt/etcfuse" "stat /mnt/etcfuse")"
+    read -r dt rc <<< "$(timed_probe4 "stat /mnt/etcfuse/fj5-before.txt" "stat /mnt/etcfuse/fj5-before.txt")"
     assert_bounded4 "getattr" "$dt" "$rc"
 
     read -r dt rc <<< "$(timed_probe4 "ls /mnt/etcfuse" "ls /mnt/etcfuse")"
