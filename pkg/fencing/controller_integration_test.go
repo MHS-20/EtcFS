@@ -15,8 +15,6 @@ package fencing
 import (
 	"context"
 	"errors"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -26,28 +24,13 @@ import (
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/test/etcdtest"
 )
 
 func testController(t *testing.T, nodeID string) (*Controller, *metadata.Store, context.Context) {
 	t.Helper()
 
-	endpoints := os.Getenv("ETCD_ENDPOINTS")
-	if endpoints == "" {
-		endpoints = "http://localhost:2379"
-	}
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   strings.Split(endpoints, ","),
-		DialTimeout: 5 * time.Second,
-	})
-	require.NoError(t, err, "cannot connect to etcd at %s", endpoints)
-
-	t.Cleanup(func() {
-		cli.Delete(context.Background(), metadata.PrefixGen, clientv3.WithPrefix())
-		cli.Delete(context.Background(), metadata.PrefixMembership, clientv3.WithPrefix())
-		cli.Delete(context.Background(), metadata.PrefixFencePending, clientv3.WithPrefix())
-		cli.Delete(context.Background(), metadata.PrefixFenceClaim, clientv3.WithPrefix())
-		cli.Close()
-	})
+	cli := etcdtest.Client(t)
 
 	store := metadata.NewStore(cli, nodeID)
 	mem := metadata.NewMembership(cli, nodeID, "test-cluster", 10*time.Second)
@@ -142,17 +125,7 @@ func TestController_InstanceIDRoundTripsThroughMembershipValue(t *testing.T) {
 	// value, so the encoding written by Membership must be readable by the
 	// extractor. A silent mismatch here would disable detaching entirely
 	// while every test that stubs the value directly still passed.
-	endpoints := os.Getenv("ETCD_ENDPOINTS")
-	if endpoints == "" {
-		endpoints = "http://localhost:2379"
-	}
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   strings.Split(endpoints, ","),
-		DialTimeout: 5 * time.Second,
-	})
-	require.NoError(t, err)
-	defer cli.Close()
-	defer cli.Delete(context.Background(), metadata.PrefixMembership, clientv3.WithPrefix())
+	cli := etcdtest.Client(t)
 
 	ctx := context.Background()
 	mem := metadata.NewMembership(cli, "rt-node", "test-cluster", 10*time.Second)
