@@ -279,12 +279,80 @@ func (s *Store) AtomicUnlink(ctx context.Context, parent uint64, name string) er
 			clientv3.Compare(clientv3.ModRevision(direntKey), "=", direntKvs[0].ModRevision),
 			InodeUnchanged(ino, rev),
 		}
-		ops := []clientv3.Op{
-			DeleteDirent(parent, name),
-			s.unlinkInodeOp(rec),
-		}
+		ops := append([]clientv3.Op{DeleteDirent(parent, name)}, s.unlinkInodeOps(rec)...)
 		return s.Txn(ctx, cmps, ops, nil)
 	})
+}
+
+// AtomicRmdir removes an empty directory and its entry in one transaction.
+//
+// Emptiness is asserted inside the transaction rather than read beforehand.
+// etcd cannot express "no keys under this prefix" as a value comparison, but it
+// can compare a whole range: "every key under dirent:<ino>/ has creation
+// revision 0" is true only when the range is empty, since a key that exists has
+// a non-zero one.  A separate listing followed by a delete would let another
+// node create an entry in between and strand the subtree — the parent's name
+// gone, the children reachable by nothing.
+func (s *Store) AtomicRmdir(ctx context.Context, parent uint64, name string) error {
+	return retryCAS(ctx, fmt.Sprintf("atomic rmdir %d/%q", parent, name), func() (bool, error) {
+		fail := func(format string, args ...any) (bool, error) {
+			prefix := fmt.Sprintf("atomic rmdir %d/%q: ", parent, name)
+			return false, fmt.Errorf(prefix+format, args...)
+		}
+
+		direntKey := DirentKey(parent, name)
+		direntKvs, _, err := s.GetRevision(ctx, direntKey)
+		if err != nil {
+			return fail("%w", err)
+		}
+		if len(direntKvs) == 0 {
+			return fail("%w", ErrNotFound)
+		}
+		ino := DecodeUint64(direntKvs[0].Value)
+
+		rec, rev, err := s.GetInodeRev(ctx, ino)
+		if err != nil {
+			return fail("%w", err)
+		}
+		if rec == nil {
+			return fail("inode %d not found (%w)", ino, ErrNotFound)
+		}
+		if rec.Mode&S_IFMT != ModeDir {
+			return fail("%w", ErrNotDir)
+		}
+
+		cmps := []clientv3.Cmp{
+			clientv3.Compare(clientv3.ModRevision(direntKey), "=", direntKvs[0].ModRevision),
+			InodeUnchanged(ino, rev),
+			DirEmpty(ino),
+		}
+		ops := []clientv3.Op{
+			DeleteDirent(parent, name),
+			clientv3.OpDelete(InodeKey(ino)),
+		}
+		ok, err := s.Txn(ctx, cmps, ops, nil)
+		if err != nil {
+			return fail("%w", err)
+		}
+		if ok {
+			return true, nil
+		}
+		// Losing a revision comparison is contention worth retrying; an entry
+		// having appeared in the directory is the caller's answer.
+		entries, lerr := s.ListDirents(ctx, ino)
+		if lerr == nil && len(entries) > 0 {
+			return fail("%w", ErrNotEmpty)
+		}
+		return false, nil
+	})
+}
+
+// DirEmpty holds only when a directory has no entries.  A range comparison is
+// the only way to ask etcd this: every key under the prefix must have creation
+// revision 0, which no existing key does, so it is true exactly when the range
+// is empty.
+func DirEmpty(ino uint64) clientv3.Cmp {
+	return clientv3.Compare(clientv3.CreateRevision(DirentPrefix(ino)), "=", 0).WithPrefix()
 }
 
 // AtomicRename moves ino from oldParent/oldName to newParent/newName in a
@@ -385,12 +453,15 @@ func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName stri
 			if len(entries) > 0 {
 				return fail("target directory is not empty (%w)", ErrNotEmpty)
 			}
+			// The listing above is what produces ENOTEMPTY; this is what makes
+			// it safe, by refusing the rename if an entry appears in between.
+			cmps = append(cmps, DirEmpty(victimIno))
 		}
 		// Pinned like the dirent above: the link count written below is
 		// computed from this record, so a concurrent change to it has to abort
 		// the rename rather than be overwritten by it.
 		cmps = append(cmps, InodeUnchanged(victimIno, victimRev))
-		ops = append(ops, s.unlinkInodeOp(victim))
+		ops = append(ops, s.unlinkInodeOps(victim)...)
 	}
 
 	if err := s.commitRename(ctx, cmps, ops); err != nil {
@@ -406,13 +477,27 @@ func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName stri
 // orphans, which the scrubber reclaims on the node that owns their arena — the
 // only node that may, since its in-memory free list is rebuilt from exactly
 // those records.
-func (s *Store) unlinkInodeOp(rec *InodeRecord) clientv3.Op {
+func (s *Store) unlinkInodeOps(rec *InodeRecord) []clientv3.Op {
+	// A directory carries a fixed count of 2 for its whole life, so the count
+	// says nothing about whether it is still referenced: losing its one name
+	// removes it outright.  Decrementing instead would leave the record behind
+	// with a count no path can ever bring back to zero.
+	if rec.Mode&S_IFMT == ModeDir {
+		return []clientv3.Op{clientv3.OpDelete(InodeKey(rec.Ino))}
+	}
 	if rec.Nlink > 1 {
 		reduced := *rec
 		reduced.Nlink--
-		return clientv3.OpPut(InodeKey(rec.Ino), string(EncodeInode(&reduced)))
+		return []clientv3.Op{clientv3.OpPut(InodeKey(rec.Ino), string(EncodeInode(&reduced)))}
 	}
-	return clientv3.OpDelete(InodeKey(rec.Ino))
+	ops := []clientv3.Op{clientv3.OpDelete(InodeKey(rec.Ino))}
+	// A symlink's target lives in its own key, which nothing else references —
+	// leaving it behind leaks a key per deleted symlink, and no check looks for
+	// one.
+	if rec.Mode&S_IFMT == ModeSymlink {
+		ops = append(ops, clientv3.OpDelete(InodeSymlinkKey(rec.Ino)))
+	}
+	return ops
 }
 
 func (s *Store) commitRename(ctx context.Context, cmps []clientv3.Cmp, ops []clientv3.Op) error {

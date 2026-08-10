@@ -1431,3 +1431,58 @@ func TestIntegration_RefusedLinkLeavesNlinkAlone(t *testing.T) {
 	_, err = s.AtomicLink(ctx, parent, parent, "self")
 	require.ErrorIs(t, err, ErrPerm)
 }
+
+// ---- rmdir ----
+
+// Emptiness has to be asserted by the transaction that removes the directory.
+// Checked beforehand and committed afterwards, another node can create an entry
+// in between, and the subtree is stranded: the parent's name is gone and
+// nothing reaches the children.
+func TestIntegration_RmdirRefusesADirectoryFilledUnderIt(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent, child = 9700, 9701
+
+	_, err := s.AtomicCreateDir(ctx, RootIno, "rmdir-parent", parent, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateDir(ctx, parent, "victim", child, 0755, 1000, 1000)
+	require.NoError(t, err)
+
+	require.NoError(t, s.CreateDirent(ctx, child, "surprise", 9702))
+	require.ErrorIs(t, s.AtomicRmdir(ctx, parent, "victim"), ErrNotEmpty)
+
+	rec, err := s.GetInode(ctx, child)
+	require.NoError(t, err)
+	require.NotNil(t, rec, "a refused rmdir must leave the directory in place")
+
+	require.NoError(t, s.RemoveDirent(ctx, child, "surprise"))
+	require.NoError(t, s.AtomicRmdir(ctx, parent, "victim"))
+
+	rec, err = s.GetInode(ctx, child)
+	require.NoError(t, err)
+	assert.Nil(t, rec, "an emptied directory is removed outright, not decremented")
+
+	// A file is not a directory, whatever the caller asked for.
+	_, err = s.AtomicCreateFile(ctx, parent, "file", 9703, ModeFile|0644, 1000, 1000)
+	require.NoError(t, err)
+	require.ErrorIs(t, s.AtomicRmdir(ctx, parent, "file"), ErrNotDir)
+}
+
+// A symlink's target lives in a key of its own, which nothing else references
+// and no check looks for. Unlinking the symlink has to take it along.
+func TestIntegration_UnlinkRemovesTheSymlinkTarget(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent = 9800
+
+	_, err := s.AtomicCreateDir(ctx, RootIno, "symlink-unlink", parent, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateSymlink(ctx, parent, "link", 9801, "../target", 1000, 1000)
+	require.NoError(t, err)
+
+	require.NoError(t, s.AtomicUnlink(ctx, parent, "link"))
+
+	target, err := s.Get(ctx, InodeSymlinkKey(9801))
+	require.NoError(t, err)
+	assert.Nil(t, target, "the target key must go with the inode")
+}

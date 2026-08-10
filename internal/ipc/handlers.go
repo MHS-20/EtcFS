@@ -308,22 +308,7 @@ func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, erro
 	nameLen, _ := readU32(rest)
 	name := string(rest[4 : 4+nameLen])
 
-	ino, err := s.store.LookupDirent(ctx, parent, name)
-	if err != nil || ino == 0 {
-		return int32Resp(-2), nil
-	}
-	rec, err := s.store.GetInode(ctx, ino)
-	if err != nil || rec == nil || rec.Mode&metadata.ModeDir == 0 {
-		return int32Resp(-20), nil // ENOTDIR
-	}
-	// Check directory is empty
-	entries, _ := s.store.ListDirents(ctx, ino)
-	if len(entries) > 0 {
-		return int32Resp(-39), nil // ENOTEMPTY
-	}
-
-	err = s.store.AtomicUnlink(ctx, parent, name)
-	if err != nil {
+	if err := s.store.AtomicRmdir(ctx, parent, name); err != nil {
 		return int32Resp(errnoFor(err, -2)), nil
 	}
 	return okResp(), nil
