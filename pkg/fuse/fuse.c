@@ -26,7 +26,9 @@
 static void *notify_thread(void *arg)
 {
     struct etcfs_context *ctx = (struct etcfs_context *) arg;
-    const char *path = "/tmp/etcfuse-notify.sock";
+    const char *path = getenv("ETCFS_NOTIFY_SOCKET");
+    if (!path)
+        path = "/run/etcfuse/etcfuse-notify.sock";
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return NULL;

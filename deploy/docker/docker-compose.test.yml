@@ -49,7 +49,7 @@ services:
         # Start Go metadata backend
         /usr/local/bin/etcfuse-meta \
           --etcd-endpoints=http://etcd:2379 \
-          --listen=/tmp/etcfuse.sock \
+          --listen=/run/etcfuse/etcfuse.sock \
           --node-id=test-node \
           --lease-ttl=30s &
         sleep 2
@@ -61,7 +61,7 @@ services:
         # Mount FUSE daemon
         mkdir -p /mnt/etcfuse
         /usr/local/bin/etcfuse \
-          --socket=/tmp/etcfuse.sock \
+          --socket=/run/etcfuse/etcfuse.sock \
           --log-level=3 \
           /mnt/etcfuse &
         sleep 2

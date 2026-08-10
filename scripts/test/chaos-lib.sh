@@ -152,13 +152,13 @@ if [[ "$MODE" == "docker" ]]; then
         endpoints=$(etcd_client_urls)
         docker run -d --name "etcfs-meta$id" --network docker_etcfuse-net \
             -v "docker_block_data:/block-device" -v "etcfuse-meta${id}-sock:/var/run" "$META_IMG" \
-            --listen=/var/run/etcfuse.sock --etcd-endpoints="$endpoints" --node-id="n$id" \
+            --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints="$endpoints" --node-id="n$id" \
             --cluster-name=docker-chaos --lease-ttl=$CHAOS_LEASE_TTL --block-device=/block-device/etcfuse.img --log-level=1 >/dev/null
 
         sleep 2
         docker run -d --name "etcfs-fuse$id" --network docker_etcfuse-net --privileged --device /dev/fuse \
             -v "etcfuse-meta${id}-sock:/var/run" --entrypoint /bin/sh "$FUSE_IMG" \
-            -c "mkdir -p /mnt/etcfuse && exec /usr/local/bin/etcfuse --socket=/var/run/etcfuse.sock --node-id=n$id --log-level=1 /mnt/etcfuse" >/dev/null
+            -c "mkdir -p /mnt/etcfuse && exec /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock --node-id=n$id --log-level=1 /mnt/etcfuse" >/dev/null
 
         for i in $(seq 1 20); do
             check_mount "etcfs-fuse$id" && { echo "etcfs-fuse$id"; return 0; }
@@ -323,8 +323,8 @@ for d in json.load(sys.stdin).get('blockdevices', []):
           # Retried because the kernel can take a moment past the kill to let
           # go of the fd.
           for k in \$(seq 1 5); do sudo umount /mnt/etcfuse 2>/dev/null && break; sleep 1; done
-          sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
-          sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=$CHAOS_LEASE_TTL $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
+          sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
+          sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=$CHAOS_LEASE_TTL $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
           # A restart right after a partition heals (this is R7's exact
           # case) can legitimately need this long: the node's own local etcd
           # has to rejoin raft and the client has to reconnect and ride out a
@@ -337,12 +337,12 @@ for d in json.load(sys.stdin).get('blockdevices', []):
           # exists), so starting it early was a guaranteed, permanent
           # failure rather than a race that sometimes wins.
           SOCK_OK=0
-          for k in \$(seq 1 40); do [ -S /tmp/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
+          for k in \$(seq 1 40); do [ -S /run/etcfuse/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
           if [ \"\$SOCK_OK\" -ne 1 ]; then
             echo 'FAIL (socket never appeared)'; echo '--- meta.log tail ---'; sudo tail -20 /tmp/meta.log 2>/dev/null
             exit 1
           fi
-          sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
+          sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
           for k in \$(seq 1 30); do sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0; sleep 1; done
           echo 'FAIL'; echo '--- meta.log tail ---'; sudo tail -15 /tmp/meta.log 2>/dev/null; echo '--- fuse.log tail ---'; sudo tail -15 /tmp/fuse.log 2>/dev/null
         " 2>/dev/null || echo "ERR:$?"
@@ -435,12 +435,12 @@ for d in json.load(sys.stdin).get('blockdevices', []):
             [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" && -n "$vol_id" ]] && dev_flag="--volume-id=$vol_id"
             ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip "
                 sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; sleep 1
-                sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
-                sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
+                sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
+                sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock \
                     --etcd-endpoints=$ETCD --node-id=n$i --cluster-name=$TAG \
                     --lease-ttl=$CHAOS_LEASE_TTL $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
                 sleep 4
-                sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock \
+                sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock \
                     --node-id=n$i --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
                 sleep 7
                 sudo mountpoint -q /mnt/etcfuse && echo OK || echo FAIL
@@ -582,12 +582,12 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         done
 
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@"$pub" "
-            sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
+            sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock \
                 --etcd-endpoints=$endpoints --node-id=n$id --cluster-name=$TAG \
                 --lease-ttl=$CHAOS_LEASE_TTL --block-device=/dev/nvme1n1 --log-level=1 \
                 --ebs-volume-id=$vol_id --ec2-instance-id=$inst > /tmp/meta.log 2>&1 &
             sleep 4
-            sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock \
+            sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock \
                 --node-id=n$id --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
             sleep 7
         " 2>/dev/null

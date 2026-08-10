@@ -237,7 +237,14 @@ func main() {
 
 	log.Info("binary IPC server starting")
 	svc.StartNotificationServer(ctx)
-	go func() { _ = ipc.StartNotifyServer(svc, "/tmp/etcfuse-notify.sock") }()
+	go func() {
+		if err := ipc.StartNotifyServer(svc, cfg.NotifyAddr); err != nil {
+			// Not fatal: the mount works without it, but every node's caches
+			// then rely on their timeouts alone, so it must not be silent.
+			log.Error("cache-invalidation notify server stopped; peers will not be "+
+				"invalidated until it is restarted", "path", cfg.NotifyAddr, "error", err)
+		}
+	}()
 	if err := ipc.StartSocketServer(ctx, svc, cfg.ListenAddr, log); err != nil {
 		log.Fatal("IPC server failed", "error", err)
 	}

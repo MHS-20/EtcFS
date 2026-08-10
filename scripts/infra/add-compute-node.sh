@@ -138,7 +138,7 @@ else
     log "WARNING: etcfuse-meta build failed, falling back to bin/etcfuse-meta"
     META_BIN="$PROJECT_ROOT/bin/etcfuse-meta"
 fi
-SOCKET_PATH="/run/etcfuse.sock"
+SOCKET_PATH="/run/etcfuse/etcfuse.sock"
 if [[ -f "$DAEMON_BIN" ]]; then
     gzip -c "$DAEMON_BIN" > /tmp/etcfuse.gz
     scp $SSH_OPTS /tmp/etcfuse.gz "ec2-user@$PUB_IP:/tmp/"

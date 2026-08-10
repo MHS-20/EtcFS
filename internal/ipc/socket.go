@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime/debug"
+	"syscall"
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
@@ -101,6 +103,30 @@ func (s *Service) safeDispatch(op uint16, payload []byte) (resp []byte, err erro
 		}
 	}()
 	return s.dispatch(op, payload)
+}
+
+// ListenPrivate binds a Unix socket only its owner can use.
+//
+// The permissions are set by the umask around the bind rather than by a chmod
+// after it: between bind and chmod the socket carries the process umask, and
+// anything able to connect in that window is already past the only access
+// control there is.  The parent directory is created 0700 for the same reason —
+// a socket is only as private as the directory holding it.
+func ListenPrivate(sockPath string) (net.Listener, error) {
+	if dir := filepath.Dir(sockPath); dir != "." && dir != "/" {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, fmt.Errorf("create socket directory %s: %w", dir, err)
+		}
+	}
+	_ = os.Remove(sockPath)
+
+	old := syscall.Umask(0177)
+	listener, err := net.Listen("unix", sockPath)
+	syscall.Umask(old)
+	if err != nil {
+		return nil, fmt.Errorf("listen unix %s: %w", sockPath, err)
+	}
+	return listener, nil
 }
 
 // ---- wire format ----
@@ -382,11 +408,9 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 // all. Without this, main blocked in RunSocket forever and never reached them
 // on anything short of SIGKILL.
 func StartSocketServer(ctx context.Context, svc *Service, sockPath string, log *config.Logger) error {
-	_ = os.Remove(sockPath)
-
-	listener, err := net.Listen("unix", sockPath)
+	listener, err := ListenPrivate(sockPath)
 	if err != nil {
-		return fmt.Errorf("listen unix %s: %w", sockPath, err)
+		return err
 	}
 	defer func() { _ = listener.Close() }()
 
@@ -394,10 +418,6 @@ func StartSocketServer(ctx context.Context, svc *Service, sockPath string, log *
 		<-ctx.Done()
 		_ = listener.Close()
 	}()
-
-	if err := os.Chmod(sockPath, 0600); err != nil {
-		log.Warn("cannot chmod socket", "path", sockPath, "error", err)
-	}
 
 	log.Info("binary IPC server listening", "path", sockPath)
 	if err := svc.RunSocket(listener); err != nil && ctx.Err() == nil {

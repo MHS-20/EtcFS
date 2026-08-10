@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"sync"
 
@@ -84,12 +83,8 @@ func (s *Service) RunNotifyListener(listener net.Listener) error {
 }
 
 func StartNotifyServer(svc *Service, sockPath string) error {
-	_ = os.Remove(sockPath)
-	listener, err := net.Listen("unix", sockPath)
+	listener, err := ListenPrivate(sockPath)
 	if err != nil {
-		return fmt.Errorf("notify listen %s: %w", sockPath, err)
-	}
-	if err := os.Chmod(sockPath, 0600); err != nil {
 		return err
 	}
 	return svc.RunNotifyListener(listener)

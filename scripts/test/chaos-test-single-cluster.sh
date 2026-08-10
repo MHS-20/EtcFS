@@ -40,7 +40,7 @@ run_s1() {
     else
         runcmd "$N1" "sudo pkill -9 -x etcfuse 2>/dev/null; sleep 1; sudo fusermount -uz /mnt/etcfuse 2>/dev/null; sleep 1; true"
         local R=$(runcmd30 "$N1" "
-          sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
+          sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
           for i in \$(seq 1 20); do sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0; sleep 1; done
           echo FAIL
         ")
@@ -58,7 +58,7 @@ run_s2() {
     if [[ "$MODE" == "docker" ]]; then
         local R=$(restart_pair "$M1" "$N1")
     else
-        runcmd "$N1" "sudo pkill -9 etcfuse-meta 2>/dev/null; sleep 1; sudo rm -f /tmp/etcfuse.sock; true"
+        runcmd "$N1" "sudo pkill -9 etcfuse-meta 2>/dev/null; sleep 1; sudo rm -f /run/etcfuse/etcfuse.sock; true"
         runcmd "$N1" "sudo fusermount -uz /mnt/etcfuse 2>/dev/null; sleep 1; true"
         local R=$(restart_daemons "$N1" "n1")
     fi

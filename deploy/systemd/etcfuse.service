@@ -7,7 +7,7 @@ Documentation=https://github.com/anomalyco/etcfuse
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/etcfuse \
-  --socket=/var/run/etcfuse.sock \
+  --socket=/run/etcfuse/etcfuse.sock \
   --node-id=%H \
   --log-level=2 \
   /mnt/etcfuse

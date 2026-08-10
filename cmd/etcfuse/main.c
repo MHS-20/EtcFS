@@ -9,7 +9,7 @@
  * The Go binary (etcfuse-meta) handles all etcd operations.
  *
  * Usage:
- *   etcfuse [--socket=/tmp/etcfuse.sock] [--volume-id=vol-xxx] <mountpoint>
+ *   etcfuse [--socket=/run/etcfuse/etcfuse.sock] [--volume-id=vol-xxx] <mountpoint>
  */
 
 #include <errno.h>
@@ -35,6 +35,7 @@ static void print_usage(const char *prog)
             "\n"
             "Options:\n"
             "  --socket=PATH      Unix socket path for Go metadata backend\n"
+            "  --notify-socket=PATH  Unix socket for cache-invalidation notifications\n"
             "                     (default: /tmp/etcfuse.sock)\n"
             "  --volume-id=ID     EBS volume ID or block device path\n"
             "                     (example: vol-0abcdef1234567890 or /dev/nvme1n1)\n"
@@ -51,7 +52,9 @@ static void print_usage(const char *prog)
 int main(int argc, char *argv[])
 {
     struct etcfs_context ctx;
-    const char *socket_path = "/tmp/etcfuse.sock";
+    /* Must match DefaultSocket / DefaultNotifySocket in internal/config. */
+    const char *socket_path = "/run/etcfuse/etcfuse.sock";
+    const char *notify_socket_path = "/run/etcfuse/etcfuse-notify.sock";
     const char *volume_id = NULL;
     const char *node_id = NULL;
     const char *mountpoint = NULL;
@@ -60,16 +63,22 @@ int main(int argc, char *argv[])
     memset(&ctx, 0, sizeof(ctx));
 
     /* parse arguments */
-    static struct option long_opts[] = {
-        {"socket", required_argument, 0, 's'},  {"volume-id", required_argument, 0, 'v'},
-        {"node-id", required_argument, 0, 'n'}, {"log-level", required_argument, 0, 'l'},
-        {"help", no_argument, 0, 'h'},          {0, 0, 0, 0}};
+    static struct option long_opts[] = {{"socket", required_argument, 0, 's'},
+                                        {"notify-socket", required_argument, 0, 'N'},
+                                        {"volume-id", required_argument, 0, 'v'},
+                                        {"node-id", required_argument, 0, 'n'},
+                                        {"log-level", required_argument, 0, 'l'},
+                                        {"help", no_argument, 0, 'h'},
+                                        {0, 0, 0, 0}};
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "s:v:n:l:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "s:N:v:n:l:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 's':
             socket_path = optarg;
+            break;
+        case 'N':
+            notify_socket_path = optarg;
             break;
         case 'v':
             volume_id = optarg;
@@ -114,6 +123,7 @@ int main(int argc, char *argv[])
 
     /* set environment for IPC socket (read by fuse.c) */
     setenv("ETCFS_IPC_SOCKET", socket_path, 1);
+    setenv("ETCFS_NOTIFY_SOCKET", notify_socket_path, 1);
 
     /* populate context */
     ctx.mountpoint = (char *) mountpoint;

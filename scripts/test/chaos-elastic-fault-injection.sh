@@ -101,7 +101,7 @@ if [[ "$MODE" == "docker" ]]; then
         local endpoints; endpoints=$(etcd_client_urls)
         docker run -d --name "etcfs-meta$id" --network docker_etcfuse-net \
             -v "docker_block_data:/block-device" -v "etcfuse-meta${id}-sock:/var/run" "$META_IMG" \
-            --listen=/var/run/etcfuse.sock --etcd-endpoints="$endpoints" --node-id="n$id" \
+            --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints="$endpoints" --node-id="n$id" \
             --cluster-name=docker-chaos --lease-ttl=10s --block-device=/block-device/etcfuse.img --log-level=1 >/dev/null
 
         # STOP HERE — no fuse container. This is the "before FUSE mount" window.
@@ -179,7 +179,7 @@ else
 
         local endpoints="http://$P1:2379,http://$P2:2379,http://$P3:2379"
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@"$pub" "
-            sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
+            sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock \
                 --etcd-endpoints=$endpoints --node-id=n$id --cluster-name=$TAG \
                 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
         " 2>/dev/null

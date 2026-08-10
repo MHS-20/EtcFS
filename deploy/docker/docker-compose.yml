@@ -116,7 +116,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.etcfuse-meta
     container_name: etcfs-meta1
     command:
-      - --listen=/var/run/etcfuse.sock
+      - --listen=/run/etcfuse/etcfuse.sock
       - --etcd-endpoints=http://etcd1:2379
       - --node-id=n1
       - --cluster-name=docker-chaos
@@ -140,7 +140,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.etcfuse-meta
     container_name: etcfs-meta2
     command:
-      - --listen=/var/run/etcfuse.sock
+      - --listen=/run/etcfuse/etcfuse.sock
       - --etcd-endpoints=http://etcd2:2379
       - --node-id=n2
       - --cluster-name=docker-chaos
@@ -164,7 +164,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.etcfuse-meta
     container_name: etcfs-meta3
     command:
-      - --listen=/var/run/etcfuse.sock
+      - --listen=/run/etcfuse/etcfuse.sock
       - --etcd-endpoints=http://etcd3:2379
       - --node-id=n3
       - --cluster-name=docker-chaos
@@ -193,7 +193,7 @@ services:
       - /dev/fuse
     entrypoint: ["/bin/sh", "-c", "mkdir -p /mnt/etcfuse && exec /usr/local/bin/etcfuse \"$@\"", "--"]
     command:
-      - --socket=/var/run/etcfuse.sock
+      - --socket=/run/etcfuse/etcfuse.sock
       - --node-id=n1
       - --log-level=1
       - /mnt/etcfuse
@@ -214,7 +214,7 @@ services:
       - /dev/fuse
     entrypoint: ["/bin/sh", "-c", "mkdir -p /mnt/etcfuse && exec /usr/local/bin/etcfuse \"$@\"", "--"]
     command:
-      - --socket=/var/run/etcfuse.sock
+      - --socket=/run/etcfuse/etcfuse.sock
       - --node-id=n2
       - --log-level=1
       - /mnt/etcfuse
@@ -235,7 +235,7 @@ services:
       - /dev/fuse
     entrypoint: ["/bin/sh", "-c", "mkdir -p /mnt/etcfuse && exec /usr/local/bin/etcfuse \"$@\"", "--"]
     command:
-      - --socket=/var/run/etcfuse.sock
+      - --socket=/run/etcfuse/etcfuse.sock
       - --node-id=n3
       - --log-level=1
       - /mnt/etcfuse

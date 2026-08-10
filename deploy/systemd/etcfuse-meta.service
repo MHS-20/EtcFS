@@ -7,7 +7,7 @@ Documentation=https://github.com/anomalyco/etcfuse
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/etcfuse-meta \
-  --listen=/var/run/etcfuse.sock \
+  --listen=/run/etcfuse/etcfuse.sock \
   --node-id=%H \
   --lease-ttl=10s
 Restart=on-failure

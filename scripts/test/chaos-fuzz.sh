@@ -84,7 +84,7 @@ inject_fault() {
             chaos_event "fault: kill FUSE daemon on node$target"
             if [[ "$MODE" == "docker" ]]; then restart_fuse "$n" >/dev/null
             else runcmd "$n" "sudo pkill -9 -x etcfuse 2>/dev/null; sleep 1; true"
-                 runcmd30 "$n" "sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=n$target --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 & sleep 3; true" >/dev/null
+                 runcmd30 "$n" "sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock --node-id=n$target --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 & sleep 3; true" >/dev/null
             fi
             ;;
         1)

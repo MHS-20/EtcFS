@@ -56,7 +56,22 @@ type Config struct {
 	// the other attachers — so it is off by default and meant for single-node
 	// mounts and file-backed test devices.
 	AllowBufferedIO bool
+
+	// NotifyAddr is the socket the C daemon connects to for cache-invalidation
+	// notifications.  Configurable for the same reason ListenAddr is: two
+	// daemons on one host need two paths.
+	NotifyAddr string
 }
+
+// Default socket paths.
+//
+// Under /run rather than /tmp: both sockets are removed and re-bound at
+// startup, and anything able to write the directory can win that race or
+// occupy the path first.  /run is root-writable only, which /tmp is not.
+const (
+	DefaultSocket       = "/run/etcfuse/etcfuse.sock"
+	DefaultNotifySocket = "/run/etcfuse/etcfuse-notify.sock"
+)
 
 // RequestTimeout bounds the etcd work behind a single FUSE request.
 //
@@ -86,7 +101,9 @@ func Parse() *Config {
 	var etcdEndpoints string
 	var leaseTTL string
 
-	flag.StringVar(&cfg.ListenAddr, "listen", "/tmp/etcfuse.sock",
+	flag.StringVar(&cfg.NotifyAddr, "notify-socket", DefaultNotifySocket,
+		"Unix socket the C daemon connects to for cache-invalidation notifications")
+	flag.StringVar(&cfg.ListenAddr, "listen", DefaultSocket,
 		"Unix domain socket path for C daemon IPC")
 	flag.StringVar(&etcdEndpoints, "etcd-endpoints", "http://localhost:2379",
 		"Comma-separated etcd client endpoints")

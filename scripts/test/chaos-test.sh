@@ -113,12 +113,12 @@ provision() {
         eval "ip=\$N$i"
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip "
             sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; sleep 1
-            sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
-            sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock \
+            sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
+            sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock \
                 --etcd-endpoints=$ETCD --node-id=n$i --cluster-name=$TAG \
                 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
             sleep 4
-            sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock \
+            sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock \
                 --node-id=n$i --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
             sleep 7
             sudo mountpoint -q /mnt/etcfuse && echo OK || echo FAIL
@@ -195,15 +195,15 @@ restart_daemons() {
       sudo killall -9 etcfuse-meta etcfuse 2>/dev/null
       sleep 1
       for k in \$(seq 1 5); do sudo umount /mnt/etcfuse 2>/dev/null && break; sleep 1; done
-      sudo rm -f /tmp/etcfuse.sock /tmp/etcfuse-notify.sock
-      sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$3 --node-id=$2 --cluster-name=$4 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
+      sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
+      sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints=$3 --node-id=$2 --cluster-name=$4 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
       SOCK_OK=0
-      for k in \$(seq 1 40); do [ -S /tmp/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
+      for k in \$(seq 1 40); do [ -S /run/etcfuse/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
       if [ \"\$SOCK_OK\" -ne 1 ]; then
         echo 'FAIL (socket never appeared)'; echo '--- meta.log tail ---'; sudo tail -20 /tmp/meta.log 2>/dev/null
         exit 1
       fi
-      sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
+      sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock --node-id=$2 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
       for k in \$(seq 1 30); do
         sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0
         sleep 1
@@ -251,11 +251,11 @@ run_s1() {
     # a bare "etcfuse" also kills etcfuse-meta.  This scenario must kill only the
     # C daemon and leave the Go daemon (and its socket) up.
     runcmd "$N1" "sudo pkill -9 -x etcfuse 2>/dev/null; sleep 1; sudo fusermount -uz /mnt/etcfuse 2>/dev/null; sleep 1; true"
-    # Do NOT remove /tmp/etcfuse.sock here either: the Go daemon owns it, and
+    # Do NOT remove /run/etcfuse/etcfuse.sock here either: the Go daemon owns it, and
     # unlinking it makes the new C daemon's connect() fail with ENOENT, so it
     # exits before fuse_session_mount is ever reached.
     local M=$(runcmd30 "$N1" "
-      sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
+      sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
       for i in \$(seq 1 20); do
         sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0
         sleep 1
@@ -277,14 +277,14 @@ run_s2() {
     if ! writef "$N1" "go-data" "hello.txt"; then
         FAIL=$((FAIL+1)); log "  FAIL: pre-crash write did not land"; dump_logs "$N1"; teardown; return
     fi
-    runcmd "$N1" "sudo pkill -9 etcfuse-meta 2>/dev/null; sleep 1; sudo rm -f /tmp/etcfuse.sock; true"
+    runcmd "$N1" "sudo pkill -9 etcfuse-meta 2>/dev/null; sleep 1; sudo rm -f /run/etcfuse/etcfuse.sock; true"
     runcmd "$N1" "sudo fusermount -uz /mnt/etcfuse 2>/dev/null; sleep 1; true"
     local ETCD="http://$(jq -r '.compute_ips[0]' $PROJECT_ROOT/$STATE_FILE):2379,http://$(jq -r '.compute_ips[1]' $PROJECT_ROOT/$STATE_FILE):2379,http://$(jq -r '.compute_ips[2]' $PROJECT_ROOT/$STATE_FILE):2379"
     local TAG=$(jq -r '.cluster_name' $PROJECT_ROOT/$STATE_FILE)
     local M=$(runcmd60 "$N1" "
-      sudo nohup /usr/local/bin/etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=$ETCD --node-id=n1 --cluster-name=$TAG --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
-      for i in \$(seq 1 10); do [ -S /tmp/etcfuse.sock ] && break; sleep 1; done
-      sudo nohup /usr/local/bin/etcfuse --socket=/tmp/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
+      sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints=$ETCD --node-id=n1 --cluster-name=$TAG --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
+      for i in \$(seq 1 10); do [ -S /run/etcfuse/etcfuse.sock ] && break; sleep 1; done
+      sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
       for i in \$(seq 1 20); do
         sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0
         sleep 1

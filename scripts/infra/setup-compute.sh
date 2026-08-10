@@ -166,7 +166,7 @@ else
     META_BIN=""
     [[ -f "$PROJECT_ROOT/bin/etcfuse-meta" ]] && META_BIN="$PROJECT_ROOT/bin/etcfuse-meta"
 fi
-SOCKET_PATH="/run/etcfuse.sock"
+SOCKET_PATH="/run/etcfuse/etcfuse.sock"
 
 # ---- Setup each node ----
 
