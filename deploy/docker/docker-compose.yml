@@ -101,9 +101,12 @@ services:
     command:
       - |
         apk add --no-cache e2fsprogs-extra
-        dd if=/dev/zero of=/block-device/etcfuse.img bs=1M count=1024 2>/dev/null
+        # Sparse, so it costs nothing until written.  It has to hold one 1 GiB
+        # arena per node with room to acquire more, and the allocator now
+        # refuses an arena that would not fit on the device.
+        truncate -s 8G /block-device/etcfuse.img
         chmod 666 /block-device/etcfuse.img
-        echo "Block device initialised: 1 GB file at /block-device/etcfuse.img"
+        echo "Block device initialised: 8 GiB sparse file at /block-device/etcfuse.img"
     volumes:
       - block_data:/block-device
     networks:

@@ -150,6 +150,39 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	return resp.Kvs[0].Value, nil
 }
 
+// GetMany reads several keys in one round trip, returning only those present.
+//
+// A read needs no comparisons, so this is an unconditional transaction: etcd
+// applies its operations against a single revision, which also makes the batch
+// a consistent snapshot rather than a sequence of independent reads.
+//
+// Batched because the alternative is a request per key.  A readdir of a
+// thousand-entry directory made a thousand sequential gets, on every listing.
+func (s *Store) GetMany(ctx context.Context, keys []string) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(keys))
+
+	// etcd rejects a transaction with more than maxTxnOps operations, so a
+	// large directory is read in several.
+	const maxTxnOps = 128
+	for start := 0; start < len(keys); start += maxTxnOps {
+		end := min(start+maxTxnOps, len(keys))
+		ops := make([]clientv3.Op, 0, end-start)
+		for _, k := range keys[start:end] {
+			ops = append(ops, clientv3.OpGet(k))
+		}
+		resp, err := s.client.Txn(ctx).Then(ops...).Commit()
+		if err != nil {
+			return nil, fmt.Errorf("get %d keys: %w", end-start, err)
+		}
+		for _, r := range resp.Responses {
+			for _, kv := range r.GetResponseRange().Kvs {
+				out[string(kv.Key)] = kv.Value
+			}
+		}
+	}
+	return out, nil
+}
+
 // GetPrefix reads all keys with the given prefix.
 func (s *Store) GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.KeyValue, error) {
 	resp, err := s.client.Get(ctx, prefix, clientv3.WithPrefix())

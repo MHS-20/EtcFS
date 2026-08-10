@@ -3,7 +3,10 @@ package ipc
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"testing"
+
+	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
 // Every handler used to slice with a length field it had not checked, so a
@@ -62,5 +65,32 @@ func TestRecvReqRefusesAnOversizedFrame(t *testing.T) {
 
 	if _, _, err := recvReq(bytes.NewReader(frame)); err == nil {
 		t.Fatal("an oversized frame was accepted")
+	}
+}
+
+// readdir returns a page of the directory, not the whole of it, and the kernel
+// resumes from the cookie of the last entry it got. Returning nothing while
+// entries remain would end the listing early, so at least one entry always
+// comes back however small the buffer.
+func TestReaddirPageFitsTheKernelBuffer(t *testing.T) {
+	entries := make([]metadata.DirentEntry, 100)
+	for i := range entries {
+		entries[i] = metadata.DirentEntry{Name: fmt.Sprintf("file-%04d", i), Ino: uint64(i + 2)}
+	}
+
+	if got := truncateToBuffer(entries, 0, false); len(got) != len(entries) {
+		t.Errorf("a zero-size hint should not truncate: got %d entries", len(got))
+	}
+	if got := truncateToBuffer(entries, 1, false); len(got) != 1 {
+		t.Errorf("a buffer too small for one entry returned %d entries, want 1", len(got))
+	}
+
+	// Each entry costs a 24-byte header plus its 9-byte name padded to 16.
+	if got := truncateToBuffer(entries, 40*4, false); len(got) != 4 {
+		t.Errorf("four entries' worth of buffer returned %d", len(got))
+	}
+	// readdirplus adds an entry_out block per entry, so far fewer fit.
+	if got := truncateToBuffer(entries, 40*4, true); len(got) != 1 {
+		t.Errorf("readdirplus in the same buffer returned %d entries", len(got))
 	}
 }

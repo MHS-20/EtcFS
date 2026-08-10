@@ -101,10 +101,7 @@ func (s *Service) handleReaddirPlus(ctx context.Context, payload []byte) ([]byte
 
 func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([]byte, error) {
 	r := newReader(payload)
-	ino := r.u64()
-	r.u64() // offset hint, unused
-	r.u32() // size hint, unused: the whole directory is returned and the C
-	// daemon skips entries at or below its own cookie.
+	ino, offset, size := r.u64(), r.u64(), r.u32()
 	if !r.ok {
 		return int32Resp(-22), nil
 	}
@@ -114,18 +111,41 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 		return int32Resp(-5), nil
 	}
 
+	// The cookie of an entry is its 1-based position, so the kernel's offset is
+	// the count already returned.  Resuming here rather than sending the whole
+	// directory every time is what keeps a large directory from being
+	// materialised in full on each of the calls it takes to read it.
+	if offset >= uint64(len(entries)) {
+		entries = nil
+	} else {
+		entries = entries[offset:]
+	}
+	entries = truncateToBuffer(entries, size, plus)
+
+	// One round trip for every inode record rather than one per entry: readdir
+	// on a directory of a thousand files used to be a thousand sequential etcd
+	// gets, repeated on every listing.
+	keys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		keys = append(keys, metadata.InodeKey(e.Ino))
+	}
+	records, err := s.store.GetMany(ctx, keys)
+	if err != nil {
+		return int32Resp(-5), nil
+	}
+
 	var b buf
 	b.w32(0) // error = success
 	b.w32(uint32(len(entries)))
 
 	for i, e := range entries {
-		rec, _ := s.store.GetInode(ctx, e.Ino)
+		rec := metadata.DecodeInode(records[metadata.InodeKey(e.Ino)])
 
 		b.w64(e.Ino)
 		b.w32(uint32(len(e.Name)))
 		b.b = append(b.b, []byte(e.Name)...)
 		b.w32(direntType(rec))
-		b.w64(uint64(i + 1)) // directory offset cookie
+		b.w64(offset + uint64(i) + 1) // directory offset cookie
 
 		if !plus {
 			continue
@@ -143,6 +163,39 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 	}
 
 	return b.b, nil
+}
+
+// truncateToBuffer drops the entries that would not fit in the kernel's reply
+// buffer anyway.
+//
+// The estimate is the kernel's own dirent framing — a fixed header plus the
+// name, padded to eight bytes — with the entry_out block added for
+// readdirplus.  It is deliberately generous: under-filling costs one more
+// readdir call, while over-filling costs nothing at all, since the C daemon
+// stops adding entries once its buffer is full.  At least one entry is always
+// returned, because an empty reply is how a listing ends.
+func truncateToBuffer(entries []metadata.DirentEntry, size uint32, plus bool) []metadata.DirentEntry {
+	if size == 0 {
+		return entries
+	}
+	const direntHeader = 24   // fuse_dirent, before the name
+	const entryOutBytes = 128 // fuse_entry_out, readdirplus only
+
+	budget := int(size)
+	for i, e := range entries {
+		cost := direntHeader + (len(e.Name)+7)/8*8
+		if plus {
+			cost += entryOutBytes
+		}
+		budget -= cost
+		if budget < 0 {
+			if i == 0 {
+				return entries[:1]
+			}
+			return entries[:i]
+		}
+	}
+	return entries
 }
 
 // direntType maps an inode record to its DT_* directory entry type.
@@ -192,12 +245,21 @@ func (s *Service) handleStatfs(ctx context.Context, _ []byte) ([]byte, error) {
 		ratio := s.alloc.LiveRatio()
 		bfree = uint64(float64(blocks) * (1 - ratio))
 	}
-	inodeKvs, _ := s.store.GetPrefix(ctx, "inode:")
-	files := uint64(len(inodeKvs))
-	ffree := uint64(1000000 - len(inodeKvs))
-	if ffree > 1000000 {
-		ffree = 900000
+	// The inode allocation counter, not a scan of the inode space: every `df`
+	// used to be a full range read over the whole namespace to use nothing but
+	// its length.  The counter counts numbers handed out rather than inodes
+	// alive, so it over-reports after deletions — an upper bound is the right
+	// error to make for a number no caller can act on.
+	files := uint64(0)
+	if v, err := s.store.Get(ctx, metadata.KeyInodeAllocCounter); err == nil && v != nil {
+		if n := metadata.DecodeUint64(v); n > metadata.FirstUsableIno {
+			files = n - metadata.FirstUsableIno
+		}
 	}
+	// Inode numbers are 64-bit, so nothing but space limits how many files can
+	// exist, and every file needs at least one block.  The hardcoded 1,000,000
+	// ceiling this replaces was not a limit the filesystem enforced anywhere.
+	ffree := bfree
 
 	var b buf
 	b.w32(0)
@@ -234,10 +296,12 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(-22), nil
 	}
 
-	// Reserve inode number
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(-28), nil // ENOSPC
+		// ENOSPC unless the node has been fenced, which has to surface as EIO:
+		// a fenced create reported as "disk full" is indistinguishable from a
+		// genuinely full device in a log.
+		return int32Resp(errnoFor(err, -28)), nil
 	}
 
 	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, applyUmask(mode, umask), uid, gid)
@@ -260,7 +324,7 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(-28), nil
+		return int32Resp(errnoFor(err, -28)), nil
 	}
 
 	rec, err := s.store.AtomicCreateDir(ctx, parent, name, ino, applyUmask(mode, umask), uid, gid)
@@ -443,7 +507,7 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(-28), nil
+		return int32Resp(errnoFor(err, -28)), nil
 	}
 
 	rec, err := s.store.AtomicCreateSymlink(ctx, parent, name, ino, target, uid, gid)
@@ -483,7 +547,7 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(-28), nil
+		return int32Resp(errnoFor(err, -28)), nil
 	}
 
 	rec, err := s.store.AtomicCreateNode(ctx, parent, name, ino, applyUmask(mode, umask), rdev, uid, gid)
