@@ -665,10 +665,13 @@ run_fj5() {
         heal_node4; remove_node 4; return
     fi
 
-    # requestTimeout (internal/ipc/retry.go) bounds every FUSE op's etcd work
-    # at 10s. 15s gives margin for ssh/docker-exec overhead without coming
-    # close to the ~240-360s fence window above.
-    local bound=15
+    # requestTimeout (internal/config) bounds each FUSE operation's etcd work
+    # at 10s — but one syscall is not one operation: `stat path` costs a LOOKUP
+    # and a GETATTR, so a partitioned node answers it in two bounded stalls
+    # rather than one.  25s covers two of them plus ssh/docker-exec overhead,
+    # and is still nowhere near the ~240-360s fence window above, which is what
+    # this scenario exists to distinguish.
+    local bound=25
     local dt rc
 
     assert_bounded4() {
