@@ -52,13 +52,13 @@ func (s *Service) directSafe(buf []byte) bool {
 // WRITE payload: [u64:ino][u64:offset][u32:data_len][data]
 // Response: [i32:error][u32:written]
 func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 20 {
+	r := newReader(payload)
+	ino, offset := r.u64(), r.u64()
+	data := r.blob()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	ino, rest := readU64(payload)
-	offset, rest := readU64(rest)
-	dataLen, rest := readU32(rest)
-	data := rest[:dataLen]
+	dataLen := uint32(len(data))
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
@@ -280,12 +280,11 @@ func (s *Service) writeGeneration(ctx context.Context) uint64 {
 // READ payload: [u64:ino][u64:offset][u32:size]
 // Response: [i32:error][u32:data_len][data_bytes]
 func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 20 {
+	r := newReader(payload)
+	ino, offset, size := r.u64(), r.u64(), r.u32()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	ino, rest := readU64(payload)
-	offset, rest := readU64(rest)
-	size, _ := readU32(rest)
 
 	s.log.Debug("READ", "ino", ino, "offset", offset, "size", size)
 

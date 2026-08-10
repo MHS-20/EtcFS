@@ -45,13 +45,11 @@ func errnoFor(err error, fallback int32) int32 {
 // LOOKUP payload: [u64:parent][u32:name_len][name_bytes]
 // Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 12 {
+	r := newReader(payload)
+	parent, name := r.u64(), r.str()
+	if !r.ok {
 		return int32Resp(-22), nil // EINVAL
 	}
-
-	parent, rest := readU64(payload)
-	nameLen, rest := readU32(rest)
-	name := string(rest[:nameLen])
 
 	ino, err := s.store.LookupDirent(ctx, parent, name)
 	if err != nil {
@@ -74,11 +72,11 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 // GETATTR payload: [u64:ino]
 // Response: [i32:error][u64×9+u32×6:attr][u32:attr_timeout]
 func (s *Service) handleGetattr(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 8 {
+	r := newReader(payload)
+	ino := r.u64()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-
-	ino, _ := readU64(payload)
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
@@ -102,13 +100,14 @@ func (s *Service) handleReaddirPlus(ctx context.Context, payload []byte) ([]byte
 }
 
 func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([]byte, error) {
-	if len(payload) < 20 {
+	r := newReader(payload)
+	ino := r.u64()
+	r.u64() // offset hint, unused
+	r.u32() // size hint, unused: the whole directory is returned and the C
+	// daemon skips entries at or below its own cookie.
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-
-	ino, _ := readU64(payload)
-	// The remaining offset and size hints are unused: the whole directory is
-	// returned and the C daemon skips entries at or below its own cookie.
 
 	entries, err := s.store.ListDirents(ctx, ino)
 	if err != nil {
@@ -165,11 +164,11 @@ func direntType(rec *metadata.InodeRecord) uint32 {
 // READLINK payload: [u64:ino]
 // Response: [i32:error][u32:target_len][target_bytes]
 func (s *Service) handleReadlink(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 8 {
+	r := newReader(payload)
+	ino := r.u64()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-
-	ino, _ := readU64(payload)
 
 	target, err := s.store.Get(ctx, metadata.InodeSymlinkKey(ino))
 	if err != nil || target == nil {
@@ -226,18 +225,14 @@ func applyUmask(mode, umask uint32) uint32 {
 // CREATE payload:  [u64:parent][u32:name_len][name][u32:mode][u32:flags][u32:umask][u32:uid][u32:gid]
 // Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 32 {
+	r := newReader(payload)
+	parent, name := r.u64(), r.str()
+	mode := r.u32()
+	r.u32() // flags
+	umask, uid, gid := r.u32(), r.u32(), r.u32()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	parent, rest := readU64(payload)
-	nameLen, rest := readU32(rest)
-	name := string(rest[:nameLen])
-	rest = rest[nameLen:]
-	mode, rest := readU32(rest)
-	_, rest = readU32(rest) // flags
-	umask, rest := readU32(rest)
-	uid, rest := readU32(rest)
-	gid, _ := readU32(rest)
 
 	// Reserve inode number
 	ino, err := s.allocInode(ctx)
@@ -256,17 +251,12 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 // MKDIR payload:  [u64:parent][u32:name_len][name][u32:mode][u32:umask][u32:uid][u32:gid]
 // Response: same as CREATE
 func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 28 {
+	r := newReader(payload)
+	parent, name := r.u64(), r.str()
+	mode, umask, uid, gid := r.u32(), r.u32(), r.u32(), r.u32()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	parent, rest := readU64(payload)
-	nameLen, rest := readU32(rest)
-	name := string(rest[:nameLen])
-	rest = rest[nameLen:]
-	mode, rest := readU32(rest)
-	umask, rest := readU32(rest)
-	uid, rest := readU32(rest)
-	gid, _ := readU32(rest)
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
@@ -284,12 +274,11 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 // UNLINK payload: [u64:parent][u32:name_len][name]
 // Response: [i32:error]
 func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 12 {
+	r := newReader(payload)
+	parent, name := r.u64(), r.str()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	parent, rest := readU64(payload)
-	nameLen, _ := readU32(rest)
-	name := string(rest[4 : 4+nameLen])
 
 	err := s.store.AtomicUnlink(ctx, parent, name)
 	if err != nil {
@@ -301,12 +290,11 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 // RMDIR payload: [u64:parent][u32:name_len][name]
 // Response: [i32:error]
 func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 12 {
+	r := newReader(payload)
+	parent, name := r.u64(), r.str()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	parent, rest := readU64(payload)
-	nameLen, _ := readU32(rest)
-	name := string(rest[4 : 4+nameLen])
 
 	if err := s.store.AtomicRmdir(ctx, parent, name); err != nil {
 		return int32Resp(errnoFor(err, -2)), nil
@@ -317,18 +305,13 @@ func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, erro
 // RENAME payload: [u64:old_parent][u32:old_name_len][old_name][u64:new_parent][u32:new_name_len][new_name][u32:flags]
 // Response: [i32:error]
 func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 28 {
+	r := newReader(payload)
+	oldParent, oldName := r.u64(), r.str()
+	newParent, newName := r.u64(), r.str()
+	flags := r.u32()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	oldParent, rest := readU64(payload)
-	oldNameLen, rest := readU32(rest)
-	oldName := string(rest[:oldNameLen])
-	rest = rest[oldNameLen:]
-	newParent, rest := readU64(rest)
-	newNameLen, rest := readU32(rest)
-	newName := string(rest[:newNameLen])
-	rest = rest[newNameLen:]
-	flags, _ := readU32(rest)
 
 	// Resolve old inode
 	ino, err := s.store.LookupDirent(ctx, oldParent, oldName)
@@ -368,19 +351,16 @@ const (
 const setattrPayloadLen = 8 + 8 + 4 + 8 + 4 + 4 + 4 + 8 + 8 + 8
 
 func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < setattrPayloadLen {
+	r := newReader(payload)
+	ino := r.u64()
+	r.u64() // fh
+	valid := r.u32()
+	newSize := r.u64()
+	mode, uid, gid := r.u32(), r.u32(), r.u32()
+	atime, mtime, ctime := r.u64(), r.u64(), r.u64()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	ino, rest := readU64(payload)
-	_, rest = readU64(rest) // fh
-	valid, rest := readU32(rest)
-	newSize, rest := readU64(rest)
-	mode, rest := readU32(rest)
-	uid, rest := readU32(rest)
-	gid, rest := readU32(rest)
-	atime, rest := readU64(rest)
-	mtime, rest := readU64(rest)
-	ctime, _ := readU64(rest)
 
 	rec, rev, err := s.store.GetInodeRev(ctx, ino)
 	if err != nil || rec == nil {
@@ -448,18 +428,12 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 // SYMLINK payload: [u64:parent][u32:name_len][name][u32:target_len][target][u32:uid][u32:gid]
 // Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 24 {
+	r := newReader(payload)
+	parent, name, target := r.u64(), r.str(), r.str()
+	uid, gid := r.u32(), r.u32()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	parent, rest := readU64(payload)
-	nameLen, rest := readU32(rest)
-	name := string(rest[:nameLen])
-	rest = rest[nameLen:]
-	targetLen, rest := readU32(rest)
-	target := string(rest[:targetLen])
-	rest = rest[targetLen:]
-	uid, rest := readU32(rest)
-	gid, _ := readU32(rest)
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
@@ -477,13 +451,11 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 // LINK payload: [u64:ino][u64:new_parent][u32:new_name_len][new_name]
 // Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 24 {
+	r := newReader(payload)
+	ino, newParent, name := r.u64(), r.u64(), r.str()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	ino, rest := readU64(payload)
-	newParent, rest := readU64(rest)
-	nameLen, rest := readU32(rest)
-	name := string(rest[:nameLen])
 
 	rec, err := s.store.AtomicLink(ctx, ino, newParent, name)
 	if err != nil {
@@ -495,18 +467,13 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 // MKNOD payload: [u64:parent][u32:name_len][name][u32:mode][u32:rdev][u32:umask][u32:uid][u32:gid]
 // Response: [i32:error][u64:ino][attr:84][u32:entry_timeout][u32:attr_timeout]
 func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, error) {
-	if len(payload) < 32 {
+	r := newReader(payload)
+	parent, name := r.u64(), r.str()
+	mode, rdev, umask := r.u32(), r.u32(), r.u32()
+	uid, gid := r.u32(), r.u32()
+	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	parent, rest := readU64(payload)
-	nameLen, rest := readU32(rest)
-	name := string(rest[:nameLen])
-	rest = rest[nameLen:]
-	mode, rest := readU32(rest)
-	rdev, rest := readU32(rest)
-	umask, rest := readU32(rest)
-	uid, rest := readU32(rest)
-	gid, _ := readU32(rest)
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {

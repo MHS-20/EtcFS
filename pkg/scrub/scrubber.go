@@ -439,8 +439,8 @@ func (s *Scrubber) CheckUnreferencedInodes(ctx context.Context) []Result {
 		referenced[metadata.DecodeUint64(kv.Value)] = true
 	}
 
-	var results []Result
 	inodeKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixInode)
+	results := make([]Result, 0, len(inodeKvs))
 	for _, kv := range inodeKvs {
 		rec := metadata.DecodeInode(kv.Value)
 		// The root has no dirent by construction — it is the directory every

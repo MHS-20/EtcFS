@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime/debug"
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
@@ -69,7 +70,7 @@ func (s *Service) handleConn(conn net.Conn) {
 			return
 		}
 
-		resp, err := s.dispatch(op, payload)
+		resp, err := s.safeDispatch(op, payload)
 		if err != nil {
 			s.log.Warn("ipc dispatch", "op", op, "error", err)
 			return
@@ -84,10 +85,35 @@ func (s *Service) handleConn(conn net.Conn) {
 	}
 }
 
+// safeDispatch runs a handler and turns a panic into one failed request.
+//
+// Connections are served one goroutine each with no recovery of their own, so
+// an unrecovered panic ends the whole process — every mount this daemon serves,
+// not just the request that tripped it.  The payload readers make that
+// unreachable through a malformed frame; this is the backstop for everything
+// else, and it logs loudly because reaching it is a bug either way.
+func (s *Service) safeDispatch(op uint16, payload []byte) (resp []byte, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			s.log.Error("ipc handler panicked", "op", op, "payload_len", len(payload),
+				"panic", p, "stack", string(debug.Stack()))
+			resp, err = int32Resp(-5), nil // EIO for this request only
+		}
+	}()
+	return s.dispatch(op, payload)
+}
+
 // ---- wire format ----
 //
 // Request:  [u16:be opcode][u32:be payload_len][payload]
 // Response: [u32:be payload_len][payload]
+
+// maxFrameLen caps what one request may claim to carry.  The length is read
+// straight off the wire and used as an allocation size, so an unbounded field
+// lets a desynchronised peer ask for 4 GiB.  The largest legitimate frame is a
+// write payload plus its fixed header, and the C daemon caps its own reads at
+// the same number.
+const maxFrameLen = 1 << 20 // 1 MiB
 
 func recvReq(r io.Reader) (uint16, []byte, error) {
 	var hdr [6]byte
@@ -96,6 +122,11 @@ func recvReq(r io.Reader) (uint16, []byte, error) {
 	}
 	op := binary.BigEndian.Uint16(hdr[0:2])
 	plen := binary.BigEndian.Uint32(hdr[2:6])
+	if plen > maxFrameLen {
+		// The stream is desynchronised: whatever follows is not a frame
+		// boundary, so the connection cannot be recovered by skipping ahead.
+		return 0, nil, fmt.Errorf("ipc frame of %d bytes exceeds the %d byte limit", plen, maxFrameLen)
+	}
 
 	payload := make([]byte, plen)
 	if plen > 0 {
@@ -120,12 +151,72 @@ func sendResp(w io.Writer, data []byte) error {
 
 // ---- payload readers ----
 
-func readU64(b []byte) (uint64, []byte) {
-	return binary.BigEndian.Uint64(b[:8]), b[8:]
+// reader walks a request payload without ever slicing past its end.
+//
+// The peer is the local C daemon over a 0600 socket, so a malformed frame is a
+// protocol desync rather than an attack — but a desync of exactly this kind has
+// happened before, in the readdirplus parser, and every handler used to slice
+// with a length field it had not checked.  One out-of-range length panicked the
+// connection goroutine, and an unrecovered panic takes down the daemon serving
+// every mount on the node.
+//
+// Once a read has run past the end, ok stays false and every later read returns
+// a zero value, so a handler only has to test ok once, before it acts.
+type reader struct {
+	b  []byte
+	ok bool
 }
 
-func readU32(b []byte) (uint32, []byte) {
-	return binary.BigEndian.Uint32(b[:4]), b[4:]
+func newReader(payload []byte) *reader {
+	return &reader{b: payload, ok: true}
+}
+
+func (r *reader) u32() uint32 {
+	b := r.take(4)
+	if b == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(b)
+}
+
+func (r *reader) u64() uint64 {
+	b := r.take(8)
+	if b == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint64(b)
+}
+
+// str reads a u32 length followed by that many bytes — the encoding every name
+// and symlink target uses.
+func (r *reader) str() string {
+	n := r.u32()
+	b := r.take(int(n))
+	if b == nil {
+		return ""
+	}
+	return string(b)
+}
+
+// blob is str's counterpart for payload data, returning the bytes themselves
+// rather than a copy of them as a string.
+func (r *reader) blob() []byte {
+	n := r.u32()
+	b := r.take(int(n))
+	if b == nil {
+		return nil
+	}
+	return b
+}
+
+func (r *reader) take(n int) []byte {
+	if !r.ok || n < 0 || n > len(r.b) {
+		r.ok = false
+		return nil
+	}
+	b := r.b[:n]
+	r.b = r.b[n:]
+	return b
 }
 
 // ---- payload writers ----

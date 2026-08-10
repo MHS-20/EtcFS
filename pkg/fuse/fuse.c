@@ -8,7 +8,6 @@
 
 #include "fuse.h"
 #include "ops.h"
-#include "pool.h"
 #include "../block/block.h"
 
 #include <errno.h>
@@ -269,7 +268,16 @@ after_cleanup:
     pthread_t ntid;
     pthread_create(&ntid, NULL, notify_thread, ctx);
 
-    /* enter event loop (single-threaded with synchronous IPC) */
+    /*
+     * Single-threaded on purpose: every handler in ops.c performs a
+     * synchronous exchange over one shared IPC fd with no mutex around it.
+     * Switching to fuse_session_loop_mt() here alone would let two threads
+     * interleave their frames on that fd and steal each other's replies —
+     * corruption of the protocol, not merely a race.  Making the mount
+     * concurrent means giving each FUSE worker its own connection (the Go
+     * side already serves one goroutine per connection), not changing this
+     * line.
+     */
     ret = fuse_session_loop(se);
 
     /* cleanup */

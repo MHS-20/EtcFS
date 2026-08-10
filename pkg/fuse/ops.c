@@ -46,6 +46,9 @@
 #define IPC_OP_FLUSH       26
 #define IPC_OP_READDIRPLUS 29
 
+/* Must match maxFrameLen in internal/ipc/socket.go. */
+#define IPC_MAX_FRAME_LEN (1u << 20)
+
 #define MAX_NAME_LEN 255
 /* A symlink target is a path, not a name: bounded by PATH_MAX, not NAME_MAX. */
 #define MAX_TARGET_LEN 4095
@@ -106,6 +109,13 @@ static int ipc_sync(int fd, uint16_t op, const uint8_t *payload, uint32_t plen, 
         return -1;
     uint32_t rl = ((uint32_t) rhdr[0] << 24) | ((uint32_t) rhdr[1] << 16) |
                   ((uint32_t) rhdr[2] << 8) | (uint32_t) rhdr[3];
+    /*
+     * The length is whatever arrived on the wire, and it is about to become a
+     * malloc size.  A desynchronised stream would otherwise ask for up to 4
+     * GiB.  The Go side refuses to send or accept a frame past the same cap.
+     */
+    if (rl > IPC_MAX_FRAME_LEN)
+        return -1;
     uint8_t *rb = malloc(rl > 0 ? rl : 1);
     if (!rb)
         return -1;
