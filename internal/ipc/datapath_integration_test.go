@@ -346,3 +346,51 @@ func assertOwned(t *testing.T, svc *Service, store *metadata.Store, ctx context.
 		t.Errorf("permissions = %#o, want %#o", got, wantPerm)
 	}
 }
+
+// A read is answered with the whole requested range, holes included, so it has
+// to be clamped to the file's size: without that, a request reaching past the
+// end comes back as a full buffer of zeroes instead of a short read, and a
+// reader that never sees a short read never sees EOF. `cat` on a 7-byte file
+// produced hundreds of megabytes of NULs.
+func TestIntegration_ReadStopsAtTheEndOfTheFile(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino = 7004
+	seedFile(t, store, ino, metadata.ModeFile|0644)
+
+	payloadData := []byte("s1-data")
+	var wq buf
+	wq.w64(ino)
+	wq.w64(0)
+	wq.w32(uint32(len(payloadData)))
+	wq.b = append(wq.b, payloadData...)
+	if _, err := svc.handleWrite(ctx, wq.b); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// The kernel's typical request is far larger than the file.
+	var rq buf
+	rq.w64(ino)
+	rq.w64(0)
+	rq.w32(131072)
+	resp, err := svc.handleRead(ctx, rq.b)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := readPayload(t, resp); !bytes.Equal(got, payloadData) {
+		t.Fatalf("read returned %d bytes (%q), want the file's %d", len(got), got, len(payloadData))
+	}
+
+	// And a read starting at or past the end is empty, not a buffer of zeroes.
+	var eof buf
+	eof.w64(ino)
+	eof.w64(uint64(len(payloadData)))
+	eof.w32(4096)
+	resp, err = svc.handleRead(ctx, eof.b)
+	if err != nil {
+		t.Fatalf("read at EOF: %v", err)
+	}
+	if got := readPayload(t, resp); len(got) != 0 {
+		t.Fatalf("read at EOF returned %d bytes", len(got))
+	}
+}

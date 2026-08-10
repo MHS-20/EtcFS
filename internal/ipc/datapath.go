@@ -258,14 +258,17 @@ func (s *Service) allocateBlocks(ctx context.Context, size uint64) ([]arena.Run,
 	return s.alloc.Allocate(size)
 }
 
-// writeGeneration returns the fencing generation to stamp on an extent.
-// Generation 0 means "never fenced"; extents are stamped from 1 so that a
-// missing stamp stays distinguishable from a genuine generation.
+// writeGeneration returns the fencing generation to stamp on an extent: this
+// node's own, which is 0 until it is first fenced.
+//
+// It used to floor the value at 1, so that a missing stamp stayed
+// distinguishable from a real generation.  That is no longer a distinction
+// worth making — every field of an extent value is required, so a missing stamp
+// is a decode failure rather than a zero — and the floor put every extent
+// written by a never-fenced node one generation ahead of the node itself, which
+// the scrubber correctly reports as an extent from the future.
 func (s *Service) writeGeneration(ctx context.Context) uint64 {
 	gen, _ := s.store.GetMyGeneration(ctx)
-	if gen < 1 {
-		return 1
-	}
 	return gen
 }
 
@@ -282,6 +285,23 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 
 	if s.dev == nil {
 		return int32Resp(-5), nil
+	}
+
+	// Clamp to the file's size before anything else.  A read is answered with
+	// the whole requested range, holes included, so a request reaching past the
+	// end would otherwise come back as a full buffer of zeroes instead of a
+	// short read — and a reader that never sees a short read never sees EOF.
+	// The kernel usually clamps for us, from the size it last cached; it does
+	// not always, and "usually" is not what a read loop terminates on.
+	rec, err := s.store.GetInode(ctx, ino)
+	if err != nil || rec == nil {
+		return int32Resp(-2), nil
+	}
+	if offset >= rec.Size {
+		return dataResp(nil), nil
+	}
+	if remaining := rec.Size - offset; uint64(size) > remaining {
+		size = uint32(remaining)
 	}
 
 	// A shared lock keeps a concurrent writer off the range while it is read.
@@ -333,9 +353,9 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		pos += n
 	}
 
-	// The whole requested range is returned, holes included.  The kernel has
-	// already clamped the request to the size it last saw, so there is nothing
-	// past the end of the file in it to over-report.
+	// The whole requested range is returned, holes included — clamped to the
+	// file's size above, so a hole reads back as zeroes and the end of the file
+	// reads back short.
 	return dataResp(data), nil
 }
 
