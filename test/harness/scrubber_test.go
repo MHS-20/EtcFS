@@ -46,12 +46,24 @@ func TestScrub_Collision(t *testing.T) {
 func TestScrub_RangeViolation(t *testing.T) {
 	scrubber, store := newTestScrubber(t)
 	ctx := t.Context()
+	scrubber.SetDeviceSize(4 << 30) // a 4 GiB device
 
-	// Extent far beyond arena range
-	store.kv["extent:300/0"] = []byte("0,1099511627776,4096,1,0,node-A") // 1 TB + 4096
+	store.kv["extent:300/0"] = []byte("0,1099511627776,4096,1,0,node-A") // 1 TiB in
+	store.kv["extent:301/0"] = []byte("0,4096,4096,1,0,node-A")          // comfortably inside
 
 	results := scrubber.CheckRangeValidity(ctx)
-	assert.GreaterOrEqual(t, len(results), 1, "should detect out-of-range extent")
+	assert.Len(t, results, 1, "should detect exactly the out-of-range extent")
+}
+
+// Without a device size there is nothing to compare against, and the check
+// used to invent a 1 TiB ceiling that matched neither the device nor fsck.
+func TestScrub_RangeCheckSkippedWithoutADeviceSize(t *testing.T) {
+	scrubber, store := newTestScrubber(t)
+	ctx := t.Context()
+
+	store.kv["extent:300/0"] = []byte("0,1099511627776,4096,1,0,node-A")
+
+	assert.Empty(t, scrubber.CheckRangeValidity(ctx))
 }
 
 // ---- C8.3: Scrubber detects orphan extents ----

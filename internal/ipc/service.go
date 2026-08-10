@@ -55,6 +55,9 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 // SetBlockDevice attaches a block device for data I/O.
 func (s *Service) SetBlockDevice(dev *blockio.Device) {
 	s.dev = dev
+	// The allocator hands out arenas by multiplying an ID by the arena size,
+	// with nothing else to stop it running past the end of the device.
+	s.alloc.SetDeviceSize(uint64(dev.TotalSize()))
 }
 
 // ReconstructArenas rebuilds the arena free-list from existing extents in etcd.

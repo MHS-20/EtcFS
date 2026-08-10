@@ -27,6 +27,12 @@ type Finding struct {
 type Checker struct {
 	Store    MetadataStore
 	Findings []Finding
+
+	// DeviceSize bounds where an extent and an arena may legitimately live.
+	// Zero means the run was not told the device size — offline fsck is often
+	// pointed at etcd alone — and both range checks are skipped rather than run
+	// against a guessed limit.
+	DeviceSize uint64
 }
 
 func New(store MetadataStore) *Checker {
@@ -167,11 +173,11 @@ func (c *Checker) checkExtentValidity(ctx context.Context) {
 				Message: fmt.Sprintf("orphan extent %s (no inode)", ext.Key),
 			})
 		}
-		if ext.DiskOff+ext.Length > maxArenaRange {
+		if c.DeviceSize > 0 && ext.DiskOff+ext.Length > c.DeviceSize {
 			c.Findings = append(c.Findings, Finding{
 				Level: "error",
-				Message: fmt.Sprintf("extent %s beyond arena range: disk_off=%d len=%d",
-					ext.Key, ext.DiskOff, ext.Length),
+				Message: fmt.Sprintf("extent %s is past the end of the %d byte device: disk_off=%d len=%d",
+					ext.Key, c.DeviceSize, ext.DiskOff, ext.Length),
 			})
 		}
 	}
@@ -194,10 +200,11 @@ func (c *Checker) checkArenaBoundaries(ctx context.Context) {
 			})
 			continue
 		}
-		if id > maxArenaID {
+		if c.DeviceSize > 0 && (id+1)*arenaSizeBytes > c.DeviceSize {
 			c.Findings = append(c.Findings, Finding{
-				Level:   "warning",
-				Message: fmt.Sprintf("node %s holds arena %d, an excessive ID", node, id),
+				Level: "error",
+				Message: fmt.Sprintf("node %s holds arena %d, which ends past the %d byte device",
+					node, id, c.DeviceSize),
 			})
 		}
 	}
@@ -257,8 +264,10 @@ func (c *Checker) checkArenaOrphans(ctx context.Context) {
 
 // ---- helpers ----
 
-const maxArenaRange = 1024 * (1 << 30) // 1 TB
-const maxArenaID = 1024
+// arenaSizeBytes mirrors arena.ArenaSizeBytes.  It is duplicated rather than
+// imported because pkg/arena depends on the metadata store, and fsck is meant
+// to run against etcd alone.
+const arenaSizeBytes = 1 << 30
 
 func (c *Checker) collectInodeSet(ctx context.Context) map[uint64]bool {
 	set := make(map[uint64]bool)

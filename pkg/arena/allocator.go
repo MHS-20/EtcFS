@@ -38,7 +38,18 @@ type Allocator struct {
 	nodeID string
 	store  *metadata.Store
 	arenas []*Arena
+
+	// deviceSize bounds the arenas that may be handed out.  Zero means unknown
+	// — a metadata-only service with no device attached — and no arena is
+	// refused for size in that case.
+	deviceSize uint64
 }
+
+// ErrNoSpace reports that the device has no room for another arena.  It is a
+// distinct error because the caller has to answer ENOSPC rather than EIO: a
+// write past the end of the device fails at the pwrite with a short write or
+// EINVAL, which surfaces as a disk error rather than a full filesystem.
+var ErrNoSpace = fmt.Errorf("no space left on device")
 
 // Arena represents a single contiguous range on the block device.
 type Arena struct {
@@ -48,6 +59,21 @@ type Arena struct {
 
 	// bitmap tracks allocated blocks.  bit=1 means allocated, bit=0 means free.
 	bitmap []uint64
+}
+
+// SetDeviceSize tells the allocator how large the shared device is, so it can
+// refuse an arena that would not fit on it.
+func (a *Allocator) SetDeviceSize(bytes uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.deviceSize = bytes
+}
+
+// DeviceSize returns the size the allocator was given, or 0 if none was.
+func (a *Allocator) DeviceSize() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.deviceSize
 }
 
 // NewAllocator creates an Allocator for the given node.
@@ -61,6 +87,14 @@ func NewAllocator(nodeID string, store *metadata.Store) *Allocator {
 // AcquireArena reserves a new arena from the global pool via etcd.
 // The arena is leased exclusively to this node.
 func (a *Allocator) AcquireArena(ctx context.Context) (*Arena, error) {
+	// Checked before an ID is drawn as well as after, because a device too
+	// small for a single arena would otherwise burn a counter value on every
+	// attempt.
+	if size := a.DeviceSize(); size > 0 && size < ArenaSizeBytes {
+		return nil, fmt.Errorf("acquire arena: the device holds %d bytes, less than one arena (%w)",
+			size, ErrNoSpace)
+	}
+
 	arenaID, reused, err := a.allocateArenaID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("acquire arena: %w", err)
@@ -68,6 +102,15 @@ func (a *Allocator) AcquireArena(ctx context.Context) (*Arena, error) {
 
 	diskStart := arenaID * ArenaSizeBytes
 	diskEnd := diskStart + ArenaSizeBytes
+
+	// The ID is not handed back on refusal.  A device with no room left is
+	// stuck for the whole cluster until it grows, and fsck reports the unowned
+	// ID as an orphaned arena — a cheaper outcome than a return path that has
+	// to be correct under a concurrent claim of the same ID.
+	if size := a.DeviceSize(); size > 0 && diskEnd > size {
+		return nil, fmt.Errorf("acquire arena %d: ends at %d, past the %d byte device (%w)",
+			arenaID, diskEnd, size, ErrNoSpace)
+	}
 
 	// Record ownership before using the arena.  Without this the node has no
 	// durable claim on the range it is about to write into, and a restart
@@ -252,7 +295,9 @@ func (a *Allocator) LiveRatio() float64 {
 		used += free.countAllocated()
 	}
 	if total == 0 {
-		return 1.0
+		// Nothing held is nothing used.  Reporting 1.0 made statfs answer that
+		// the filesystem was full before the first write took an arena.
+		return 0.0
 	}
 	return float64(used) / float64(total)
 }

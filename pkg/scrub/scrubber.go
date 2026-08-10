@@ -55,6 +55,11 @@ type Scrubber struct {
 	rateLimit float64 // max fraction of foreground I/O bandwidth to use
 	reclaimer Reclaimer
 
+	// deviceSize bounds where an extent may legitimately live.  Zero means the
+	// scrubber was not told, and the range check is skipped rather than run
+	// against a guessed limit.
+	deviceSize uint64
+
 	mu           sync.Mutex
 	lastRun      time.Time
 	anomalies    []Result
@@ -91,6 +96,13 @@ func New(store MetadataStore, nodeID string, interval time.Duration, log Logger)
 		interval:  interval,
 		rateLimit: 0.1, // default: 10% of I/O bandwidth
 	}
+}
+
+// SetDeviceSize tells the scrubber how large the shared device is, so its
+// range check uses the same number the allocator does rather than a hardcoded
+// copy of it.
+func (s *Scrubber) SetDeviceSize(bytes uint64) {
+	s.deviceSize = bytes
 }
 
 // SetReclaimer attaches the block allocator whose space the scrubber may
@@ -333,19 +345,24 @@ func deadReason(ext metadata.Extent, size uint64, siblings []metadata.Extent) st
 	return ""
 }
 
-// checkRangeValidity detects extents outside their arena range.
+// CheckRangeValidity detects extents that do not fit on the device.
+//
+// Skipped entirely when the device size is unknown: the previous version
+// compared against a hardcoded 1 TiB, which was neither the device's size nor
+// the limit fsck used.
 func (s *Scrubber) CheckRangeValidity(ctx context.Context) []Result {
-	// Simplified: check that extents fall within the global arena range (0 to MaxArena)
-	const maxArena = 1024 // up to 1024 arenas (1 TB total)
-	const arenaSize = 1 << 30
+	if s.deviceSize == 0 {
+		return nil
+	}
 
-	var results []Result
 	extKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixExtent)
+	results := make([]Result, 0, len(extKvs))
 	for _, ext := range metadata.DecodeExtents(extKvs) {
-		if ext.DiskOff+ext.Length > maxArena*arenaSize {
+		if ext.DiskOff+ext.Length > s.deviceSize {
 			results = append(results, Result{
-				Type:    "range",
-				Detail:  fmt.Sprintf("extent %s disk_off=%d+%d exceeds arena range", ext.Key, ext.DiskOff, ext.Length),
+				Type: "range",
+				Detail: fmt.Sprintf("extent %s disk_off=%d+%d is past the end of the %d byte device",
+					ext.Key, ext.DiskOff, ext.Length, s.deviceSize),
 				Ino:     ext.Ino(),
 				DiskOff: ext.DiskOff,
 				Key:     ext.Key,

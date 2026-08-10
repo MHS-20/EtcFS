@@ -1,6 +1,10 @@
 package arena
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+)
 
 // fullArena returns an arena with every block marked allocated, so a test can
 // carve out exactly the holes it wants to reason about.
@@ -141,5 +145,27 @@ func TestOwnsCoversOnlyHeldArenas(t *testing.T) {
 	}
 	if a.Owns(2 * ArenaSizeBytes) {
 		t.Error("first byte past the held arena reported as owned")
+	}
+}
+
+// Arena IDs are handed out by a counter and turned into offsets by multiplying
+// by the arena size, with nothing else to stop them running past the end of the
+// device. A write there fails at the pwrite with a short write or EINVAL, which
+// surfaces as EIO — a disk error — rather than as a full filesystem.
+func TestAcquireArenaRefusesToRunPastTheDevice(t *testing.T) {
+	a := NewAllocator("node-A", nil)
+	a.SetDeviceSize(ArenaSizeBytes / 2)
+
+	_, err := a.AcquireArena(context.Background())
+	if !errors.Is(err, ErrNoSpace) {
+		t.Fatalf("arena past the end of the device: err = %v, want ErrNoSpace", err)
+	}
+}
+
+// statfs derives free space from this, so answering 1.0 with nothing held made
+// df report the filesystem full before the first write took an arena.
+func TestLiveRatioIsZeroWithNoArenas(t *testing.T) {
+	if got := NewAllocator("node-A", nil).LiveRatio(); got != 0 {
+		t.Errorf("LiveRatio with no arenas = %v, want 0", got)
 	}
 }

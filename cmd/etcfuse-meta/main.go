@@ -213,6 +213,9 @@ func main() {
 	// records but never returns their blocks, so disk space leaks on every
 	// deletion.
 	scrubber.SetReclaimer(svc.Allocator())
+	// The range check compares against the real device rather than a hardcoded
+	// ceiling; without a device attached it is skipped.
+	scrubber.SetDeviceSize(svc.Allocator().DeviceSize())
 	go scrubber.Run(ctx)
 
 	// Return arenas this node has emptied to the global free pool.  Without
