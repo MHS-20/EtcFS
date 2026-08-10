@@ -230,7 +230,7 @@ sample_once() {
         echo "tick=$tick container=$c rss_kb=${rss:-0} fds=${fds:-0}" >> "$SAMPLE_LOG"
     done
     db=$(docker exec etcfs-etcd1 etcdctl endpoint status --write-out=fields 2>/dev/null |
-        awk -F': ' '/DbSize/ {print $2; exit}' | tr -d ' \r')
+        awk -F' : ' '/"DBSize"/ {print $2; exit}' | tr -d ' \r')
     echo "tick=$tick container=etcfs-etcd1 db_bytes=${db:-0}" >> "$SAMPLE_LOG"
 }
 
