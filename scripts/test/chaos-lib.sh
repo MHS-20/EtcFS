@@ -355,7 +355,7 @@ for d in json.load(sys.stdin).get('blockdevices', []):
           # exists), so starting it early was a guaranteed, permanent
           # failure rather than a race that sometimes wins.
           SOCK_OK=0
-          for k in \$(seq 1 40); do [ -S /run/etcfuse/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
+          for k in \$(seq 1 40); do sudo [ -S /run/etcfuse/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
           if [ \"\$SOCK_OK\" -ne 1 ]; then
             echo 'FAIL (socket never appeared)'; echo '--- meta.log tail ---'; sudo tail -20 /tmp/meta.log 2>/dev/null
             exit 1

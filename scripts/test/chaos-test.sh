@@ -198,7 +198,7 @@ restart_daemons() {
       sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
       sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints=$3 --node-id=$2 --cluster-name=$4 --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
       SOCK_OK=0
-      for k in \$(seq 1 40); do [ -S /run/etcfuse/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
+      for k in \$(seq 1 40); do sudo [ -S /run/etcfuse/etcfuse.sock ] && SOCK_OK=1 && break; sleep 1; done
       if [ \"\$SOCK_OK\" -ne 1 ]; then
         echo 'FAIL (socket never appeared)'; echo '--- meta.log tail ---'; sudo tail -20 /tmp/meta.log 2>/dev/null
         exit 1
@@ -283,7 +283,7 @@ run_s2() {
     local TAG=$(jq -r '.cluster_name' $PROJECT_ROOT/$STATE_FILE)
     local M=$(runcmd60 "$N1" "
       sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints=$ETCD --node-id=n1 --cluster-name=$TAG --lease-ttl=10s --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
-      for i in \$(seq 1 10); do [ -S /run/etcfuse/etcfuse.sock ] && break; sleep 1; done
+      for i in \$(seq 1 10); do sudo [ -S /run/etcfuse/etcfuse.sock ] && break; sleep 1; done
       sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock --node-id=n1 --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
       for i in \$(seq 1 20); do
         sudo mountpoint -q /mnt/etcfuse 2>/dev/null && echo OK && exit 0
