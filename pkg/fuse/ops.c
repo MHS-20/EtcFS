@@ -130,43 +130,89 @@ static int ipc_sync(int fd, uint16_t op, const uint8_t *payload, uint32_t plen, 
 
 /* ---- binary readers on response buffers ---- */
 
-static uint64_t rb_u64(const uint8_t *p, uint32_t *off)
+/*
+ * A cursor over a response, so a short one cannot be read past.  The readers
+ * used to advance a bare offset with no reference to rlen: the Go side always
+ * sends fixed-width blocks, which is why that held, but it is the same
+ * assumption the readdirplus desync broke.  Once a read runs out of buffer, ok
+ * stays 0 and every later read yields zero, so a handler tests ok once before
+ * replying.
+ */
+struct rbuf {
+    const uint8_t *p;
+    uint32_t len;
+    uint32_t off;
+    int ok;
+};
+
+static struct rbuf rb_new(const uint8_t *p, uint32_t len)
 {
-    uint64_t v = ((uint64_t) p[*off] << 56) | ((uint64_t) p[*off + 1] << 48) |
-                 ((uint64_t) p[*off + 2] << 40) | ((uint64_t) p[*off + 3] << 32) |
-                 ((uint64_t) p[*off + 4] << 24) | ((uint64_t) p[*off + 5] << 16) |
-                 ((uint64_t) p[*off + 6] << 8) | (uint64_t) p[*off + 7];
-    *off += 8;
-    return v;
+    struct rbuf r = {p, len, 0, 1};
+    return r;
 }
-static uint32_t rb_u32(const uint8_t *p, uint32_t *off)
+
+static int rb_take(struct rbuf *r, uint32_t n)
 {
-    uint32_t v = ((uint32_t) p[*off] << 24) | ((uint32_t) p[*off + 1] << 16) |
-                 ((uint32_t) p[*off + 2] << 8) | (uint32_t) p[*off + 3];
-    *off += 4;
-    return v;
+    if (!r->ok || n > r->len - r->off) {
+        r->ok = 0;
+        return 0;
+    }
+    return 1;
 }
-static int32_t rb_i32(const uint8_t *p, uint32_t *off)
+
+static uint64_t rb_u64(struct rbuf *r)
 {
-    return (int32_t) rb_u32(p, off);
+    if (!rb_take(r, 8))
+        return 0;
+    const uint8_t *p = r->p + r->off;
+    r->off += 8;
+    return ((uint64_t) p[0] << 56) | ((uint64_t) p[1] << 48) | ((uint64_t) p[2] << 40) |
+           ((uint64_t) p[3] << 32) | ((uint64_t) p[4] << 24) | ((uint64_t) p[5] << 16) |
+           ((uint64_t) p[6] << 8) | (uint64_t) p[7];
 }
-static void rb_attr(const uint8_t *p, uint32_t *off, struct etcfs_attr *a)
+
+static uint32_t rb_u32(struct rbuf *r)
 {
-    a->ino = rb_u64(p, off);
-    a->size = rb_u64(p, off);
-    a->blocks = rb_u64(p, off);
-    a->atime = rb_u64(p, off);
-    a->mtime = rb_u64(p, off);
-    a->ctime = rb_u64(p, off);
-    a->atime_nsec = rb_u32(p, off);
-    a->mtime_nsec = rb_u32(p, off);
-    a->ctime_nsec = rb_u32(p, off);
-    a->mode = rb_u32(p, off);
-    a->nlink = rb_u32(p, off);
-    a->uid = rb_u32(p, off);
-    a->gid = rb_u32(p, off);
-    a->rdev = rb_u32(p, off);
-    a->blksize = rb_u32(p, off);
+    if (!rb_take(r, 4))
+        return 0;
+    const uint8_t *p = r->p + r->off;
+    r->off += 4;
+    return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | ((uint32_t) p[2] << 8) |
+           (uint32_t) p[3];
+}
+
+static int32_t rb_i32(struct rbuf *r)
+{
+    return (int32_t) rb_u32(r);
+}
+
+/* rb_bytes returns a pointer to n bytes and advances past them, or NULL. */
+static const uint8_t *rb_bytes(struct rbuf *r, uint32_t n)
+{
+    if (!rb_take(r, n))
+        return NULL;
+    const uint8_t *p = r->p + r->off;
+    r->off += n;
+    return p;
+}
+
+static void rb_attr(struct rbuf *r, struct etcfs_attr *a)
+{
+    a->ino = rb_u64(r);
+    a->size = rb_u64(r);
+    a->blocks = rb_u64(r);
+    a->atime = rb_u64(r);
+    a->mtime = rb_u64(r);
+    a->ctime = rb_u64(r);
+    a->atime_nsec = rb_u32(r);
+    a->mtime_nsec = rb_u32(r);
+    a->ctime_nsec = rb_u32(r);
+    a->mode = rb_u32(r);
+    a->nlink = rb_u32(r);
+    a->uid = rb_u32(r);
+    a->gid = rb_u32(r);
+    a->rdev = rb_u32(r);
+    a->blksize = rb_u32(r);
 }
 
 /* ---- binary writers for building request payloads ---- */
@@ -265,8 +311,8 @@ static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
         return;
     }
 
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
@@ -274,13 +320,17 @@ static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
     }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
-    ep.ino = rb_u64(resp, &pos);
+    ep.ino = rb_u64(&rb);
     struct etcfs_attr a;
-    rb_attr(resp, &pos, &a);
-    ep.entry_timeout = (double) rb_u32(resp, &pos);
-    ep.attr_timeout = (double) rb_u32(resp, &pos);
+    rb_attr(&rb, &a);
+    ep.entry_timeout = (double) rb_u32(&rb);
+    ep.attr_timeout = (double) rb_u32(&rb);
     fill_stat(&ep.attr, &a);
     free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     fuse_reply_entry(req, &ep);
 }
 
@@ -308,19 +358,23 @@ static void ec_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
         return;
     }
     struct etcfs_attr a;
-    rb_attr(resp, &pos, &a);
-    uint32_t to = rb_u32(resp, &pos);
+    rb_attr(&rb, &a);
+    uint32_t to = rb_u32(&rb);
     free(resp);
     struct stat st;
     fill_stat(&st, &a);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     fuse_reply_attr(req, &st, (double) to);
 }
 
@@ -340,33 +394,35 @@ static void ec_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
         return;
     }
 
-    uint32_t count = rb_u32(resp, &pos);
+    uint32_t count = rb_u32(&rb);
     size_t bufsz = size > 0 ? size : 4096;
     char *dbuf = malloc(bufsz + 512);
     size_t used = 0;
     uint64_t off_cookie = (uint64_t) off;
     for (uint32_t i = 0; i < count; i++) {
-        uint64_t di = rb_u64(resp, &pos);
-        uint32_t nl = rb_u32(resp, &pos);
-        char *dn = (char *) (resp + pos);
-        pos += nl;
-        uint32_t dt = rb_u32(resp, &pos);
-        uint64_t d_off = rb_u64(resp, &pos);
+        uint64_t di = rb_u64(&rb);
+        uint32_t nl = rb_u32(&rb);
+        const uint8_t *dn = rb_bytes(&rb, nl);
+        if (!dn)
+            break; /* short response: stop rather than read past it */
+        uint32_t dt = rb_u32(&rb);
+        uint64_t d_off = rb_u64(&rb);
         if (d_off <= off_cookie)
             continue; /* skip already-returned entries */
         struct stat st;
         memset(&st, 0, sizeof(st));
         st.st_ino = di;
         st.st_mode = (dt == 4) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
-        size_t sz = fuse_add_direntry(req, dbuf + used, bufsz - used, dn, &st, (off_t) d_off);
+        size_t sz = fuse_add_direntry(req, dbuf + used, bufsz - used, (const char *) dn, &st,
+                                      (off_t) d_off);
         if (sz > bufsz - used)
             break;
         used += sz;
@@ -392,27 +448,28 @@ static void ec_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t of
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
         return;
     }
 
-    uint32_t count = rb_u32(resp, &pos);
+    uint32_t count = rb_u32(&rb);
     size_t bufsz = size > 0 ? size : 4096;
     char *dbuf = malloc(bufsz + 512);
     size_t used = 0;
     uint64_t off_cookie = (uint64_t) off;
 
     for (uint32_t i = 0; i < count; i++) {
-        uint64_t di = rb_u64(resp, &pos);
-        uint32_t nl = rb_u32(resp, &pos);
-        char *dn = (char *) (resp + pos);
-        pos += nl;
-        uint32_t dt __attribute__((unused)) = rb_u32(resp, &pos);
-        uint64_t d_off = rb_u64(resp, &pos);
+        uint64_t di = rb_u64(&rb);
+        uint32_t nl = rb_u32(&rb);
+        const uint8_t *dn = rb_bytes(&rb, nl);
+        if (!dn)
+            break; /* short response: stop rather than read past it */
+        uint32_t dt __attribute__((unused)) = rb_u32(&rb);
+        uint64_t d_off = rb_u64(&rb);
 
         /* Consume the whole entry before deciding whether to skip it.  Each
          * readdirplus entry carries an attr block and two timeouts after the
@@ -423,15 +480,16 @@ static void ec_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t of
         memset(&ep, 0, sizeof(ep));
         ep.ino = di;
         struct etcfs_attr a;
-        rb_attr(resp, &pos, &a);
-        ep.entry_timeout = (double) rb_u32(resp, &pos);
-        ep.attr_timeout = (double) rb_u32(resp, &pos);
+        rb_attr(&rb, &a);
+        ep.entry_timeout = (double) rb_u32(&rb);
+        ep.attr_timeout = (double) rb_u32(&rb);
         fill_stat(&ep.attr, &a);
 
         if (d_off <= off_cookie)
             continue; /* already returned in an earlier call */
 
-        size_t sz = fuse_add_direntry_plus(req, dbuf + used, bufsz - used, dn, &ep, d_off);
+        size_t sz =
+            fuse_add_direntry_plus(req, dbuf + used, bufsz - used, (const char *) dn, &ep, d_off);
         if (sz > bufsz - used)
             break;
         used += sz;
@@ -451,17 +509,31 @@ static void ec_readlink(fuse_req_t req, fuse_ino_t ino)
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
         return;
     }
-    uint32_t tl = rb_u32(resp, &pos);
-    char *target = (char *) (resp + pos);
-    resp[pos + tl] = '\0';
-    fuse_reply_readlink(req, target);
+    uint32_t tl = rb_u32(&rb);
+    const uint8_t *target = rb_bytes(&rb, tl);
+    if (!target) {
+        fuse_reply_err(req, EIO);
+        free(resp);
+        return;
+    }
+    /* fuse_reply_readlink wants a C string, and the wire form is not one. */
+    char *path = malloc((size_t) tl + 1);
+    if (!path) {
+        fuse_reply_err(req, ENOMEM);
+        free(resp);
+        return;
+    }
+    memcpy(path, target, tl);
+    path[tl] = '\0';
+    fuse_reply_readlink(req, path);
+    free(path);
     free(resp);
 }
 
@@ -474,8 +546,8 @@ static void ec_statfs(fuse_req_t req, fuse_ino_t ino)
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
@@ -483,15 +555,19 @@ static void ec_statfs(fuse_req_t req, fuse_ino_t ino)
     }
     struct statvfs sv;
     memset(&sv, 0, sizeof(sv));
-    sv.f_blocks = rb_u64(resp, &pos);
-    sv.f_bfree = rb_u64(resp, &pos);
-    sv.f_bavail = rb_u64(resp, &pos);
-    sv.f_files = rb_u64(resp, &pos);
-    sv.f_ffree = rb_u64(resp, &pos);
-    sv.f_bsize = rb_u32(resp, &pos);
-    sv.f_namemax = rb_u32(resp, &pos);
-    sv.f_frsize = rb_u32(resp, &pos);
+    sv.f_blocks = rb_u64(&rb);
+    sv.f_bfree = rb_u64(&rb);
+    sv.f_bavail = rb_u64(&rb);
+    sv.f_files = rb_u64(&rb);
+    sv.f_ffree = rb_u64(&rb);
+    sv.f_bsize = rb_u32(&rb);
+    sv.f_namemax = rb_u32(&rb);
+    sv.f_frsize = rb_u32(&rb);
     free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     fuse_reply_statfs(req, &sv);
 }
 
@@ -539,8 +615,8 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
@@ -548,17 +624,25 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
     }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
-    ep.ino = rb_u64(resp, &pos);
+    ep.ino = rb_u64(&rb);
     struct etcfs_attr a;
-    rb_attr(resp, &pos, &a);
-    ep.entry_timeout = (double) rb_u32(resp, &pos);
-    ep.attr_timeout = (double) rb_u32(resp, &pos);
+    rb_attr(&rb, &a);
+    ep.entry_timeout = (double) rb_u32(&rb);
+    ep.attr_timeout = (double) rb_u32(&rb);
     fill_stat(&ep.attr, &a);
     free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     struct etcfs_context *ctx = fuse_req_userdata(req);
     fi->fh = ++ctx->next_fh;
     fi->direct_io = 1;
     fi->keep_cache = 0;
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     fuse_reply_create(req, &ep, fi);
 }
 
@@ -586,8 +670,8 @@ static void ec_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
@@ -595,13 +679,17 @@ static void ec_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
     }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
-    ep.ino = rb_u64(resp, &pos);
+    ep.ino = rb_u64(&rb);
     struct etcfs_attr a;
-    rb_attr(resp, &pos, &a);
-    ep.entry_timeout = (double) rb_u32(resp, &pos);
-    ep.attr_timeout = (double) rb_u32(resp, &pos);
+    rb_attr(&rb, &a);
+    ep.entry_timeout = (double) rb_u32(&rb);
+    ep.attr_timeout = (double) rb_u32(&rb);
     fill_stat(&ep.attr, &a);
     free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     fuse_reply_entry(req, &ep);
 }
 
@@ -716,9 +804,9 @@ static void ec_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t siz
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t p = 0;
-    int32_t e = rb_i32(resp, &p);
-    uint32_t written = rb_u32(resp, &p);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
+    uint32_t written = rb_u32(&rb);
     free(resp);
     if (e != 0) {
         fuse_reply_err(req, -e);
@@ -754,19 +842,23 @@ static void ec_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
         return;
     }
     struct etcfs_attr a;
-    rb_attr(resp, &pos, &a);
-    uint32_t to = rb_u32(resp, &pos);
+    rb_attr(&rb, &a);
+    uint32_t to = rb_u32(&rb);
     free(resp);
     struct stat st;
     fill_stat(&st, &a);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     fuse_reply_attr(req, &st, (double) to);
 }
 
@@ -795,8 +887,8 @@ static void ec_symlink(fuse_req_t req, const char *target, fuse_ino_t parent, co
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
@@ -804,13 +896,17 @@ static void ec_symlink(fuse_req_t req, const char *target, fuse_ino_t parent, co
     }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
-    ep.ino = rb_u64(resp, &pos);
+    ep.ino = rb_u64(&rb);
     struct etcfs_attr a;
-    rb_attr(resp, &pos, &a);
-    ep.entry_timeout = (double) rb_u32(resp, &pos);
-    ep.attr_timeout = (double) rb_u32(resp, &pos);
+    rb_attr(&rb, &a);
+    ep.entry_timeout = (double) rb_u32(&rb);
+    ep.attr_timeout = (double) rb_u32(&rb);
     fill_stat(&ep.attr, &a);
     free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     fuse_reply_entry(req, &ep);
 }
 
@@ -835,8 +931,8 @@ static void ec_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t new_parent, const
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
@@ -844,13 +940,17 @@ static void ec_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t new_parent, const
     }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
-    ep.ino = rb_u64(resp, &pos);
+    ep.ino = rb_u64(&rb);
     struct etcfs_attr a;
-    rb_attr(resp, &pos, &a);
-    ep.entry_timeout = (double) rb_u32(resp, &pos);
-    ep.attr_timeout = (double) rb_u32(resp, &pos);
+    rb_attr(&rb, &a);
+    ep.entry_timeout = (double) rb_u32(&rb);
+    ep.attr_timeout = (double) rb_u32(&rb);
     fill_stat(&ep.attr, &a);
     free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     fuse_reply_entry(req, &ep);
 }
 
@@ -879,8 +979,8 @@ static void ec_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
@@ -888,13 +988,17 @@ static void ec_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
     }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
-    ep.ino = rb_u64(resp, &pos);
+    ep.ino = rb_u64(&rb);
     struct etcfs_attr a;
-    rb_attr(resp, &pos, &a);
-    ep.entry_timeout = (double) rb_u32(resp, &pos);
-    ep.attr_timeout = (double) rb_u32(resp, &pos);
+    rb_attr(&rb, &a);
+    ep.entry_timeout = (double) rb_u32(&rb);
+    ep.attr_timeout = (double) rb_u32(&rb);
     fill_stat(&ep.attr, &a);
     free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
     fuse_reply_entry(req, &ep);
 }
 
@@ -948,15 +1052,21 @@ static void ec_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
         fuse_reply_err(req, EIO);
         return;
     }
-    uint32_t pos = 0;
-    int32_t e = rb_i32(resp, &pos);
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
     if (e != 0) {
         fuse_reply_err(req, -e);
         free(resp);
         return;
     }
-    uint32_t dataLen = rb_u32(resp, &pos);
-    fuse_reply_buf(req, (const char *) (resp + pos), dataLen);
+    uint32_t dataLen = rb_u32(&rb);
+    const uint8_t *data = rb_bytes(&rb, dataLen);
+    if (!data) {
+        fuse_reply_err(req, EIO);
+        free(resp);
+        return;
+    }
+    fuse_reply_buf(req, (const char *) data, dataLen);
     free(resp);
 }
 static void ec_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t length,
