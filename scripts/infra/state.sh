@@ -308,65 +308,6 @@ wait_for_fuse_mount() {
     return 1
 }
 
-# wait_for_daemon_ready <ip> [max_retries] [delay_secs]
-# Waits for the EtcFS FUSE daemon to be fully ready:
-#   1. etcfuse-meta systemd unit is active (process running)
-#   2. etcfuse (C, FUSE frontend) systemd unit is active
-#   3. local etcd is healthy
-#   4. FUSE mount is present and responsive
-wait_for_daemon_ready() {
-    local ip="$1"
-    local max_retries="${2:-60}"
-    local delay="${3:-2}"
-    local i=0
-    while [[ $i -lt $max_retries ]]; do
-        # 1. etcfuse-meta active — etcfuse (below) can never become ready
-        # without it, since it's the only thing that talks to etcd; checking
-        # it separately turns "stuck waiting" into a clear failure signal.
-        local meta_active
-        meta_active=$(ssh $SSH_OPTS "ec2-user@${ip}" "systemctl is-active etcfuse-meta 2>/dev/null || true" 2>/dev/null)
-        if [[ "$meta_active" != "active" ]]; then
-            i=$((i + 1))
-            sleep "$delay"
-            continue
-        fi
-
-        # 2. etcfuse (C daemon) systemd unit active
-        local active
-        active=$(ssh $SSH_OPTS "ec2-user@${ip}" "systemctl is-active etcfuse 2>/dev/null || true" 2>/dev/null)
-        if [[ "$active" != "active" ]]; then
-            i=$((i + 1))
-            sleep "$delay"
-            continue
-        fi
-
-        # 3. etcd healthy
-        local etcd_ok
-        etcd_ok=$(ssh $SSH_OPTS "ec2-user@${ip}" \
-            "sudo ETCDCTL_API=3 etcdctl \
-              --endpoints=https://localhost:2379 \
-              --cacert=/etc/etcfuse/ca.crt \
-              --cert=/etc/etcfuse/client.crt \
-              --key=/etc/etcfuse/client.key \
-              endpoint health 2>&1 | grep -c 'is healthy' | tr -d '[:space:]'" 2>/dev/null || echo 0)
-        if [[ "$etcd_ok" != "1" ]]; then
-            i=$((i + 1))
-            sleep "$delay"
-            continue
-        fi
-
-        # 4. FUSE mount responsive
-        if ! ssh $SSH_OPTS "ec2-user@${ip}" "test -d $FUSE_MOUNTPOINT && ls $FUSE_MOUNTPOINT >/dev/null 2>&1" 2>/dev/null; then
-            i=$((i + 1))
-            sleep "$delay"
-            continue
-        fi
-
-        return 0
-    done
-    return 1
-}
-
 # detect_ebs_dev <ip> — find the shared EBS block device on a node
 detect_ebs_dev() {
     local ip="$1"
@@ -391,15 +332,16 @@ echo \"\$EBS_DEV\"
 "
 }
 
-# etcdctl_on <ip> <args...> — run etcdctl on a node
+# etcdctl_on <ip> <args...> — run etcdctl on a node.
+#
+# Plain http, no client cert: every cluster this repo's scripts create is
+# TLS-less now (see bootstrap-cluster.sh's header for why) and reachable
+# only inside the VPC's own security group.
 etcdctl_cmd() {
     local ip="$1"; shift
     ssh $SSH_OPTS "ec2-user@${ip}" -- \
         "sudo ETCDCTL_API=3 etcdctl \
-          --endpoints=https://localhost:2379 \
-          --cacert=/etc/etcfuse/ca.crt \
-          --cert=/etc/etcfuse/client.crt \
-          --key=/etc/etcfuse/client.key $*" 2>/dev/null
+          --endpoints=http://localhost:2379 $*" 2>/dev/null
 }
 
 # remote_cmd <ip> <cmd...> — run command on a node

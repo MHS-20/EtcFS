@@ -31,8 +31,13 @@ done
 TESTDIR="/mnt/etcfuse/run-full-test-$$"
 PASS=0; FAIL=0
 
-pass() { echo "  PASS: $1"; ((PASS++)); }
-fail() { echo "  FAIL: $1"; ((FAIL++)); }
+# Arithmetic assignment, not post-increment: under `set -e`, `((PASS++))`
+# evaluates to the *old* value as its exit status, and `((0))` is false — so
+# incrementing PASS from 0 on the very first pass() call killed the whole
+# script right there. This ran to completion for the first time only once
+# that was fixed.
+pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 log "=== EtcFS Full Validation ==="
 log "Nodes:     $COUNT"
@@ -175,15 +180,34 @@ echo 'hello-from-node0' | sudo tee $TESTDIR/write-test.txt > /dev/null
     fi
 
     # ---- Test 10: EtcFS daemon restart ----
+    # No systemd here (see bootstrap-cluster.sh): both daemons are nohup'd
+    # background processes, so "restart" means kill them and start them
+    # again over SSH, the same way bootstrap-cluster.sh started them.
     log "--- Test 10: EtcFS daemon restart survival ---"
     TARGET="${PUB_IPS[0]}"
-    $SSH_CMD "ec2-user@$TARGET" "sudo systemctl restart etcfuse 2>/dev/null" || true
-    sleep 3
+    TARGET_NODE_ID="n1"
+    ENDPOINTS=""
+    for p in "${PRIV_IPS[@]}"; do
+        [[ -n "$ENDPOINTS" ]] && ENDPOINTS+=","
+        ENDPOINTS+="http://$p:2379"
+    done
+    VOL_ID=$(state_get volume_id 2>/dev/null | tr -d '"')
+    CLUSTER_NAME=$(state_get cluster_name 2>/dev/null | tr -d '"')
+    $SSH_CMD "ec2-user@$TARGET" "
+        sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l $FUSE_MOUNTPOINT 2>/dev/null; sleep 1
+        sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
+        sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock \
+            --etcd-endpoints=$ENDPOINTS --node-id=$TARGET_NODE_ID --cluster-name=$CLUSTER_NAME \
+            --block-device=/dev/nvme1n1 --log-level=1 > /tmp/meta.log 2>&1 &
+        sleep 4
+        sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock \
+            --node-id=$TARGET_NODE_ID --log-level=1 $FUSE_MOUNTPOINT > /tmp/fuse.log 2>&1 &
+    " 2>/dev/null || true
+    sleep 8
     if $SSH_CMD "ec2-user@$TARGET" "mountpoint -q $FUSE_MOUNTPOINT 2>/dev/null" 2>/dev/null; then
         pass "daemon restarted, mount survived"
     else
-        # Expected during design phase — daemon may not exist yet
-        log "  (daemon restart — daemon may not exist yet, expected in design phase)"
+        fail "daemon restart — mount did not come back"
     fi
 
     # Cleanup

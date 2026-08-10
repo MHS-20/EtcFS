@@ -371,8 +371,6 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         log "  Provisioning cluster=$TAG (state=$STATE_FILE)..."
         cd "$PROJECT_ROOT" || return 1
         rm -f "$STATE_FILE"
-        go build -o "$PROJECT_ROOT/bin/etcfuse-meta" "$PROJECT_ROOT/cmd/etcfuse-meta/" 2>&1 | tail -1
-        tar czf /tmp/chaos.tar.gz -C "$PROJECT_ROOT" cmd/etcfuse pkg/fuse pkg/block
         ETCFS_STATE="$STATE_FILE" ETCFS_CLUSTER="$TAG" ETCFS_COMPUTE_NODES=3 \
           bash scripts/infra/create-infra.sh 2>&1 | tail -3
 
@@ -385,97 +383,20 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         SG=$(jq -r '.sg_id' "$STATE_FILE")
         log "  Nodes: $N1 $N2 $N3  SG: $SG"
 
-        for ip in $N1 $N2 $N3; do
-            wait_ssh "$ip" 12
-            ssh_retry "$ip" "sudo dnf install -y fuse3-libs fuse3-devel gcc 2>&1 | tail -2" || true
-            wait_ssh "$ip" 6
-            ssh_retry "$ip" "
-                curl -fsSL https://github.com/etcd-io/etcd/releases/download/v3.5.18/etcd-v3.5.18-linux-amd64.tar.gz -o /tmp/etcd.tar.gz && \
-                sudo tar -xzf /tmp/etcd.tar.gz -C /usr/local/bin --strip-components=1 etcd-v3.5.18-linux-amd64/etcd etcd-v3.5.18-linux-amd64/etcdctl && \
-                sudo chmod +x /usr/local/bin/etcd /usr/local/bin/etcdctl
-            " || true
-            wait_ssh "$ip" 3
-            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q "$PROJECT_ROOT/bin/etcfuse-meta" ec2-user@$ip:/tmp/ 2>/dev/null || true
-            ssh_retry "$ip" "sudo cp /tmp/etcfuse-meta /usr/local/bin/etcfuse-meta && sudo chmod +x /usr/local/bin/etcfuse-meta" || true
-            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -q /tmp/chaos.tar.gz ec2-user@$ip:/tmp/ 2>/dev/null || true
-            ssh_retry "$ip" "
-                rm -rf /tmp/s && mkdir /tmp/s && cd /tmp/s && tar xzf /tmp/chaos.tar.gz && \
-                gcc -I. -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g \
-                    cmd/etcfuse/main.c pkg/fuse/fuse.c pkg/fuse/ops.c pkg/block/block.c \
-                    -o /tmp/etcfuse -lfuse3 -lpthread 2>&1 && \
-                sudo cp /tmp/etcfuse /usr/local/bin/etcfuse && sudo chmod +x /usr/local/bin/etcfuse
-            " || true
-            ssh_retry "$ip" "sudo mkdir -p /mnt/etcfuse" || true
-        done
+        # The actual node bootstrap (packages, etcd, both EtcFS binaries, a
+        # fresh etcd cluster, the daemons) is bootstrap-cluster.sh — the same
+        # script scripts/infra/setup-compute.sh calls for a persistent
+        # cluster. This IS the logic that used to be inlined here; it moved
+        # so the two callers share one implementation instead of two that
+        # drift apart.
+        local ok=0
+        ETCFS_LEASE_TTL="$CHAOS_LEASE_TTL" bash "$PROJECT_ROOT/scripts/infra/bootstrap-cluster.sh" "$STATE_FILE" || ok=1
 
-        log "  Starting etcd cluster..."
-        local INIT="e0=http://$P1:2380,e1=http://$P2:2380,e2=http://$P3:2380"
-        for i in 1 2 3; do
-            eval "ip=\$N$i"; eval "priv=\$P$i"; local ename="e$((i-1))"
-            # shellcheck disable=SC2154
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip "
-                sudo rm -rf /var/lib/etcd && sudo mkdir -p /var/lib/etcd
-                sudo nohup /usr/local/bin/etcd --name $ename --data-dir /var/lib/etcd \
-                    --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://$priv:2379 \
-                    --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://$priv:2380 \
-                    --initial-cluster $INIT --initial-cluster-state new > /tmp/etcd.log 2>&1 &
-            " 2>/dev/null
-        done
-        sleep 10
-        log "  etcd cluster running"
-
-        log "  Starting daemons..."
-        local ETCD="http://$P1:2379,http://$P2:2379,http://$P3:2379"
-        # Both flags enable dual-confirmed external fencing (detach + poll
-        # before the generation bumps, see pkg/fencing/detach.go). Without
-        # them the controller degrades to single-signal fencing. Requires the
-        # instance to carry the etcfs-nodes IAM instance profile
-        # (scripts/infra/fencing-iam.sh), which create-infra.sh attaches by
-        # default — omitted here only if the state file predates that.
-        local vol_id; vol_id=$(jq -r '.volume_id // empty' "$PROJECT_ROOT/$STATE_FILE")
-        for i in 1 2 3; do
-            eval "ip=\$N$i"
-            local inst_id; inst_id=$(jq -r ".compute_instance_ids[$((i-1))] // empty" "$PROJECT_ROOT/$STATE_FILE")
-            local fence_flags=""
-            [[ -n "$vol_id" && -n "$inst_id" ]] && fence_flags="--ebs-volume-id=$vol_id --ec2-instance-id=$inst_id"
-            # ETCFS_FENCE_MODE=nvme selects device-enforced fencing instead:
-            # peers preempt the expired node's reservation key on the shared
-            # namespace, and the device rejects its writes outright. Mutually
-            # exclusive with the EBS flags by design — the preempt is the
-            # stronger signal and needs nothing from the EC2 control plane.
-            [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" ]] && fence_flags="--nvme-reservations"
-            # nvme mode passes --volume-id and lets the daemon itself resolve
-            # the current device path (pkg/blockio.ResolvePath) instead of a
-            # fixed /dev/nvme1n1 — this is the production code path
-            # docs/TODO-hardening.md § 10 covers; other modes keep the fixed
-            # guess since they never detach/reattach.
-            local dev_flag="--block-device=/dev/nvme1n1"
-            [[ "${ETCFS_FENCE_MODE:-ebs}" == "nvme" && -n "$vol_id" ]] && dev_flag="--volume-id=$vol_id"
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@$ip "
-                sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; sleep 1
-                sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
-                sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock \
-                    --etcd-endpoints=$ETCD --node-id=n$i --cluster-name=$TAG \
-                    --lease-ttl=$CHAOS_LEASE_TTL $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
-                sleep 4
-                sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock \
-                    --node-id=n$i --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &
-                sleep 7
-                sudo mountpoint -q /mnt/etcfuse && echo OK || echo FAIL
-            " 2>/dev/null
-        done
-        local MOUNT_OK=0
-        for i in 1 2 3; do
-            eval "ip=\$N$i"
-            # shellcheck disable=SC2015
-            check_mount "$ip" && MOUNT_OK=$((MOUNT_OK+1)) || { log "  ERROR: FUSE mount on $ip FAILED!"; dump_logs "$ip"; }
-        done
         # aws has no separate meta "container" — alias M1..M3 to the same
         # host as N1..N3 so callers written for docker's meta/fuse split
         # (chaos-fuzz.sh's inject_fault) don't hit unbound variables.
         M1="$N1"; M2="$N2"; M3="$N3"
-        log "  Daemons running ($MOUNT_OK/3 mounts OK)"
-        [[ "$MOUNT_OK" -eq 3 ]]
+        return "$ok"
     }
     teardown_cluster() {
         log "  Teardown ($STATE_FILE)..."
