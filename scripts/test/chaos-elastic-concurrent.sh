@@ -137,12 +137,15 @@ if [[ -n "$NODE4" ]]; then writef "$NODE4" "n4-arena-claim" "cs-n4-arena.txt" >/
 if [[ -n "$NODE5" ]]; then writef "$NODE5" "n5-arena-claim" "cs-n5-arena.txt" >/dev/null 2>&1; fi
 
 if [[ -n "$NODE4" && -n "$NODE5" ]]; then
-    ARENA4=$(etcdctl_on get "arena:n4" --print-value-only 2>/dev/null | od -An -tx1 | tr -d ' \n')
-    ARENA5=$(etcdctl_on get "arena:n5" --print-value-only 2>/dev/null | od -An -tx1 | tr -d ' \n')
-    if [[ -n "$ARENA4" && -n "$ARENA5" && "$ARENA4" != "$ARENA5" ]]; then
-        ok "arena:n4 ($ARENA4) and arena:n5 ($ARENA5) are disjoint"
+    # Ownership is one key per arena — arena:<node>/<arena_id> — so the node's
+    # holdings are a prefix, not a single key.
+    ARENA4=$(etcdctl_on get --prefix "arena:n4/" --keys-only 2>/dev/null | grep -c 'arena:n4/')
+    ARENA5=$(etcdctl_on get --prefix "arena:n5/" --keys-only 2>/dev/null | grep -c 'arena:n5/')
+    SHARED=$(etcdctl_on get --prefix "arena:" --keys-only 2>/dev/null | grep -oE '/[0-9]+$' | sort | uniq -d | tr -d '\n')
+    if [[ "$ARENA4" -gt 0 && "$ARENA5" -gt 0 && -z "$SHARED" ]]; then
+        ok "n4 holds $ARENA4 arena(s), n5 holds $ARENA5, and no arena ID is claimed twice"
     else
-        bad "arena collision or missing arena record — arena:n4=$ARENA4 arena:n5=$ARENA5"
+        bad "arena collision or missing arena record — n4 arenas=$ARENA4 n5 arenas=$ARENA5 shared=[$SHARED]"
     fi
 else
     log "  SKIP: arena check needs both n4 and n5 to have joined"

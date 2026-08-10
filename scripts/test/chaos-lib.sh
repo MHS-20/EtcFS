@@ -98,6 +98,14 @@ if [[ "$MODE" == "docker" ]]; then
     }
     teardown_cluster() {
         log "  Tearing down docker-compose cluster..."
+        # Nodes added during the run are not part of the compose project, so
+        # `compose down` leaves them behind — and a leftover etcd member makes
+        # the *next* run's `member add` fail with "Peer URLs already exists",
+        # which reads as a product failure and is not one.
+        for id in 4 5 6 7 8; do
+            docker rm -f "etcfs-fuse$id" "etcfs-meta$id" "etcfs-etcd$id" >/dev/null 2>&1
+            docker volume rm "etcfuse-meta${id}-sock" >/dev/null 2>&1
+        done
         $COMPOSE down -v >/dev/null 2>&1 &
     }
 
