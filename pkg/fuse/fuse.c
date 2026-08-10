@@ -186,10 +186,19 @@ int etcfs_run(struct etcfs_context *ctx)
      * evaluates the mode, uid and gid this daemon reports against the calling
      * process before the request is ever sent.  EtcFS deliberately implements
      * no access checks of its own: duplicating them in the daemon would mean a
-     * second, divergent copy of rules the kernel already applies correctly. */
+     * second, divergent copy of rules the kernel already applies correctly.
+     *
+     * allow_other is required alongside it: the daemon runs as root, and
+     * without allow_other FUSE restricts the mount to the mounting user only
+     * — every other user, including one connecting over SSH to use the mount,
+     * gets EACCES on the mountpoint itself regardless of default_permissions.
+     * It is safe together with default_permissions because the kernel still
+     * enforces per-file mode/uid/gid on every access; allow_other only lifts
+     * the FUSE-level single-user restriction, it does not bypass Unix
+     * permissions. */
     if (fuse_opt_add_arg(&args, "-o") < 0)
         return -1;
-    if (fuse_opt_add_arg(&args, "default_permissions") < 0)
+    if (fuse_opt_add_arg(&args, "default_permissions,allow_other") < 0)
         return -1;
 
     /* register init callback */
