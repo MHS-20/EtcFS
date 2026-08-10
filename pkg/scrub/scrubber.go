@@ -17,6 +17,7 @@ package scrub
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -138,13 +139,19 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 
 	s.log.Info("scrub pass starting")
 
-	collisions := s.CheckExtentCollisions(ctx)
-	orphans := s.CheckOrphanExtents(ctx)
-	dead := s.CheckDeadExtents(ctx)
-	rangeV := s.CheckRangeValidity(ctx)
-	genM := s.CheckGenerationConsistency(ctx)
-	nlinkV := s.CheckNlinkConsistency(ctx)
-	unref := s.CheckUnreferencedInodes(ctx)
+	snap, err := s.Scan(ctx)
+	if err != nil {
+		s.log.Error("scrub pass aborted", "error", err)
+		return
+	}
+
+	collisions := s.CheckExtentCollisions(snap)
+	orphans := s.CheckOrphanExtents(snap)
+	dead := s.CheckDeadExtents(snap)
+	rangeV := s.CheckRangeValidity(snap)
+	genM := s.CheckGenerationConsistency(snap)
+	nlinkV := s.CheckNlinkConsistency(snap)
+	unref := s.CheckUnreferencedInodes(snap)
 
 	s.record(collisions, orphans, dead, rangeV, genM, nlinkV, unref)
 
@@ -226,70 +233,121 @@ func (s *Scrubber) record(passes ...[]Result) {
 // cannot consume the process.
 const maxAnomalies = 1000
 
-// ---- scrub checks ----
+// ---- the pass snapshot ----
 
-// checkExtentCollisions detects two different inodes claiming the same disk offset.
-func (s *Scrubber) CheckExtentCollisions(ctx context.Context) []Result {
-	kvs, err := s.store.GetPrefix(ctx, metadata.PrefixExtent)
+// Snapshot is everything one scrub pass reads, gathered once.
+//
+// Each check used to scan the key space it needed for itself, so a pass read
+// the whole extent space five times and the inode space twice, and the orphan
+// check additionally issued one Get per extent to ask whether its inode
+// existed — a question the inode scan already answers.
+type Snapshot struct {
+	Extents []metadata.Extent
+	// Inodes holds every inode record, by inode number.
+	Inodes map[uint64]*metadata.InodeRecord
+	// DirentRefs counts the directory entries pointing at each inode.
+	DirentRefs map[uint64]uint32
+	// Generations is each node's current fencing generation.
+	Generations map[string]uint64
+}
+
+// Scan reads the whole key space once, for every check in a pass to share.
+func (s *Scrubber) Scan(ctx context.Context) (*Snapshot, error) {
+	extKvs, err := s.store.GetPrefix(ctx, metadata.PrefixExtent)
 	if err != nil {
-		s.log.Error("scrub: cannot scan extents", "error", err)
-		return nil
+		return nil, fmt.Errorf("scan extents: %w", err)
+	}
+	inodeKvs, err := s.store.GetPrefix(ctx, metadata.PrefixInode)
+	if err != nil {
+		return nil, fmt.Errorf("scan inodes: %w", err)
+	}
+	direntKvs, err := s.store.GetPrefix(ctx, metadata.PrefixDirent)
+	if err != nil {
+		return nil, fmt.Errorf("scan dirents: %w", err)
+	}
+	genKvs, err := s.store.GetPrefix(ctx, metadata.PrefixGen)
+	if err != nil {
+		return nil, fmt.Errorf("scan generations: %w", err)
 	}
 
-	// Map: disk_off → list of inode claimers
-	seen := make(map[uint64][]uint64)
-	var results []Result
-
-	for _, ext := range metadata.DecodeExtents(kvs) {
-		ino := ext.Ino()
-		for _, existingIno := range seen[ext.DiskOff] {
-			if existingIno != ino {
-				results = append(results, Result{
-					Type:    "collision",
-					Detail:  fmt.Sprintf("ino %d and %d both claim disk_off=%d", ino, existingIno, ext.DiskOff),
-					Ino:     ino,
-					DiskOff: ext.DiskOff,
-					Key:     ext.Key,
-				})
-			}
+	snap := &Snapshot{
+		Extents:     metadata.DecodeExtents(extKvs),
+		Inodes:      make(map[uint64]*metadata.InodeRecord, len(inodeKvs)),
+		DirentRefs:  make(map[uint64]uint32, len(direntKvs)),
+		Generations: make(map[string]uint64, len(genKvs)),
+	}
+	for _, kv := range inodeKvs {
+		if rec := metadata.DecodeInode(kv.Value); rec != nil {
+			snap.Inodes[rec.Ino] = rec
 		}
-		seen[ext.DiskOff] = append(seen[ext.DiskOff], ino)
+	}
+	for _, kv := range direntKvs {
+		snap.DirentRefs[metadata.DecodeUint64(kv.Value)]++
+	}
+	for _, kv := range genKvs {
+		n := uint64(0)
+		_, _ = fmt.Sscanf(string(kv.Value), "%d", &n)
+		snap.Generations[string(kv.Key[len(metadata.PrefixGen):])] = n
+	}
+	return snap, nil
+}
+
+// ---- scrub checks ----
+
+// CheckExtentCollisions detects two extents whose device ranges overlap.
+//
+// Overlap, not an identical starting offset: two extents sharing a disk_off is
+// only the most obvious case, and comparing offsets for equality missed every
+// partial overlap — which is the same corruption, one byte over.
+func (s *Scrubber) CheckExtentCollisions(snap *Snapshot) []Result {
+	byStart := append([]metadata.Extent(nil), snap.Extents...)
+	sort.Slice(byStart, func(i, j int) bool { return byStart[i].DiskOff < byStart[j].DiskOff })
+
+	results := make([]Result, 0, len(byStart))
+	for i := 1; i < len(byStart); i++ {
+		prev, cur := byStart[i-1], byStart[i]
+		// Sorted by start, so only the immediately preceding extent can be the
+		// one that reaches into this one — except where several overlap, and
+		// there each adjacent pair is reported in turn.
+		if prev.DiskOff+prev.Length <= cur.DiskOff {
+			continue
+		}
+		if prev.Key == cur.Key {
+			continue
+		}
+		results = append(results, Result{
+			Type: "collision",
+			Detail: fmt.Sprintf("extent %s (ino %d) at %d+%d overlaps %s (ino %d) at %d+%d",
+				cur.Key, cur.Ino(), cur.DiskOff, cur.Length,
+				prev.Key, prev.Ino(), prev.DiskOff, prev.Length),
+			Ino:     cur.Ino(),
+			DiskOff: cur.DiskOff,
+			Key:     cur.Key,
+		})
 	}
 	return results
 }
 
-// checkOrphanExtents detects allocated extents with no inode reference.
-func (s *Scrubber) CheckOrphanExtents(ctx context.Context) []Result {
-	extKvs, err := s.store.GetPrefix(ctx, metadata.PrefixExtent)
-	if err != nil {
-		return nil
-	}
-
-	var results []Result
-	for _, kv := range extKvs {
-		key := string(kv.Key)
-		ino := metadata.InoFromExtentKey(key)
-
-		// Check if the inode exists
-		val, _ := s.store.Get(ctx, metadata.InodeKey(ino))
-		if val == nil {
-			// The disk range is carried along, not just the key: deleting the
-			// extent record makes the metadata clean but leaves the blocks
-			// behind it marked allocated forever.  Reclaiming them is what
-			// makes deletion actually return space.  A malformed value yields
-			// a zero range, and Free ignores ranges outside this node's own
-			// arenas, so the metadata cleanup still happens either way.
-			ext, _ := metadata.DecodeExtent(key, kv.Value)
-			results = append(results, Result{
-				Type:    "orphan",
-				Detail:  fmt.Sprintf("extent %s has no inode reference", key),
-				Ino:     ino,
-				DiskOff: ext.DiskOff,
-				Length:  ext.Length,
-				Key:     key,
-				AutoFix: true,
-			})
+// CheckOrphanExtents detects allocated extents with no inode reference.
+func (s *Scrubber) CheckOrphanExtents(snap *Snapshot) []Result {
+	results := make([]Result, 0, len(snap.Extents))
+	for _, ext := range snap.Extents {
+		if _, alive := snap.Inodes[ext.Ino()]; alive {
+			continue
 		}
+		// The disk range is carried along, not just the key: deleting the
+		// extent record makes the metadata clean but leaves the blocks behind
+		// it marked allocated forever.  Reclaiming them is what makes deletion
+		// actually return space.
+		results = append(results, Result{
+			Type:    "orphan",
+			Detail:  fmt.Sprintf("extent %s has no inode reference", ext.Key),
+			Ino:     ext.Ino(),
+			DiskOff: ext.DiskOff,
+			Length:  ext.Length,
+			Key:     ext.Key,
+			AutoFix: true,
+		})
 	}
 	return results
 }
@@ -303,42 +361,24 @@ func (s *Scrubber) CheckOrphanExtents(ctx context.Context) []Result {
 // behind them stay allocated for the lifetime of the file.
 //
 // Both cases arise on the node that performed the operation as well, but that
-// node reclaims what it owns inline (see ipc.Service.dropExtent).  What reaches
-// here is the cross-node remainder: a truncate or overwrite issued from one
-// node against bytes sitting in another node's arena, which only the owner may
-// reclaim.
-func (s *Scrubber) CheckDeadExtents(ctx context.Context) []Result {
-	extKvs, err := s.store.GetPrefix(ctx, metadata.PrefixExtent)
-	if err != nil {
-		s.log.Error("scrub: cannot scan extents", "error", err)
-		return nil
-	}
-
-	sizes := make(map[uint64]uint64)
-	inodeKvs, err := s.store.GetPrefix(ctx, metadata.PrefixInode)
-	if err != nil {
-		s.log.Error("scrub: cannot scan inodes", "error", err)
-		return nil
-	}
-	for _, kv := range inodeKvs {
-		if rec := metadata.DecodeInode(kv.Value); rec != nil {
-			sizes[rec.Ino] = rec.Size
-		}
-	}
-
+// node reclaims what it owns inline (see ipc.Service.reclaimCovered).  What
+// reaches here is the cross-node remainder: a truncate or overwrite issued from
+// one node against bytes sitting in another node's arena, which only the owner
+// may reclaim.
+func (s *Scrubber) CheckDeadExtents(snap *Snapshot) []Result {
 	byIno := make(map[uint64][]metadata.Extent)
-	for _, ext := range metadata.DecodeExtents(extKvs) {
+	for _, ext := range snap.Extents {
 		byIno[ext.Ino()] = append(byIno[ext.Ino()], ext)
 	}
 
-	var results []Result
+	results := make([]Result, 0, len(snap.Extents))
 	for ino, extents := range byIno {
-		size, alive := sizes[ino]
+		rec, alive := snap.Inodes[ino]
 		if !alive {
 			continue // no inode: the orphan check owns this one
 		}
 		for _, ext := range extents {
-			reason := deadReason(ext, size, extents)
+			reason := deadReason(ext, rec.Size, extents)
 			if reason == "" {
 				continue
 			}
@@ -378,14 +418,13 @@ func deadReason(ext metadata.Extent, size uint64, siblings []metadata.Extent) st
 // Skipped entirely when the device size is unknown: the previous version
 // compared against a hardcoded 1 TiB, which was neither the device's size nor
 // the limit fsck used.
-func (s *Scrubber) CheckRangeValidity(ctx context.Context) []Result {
+func (s *Scrubber) CheckRangeValidity(snap *Snapshot) []Result {
 	if s.deviceSize == 0 {
 		return nil
 	}
 
-	extKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixExtent)
-	results := make([]Result, 0, len(extKvs))
-	for _, ext := range metadata.DecodeExtents(extKvs) {
+	results := make([]Result, 0, len(snap.Extents))
+	for _, ext := range snap.Extents {
 		if ext.DiskOff+ext.Length > s.deviceSize {
 			results = append(results, Result{
 				Type: "range",
@@ -413,20 +452,10 @@ func (s *Scrubber) CheckRangeValidity(ctx context.Context) []Result {
 // written before a fence looks like.  The check used to compare against the
 // maximum generation across the whole cluster, so one node ever being fenced
 // turned every extent written by every other node into an anomaly.
-func (s *Scrubber) CheckGenerationConsistency(ctx context.Context) []Result {
-	nodeGens := make(map[string]uint64)
-	genKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixGen)
-	for _, kv := range genKvs {
-		nodeID := string(kv.Key[len(metadata.PrefixGen):])
-		n := uint64(0)
-		_, _ = fmt.Sscanf(string(kv.Value), "%d", &n)
-		nodeGens[nodeID] = n
-	}
-
-	extKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixExtent)
-	results := make([]Result, 0, len(extKvs))
-	for _, ext := range metadata.DecodeExtents(extKvs) {
-		current, known := nodeGens[ext.Node]
+func (s *Scrubber) CheckGenerationConsistency(snap *Snapshot) []Result {
+	results := make([]Result, 0, len(snap.Extents))
+	for _, ext := range snap.Extents {
+		current, known := snap.Generations[ext.Node]
 		if !known || ext.Gen <= current {
 			continue
 		}
@@ -442,29 +471,17 @@ func (s *Scrubber) CheckGenerationConsistency(ctx context.Context) []Result {
 	return results
 }
 
-// checkNlinkConsistency verifies every inode's nlink matches dirent count.
-func (s *Scrubber) CheckNlinkConsistency(ctx context.Context) []Result {
-	// Count dirent references per inode
-	refCount := make(map[uint64]uint32)
-	direntKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixDirent)
-	for _, kv := range direntKvs {
-		ino := metadata.DecodeUint64(kv.Value)
-		refCount[ino]++
-	}
-
-	var results []Result
-	inodeKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixInode)
-	for _, kv := range inodeKvs {
-		rec := metadata.DecodeInode(kv.Value)
-		if rec == nil {
-			continue
-		}
-		expected := expectedNlink(rec, refCount[rec.Ino])
+// CheckNlinkConsistency verifies every inode's nlink matches its dirent count.
+func (s *Scrubber) CheckNlinkConsistency(snap *Snapshot) []Result {
+	results := make([]Result, 0, len(snap.Inodes))
+	for ino, rec := range snap.Inodes {
+		expected := expectedNlink(rec, snap.DirentRefs[ino])
 		if rec.Nlink != expected {
 			results = append(results, Result{
 				Type:   "nlink",
-				Detail: fmt.Sprintf("ino=%d nlink=%d dirents=%d", rec.Ino, rec.Nlink, expected),
-				Ino:    rec.Ino,
+				Detail: fmt.Sprintf("ino=%d nlink=%d dirents=%d", ino, rec.Nlink, expected),
+				Ino:    ino,
+				Key:    metadata.InodeKey(ino),
 			})
 		}
 	}
@@ -482,27 +499,19 @@ func (s *Scrubber) CheckNlinkConsistency(ctx context.Context) []Result {
 // It is reported, never auto-fixed.  Deleting an inode is not reversible, and
 // the blocks behind it are reclaimed by the orphan check once it goes — so an
 // operator, or fsck, decides.
-func (s *Scrubber) CheckUnreferencedInodes(ctx context.Context) []Result {
-	referenced := make(map[uint64]bool)
-	direntKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixDirent)
-	for _, kv := range direntKvs {
-		referenced[metadata.DecodeUint64(kv.Value)] = true
-	}
-
-	inodeKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixInode)
-	results := make([]Result, 0, len(inodeKvs))
-	for _, kv := range inodeKvs {
-		rec := metadata.DecodeInode(kv.Value)
+func (s *Scrubber) CheckUnreferencedInodes(snap *Snapshot) []Result {
+	results := make([]Result, 0, len(snap.Inodes))
+	for ino := range snap.Inodes {
 		// The root has no dirent by construction — it is the directory every
 		// path starts from, so nothing names it.
-		if rec == nil || rec.Ino == metadata.RootIno || referenced[rec.Ino] {
+		if ino == metadata.RootIno || snap.DirentRefs[ino] > 0 {
 			continue
 		}
 		results = append(results, Result{
 			Type:   "unreferenced",
-			Detail: fmt.Sprintf("inode %d has no directory entry", rec.Ino),
-			Ino:    rec.Ino,
-			Key:    string(kv.Key),
+			Detail: fmt.Sprintf("inode %d has no directory entry", ino),
+			Ino:    ino,
+			Key:    metadata.InodeKey(ino),
 		})
 	}
 	return results

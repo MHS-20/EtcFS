@@ -27,6 +27,14 @@ func newTestScrubber(t *testing.T) (*scrub.Scrubber, *MockStore) {
 
 // ---- C8.1: Scrubber detects extent collision ----
 
+// snap gathers the one snapshot a pass shares between its checks.
+func snap(t *testing.T, s *scrub.Scrubber, ctx context.Context) *scrub.Snapshot {
+	t.Helper()
+	got, err := s.Scan(ctx)
+	require.NoError(t, err)
+	return got
+}
+
 func TestScrub_Collision(t *testing.T) {
 	scrubber, store := newTestScrubber(t)
 	ctx := t.Context()
@@ -35,7 +43,7 @@ func TestScrub_Collision(t *testing.T) {
 	store.kv["extent:100/0"] = []byte("0,4096,4096,1,0,node-A")
 	store.kv["extent:200/0"] = []byte("0,4096,4096,1,0,node-A") // same disk_off!
 
-	results := scrubber.CheckExtentCollisions(ctx)
+	results := scrubber.CheckExtentCollisions(snap(t, scrubber, ctx))
 	require.Len(t, results, 1, "should detect one collision")
 	assert.Equal(t, "collision", results[0].Type)
 	assert.Contains(t, results[0].Detail, "4096")
@@ -51,7 +59,7 @@ func TestScrub_RangeViolation(t *testing.T) {
 	store.kv["extent:300/0"] = []byte("0,1099511627776,4096,1,0,node-A") // 1 TiB in
 	store.kv["extent:301/0"] = []byte("0,4096,4096,1,0,node-A")          // comfortably inside
 
-	results := scrubber.CheckRangeValidity(ctx)
+	results := scrubber.CheckRangeValidity(snap(t, scrubber, ctx))
 	assert.Len(t, results, 1, "should detect exactly the out-of-range extent")
 }
 
@@ -63,7 +71,7 @@ func TestScrub_RangeCheckSkippedWithoutADeviceSize(t *testing.T) {
 
 	store.kv["extent:300/0"] = []byte("0,1099511627776,4096,1,0,node-A")
 
-	assert.Empty(t, scrubber.CheckRangeValidity(ctx))
+	assert.Empty(t, scrubber.CheckRangeValidity(snap(t, scrubber, ctx)))
 }
 
 // ---- C8.3: Scrubber detects orphan extents ----
@@ -75,7 +83,7 @@ func TestScrub_Orphan(t *testing.T) {
 	// Extent exists but inode doesn't
 	store.kv["extent:999/0"] = []byte("0,8192,4096,1,0,node-A")
 
-	results := scrubber.CheckOrphanExtents(ctx)
+	results := scrubber.CheckOrphanExtents(snap(t, scrubber, ctx))
 	require.Len(t, results, 1, "should detect one orphan")
 	assert.Equal(t, "orphan", results[0].Type)
 	assert.True(t, results[0].AutoFix, "orphans should be auto-fixable")
@@ -93,7 +101,7 @@ func TestScrub_GenerationFromTheFutureIsAnomalous(t *testing.T) {
 	store.kv["gen:node-A"] = []byte("3")
 	store.kv["extent:400/0"] = []byte("0,16384,4096,9,0,node-A")
 
-	results := scrubber.CheckGenerationConsistency(ctx)
+	results := scrubber.CheckGenerationConsistency(snap(t, scrubber, ctx))
 	assert.GreaterOrEqual(t, len(results), 1, "should detect generation mismatch")
 }
 
@@ -109,7 +117,7 @@ func TestScrub_ExtentsOlderThanTheirNodesFenceAreNotAnomalies(t *testing.T) {
 	store.kv["extent:400/0"] = []byte("0,16384,4096,3,0,node-A")
 	store.kv["extent:401/0"] = []byte("0,20480,4096,0,0,node-B")
 
-	assert.Empty(t, scrubber.CheckGenerationConsistency(ctx),
+	assert.Empty(t, scrubber.CheckGenerationConsistency(snap(t, scrubber, ctx)),
 		"extents predating a fence are ordinary data")
 }
 
@@ -125,7 +133,7 @@ func TestScrub_NlinkMismatch(t *testing.T) {
 	store.kv["dirent:1/link1"] = encodeUint64BE(500)
 	store.kv["dirent:1/link2"] = encodeUint64BE(500)
 
-	results := scrubber.CheckNlinkConsistency(ctx)
+	results := scrubber.CheckNlinkConsistency(snap(t, scrubber, ctx))
 	assert.GreaterOrEqual(t, len(results), 1, "should detect nlink mismatch")
 }
 
@@ -158,12 +166,12 @@ func TestScrub_SurviveRestart(t *testing.T) {
 	ctx := t.Context()
 
 	store.kv["extent:700/0"] = []byte("0,28672,4096,1,0,node-A")
-	results1 := scrubber1.CheckOrphanExtents(ctx)
+	results1 := scrubber1.CheckOrphanExtents(snap(t, scrubber1, ctx))
 	assert.Len(t, results1, 1)
 
 	// "Restart" — create a new scrubber with the same store
 	scrubber2 := scrub.New(store, "node-a", 10*time.Millisecond, testLogger{t})
-	results2 := scrubber2.CheckOrphanExtents(ctx)
+	results2 := scrubber2.CheckOrphanExtents(snap(t, scrubber2, ctx))
 	assert.Len(t, results2, 1, "should detect same anomaly after restart")
 }
 
@@ -180,7 +188,7 @@ func TestScrub_Throughput(t *testing.T) {
 	}
 
 	start := time.Now()
-	results := scrubber.CheckExtentCollisions(ctx)
+	results := scrubber.CheckExtentCollisions(snap(t, scrubber, ctx))
 	elapsed := time.Since(start)
 
 	assert.Empty(t, results, "no collisions expected")
@@ -217,12 +225,12 @@ func TestScrub_Alerting(t *testing.T) {
 	store.kv["inode:6000"] = metadata.EncodeInode(rec)
 	store.kv["dirent:1/clean.txt"] = encodeUint64BE(6000)
 
-	results := scrubber.CheckNlinkConsistency(ctx)
+	results := scrubber.CheckNlinkConsistency(snap(t, scrubber, ctx))
 	assert.Empty(t, results, "clean state should have no alerts")
 
 	// Inject anomaly
 	store.kv["dirent:1/extra.txt"] = encodeUint64BE(6000) // now 2 dirents, nlink=1
-	results = scrubber.CheckNlinkConsistency(ctx)
+	results = scrubber.CheckNlinkConsistency(snap(t, scrubber, ctx))
 	assert.NotEmpty(t, results, "anomaly should trigger alert")
 }
 

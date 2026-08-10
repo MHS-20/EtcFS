@@ -77,7 +77,9 @@ func TestSoak_ScaledJepsenWithMetrics(t *testing.T) {
 			reg.IncCounter("etcfuse_etcd_txn_total", "txn_commit")
 			faults++
 		case 8:
-			_ = sc.CheckExtentCollisions(ctx)
+			if snapshot, serr := sc.Scan(ctx); serr == nil {
+				_ = sc.CheckExtentCollisions(snapshot)
+			}
 			reg.IncCounter("etcfuse_scrub_anomalies_total", "scrub_pass")
 		case 9:
 			reg.SetGauge("etcfuse_arena_utilization", 0.4+float64(ops%30)/100.0)
