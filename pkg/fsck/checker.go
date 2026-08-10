@@ -9,6 +9,7 @@ import (
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/scrub"
 )
 
 // MetadataStore is the interface required by the checker.
@@ -42,15 +43,40 @@ func New(store MetadataStore) *Checker {
 func (c *Checker) Run(ctx context.Context) []Finding {
 	c.Findings = nil
 
+	// The consistency checks themselves live in pkg/scrub and are shared: this
+	// is the offline front end, the scrubber is the online one.  They were
+	// implemented twice, with different thresholds and severities, which is
+	// exactly how an offline check and an online check come to disagree about
+	// whether a filesystem is healthy.
+	snap, err := scrub.Scan(ctx, c.Store)
+	if err != nil {
+		c.Findings = append(c.Findings, Finding{
+			Level:   "error",
+			Message: fmt.Sprintf("cannot read the filesystem: %v", err),
+		})
+		return c.Findings
+	}
+
 	c.checkInodesDecodable(ctx)
-	c.checkDirentsReferenced(ctx)
-	c.checkInodesReferenced(ctx)
-	c.checkNlinkConsistency(ctx)
-	c.checkExtentValidity(ctx)
+	c.checkDirentsReferenced(ctx, snap)
+	c.report("warning", scrub.CheckUnreferencedInodes(snap))
+	c.report("warning", scrub.CheckNlinkConsistency(snap))
+	c.report("warning", scrub.CheckOrphanExtents(snap))
+	c.report("warning", scrub.CheckDeadExtents(snap))
+	c.report("error", scrub.CheckExtentCollisions(snap))
+	c.report("error", scrub.CheckRangeValidity(snap, c.DeviceSize))
+	c.report("error", scrub.CheckGenerationConsistency(snap))
 	c.checkArenaBoundaries(ctx)
 	c.checkArenaOrphans(ctx)
 
 	return c.Findings
+}
+
+// report records a scrub check's findings at the given severity.
+func (c *Checker) report(level string, results []scrub.Result) {
+	for _, r := range results {
+		c.Findings = append(c.Findings, Finding{Level: level, Message: r.Detail})
+	}
 }
 
 func (c *Checker) ErrorCount() int {
@@ -73,7 +99,7 @@ func (c *Checker) WarningCount() int {
 	return n
 }
 
-// ---- individual checks ----
+// ---- checks that are fsck's own ----
 
 func (c *Checker) checkInodesDecodable(ctx context.Context) {
 	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixInode)
@@ -87,97 +113,20 @@ func (c *Checker) checkInodesDecodable(ctx context.Context) {
 	}
 }
 
-func (c *Checker) checkDirentsReferenced(ctx context.Context) {
+// checkDirentsReferenced reports names whose inode is missing — the mirror of
+// the scrubber's unreferenced-inode check, and the one condition that makes a
+// path resolve to nothing.
+func (c *Checker) checkDirentsReferenced(ctx context.Context, snap *scrub.Snapshot) {
 	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixDirent)
-	seenInos := c.collectInodeSet(ctx)
 	for _, kv := range kvs {
-		ino := decodeUint64(kv.Value)
+		ino := metadata.DecodeUint64(kv.Value)
 		if ino == 0 {
 			continue
 		}
-		if !seenInos[ino] {
+		if _, alive := snap.Inodes[ino]; !alive {
 			c.Findings = append(c.Findings, Finding{
 				Level:   "error",
 				Message: fmt.Sprintf("dirent %s points to missing inode %d", string(kv.Key), ino),
-			})
-		}
-	}
-}
-
-// checkInodesReferenced reports inode records no directory entry names.  Such
-// an inode is unreachable: it appears in no listing, and the orphan-extent
-// check cannot see the space behind it, because that check looks for extents
-// whose inode is missing rather than unreachable.
-func (c *Checker) checkInodesReferenced(ctx context.Context) {
-	referenced := make(map[uint64]bool)
-	direntKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixDirent)
-	for _, kv := range direntKvs {
-		referenced[decodeUint64(kv.Value)] = true
-	}
-
-	inodeKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixInode)
-	for _, kv := range inodeKvs {
-		ino := inoFromKey(string(kv.Key))
-		// The root is named by nothing by construction: it is where paths start.
-		if ino == metadata.RootIno || referenced[ino] {
-			continue
-		}
-		c.Findings = append(c.Findings, Finding{
-			Level:   "warning",
-			Message: fmt.Sprintf("inode %d has no directory entry", ino),
-		})
-	}
-}
-
-func (c *Checker) checkNlinkConsistency(ctx context.Context) {
-	refCount := make(map[uint64]uint32)
-	direntKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixDirent)
-	for _, kv := range direntKvs {
-		ino := decodeUint64(kv.Value)
-		if ino != 0 {
-			refCount[ino]++
-		}
-	}
-
-	inodeKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixInode)
-	for _, kv := range inodeKvs {
-		rec := metadata.DecodeInode(kv.Value)
-		if rec == nil {
-			continue
-		}
-		ino := inoFromKey(string(kv.Key))
-		// A directory's count is fixed, not counted: directories cannot be
-		// hard-linked, and this filesystem does not model the ".." link a
-		// subdirectory contributes to its parent.
-		expected := refCount[ino]
-		if rec.Mode&metadata.S_IFMT == metadata.ModeDir {
-			expected = metadata.InitialNlink(rec.Mode)
-		}
-		if rec.Nlink != expected {
-			c.Findings = append(c.Findings, Finding{
-				Level: "warning",
-				Message: fmt.Sprintf("nlink mismatch: ino=%d nlink=%d expected=%d",
-					ino, rec.Nlink, expected),
-			})
-		}
-	}
-}
-
-func (c *Checker) checkExtentValidity(ctx context.Context) {
-	seenInos := c.collectInodeSet(ctx)
-	extKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixExtent)
-	for _, ext := range metadata.DecodeExtents(extKvs) {
-		if !seenInos[ext.Ino()] {
-			c.Findings = append(c.Findings, Finding{
-				Level:   "warning",
-				Message: fmt.Sprintf("orphan extent %s (no inode)", ext.Key),
-			})
-		}
-		if c.DeviceSize > 0 && ext.DiskOff+ext.Length > c.DeviceSize {
-			c.Findings = append(c.Findings, Finding{
-				Level: "error",
-				Message: fmt.Sprintf("extent %s is past the end of the %d byte device: disk_off=%d len=%d",
-					ext.Key, c.DeviceSize, ext.DiskOff, ext.Length),
 			})
 		}
 	}
@@ -224,7 +173,7 @@ func (c *Checker) checkArenaOrphans(ctx context.Context) {
 	// The counter holds the next unissued ID, so every arena ever handed out
 	// is below it.
 	counter, _ := c.Store.Get(ctx, metadata.PrefixArenaLog)
-	highWater := decodeUint64(counter)
+	highWater := metadata.DecodeUint64(counter)
 
 	owners := make(map[uint64]string)
 	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixArena)
@@ -268,30 +217,3 @@ func (c *Checker) checkArenaOrphans(ctx context.Context) {
 // imported because pkg/arena depends on the metadata store, and fsck is meant
 // to run against etcd alone.
 const arenaSizeBytes = 1 << 30
-
-func (c *Checker) collectInodeSet(ctx context.Context) map[uint64]bool {
-	set := make(map[uint64]bool)
-	kvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixInode)
-	for _, kv := range kvs {
-		ino := inoFromKey(string(kv.Key))
-		set[ino] = true
-	}
-	return set
-}
-
-func inoFromKey(key string) uint64 {
-	trimmed := strings.TrimPrefix(key, metadata.PrefixInode)
-	ino, _ := strconv.ParseUint(trimmed, 10, 64)
-	return ino
-}
-
-func decodeUint64(b []byte) uint64 {
-	if len(b) < 8 {
-		return 0
-	}
-	var v uint64
-	for i := 0; i < 8; i++ {
-		v = v<<8 | uint64(b[i])
-	}
-	return v
-}

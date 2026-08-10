@@ -251,21 +251,32 @@ type Snapshot struct {
 	Generations map[string]uint64
 }
 
+// Reader is the read side of the store: all a snapshot and every check needs.
+// fsck runs the same checks over the same snapshot through it.
+type Reader interface {
+	GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.KeyValue, error)
+}
+
 // Scan reads the whole key space once, for every check in a pass to share.
 func (s *Scrubber) Scan(ctx context.Context) (*Snapshot, error) {
-	extKvs, err := s.store.GetPrefix(ctx, metadata.PrefixExtent)
+	return Scan(ctx, s.store)
+}
+
+// Scan reads the whole key space once.
+func Scan(ctx context.Context, store Reader) (*Snapshot, error) {
+	extKvs, err := store.GetPrefix(ctx, metadata.PrefixExtent)
 	if err != nil {
 		return nil, fmt.Errorf("scan extents: %w", err)
 	}
-	inodeKvs, err := s.store.GetPrefix(ctx, metadata.PrefixInode)
+	inodeKvs, err := store.GetPrefix(ctx, metadata.PrefixInode)
 	if err != nil {
 		return nil, fmt.Errorf("scan inodes: %w", err)
 	}
-	direntKvs, err := s.store.GetPrefix(ctx, metadata.PrefixDirent)
+	direntKvs, err := store.GetPrefix(ctx, metadata.PrefixDirent)
 	if err != nil {
 		return nil, fmt.Errorf("scan dirents: %w", err)
 	}
-	genKvs, err := s.store.GetPrefix(ctx, metadata.PrefixGen)
+	genKvs, err := store.GetPrefix(ctx, metadata.PrefixGen)
 	if err != nil {
 		return nil, fmt.Errorf("scan generations: %w", err)
 	}
@@ -299,7 +310,9 @@ func (s *Scrubber) Scan(ctx context.Context) (*Snapshot, error) {
 // Overlap, not an identical starting offset: two extents sharing a disk_off is
 // only the most obvious case, and comparing offsets for equality missed every
 // partial overlap — which is the same corruption, one byte over.
-func (s *Scrubber) CheckExtentCollisions(snap *Snapshot) []Result {
+func (s *Scrubber) CheckExtentCollisions(snap *Snapshot) []Result { return CheckExtentCollisions(snap) }
+
+func CheckExtentCollisions(snap *Snapshot) []Result {
 	byStart := append([]metadata.Extent(nil), snap.Extents...)
 	sort.Slice(byStart, func(i, j int) bool { return byStart[i].DiskOff < byStart[j].DiskOff })
 
@@ -329,7 +342,9 @@ func (s *Scrubber) CheckExtentCollisions(snap *Snapshot) []Result {
 }
 
 // CheckOrphanExtents detects allocated extents with no inode reference.
-func (s *Scrubber) CheckOrphanExtents(snap *Snapshot) []Result {
+func (s *Scrubber) CheckOrphanExtents(snap *Snapshot) []Result { return CheckOrphanExtents(snap) }
+
+func CheckOrphanExtents(snap *Snapshot) []Result {
 	results := make([]Result, 0, len(snap.Extents))
 	for _, ext := range snap.Extents {
 		if _, alive := snap.Inodes[ext.Ino()]; alive {
@@ -365,7 +380,9 @@ func (s *Scrubber) CheckOrphanExtents(snap *Snapshot) []Result {
 // reaches here is the cross-node remainder: a truncate or overwrite issued from
 // one node against bytes sitting in another node's arena, which only the owner
 // may reclaim.
-func (s *Scrubber) CheckDeadExtents(snap *Snapshot) []Result {
+func (s *Scrubber) CheckDeadExtents(snap *Snapshot) []Result { return CheckDeadExtents(snap) }
+
+func CheckDeadExtents(snap *Snapshot) []Result {
 	byIno := make(map[uint64][]metadata.Extent)
 	for _, ext := range snap.Extents {
 		byIno[ext.Ino()] = append(byIno[ext.Ino()], ext)
@@ -419,17 +436,24 @@ func deadReason(ext metadata.Extent, size uint64, siblings []metadata.Extent) st
 // compared against a hardcoded 1 TiB, which was neither the device's size nor
 // the limit fsck used.
 func (s *Scrubber) CheckRangeValidity(snap *Snapshot) []Result {
-	if s.deviceSize == 0 {
+	return CheckRangeValidity(snap, s.deviceSize)
+}
+
+// CheckRangeValidity reports extents that do not fit on a device of the given
+// size.  A zero size means the caller does not know it, and the check is
+// skipped rather than run against a guessed limit.
+func CheckRangeValidity(snap *Snapshot, deviceSize uint64) []Result {
+	if deviceSize == 0 {
 		return nil
 	}
 
 	results := make([]Result, 0, len(snap.Extents))
 	for _, ext := range snap.Extents {
-		if ext.DiskOff+ext.Length > s.deviceSize {
+		if ext.DiskOff+ext.Length > deviceSize {
 			results = append(results, Result{
 				Type: "range",
 				Detail: fmt.Sprintf("extent %s disk_off=%d+%d is past the end of the %d byte device",
-					ext.Key, ext.DiskOff, ext.Length, s.deviceSize),
+					ext.Key, ext.DiskOff, ext.Length, deviceSize),
 				Ino:     ext.Ino(),
 				DiskOff: ext.DiskOff,
 				Key:     ext.Key,
@@ -453,6 +477,10 @@ func (s *Scrubber) CheckRangeValidity(snap *Snapshot) []Result {
 // maximum generation across the whole cluster, so one node ever being fenced
 // turned every extent written by every other node into an anomaly.
 func (s *Scrubber) CheckGenerationConsistency(snap *Snapshot) []Result {
+	return CheckGenerationConsistency(snap)
+}
+
+func CheckGenerationConsistency(snap *Snapshot) []Result {
 	results := make([]Result, 0, len(snap.Extents))
 	for _, ext := range snap.Extents {
 		current, known := snap.Generations[ext.Node]
@@ -472,7 +500,9 @@ func (s *Scrubber) CheckGenerationConsistency(snap *Snapshot) []Result {
 }
 
 // CheckNlinkConsistency verifies every inode's nlink matches its dirent count.
-func (s *Scrubber) CheckNlinkConsistency(snap *Snapshot) []Result {
+func (s *Scrubber) CheckNlinkConsistency(snap *Snapshot) []Result { return CheckNlinkConsistency(snap) }
+
+func CheckNlinkConsistency(snap *Snapshot) []Result {
 	results := make([]Result, 0, len(snap.Inodes))
 	for ino, rec := range snap.Inodes {
 		expected := expectedNlink(rec, snap.DirentRefs[ino])
@@ -500,6 +530,10 @@ func (s *Scrubber) CheckNlinkConsistency(snap *Snapshot) []Result {
 // the blocks behind it are reclaimed by the orphan check once it goes — so an
 // operator, or fsck, decides.
 func (s *Scrubber) CheckUnreferencedInodes(snap *Snapshot) []Result {
+	return CheckUnreferencedInodes(snap)
+}
+
+func CheckUnreferencedInodes(snap *Snapshot) []Result {
 	results := make([]Result, 0, len(snap.Inodes))
 	for ino := range snap.Inodes {
 		// The root has no dirent by construction — it is the directory every
