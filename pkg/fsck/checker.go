@@ -38,6 +38,7 @@ func (c *Checker) Run(ctx context.Context) []Finding {
 
 	c.checkInodesDecodable(ctx)
 	c.checkDirentsReferenced(ctx)
+	c.checkInodesReferenced(ctx)
 	c.checkNlinkConsistency(ctx)
 	c.checkExtentValidity(ctx)
 	c.checkArenaBoundaries(ctx)
@@ -94,6 +95,31 @@ func (c *Checker) checkDirentsReferenced(ctx context.Context) {
 				Message: fmt.Sprintf("dirent %s points to missing inode %d", string(kv.Key), ino),
 			})
 		}
+	}
+}
+
+// checkInodesReferenced reports inode records no directory entry names.  Such
+// an inode is unreachable: it appears in no listing, and the orphan-extent
+// check cannot see the space behind it, because that check looks for extents
+// whose inode is missing rather than unreachable.
+func (c *Checker) checkInodesReferenced(ctx context.Context) {
+	referenced := make(map[uint64]bool)
+	direntKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixDirent)
+	for _, kv := range direntKvs {
+		referenced[decodeUint64(kv.Value)] = true
+	}
+
+	inodeKvs, _ := c.Store.GetPrefix(ctx, metadata.PrefixInode)
+	for _, kv := range inodeKvs {
+		ino := inoFromKey(string(kv.Key))
+		// The root is named by nothing by construction: it is where paths start.
+		if ino == metadata.RootIno || referenced[ino] {
+			continue
+		}
+		c.Findings = append(c.Findings, Finding{
+			Level:   "warning",
+			Message: fmt.Sprintf("inode %d has no directory entry", ino),
+		})
 	}
 }
 

@@ -7,6 +7,7 @@
 //  3. Orphan extents — allocated blocks with no inode reference
 //  4. Generation mismatches — extent stamped with wrong fencing generation
 //  5. Nlink inconsistencies — inode nlink doesn't match dirent count
+//  6. Unreferenced inodes — inode records no directory entry names
 //
 // Anomalies are logged and emitted as metrics.  The scrubber can reclaim
 // safe anomalies (orphans) automatically.  Unsafe anomalies (collisions,
@@ -131,6 +132,7 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	rangeV := s.CheckRangeValidity(ctx)
 	genM := s.CheckGenerationConsistency(ctx)
 	nlinkV := s.CheckNlinkConsistency(ctx)
+	unref := s.CheckUnreferencedInodes(ctx)
 
 	s.mu.Lock()
 	s.anomalies = append(s.anomalies, collisions...)
@@ -139,6 +141,7 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	s.anomalies = append(s.anomalies, rangeV...)
 	s.anomalies = append(s.anomalies, genM...)
 	s.anomalies = append(s.anomalies, nlinkV...)
+	s.anomalies = append(s.anomalies, unref...)
 	s.totalChecked++
 	s.mu.Unlock()
 
@@ -173,11 +176,11 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 		}
 	}
 
-	total := len(collisions) + len(orphans) + len(dead) + len(rangeV) + len(genM) + len(nlinkV)
+	total := len(collisions) + len(orphans) + len(dead) + len(rangeV) + len(genM) + len(nlinkV) + len(unref)
 	if total > 0 {
 		s.log.Warn("scrub found anomalies", "count", total, "collisions", len(collisions),
 			"orphans", len(orphans), "dead", len(dead), "range", len(rangeV),
-			"generation", len(genM), "nlink", len(nlinkV))
+			"generation", len(genM), "nlink", len(nlinkV), "unreferenced", len(unref))
 	} else {
 		s.log.Info("scrub pass clean")
 	}
@@ -414,6 +417,43 @@ func (s *Scrubber) CheckNlinkConsistency(ctx context.Context) []Result {
 				Ino:    rec.Ino,
 			})
 		}
+	}
+	return results
+}
+
+// CheckUnreferencedInodes detects inode records that no directory entry names.
+//
+// Nothing can reach such an inode: it does not appear in any listing, and its
+// extents are invisible to the orphan check, which looks for extents whose
+// inode is *missing* rather than unreachable.  Every creating operation is a
+// single transaction, so this should never appear; when it does, it is either a
+// leak from an older write path or genuine corruption.
+//
+// It is reported, never auto-fixed.  Deleting an inode is not reversible, and
+// the blocks behind it are reclaimed by the orphan check once it goes — so an
+// operator, or fsck, decides.
+func (s *Scrubber) CheckUnreferencedInodes(ctx context.Context) []Result {
+	referenced := make(map[uint64]bool)
+	direntKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixDirent)
+	for _, kv := range direntKvs {
+		referenced[metadata.DecodeUint64(kv.Value)] = true
+	}
+
+	var results []Result
+	inodeKvs, _ := s.store.GetPrefix(ctx, metadata.PrefixInode)
+	for _, kv := range inodeKvs {
+		rec := metadata.DecodeInode(kv.Value)
+		// The root has no dirent by construction — it is the directory every
+		// path starts from, so nothing names it.
+		if rec == nil || rec.Ino == metadata.RootIno || referenced[rec.Ino] {
+			continue
+		}
+		results = append(results, Result{
+			Type:   "unreferenced",
+			Detail: fmt.Sprintf("inode %d has no directory entry", rec.Ino),
+			Ino:    rec.Ino,
+			Key:    string(kv.Key),
+		})
 	}
 	return results
 }

@@ -852,9 +852,7 @@ func TestIntegration_Link(t *testing.T) {
 	require.NoError(t, err)
 
 	// Hard link
-	err = store.IncrementNlink(ctx, 3401)
-	require.NoError(t, err)
-	err = store.CreateDirent(ctx, parent, "hardlink.txt", 3401)
+	_, err = store.AtomicLink(ctx, 3401, parent, "hardlink.txt")
 	require.NoError(t, err)
 
 	rec, err := store.GetInode(ctx, 3401)
@@ -1112,8 +1110,8 @@ func TestIntegration_CreatedInodesCarryTheirLinkCount(t *testing.T) {
 
 	// A hard link raises the count, and unlinking one name lowers it again
 	// without removing the inode.
-	require.NoError(t, s.IncrementNlink(ctx, 9103))
-	require.NoError(t, s.CreateDirent(ctx, parent, "regular-link", 9103))
+	_, err = s.AtomicLink(ctx, 9103, parent, "regular-link")
+	require.NoError(t, err)
 	rec, err := s.GetInode(ctx, 9103)
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, rec.Nlink)
@@ -1243,11 +1241,8 @@ func TestIntegration_ConcurrentHardLinksAllCount(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if lerr := s.IncrementNlink(ctx, ino); lerr != nil {
-				errs <- lerr
-				return
-			}
-			errs <- s.CreateDirent(ctx, parent, fmt.Sprintf("link-%d", i), ino)
+			_, lerr := s.AtomicLink(ctx, ino, parent, fmt.Sprintf("link-%d", i))
+			errs <- lerr
 		}(i)
 	}
 	wg.Wait()
@@ -1364,4 +1359,75 @@ func TestIntegration_RenameOverTargetPinsTheVictimInode(t *testing.T) {
 		require.NotNil(t, victim, "a surviving name means the inode must remain")
 		assert.EqualValues(t, 1, victim.Nlink)
 	}
+}
+
+// ---- atomic creation ----
+
+// Every creating operation publishes the inode and the name that reaches it in
+// one transaction. Symlink, mknod and link used to be two or three round trips,
+// so a failure between them left an inode nothing could name — invisible to the
+// orphan check, which looks for extents without inodes, not the reverse.
+func TestIntegration_CreationsPublishInodeAndNameTogether(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent = 9500
+
+	_, err := s.AtomicCreateDir(ctx, RootIno, "atomic-create", parent, 0755, 1000, 1000)
+	require.NoError(t, err)
+
+	link, err := s.AtomicCreateSymlink(ctx, parent, "link", 9501, "../target", 1000, 1000)
+	require.NoError(t, err)
+	assert.EqualValues(t, len("../target"), link.Size)
+	target, err := s.Get(ctx, InodeSymlinkKey(9501))
+	require.NoError(t, err)
+	assert.Equal(t, "../target", string(target))
+
+	node, err := s.AtomicCreateNode(ctx, parent, "dev", 9502, 0020000|0644, 0x0103, 1000, 1000)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0x0103, node.Rdev)
+
+	for name, ino := range map[string]uint64{"link": 9501, "dev": 9502} {
+		got, lerr := s.LookupDirent(ctx, parent, name)
+		require.NoError(t, lerr)
+		assert.Equal(t, ino, got, name)
+		rec, gerr := s.GetInode(ctx, ino)
+		require.NoError(t, gerr)
+		require.NotNil(t, rec, name)
+		assert.EqualValues(t, 1, rec.Nlink, "%s link count", name)
+	}
+
+	// A create that loses the race for the name writes nothing at all: its
+	// inode number stays unused rather than becoming an unreachable record.
+	_, err = s.AtomicCreateSymlink(ctx, parent, "link", 9503, "elsewhere", 1000, 1000)
+	require.ErrorIs(t, err, ErrExists)
+	rec, err := s.GetInode(ctx, 9503)
+	require.NoError(t, err)
+	assert.Nil(t, rec, "a refused create must leave no inode behind")
+}
+
+// A hard link that cannot take its name must not leave the link count raised:
+// the count and the dirent commit together or not at all.
+func TestIntegration_RefusedLinkLeavesNlinkAlone(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t, "node-A")
+	const parent = 9600
+
+	_, err := s.AtomicCreateDir(ctx, RootIno, "atomic-link", parent, 0755, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateFile(ctx, parent, "file", 9601, ModeFile|0644, 1000, 1000)
+	require.NoError(t, err)
+	_, err = s.AtomicCreateFile(ctx, parent, "taken", 9602, ModeFile|0644, 1000, 1000)
+	require.NoError(t, err)
+
+	_, err = s.AtomicLink(ctx, 9601, parent, "taken")
+	require.ErrorIs(t, err, ErrExists)
+
+	rec, err := s.GetInode(ctx, 9601)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, rec.Nlink, "a refused link must not raise the count")
+
+	// A hard link to a directory would let the namespace form a cycle no unlink
+	// can break.
+	_, err = s.AtomicLink(ctx, parent, parent, "self")
+	require.ErrorIs(t, err, ErrPerm)
 }

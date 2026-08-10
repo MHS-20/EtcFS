@@ -36,6 +36,8 @@ func errnoFor(err error, fallback int32) int32 {
 		return -22 // EINVAL
 	case errors.Is(err, metadata.ErrNotEmpty):
 		return -39 // ENOTEMPTY
+	case errors.Is(err, metadata.ErrPerm):
+		return -1 // EPERM
 	}
 	return fallback
 }
@@ -479,27 +481,12 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 		return int32Resp(-28), nil
 	}
 
-	// A symlink's own mode is not meaningful and is never masked by the umask;
-	// the permissions that matter are those of the target it resolves to.
-	_, err = s.store.CreateInode(ctx, ino, metadata.ModeSymlink|0777, uid, gid)
+	rec, err := s.store.AtomicCreateSymlink(ctx, parent, name, ino, target, uid, gid)
 	if err != nil {
 		return int32Resp(errnoFor(err, -17)), nil
 	}
 
-	// Store target
-	if _, err := s.store.Put(ctx, metadata.InodeSymlinkKey(ino), []byte(target)); err != nil {
-		return int32Resp(errnoFor(err, -5)), nil
-	}
-
-	// Create directory entry
-	err = s.store.CreateDirent(ctx, parent, name, ino)
-	if err != nil {
-		return int32Resp(errnoFor(err, -17)), nil
-	}
-
-	return entryResp(ino, &metadata.InodeRecord{
-		Ino: ino, Mode: metadata.ModeSymlink | 0777, Nlink: 1, Size: uint64(len(target)),
-	}), nil
+	return entryResp(ino, rec), nil
 }
 
 // LINK payload: [u64:ino][u64:new_parent][u32:new_name_len][new_name]
@@ -513,19 +500,10 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 	nameLen, rest := readU32(rest)
 	name := string(rest[:nameLen])
 
-	// Increment nlink
-	err := s.store.IncrementNlink(ctx, ino)
-	if err != nil {
-		return int32Resp(errnoFor(err, -2)), nil
-	}
-
-	// Create new directory entry
-	err = s.store.CreateDirent(ctx, newParent, name, ino)
+	rec, err := s.store.AtomicLink(ctx, ino, newParent, name)
 	if err != nil {
 		return int32Resp(errnoFor(err, -17)), nil
 	}
-
-	rec, _ := s.store.GetInode(ctx, ino)
 	return entryResp(ino, rec), nil
 }
 
@@ -550,16 +528,7 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 		return int32Resp(-28), nil
 	}
 
-	rec, err := s.store.CreateInode(ctx, ino, applyUmask(mode, umask), uid, gid)
-	if err != nil {
-		return int32Resp(errnoFor(err, -17)), nil
-	}
-	rec.Rdev = rdev
-	if _, err := s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec)); err != nil {
-		return int32Resp(errnoFor(err, -5)), nil
-	}
-
-	err = s.store.CreateDirent(ctx, parent, name, ino)
+	rec, err := s.store.AtomicCreateNode(ctx, parent, name, ino, applyUmask(mode, umask), rdev, uid, gid)
 	if err != nil {
 		return int32Resp(errnoFor(err, -17)), nil
 	}

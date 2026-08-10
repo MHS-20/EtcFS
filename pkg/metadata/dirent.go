@@ -127,97 +127,118 @@ func extractNameFromKey(key string, parent uint64) string {
 	return key
 }
 
-// AtomicCreateFile creates a file in a single etcd transaction:
-//  1. Check that the dirent key does not exist
-//  2. Check that the inode key does not exist
-//  3. Create the dirent
-//  4. Create the inode
+// atomicCreate publishes a new inode and the name that refers to it in one
+// transaction, together with whatever else the file type needs (a symlink's
+// target, say).  Every creating operation goes through here: an inode written
+// without its dirent is unreachable and invisible to the orphan checks, which
+// look for extents without inodes, not inodes without names.
 //
-// This is the canonical create pattern from init_plan §4:
-// "insert dirent if absent, insert inode if absent" in one transaction.
-func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string, ino uint64, mode uint32, uid, gid uint32) (*InodeRecord, error) {
-	now := timeNow()
-
-	rec := &InodeRecord{
-		Ino:     ino,
-		Size:    0,
-		Blocks:  0,
-		Mode:    mode,
-		Nlink:   InitialNlink(mode),
-		UID:     uid,
-		GID:     gid,
-		Blksize: 4096,
-		Atime:   now,
-		Mtime:   now,
-		Ctime:   now,
-	}
-
+// The transaction asserts both that the name is free and that the inode number
+// is unused, so a create that loses either race writes nothing at all.
+func (s *Store) atomicCreate(ctx context.Context, parent uint64, name string, rec *InodeRecord, extra ...clientv3.Op) error {
 	cmps := []clientv3.Cmp{
-		clientv3.Compare(clientv3.CreateRevision(DirentKey(parent, name)), "=", 0), // entry doesn't exist
-		clientv3.Compare(clientv3.CreateRevision(InodeKey(ino)), "=", 0),           // inode doesn't exist
+		clientv3.Compare(clientv3.CreateRevision(DirentKey(parent, name)), "=", 0),
+		clientv3.Compare(clientv3.CreateRevision(InodeKey(rec.Ino)), "=", 0),
 	}
-
-	ops := []clientv3.Op{
-		PutDirent(parent, name, ino),
-		clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec))),
-	}
+	ops := append([]clientv3.Op{
+		PutDirent(parent, name, rec.Ino),
+		clientv3.OpPut(InodeKey(rec.Ino), string(EncodeInode(rec))),
+	}, extra...)
 
 	ok, err := s.Txn(ctx, cmps, ops, nil)
 	if err != nil {
-		return nil, fmt.Errorf("atomic create %d/%q: %w", parent, name, err)
+		return fmt.Errorf("atomic create %d/%q: %w", parent, name, err)
 	}
 	if !ok {
-		exists, _ := s.LookupDirent(ctx, parent, name)
-		if exists != 0 {
-			return nil, fmt.Errorf("atomic create %d/%q: %w", parent, name, ErrExists)
-		}
-		_, err := s.GetInode(ctx, ino)
-		if err == nil {
-			return nil, fmt.Errorf("atomic create %d/%q: inode %d already exists", parent, name, ino)
-		}
-		return nil, fmt.Errorf("atomic create %d/%q: transaction failed", parent, name)
+		return fmt.Errorf("atomic create %d/%q: %w", parent, name, ErrExists)
 	}
+	return nil
+}
 
-	return rec, nil
+// AtomicCreateFile creates a regular file and its directory entry in a single
+// etcd transaction.
+func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string, ino uint64, mode uint32, uid, gid uint32) (*InodeRecord, error) {
+	rec := NewInodeRecord(ino, mode, uid, gid)
+	return rec, s.atomicCreate(ctx, parent, name, rec)
 }
 
 // AtomicCreateDir creates a directory (mkdir) in a single etcd transaction.
 // Same pattern as AtomicCreateFile but with nlink=2 (. and ..) and S_IFDIR mode.
 func (s *Store) AtomicCreateDir(ctx context.Context, parent uint64, name string, ino uint64, mode uint32, uid, gid uint32) (*InodeRecord, error) {
-	now := timeNow()
+	rec := NewInodeRecord(ino, mode|ModeDir, uid, gid)
+	rec.Size = 4096
+	return rec, s.atomicCreate(ctx, parent, name, rec)
+}
 
-	rec := &InodeRecord{
-		Ino:     ino,
-		Size:    4096,
-		Blocks:  0,
-		Mode:    mode | ModeDir,
-		Nlink:   InitialNlink(mode | ModeDir),
-		UID:     uid,
-		GID:     gid,
-		Blksize: 4096,
-		Atime:   now,
-		Mtime:   now,
-		Ctime:   now,
-	}
+// AtomicCreateSymlink creates a symlink inode, its target record and its
+// directory entry in a single etcd transaction.
+func (s *Store) AtomicCreateSymlink(ctx context.Context, parent uint64, name string, ino uint64, target string, uid, gid uint32) (*InodeRecord, error) {
+	// A symlink's own permission bits are not meaningful — the target's are what
+	// an access check consults — so the mode is fixed rather than umask-masked.
+	rec := NewInodeRecord(ino, ModeSymlink|0777, uid, gid)
+	rec.Size = uint64(len(target))
+	return rec, s.atomicCreate(ctx, parent, name, rec, clientv3.OpPut(InodeSymlinkKey(ino), target))
+}
 
-	cmps := []clientv3.Cmp{
-		clientv3.Compare(clientv3.CreateRevision(DirentKey(parent, name)), "=", 0),
-		clientv3.Compare(clientv3.CreateRevision(InodeKey(ino)), "=", 0),
-	}
+// AtomicCreateNode creates a device node, FIFO or socket (mknod) and its
+// directory entry in a single etcd transaction.
+func (s *Store) AtomicCreateNode(ctx context.Context, parent uint64, name string, ino uint64, mode, rdev uint32, uid, gid uint32) (*InodeRecord, error) {
+	rec := NewInodeRecord(ino, mode, uid, gid)
+	rec.Rdev = rdev
+	return rec, s.atomicCreate(ctx, parent, name, rec)
+}
 
-	ops := []clientv3.Op{
-		PutDirent(parent, name, ino),
-		clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec))),
-	}
+// AtomicLink adds a second name for an existing inode: the new dirent and the
+// raised link count commit together, so a name that loses the race to another
+// creator does not leave the count permanently inflated.
+//
+// The inode is pinned to the revision its link count was read at, for the same
+// reason every other read-modify-write of an inode record is.
+func (s *Store) AtomicLink(ctx context.Context, ino, parent uint64, name string) (*InodeRecord, error) {
+	var linked *InodeRecord
+	err := retryCAS(ctx, fmt.Sprintf("atomic link %d/%q", parent, name), func() (bool, error) {
+		rec, rev, err := s.GetInodeRev(ctx, ino)
+		if err != nil {
+			return false, fmt.Errorf("atomic link %d/%q: %w", parent, name, err)
+		}
+		if rec == nil {
+			return false, fmt.Errorf("atomic link %d/%q: inode %d %w", parent, name, ino, ErrNotFound)
+		}
+		// Hard links to a directory would let the namespace form a cycle that no
+		// unlink can break, and POSIX reserves the right to refuse them.
+		if rec.Mode&S_IFMT == ModeDir {
+			return false, fmt.Errorf("atomic link %d/%q: %w", parent, name, ErrPerm)
+		}
+		rec.Nlink++
 
-	ok, err := s.Txn(ctx, cmps, ops, nil)
+		direntKey := DirentKey(parent, name)
+		cmps := []clientv3.Cmp{
+			clientv3.Compare(clientv3.CreateRevision(direntKey), "=", 0),
+			InodeUnchanged(ino, rev),
+		}
+		ops := []clientv3.Op{
+			PutDirent(parent, name, ino),
+			clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec))),
+		}
+		ok, err := s.Txn(ctx, cmps, ops, nil)
+		if err != nil {
+			return false, fmt.Errorf("atomic link %d/%q: %w", parent, name, err)
+		}
+		if ok {
+			linked = rec
+			return true, nil
+		}
+		// The inode moving is contention worth retrying; the name already
+		// existing is the caller's answer.
+		if existing, lerr := s.LookupDirent(ctx, parent, name); lerr == nil && existing != 0 {
+			return false, fmt.Errorf("atomic link %d/%q: %w", parent, name, ErrExists)
+		}
+		return false, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("atomic mkdir %d/%q: %w", parent, name, err)
+		return nil, err
 	}
-	if !ok {
-		return nil, fmt.Errorf("atomic mkdir %d/%q: %w", parent, name, ErrExists)
-	}
-	return rec, nil
+	return linked, nil
 }
 
 // AtomicUnlink removes a directory entry and drops one reference to the inode

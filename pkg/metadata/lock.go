@@ -53,6 +53,9 @@ var (
 	ErrInvalid = fmt.Errorf("invalid argument")
 	// ErrNotFound: the name or inode the operation names does not exist.
 	ErrNotFound = fmt.Errorf("not found")
+	// ErrPerm: the operation is not permitted on this kind of inode, such as a
+	// hard link to a directory.
+	ErrPerm = fmt.Errorf("operation not permitted")
 )
 
 // AcquireLock takes a lock on an inode and returns the lease backing it.

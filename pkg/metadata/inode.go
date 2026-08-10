@@ -29,27 +29,29 @@ func InitialNlink(mode uint32) uint32 {
 	return 1
 }
 
-// CreateInode creates a new inode record in etcd.
-// The caller must have already reserved an inode number.
-// Returns the inode record on success.
-func (s *Store) CreateInode(ctx context.Context, ino uint64, mode uint32, uid, gid uint32) (*InodeRecord, error) {
-	now := time.Now()
-
-	rec := &InodeRecord{
+// NewInodeRecord builds the record a freshly created inode of this mode starts
+// life with.  It is not written anywhere: the caller commits it alongside the
+// directory entry that makes its link count true.
+func NewInodeRecord(ino uint64, mode, uid, gid uint32) *InodeRecord {
+	now := timeNow()
+	return &InodeRecord{
 		Ino:     ino,
-		Size:    0,
-		Blocks:  0,
 		Mode:    mode,
 		Nlink:   InitialNlink(mode),
 		UID:     uid,
 		GID:     gid,
-		Rdev:    0,
 		Blksize: 4096,
 		Atime:   now,
 		Mtime:   now,
 		Ctime:   now,
 	}
+}
 
+// CreateInode creates a new inode record in etcd.
+// The caller must have already reserved an inode number.
+// Returns the inode record on success.
+func (s *Store) CreateInode(ctx context.Context, ino uint64, mode uint32, uid, gid uint32) (*InodeRecord, error) {
+	rec := NewInodeRecord(ino, mode, uid, gid)
 	value := EncodeInode(rec)
 	op := clientv3.OpPut(InodeKey(ino), string(value))
 
