@@ -58,6 +58,27 @@ type Config struct {
 	AllowBufferedIO bool
 }
 
+// RequestTimeout bounds the etcd work behind a single FUSE request.
+//
+// It lives here rather than in the IPC package because it is one half of a
+// constraint on configuration: it must sit below the self-fencing window, which
+// is derived from the membership lease TTL.  A TTL that inverts the two makes
+// the daemon exit before the request deadline can ever fire — the situation the
+// deadline exists to avoid — so Parse rejects it, and it needs the number to do
+// so.
+//
+// Above it, the value has to clear a routine leader election (~1-2 s) plus the
+// several sequential store calls a handler makes, or an otherwise healthy
+// cluster returns EIO during ordinary failover.
+const RequestTimeout = 10 * time.Second
+
+// SelfFenceWindow is how long a node keeps serving after its membership lease
+// stops being renewed, before the watchdog declares it fenced and exits.  It
+// mirrors the watchdog's own 2x rule.
+func SelfFenceWindow(leaseTTL time.Duration) time.Duration {
+	return 2 * leaseTTL
+}
+
 // Parse reads CLI flags and returns a Config.
 func Parse() *Config {
 	cfg := &Config{}
@@ -120,6 +141,18 @@ func Parse() *Config {
 	d, err := time.ParseDuration(leaseTTL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid lease-ttl %q: %v\n", leaseTTL, err)
+		os.Exit(1)
+	}
+	// The self-fencing watchdog declares the node fenced once its lease has
+	// been dead for 2x the TTL, and exits.  If that window closes before the
+	// request deadline can fire, the daemon dies with requests still waiting
+	// for the deadline that would have failed them cleanly — which is the
+	// situation the deadline exists to avoid.
+	if SelfFenceWindow(d) <= RequestTimeout {
+		fmt.Fprintf(os.Stderr,
+			"lease-ttl %s gives a %s self-fencing window, at or below the %s request timeout: "+
+				"the daemon would exit before a stalled request could fail\n",
+			d, SelfFenceWindow(d), RequestTimeout)
 		os.Exit(1)
 	}
 	cfg.LeaseTTL = d

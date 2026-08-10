@@ -85,7 +85,7 @@ func (w *Watchdog) Run(ctx context.Context) {
 
 			// Lease is dead.  Check how long it's been dead.
 			deadSince := time.Since(w.membership.LastAlive())
-			if deadSince > 2*w.leaseTTL {
+			if deadSince > config.SelfFenceWindow(w.leaseTTL) {
 				w.trigger()
 				return
 			}

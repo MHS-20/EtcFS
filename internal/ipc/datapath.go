@@ -196,7 +196,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		ops = append(ops, clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(rec))))
 	}
 
-	committed, cerr := s.commitGuarded(ops)
+	committed, cerr := s.commitGuarded(ctx, ops)
 	if cerr != nil {
 		freeRuns()
 		s.log.Warn("write: metadata commit failed", "ino", ino, "error", cerr)
@@ -302,7 +302,7 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	_ = s.dev.FlushDevice()
 
 	var extents []metadata.Extent
-	s.retryKV(func(ictx context.Context) error {
+	s.retryKV(ctx, func(ictx context.Context) error {
 		var gerr error
 		extents, gerr = s.store.GetExtents(ictx, ino)
 		return gerr

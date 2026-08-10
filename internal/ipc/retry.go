@@ -7,6 +7,7 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
@@ -20,19 +21,15 @@ const (
 	retryBaseDelay = 10 * time.Millisecond
 	retryStep      = 40 * time.Millisecond
 
-	// requestTimeout bounds the etcd work behind a single FUSE request.  It
-	// has to sit between two limits.  Above: a routine leader election (~1-2s)
-	// plus the several sequential store calls a handler such as RMDIR makes,
-	// or an otherwise healthy cluster starts returning EIO during ordinary
-	// failover.  Below: the self-fencing window (2-3x the membership lease
-	// TTL, so 20-30s at the 10s default), or the daemon exits first and this
-	// deadline never gets to fire — which is the situation it exists to fix.
+	// requestTimeout bounds the etcd work behind a single FUSE request.  It is
+	// defined in the config package because it constrains what lease TTLs are
+	// acceptable, and Parse rejects one that inverts the relationship.
 	//
 	// One value for every operation class, deliberately.  Metadata reads could
 	// justify a tighter bound than lock acquisition, but splitting them is
 	// speculative tuning until there is evidence a single ceiling is the wrong
 	// shape; the property that matters here is that a bound exists at all.
-	requestTimeout = 10 * time.Second
+	requestTimeout = config.RequestTimeout
 )
 
 // retryDelay is the pause before the attempt following the given one.
@@ -42,7 +39,11 @@ func retryDelay(attempt int) time.Duration {
 
 // retry runs fn until it succeeds or the attempt budget is spent, returning
 // the last error.
-func retry(attempts int, fn func() error) error {
+//
+// The pause between attempts honours ctx: a request whose deadline has already
+// passed used to sit out the full backoff before noticing, holding the FUSE
+// request open for a reply it was never going to give.
+func retry(ctx context.Context, attempts int, fn func() error) error {
 	var err error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err = fn(); err == nil {
@@ -51,9 +52,23 @@ func retry(attempts int, fn func() error) error {
 		if permanent(err) {
 			return err
 		}
-		time.Sleep(retryDelay(attempt))
+		if werr := wait(ctx, retryDelay(attempt)); werr != nil {
+			return err
+		}
 	}
 	return err
+}
+
+// wait pauses for d, or returns early if ctx is done.
+func wait(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // permanent reports whether an error will still hold on a retry.  A fence is
@@ -67,18 +82,18 @@ func permanent(err error) bool {
 // retryEtcd runs fn against a fresh bounded context on every attempt.  Each
 // attempt gets its own context so that one timed-out call does not poison the
 // retries that follow it.
-func retryEtcd(fn func(context.Context) error) error {
-	return retry(etcdAttempts, func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
+func retryEtcd(ctx context.Context, fn func(context.Context) error) error {
+	return retry(ctx, etcdAttempts, func() error {
+		actx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
 		defer cancel()
-		return fn(ctx)
+		return fn(actx)
 	})
 }
 
 // retryKV is retryEtcd for callers that treat a total failure as "no data"
 // rather than an error, and only want it logged.
-func (s *Service) retryKV(fn func(context.Context) error) {
-	if err := retryEtcd(fn); err != nil {
+func (s *Service) retryKV(ctx context.Context, fn func(context.Context) error) {
+	if err := retryEtcd(ctx, fn); err != nil {
 		s.log.Warn("etcd KV operation failed after retries", "error", err)
 	}
 }
@@ -97,7 +112,7 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 	var leaseID clientv3.LeaseID
 	var keepCh <-chan *clientv3.LeaseKeepAliveResponse
 
-	err = retry(etcdAttempts, func() error {
+	err = retry(ctx, etcdAttempts, func() error {
 		actx, cancel := context.WithTimeout(ctx, etcdOpTimeout)
 		defer cancel()
 		var aerr error
@@ -132,7 +147,7 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 // covers every mutation path rather than only the ones that remember to ask.
 // This wrapper keeps the retry policy and the boolean "was it a fence" contract
 // its callers are written against.
-func (s *Service) commitGuarded(ops []clientv3.Op) (bool, error) {
+func (s *Service) commitGuarded(ctx context.Context, ops []clientv3.Op) (bool, error) {
 	// Ensure the generation is resolved before committing, so a first write
 	// fails with a real etcd error rather than ErrGuardUnavailable.
 	gctx, gcancel := context.WithTimeout(context.Background(), etcdOpTimeout)
@@ -143,9 +158,9 @@ func (s *Service) commitGuarded(ops []clientv3.Op) (bool, error) {
 	}
 
 	committed := false
-	err = retryEtcd(func(ctx context.Context) error {
+	err = retryEtcd(ctx, func(tctx context.Context) error {
 		var terr error
-		committed, terr = s.store.Txn(ctx, nil, ops, nil)
+		committed, terr = s.store.Txn(tctx, nil, ops, nil)
 		return terr
 	})
 	if errors.Is(err, metadata.ErrFenced) {
