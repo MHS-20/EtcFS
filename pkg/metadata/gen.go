@@ -119,20 +119,6 @@ func (s *Store) EnsureGenerationKey(ctx context.Context, nodeID string) (uint64,
 	return s.GetGeneration(ctx, nodeID)
 }
 
-// EnsureGeneration ensures that a gen:<node> key exists with at least
-// the given generation.  Used during node bootstrap to initialise the
-// generation counter.
-func (s *Store) EnsureGeneration(ctx context.Context, nodeID string, gen uint64) error {
-	existing, err := s.GetGeneration(ctx, nodeID)
-	if err != nil {
-		return err
-	}
-	if existing >= gen {
-		return nil
-	}
-	return s.PutGeneration(ctx, nodeID, gen)
-}
-
 // WithGenerationGuard wraps a transaction with a fencing generation check.
 //
 // Every metadata mutation that modifies extents MUST be guarded:

@@ -76,41 +76,6 @@ func (s *Store) ListDirents(ctx context.Context, parent uint64) ([]DirentEntry, 
 	return entries, nil
 }
 
-// ListDirentsPaginated returns entries with cursor-based pagination.
-// limit is the max entries per page.  cursor is the name to start after
-// (empty = start from beginning).  Returns the next cursor for the next page.
-func (s *Store) ListDirentsPaginated(ctx context.Context, parent uint64, cursor string, limit int64) ([]DirentEntry, string, int64, error) {
-	prefix := DirentPrefix(parent)
-	rangeEnd := DirentPrefix(parent + 1)
-
-	var opts []clientv3.OpOption
-	opts = append(opts, clientv3.WithRange(rangeEnd))
-	opts = append(opts, clientv3.WithLimit(limit))
-	opts = append(opts, clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
-
-	if cursor != "" {
-		opts = append(opts, clientv3.WithFromKey())
-		prefix = DirentKey(parent, cursor) + "\x00"
-	}
-
-	kvs, revision, err := s.GetRevision(ctx, prefix, opts...)
-	if err != nil {
-		return nil, "", 0, fmt.Errorf("list dirents %d paginated: %w", parent, err)
-	}
-
-	entries := make([]DirentEntry, 0, len(kvs))
-	var lastKey string
-	for _, kv := range kvs {
-		name := extractNameFromKey(string(kv.Key), parent)
-		lastKey = name
-		entries = append(entries, DirentEntry{
-			Name: name,
-			Ino:  DecodeUint64(kv.Value),
-		})
-	}
-	return entries, lastKey, revision, nil
-}
-
 // DirentEntry is a directory listing entry.
 type DirentEntry struct {
 	Name string
@@ -551,16 +516,6 @@ func (s *Store) isDescendant(ctx context.Context, ino, ancestor uint64) (bool, e
 		ino = next
 	}
 	return false, fmt.Errorf("parent chain from %d does not terminate", ino)
-}
-
-// AtomicRmRf recursively deletes a directory tree by deleting the dirent prefix
-// in a single etcd DeleteRange operation.
-func (s *Store) AtomicRmRf(ctx context.Context, parent uint64) (int64, error) {
-	deleted, err := s.DeletePrefix(ctx, DirentPrefix(parent))
-	if err != nil {
-		return 0, fmt.Errorf("rm -rf %d: %w", parent, err)
-	}
-	return deleted, nil
 }
 
 // ---- rename constants ----

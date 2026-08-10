@@ -134,37 +134,6 @@ func TestIntegration_AtomicRename(t *testing.T) {
 	assert.Equal(t, ino, newIno, "new name should point to same inode")
 }
 
-// ---- C1.4: Atomic rm -rf (DeleteRange) ----
-
-func TestIntegration_AtomicRmRf(t *testing.T) {
-	store := testStore(t, "test-node")
-	ctx := context.Background()
-	parent := uint64(1)
-
-	_, err := store.CreateInode(ctx, parent, 0755|uint32(1<<31), 0, 0)
-	require.NoError(t, err)
-
-	// Create 100 files
-	for i := 0; i < 100; i++ {
-		name := fmt.Sprintf("file-%04d", i)
-		err := store.CreateDirent(ctx, parent, name, uint64(i+100))
-		require.NoError(t, err)
-	}
-
-	entries, err := store.ListDirents(ctx, parent)
-	require.NoError(t, err)
-	assert.Len(t, entries, 100)
-
-	// Bulk delete via DeleteRange on prefix
-	deleted, err := store.AtomicRmRf(ctx, parent)
-	require.NoError(t, err)
-	assert.Equal(t, int64(100), deleted)
-
-	entries, err = store.ListDirents(ctx, parent)
-	require.NoError(t, err)
-	assert.Empty(t, entries)
-}
-
 // ---- C1.5: Lease-backed lock acquire/release ----
 
 func TestIntegration_LockAcquireRelease(t *testing.T) {
@@ -288,7 +257,7 @@ func TestIntegration_GenerationBump(t *testing.T) {
 	nodeID := "fenced-node-1"
 
 	// Initialise generation
-	err := store.EnsureGeneration(ctx, nodeID, 0)
+	_, err := store.EnsureGenerationKey(ctx, nodeID)
 	require.NoError(t, err)
 
 	gen, err := store.GetGeneration(ctx, nodeID)
@@ -407,41 +376,6 @@ loop:
 	assert.GreaterOrEqual(t, eventCount, 1, "should receive at least one watch event")
 }
 
-// ---- C1.10: Paginated readdir ----
-
-func TestIntegration_PaginatedReaddir(t *testing.T) {
-	store := testStore(t, "test-node")
-	ctx := context.Background()
-	parent := uint64(5000)
-
-	_, err := store.CreateInode(ctx, parent, 0755|uint32(1<<31), 0, 0)
-	require.NoError(t, err)
-
-	const totalFiles = 100
-	for i := 0; i < totalFiles; i++ {
-		err := store.CreateDirent(ctx, parent, fmt.Sprintf("pg-file-%04d", i), uint64(i+50000))
-		require.NoError(t, err)
-	}
-
-	// Read in pages of 30
-	const pageSize int64 = 30
-	var allEntries []DirentEntry
-	cursor := ""
-
-	for {
-		entries, nextCursor, _, err := store.ListDirentsPaginated(ctx, parent, cursor, pageSize)
-		require.NoError(t, err)
-		allEntries = append(allEntries, entries...)
-
-		if len(entries) < int(pageSize) || nextCursor == "" {
-			break
-		}
-		cursor = nextCursor
-	}
-
-	assert.GreaterOrEqual(t, len(allEntries), totalFiles, "paginated readdir should return at least %d entries", totalFiles)
-}
-
 // ---- C1.11: Transaction conflict storm ----
 
 func TestIntegration_TransactionConflictStorm(t *testing.T) {
@@ -544,20 +478,12 @@ func TestIntegration_InodeCRUD(t *testing.T) {
 	_, err = store.CreateInode(ctx, 42, 0644, 1000, 1000)
 	assert.Error(t, err)
 
-	// A new inode starts with one link, so deleting it outright is refused —
-	// the caller has to drop the reference first.
+	// A new inode starts with one link; unlinking the only name that refers to
+	// it is what removes the record.
 	assert.EqualValues(t, 1, rec.Nlink)
-	assert.Error(t, store.DeleteInode(ctx, 42), "an inode with a link must not be deletable")
+	require.NoError(t, store.CreateDirent(ctx, RootIno, "inode-42", 42))
+	require.NoError(t, store.AtomicUnlink(ctx, RootIno, "inode-42"))
 
-	zero, err := store.DecrementNlink(ctx, 42)
-	require.NoError(t, err)
-	assert.True(t, zero, "the last link is gone")
-
-	// Delete
-	err = store.DeleteInode(ctx, 42)
-	require.NoError(t, err)
-
-	// Verify deleted
 	rec, err = store.GetInode(ctx, 42)
 	require.NoError(t, err)
 	assert.Nil(t, rec)
@@ -949,8 +875,8 @@ func TestIntegration_RenameOverHardlinkedFileOnlyDropsNlink(t *testing.T) {
 	const parent = 8200
 
 	inos := renameFixture(t, s, parent, "src", "victim")
-	require.NoError(t, s.IncrementNlink(ctx, inos["victim"]))
-	require.NoError(t, s.CreateDirent(ctx, parent, "victim-link", inos["victim"]))
+	_, err := s.AtomicLink(ctx, inos["victim"], parent, "victim-link")
+	require.NoError(t, err)
 
 	require.NoError(t, s.AtomicRename(ctx, parent, "src", parent, "victim", inos["src"], 0))
 
@@ -1244,8 +1170,8 @@ func TestIntegration_ConcurrentUnlinksReachZeroAndFreeTheInode(t *testing.T) {
 	_, err = s.AtomicCreateFile(ctx, parent, "name-0", ino, ModeFile|0644, 1000, 1000)
 	require.NoError(t, err)
 	for i := 1; i < names; i++ {
-		require.NoError(t, s.IncrementNlink(ctx, ino))
-		require.NoError(t, s.CreateDirent(ctx, parent, fmt.Sprintf("name-%d", i), ino))
+		_, lerr := s.AtomicLink(ctx, ino, parent, fmt.Sprintf("name-%d", i))
+		require.NoError(t, lerr)
 	}
 
 	rec, err := s.GetInode(ctx, ino)
@@ -1301,9 +1227,7 @@ func TestIntegration_RenameOverTargetPinsTheVictimInode(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
-		if lerr := s.IncrementNlink(ctx, victimIno); lerr == nil {
-			_ = s.CreateDirent(ctx, parent, "victim-link", victimIno)
-		}
+		_, _ = s.AtomicLink(ctx, victimIno, parent, "victim-link")
 	}()
 	wg.Wait()
 

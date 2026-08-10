@@ -82,56 +82,6 @@ func (s *Store) GetInode(ctx context.Context, ino uint64) (*InodeRecord, error) 
 	return DecodeInode(value), nil
 }
 
-// UpdateInode atomically updates an inode record in etcd.
-// The update is conditioned on the inode's current ModRevision to avoid
-// lost updates.  Returns the new revision and updated record.
-func (s *Store) UpdateInode(ctx context.Context, rec *InodeRecord) (*InodeRecord, error) {
-	value := EncodeInode(rec)
-	key := InodeKey(rec.Ino)
-
-	// CAS: update only if the inode hasn't been modified since we read it
-	// (optimistic concurrency via ModRevision).
-	resp, err := s.client.Txn(ctx).
-		If(clientv3.Compare(clientv3.ModRevision(key), "=", 0)). // placeholder; caller provides correct rev
-		Then(clientv3.OpPut(key, string(value))).
-		Commit()
-	if err != nil {
-		return nil, fmt.Errorf("update inode %d: %w", rec.Ino, err)
-	}
-	if !resp.Succeeded {
-		return nil, fmt.Errorf("update inode %d: conflict (inode modified since read)", rec.Ino)
-	}
-	return rec, nil
-}
-
-// DeleteInode removes an inode record from etcd.
-// Returns an error if the inode still has links (nlink > 0) — the caller
-// must have already removed all directory entries.
-func (s *Store) DeleteInode(ctx context.Context, ino uint64) error {
-	rec, err := s.GetInode(ctx, ino)
-	if err != nil {
-		return err
-	}
-	if rec == nil {
-		return fmt.Errorf("delete inode %d: not found", ino)
-	}
-	if rec.Nlink > 0 {
-		return fmt.Errorf("delete inode %d: nlink=%d (still referenced)", ino, rec.Nlink)
-	}
-
-	cmp := clientv3.Compare(clientv3.CreateRevision(InodeKey(ino)), ">", 0)
-	del := clientv3.OpDelete(InodeKey(ino))
-
-	ok, err := s.Txn(ctx, []clientv3.Cmp{cmp}, []clientv3.Op{del}, nil)
-	if err != nil {
-		return fmt.Errorf("delete inode %d: %w", ino, err)
-	}
-	if !ok {
-		return fmt.Errorf("delete inode %d: not found", ino)
-	}
-	return nil
-}
-
 // GetInodeRev retrieves an inode record together with the revision it was last
 // written at, which a later transaction compares against to prove the record
 // has not changed in between.  Returns a nil record if the inode is gone.
@@ -204,61 +154,6 @@ func casBackoff(ctx context.Context, attempt int) error {
 	case <-timer.C:
 		return nil
 	}
-}
-
-// IncrementNlink atomically increments the nlink counter on an inode.
-// Used when creating a hard link.
-func (s *Store) IncrementNlink(ctx context.Context, ino uint64) error {
-	return retryCAS(ctx, fmt.Sprintf("increment nlink %d", ino), func() (bool, error) {
-		rec, rev, err := s.GetInodeRev(ctx, ino)
-		if err != nil {
-			return false, fmt.Errorf("increment nlink %d: %w", ino, err)
-		}
-		if rec == nil {
-			return false, fmt.Errorf("increment nlink %d: %w", ino, ErrNotFound)
-		}
-		rec.Nlink++
-		return s.putInodeCAS(ctx, rec, rev)
-	})
-}
-
-// DecrementNlink atomically decrements the nlink counter.
-// Used when removing a directory entry (unlink, rmdir, rename target).
-// Returns true if nlink reached zero (inode should be deleted).
-func (s *Store) DecrementNlink(ctx context.Context, ino uint64) (bool, error) {
-	var zero bool
-	err := retryCAS(ctx, fmt.Sprintf("decrement nlink %d", ino), func() (bool, error) {
-		rec, rev, err := s.GetInodeRev(ctx, ino)
-		if err != nil {
-			return false, fmt.Errorf("decrement nlink %d: %w", ino, err)
-		}
-		if rec == nil {
-			return false, fmt.Errorf("decrement nlink %d: %w", ino, ErrNotFound)
-		}
-		if rec.Nlink == 0 {
-			return false, fmt.Errorf("decrement nlink %d: already zero", ino)
-		}
-		rec.Nlink--
-		zero = rec.Nlink == 0
-		return s.putInodeCAS(ctx, rec, rev)
-	})
-	if err != nil {
-		return false, err
-	}
-	return zero, nil
-}
-
-// putInodeCAS writes an inode record only if it still stands at modRev,
-// reporting false when it does not.
-func (s *Store) putInodeCAS(ctx context.Context, rec *InodeRecord, modRev int64) (bool, error) {
-	key := InodeKey(rec.Ino)
-	ok, err := s.Txn(ctx,
-		[]clientv3.Cmp{InodeUnchanged(rec.Ino, modRev)},
-		[]clientv3.Op{clientv3.OpPut(key, string(EncodeInode(rec)))}, nil)
-	if err != nil {
-		return false, fmt.Errorf("put inode %d: %w", rec.Ino, err)
-	}
-	return ok, nil
 }
 
 // ---- serialisation ----

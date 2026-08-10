@@ -184,7 +184,7 @@ func TestGuard_UnguardedStoreUnaffected(t *testing.T) {
 	store := testStore(t, "plain-node")
 	ctx := context.Background()
 
-	require.NoError(t, store.EnsureGeneration(ctx, "plain-node", 7))
+	require.NoError(t, store.PutGeneration(ctx, "plain-node", 7))
 
 	_, err := store.AtomicCreateFile(ctx, 1, "plain", 500, 0644, 1000, 1000)
 	assert.NoError(t, err, "unguarded store must not consult the generation")
