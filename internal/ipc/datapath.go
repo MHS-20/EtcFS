@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"context"
+	"fmt"
 	"unsafe"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -208,7 +209,12 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	// rejects would have freed blocks the file still refers to.
 	for _, old := range existing {
 		if old.LogOff < end && offset < old.End() {
-			s.reclaimCovered(ctx, old, offset, end, &chunk)
+			// The write itself is published and correct; failing to reclaim
+			// what it buried only leaks blocks the scrubber will find.
+			if rerr := s.reclaimCovered(ctx, old, offset, end, &chunk); rerr != nil {
+				s.log.Warn("buried extent not reclaimed, the scrubber will pick it up",
+					"ino", ino, "error", rerr)
+			}
 		}
 	}
 
@@ -353,11 +359,14 @@ func (s *Service) readInto(dst []byte, diskOff int64) (int, error) {
 //
 // A truncate is the same operation as an overwrite of everything from newSize
 // to the end of the address space, so it goes through the same path.
-func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
+// truncate releases what a shrink leaves past newSize, reporting a failure
+// rather than swallowing it: a fenced node's writes are rejected by the
+// generation guard, and a truncate that answered success while every extent
+// stayed in place told the caller its file had shrunk when nothing had.
+func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) error {
 	extents, err := s.store.GetExtents(ctx, ino)
 	if err != nil {
-		s.log.Warn("truncate: cannot read extents", "ino", ino, "error", err)
-		return
+		return fmt.Errorf("truncate ino %d: read extents: %w", ino, err)
 	}
 	chunk := uint64(0)
 	for _, e := range extents {
@@ -367,9 +376,12 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
 	}
 	for _, ext := range extents {
 		if ext.End() > newSize {
-			s.reclaimCovered(ctx, ext, newSize, ^uint64(0), &chunk)
+			if rerr := s.reclaimCovered(ctx, ext, newSize, ^uint64(0), &chunk); rerr != nil {
+				return fmt.Errorf("truncate ino %d: %w", ino, rerr)
+			}
 		}
 	}
+	return nil
 }
 
 // reclaimCovered rewrites old to the part a write over [start, end) leaves
@@ -392,10 +404,10 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) {
 // Metadata first, then the free: a reader resolving the old record must never
 // be sent to blocks that have already been handed to another allocation.
 func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
-	start, end uint64, nextChunk *uint64) {
+	start, end uint64, nextChunk *uint64) error {
 
 	if s.dev == nil || !s.alloc.Owns(old.DiskOff) {
-		return
+		return nil
 	}
 
 	head, tail := metadata.SplitAround(old, start, end)
@@ -403,15 +415,13 @@ func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
 	// The write covered less than a whole block at the front of old, so the
 	// split snapped back to where it began and there is nothing to give back.
 	if head == nil && tail != nil && tail.LogOff == old.LogOff {
-		return
+		return nil
 	}
 
 	switch {
 	case head == nil && tail == nil:
 		if err := s.store.Delete(ctx, old.Key); err != nil {
-			s.log.Warn("cannot delete covered extent, blocks not reclaimed",
-				"key", old.Key, "error", err)
-			return
+			return fmt.Errorf("delete covered extent %s: %w", old.Key, err)
 		}
 
 	case head != nil && tail != nil:
@@ -421,10 +431,12 @@ func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
 			clientv3.OpPut(old.Key, head.Encode()),
 			clientv3.OpPut(metadata.ExtentKey(old.Ino(), *nextChunk), tail.Encode()),
 		}
-		if ok, err := s.store.Txn(ctx, nil, ops, nil); err != nil || !ok {
-			s.log.Warn("cannot split covered extent, blocks not reclaimed",
-				"key", old.Key, "committed", ok, "error", err)
-			return
+		ok, err := s.store.Txn(ctx, nil, ops, nil)
+		if err != nil {
+			return fmt.Errorf("split covered extent %s: %w", old.Key, err)
+		}
+		if !ok {
+			return fmt.Errorf("split covered extent %s: %w", old.Key, metadata.ErrFenced)
 		}
 		*nextChunk++
 
@@ -434,13 +446,12 @@ func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
 			survivor = tail
 		}
 		if _, err := s.store.Put(ctx, old.Key, []byte(survivor.Encode())); err != nil {
-			s.log.Warn("cannot trim covered extent, blocks not reclaimed",
-				"key", old.Key, "error", err)
-			return
+			return fmt.Errorf("trim covered extent %s: %w", old.Key, err)
 		}
 	}
 
 	if off, length := metadata.CoveredBlocks(old, head, tail); length > 0 {
 		s.alloc.Free(off, length)
 	}
+	return nil
 }

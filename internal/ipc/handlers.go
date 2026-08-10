@@ -371,7 +371,13 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	// size is published: metadata-then-data, so no reader can still resolve a
 	// range whose blocks have already gone back to the arena.
 	if valid&fattrSize != 0 && newSize < rec.Size {
-		s.truncate(ctx, ino, newSize)
+		if terr := s.truncate(ctx, ino, newSize); terr != nil {
+			// Reporting success here would tell the caller the file had shrunk
+			// while every extent past the new end was still readable — which is
+			// what a fenced node did, since the guard rejects its writes.
+			s.log.Error("truncate failed, size not changed", "ino", ino, "error", terr)
+			return int32Resp(errnoFor(terr, -5)), nil
+		}
 	}
 
 	now := time.Now()

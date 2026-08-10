@@ -25,7 +25,6 @@ package fencing
 
 import (
 	"context"
-	"os"
 	"sync"
 	"time"
 
@@ -109,13 +108,16 @@ func (w *Watchdog) trigger() {
 		"last_alive", w.membership.LastAlive(),
 		"dead_for", time.Since(w.membership.LastAlive()))
 
-	// The gRPC server will detect the cancelled context and stop accepting
-	// new requests.  Existing in-flight requests are allowed to complete
-	// with errors.
-
-	// Exit with a distinctive code so systemd can detect self-fence events.
-	os.Exit(77)
+	// Closing Fenced() above is the whole signal.  main waits on it and runs
+	// the same shutdown a SIGTERM does before exiting 77 — exiting from here
+	// skipped that, so a self-fenced node never released its arenas and leaked
+	// them permanently in single-signal mode, where the fencing controller does
+	// not reclaim them either.
 }
+
+// SelfFenceExitCode is the process exit status after a self-fence, distinct so
+// systemd and the chaos harness can tell it from an ordinary failure.
+const SelfFenceExitCode = 77
 
 // IsFenced returns true if self-fencing has triggered.
 func (w *Watchdog) IsFenced() bool {

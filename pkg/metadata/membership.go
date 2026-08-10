@@ -32,10 +32,30 @@ type Membership struct {
 	leaseTTL   time.Duration
 	instanceID string
 
+	// log reports the heartbeat's failures.  Run returns on any of them, and
+	// the watchdog eventually notices the lease is dead — but "eventually, with
+	// no reason given" is the wrong thing to leave in an incident log.
+	log Logger
+
 	mu        sync.Mutex
 	leaseID   clientv3.LeaseID
 	alive     bool
 	lastAlive time.Time
+}
+
+// Logger is the reporting interface the membership heartbeat needs.
+type Logger interface {
+	Error(msg string, args ...any)
+}
+
+// SetLogger attaches a logger.  Without one the heartbeat's failures are
+// silent, which is correct only in tests.
+func (m *Membership) SetLogger(l Logger) { m.log = l }
+
+func (m *Membership) reportf(msg string, args ...any) {
+	if m.log != nil {
+		m.log.Error(msg, args...)
+	}
 }
 
 // NewMembership creates a Membership for the given node.
@@ -63,13 +83,18 @@ func (m *Membership) Run(ctx context.Context) {
 	// Grant a lease and register
 	leaseID, err := m.grantAndRegister(ctx)
 	if err != nil {
-		// The watchdog will detect this as a failure.
+		// The watchdog will detect this as a failure, after the self-fencing
+		// window; saying so now is the difference between a diagnosable
+		// startup and a node that simply stops.
+		m.reportf("membership registration failed, this node will self-fence",
+			"node", m.nodeID, "error", err)
 		return
 	}
 
-	// Keepalive loop
 	keepCh, err := m.client.KeepAlive(ctx, leaseID)
 	if err != nil {
+		m.reportf("membership keepalive could not be established, this node will self-fence",
+			"node", m.nodeID, "error", err)
 		return
 	}
 
@@ -87,11 +112,15 @@ func (m *Membership) Run(ctx context.Context) {
 				newID, err := m.grantAndRegister(ctx)
 				if err != nil {
 					m.setAlive(false)
+					m.reportf("membership re-registration failed after the keepalive stream closed",
+						"node", m.nodeID, "error", err)
 					return
 				}
 				keepCh, err = m.client.KeepAlive(ctx, newID)
 				if err != nil {
 					m.setAlive(false)
+					m.reportf("membership keepalive could not be re-established",
+						"node", m.nodeID, "error", err)
 					return
 				}
 				continue

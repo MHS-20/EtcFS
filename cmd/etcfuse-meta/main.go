@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -99,6 +100,7 @@ func main() {
 	// from this node after its lease expires — at which point the key is gone
 	// and this node can no longer be asked for it.
 	membership.SetInstanceID(cfg.EC2InstanceID)
+	membership.SetLogger(log)
 
 	// Metadata store: wraps etcd client with schema-aware helpers
 	store := metadata.NewStore(etcdCli, cfg.NodeID)
@@ -229,9 +231,19 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// A self-fence shuts the node down through the same path a signal does, so
+	// the arena release below still runs.  The watchdog used to call os.Exit
+	// itself, which skipped it: a self-fenced node's arenas leaked, permanently
+	// in single-signal mode, where no fencing controller reclaims them either.
+	var selfFenced atomic.Bool
 	go func() {
-		sig := <-sigCh
-		log.Info("received signal, shutting down", "signal", sig)
+		select {
+		case sig := <-sigCh:
+			log.Info("received signal, shutting down", "signal", sig)
+		case <-watchdog.Fenced():
+			selfFenced.Store(true)
+			log.Error("self-fenced, shutting down")
+		}
 		cancel()
 	}()
 
@@ -268,4 +280,7 @@ func main() {
 	}
 
 	log.Info("etcfuse-meta stopped")
+	if selfFenced.Load() {
+		os.Exit(fencing.SelfFenceExitCode)
+	}
 }
