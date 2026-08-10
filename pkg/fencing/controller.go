@@ -86,7 +86,22 @@ func (c *Controller) Run(ctx context.Context) {
 	// the previous value there is nothing to detach — the node is already
 	// gone, so it cannot be asked.
 	watchOpts := []clientv3.OpOption{clientv3.WithPrefix(), clientv3.WithPrevKV()}
-	watchCh := c.store.Watch(ctx, metadata.PrefixMembership, watchOpts...)
+
+	// Watches resume from the revision after the last event this controller
+	// observed, so a DELETE that lands while the channel is being re-established
+	// is still delivered.  Reconnecting from "now" dropped those events
+	// silently, and a fence is only ever triggered by an event — the sweep below
+	// is what makes even a lost event recoverable, but losing the event should
+	// not be routine.
+	var lastRev int64
+	watch := func() clientv3.WatchChan {
+		opts := watchOpts
+		if lastRev > 0 {
+			opts = append(append([]clientv3.OpOption{}, watchOpts...), clientv3.WithRev(lastRev+1))
+		}
+		return c.store.Watch(ctx, metadata.PrefixMembership, opts...)
+	}
+	watchCh := watch()
 
 	for {
 		select {
@@ -95,9 +110,12 @@ func (c *Controller) Run(ctx context.Context) {
 			return
 		case resp, ok := <-watchCh:
 			if !ok {
-				c.log.Warn("fencing watch channel closed, reconnecting")
-				watchCh = c.store.Watch(ctx, metadata.PrefixMembership, watchOpts...)
+				c.log.Warn("fencing watch channel closed, reconnecting", "from_revision", lastRev+1)
+				watchCh = watch()
 				continue
+			}
+			if resp.Header.Revision > lastRev {
+				lastRev = resp.Header.Revision
 			}
 			for _, ev := range resp.Events {
 				if ev.Type != clientv3.EventTypeDelete {
@@ -165,13 +183,16 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, f
 	// here, after the claim, is what closes that.  Observed on Docker with 3
 	// controllers, 2026-08-06.
 	if fromSweep {
-		pending, perr := c.store.Get(ctx, metadata.FencePendingKey(nodeID))
+		// Asked as a listing rather than a Get: an intent for a node whose
+		// instance ID was never known has an empty value, which a Get cannot
+		// tell from a missing key.
+		pending, perr := c.store.ListFenceIntents(ctx)
 		if perr != nil {
 			c.log.Error("cannot re-check fence intent, skipping this attempt",
 				"node", nodeID, "error", perr)
 			return
 		}
-		if pending == nil {
+		if _, owed := pending[nodeID]; !owed {
 			c.log.Info("fence already completed by another controller, nothing owed",
 				"node", nodeID)
 			return
@@ -244,7 +265,14 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, f
 		}
 	}
 
-	// Only now is the fence complete, so only now is nothing owed.
+	// Only now is the fence complete, so only now is nothing owed.  The mark
+	// goes down before the intent comes up: between the two the sweep sees a
+	// node that is both owed and marked, and treats it as owed, which costs one
+	// harmless retry rather than skipping a fence that never happened.
+	if err := c.store.MarkFenceComplete(ctx, nodeID, newGen); err != nil {
+		c.log.Warn("fence complete but not marked, the sweep will re-fence harmlessly",
+			"node", nodeID, "error", err)
+	}
 	if err := c.store.ClearFenceIntent(ctx, nodeID); err != nil {
 		c.log.Warn("fence complete but intent not cleared, sweep will re-fence harmlessly",
 			"node", nodeID, "error", err)
@@ -269,21 +297,54 @@ func (c *Controller) runSweep(ctx context.Context) {
 	}
 }
 
-// reconcile retries every fence still recorded as owed.
+// reconcile compares every node the cluster knows of against live membership
+// and fences whatever is missing, whether or not a watch event was seen for it.
 //
-// A node that has re-registered is no longer owed one: it holds a live
-// membership lease again, which means its own self-fencing watchdog did not
-// stop it and it is reachable from etcd. Fencing it at that point would sever
-// a healthy node's device access on the strength of an expiry it has already
-// recovered from — and the epoch separation the generation provides is only
-// needed against a node that cannot be told it is gone.
+// It is authoritative rather than a retry queue.  Retrying only recorded
+// intents left one hole open: intents are recorded from watch events, so a
+// DELETE that arrived while a watch was being re-established was never fenced
+// by anything at all.  Deciding from the current state instead removes the
+// dependency on having observed the transition.
+//
+// A node that has re-registered is not fenced: it holds a live membership lease
+// again, which means its own self-fencing watchdog did not stop it and it is
+// reachable from etcd. Fencing it at that point would sever a healthy node's
+// device access on the strength of an expiry it has already recovered from —
+// and the epoch separation the generation provides is only needed against a
+// node that cannot be told it is gone.
 func (c *Controller) reconcile(ctx context.Context) {
 	intents, err := c.store.ListFenceIntents(ctx)
 	if err != nil {
 		c.log.Error("fence reconciliation sweep failed to list intents", "error", err)
 		return
 	}
-	for nodeID, instanceID := range intents {
+	known, err := c.store.ListKnownNodes(ctx)
+	if err != nil {
+		c.log.Error("fence reconciliation sweep failed to list nodes", "error", err)
+		return
+	}
+	fenced, err := c.store.ListFencedNodes(ctx)
+	if err != nil {
+		c.log.Error("fence reconciliation sweep failed to list fenced nodes", "error", err)
+		return
+	}
+
+	// A recorded intent is considered even for a node with no gen: key of its
+	// own — one can be fenced before its first startup ever created one.
+	candidates := make(map[string]bool, len(known)+len(intents))
+	for _, nodeID := range known {
+		candidates[nodeID] = true
+	}
+	for nodeID := range intents {
+		candidates[nodeID] = true
+	}
+
+	for nodeID := range candidates {
+		if nodeID == c.nodeID {
+			continue // this controller's own node is alive by construction
+		}
+		instanceID, owed := intents[nodeID]
+
 		alive, err := c.store.Get(ctx, metadata.MembershipKey(nodeID))
 		if err != nil {
 			c.log.Error("fence reconciliation sweep: cannot read membership",
@@ -291,14 +352,38 @@ func (c *Controller) reconcile(ctx context.Context) {
 			continue
 		}
 		if alive != nil {
-			c.log.Info("node re-registered before its fence completed, dropping intent",
-				"node", nodeID)
-			if err := c.store.ClearFenceIntent(ctx, nodeID); err != nil {
-				c.log.Warn("failed to drop fence intent", "node", nodeID, "error", err)
+			if owed {
+				c.log.Info("node re-registered before its fence completed, dropping intent",
+					"node", nodeID)
+				if cerr := c.store.ClearFenceIntent(ctx, nodeID); cerr != nil {
+					c.log.Warn("failed to drop fence intent", "node", nodeID, "error", cerr)
+				}
+			}
+			// The node is back, so its next departure is a new one and must be
+			// fenced again.
+			if fenced[nodeID] {
+				if cerr := c.store.ClearFenceMark(ctx, nodeID); cerr != nil {
+					c.log.Warn("failed to clear fence mark", "node", nodeID, "error", cerr)
+				}
 			}
 			continue
 		}
-		c.log.Warn("retrying incomplete fence", "node", nodeID, "instance", instanceID)
+		if fenced[nodeID] && !owed {
+			continue // gone, and already fenced for this departure
+		}
+		if !owed {
+			// The membership value carried the instance ID and is already gone,
+			// so a fence discovered this way has nothing to detach.  Recording
+			// the intent still makes it survive this controller.
+			c.log.Warn("node missing from membership with no fence recorded, fencing it",
+				"node", nodeID)
+			if rerr := c.store.RecordFenceIntent(ctx, nodeID, ""); rerr != nil {
+				c.log.Error("failed to record fence intent", "node", nodeID, "error", rerr)
+				continue
+			}
+		} else {
+			c.log.Warn("retrying incomplete fence", "node", nodeID, "instance", instanceID)
+		}
 		c.fenceNode(ctx, nodeID, instanceID, true)
 	}
 }

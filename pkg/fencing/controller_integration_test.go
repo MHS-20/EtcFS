@@ -336,3 +336,38 @@ func TestController_DoesNotReclaimArenaWithoutFencer(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, v, "arena:dead-node/7 must survive a single-signal fence — no severance proof exists")
 }
+
+// The gap the sweep exists to close: a membership DELETE that lands while the
+// watch is being re-established reaches no controller, so nothing ever records
+// an intent for it. Retrying only recorded intents left that node unfenced
+// forever; deciding from current state fences it on the next pass.
+func TestController_SweepFencesANodeNoEventWasSeenFor(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	stub := &stubFencer{}
+	c.SetFencer(stub)
+
+	// The node started once — that is all the cluster knows of it — and its
+	// membership key is gone with no intent behind it.
+	_, err := store.EnsureGenerationKey(ctx, "silently-gone")
+	require.NoError(t, err)
+
+	c.reconcile(ctx)
+
+	assert.Equal(t, 1, stub.called, "a departed node must be fenced without an event")
+	gen, err := store.GetGeneration(ctx, "silently-gone")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), gen)
+
+	// And it must not be fenced again on every later pass.
+	c.reconcile(ctx)
+	assert.Equal(t, 1, stub.called, "a node already fenced must not be re-fenced")
+
+	// Until it comes back and leaves again.
+	_, err = store.Put(ctx, metadata.MembershipKey("silently-gone"),
+		[]byte(`{"node_id":"silently-gone"}`))
+	require.NoError(t, err)
+	c.reconcile(ctx)
+	require.NoError(t, store.Delete(ctx, metadata.MembershipKey("silently-gone")))
+	c.reconcile(ctx)
+	assert.Equal(t, 2, stub.called, "a second departure is a second fence")
+}

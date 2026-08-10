@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -76,6 +77,67 @@ func (s *Store) ListFenceIntents(ctx context.Context) (map[string]string, error)
 	out := make(map[string]string, len(kvs))
 	for _, kv := range kvs {
 		out[string(kv.Key[len(PrefixFencePending):])] = string(kv.Value)
+	}
+	return out, nil
+}
+
+func FenceDoneKey(nodeID string) string {
+	return fmt.Sprintf("%s%s", PrefixFenceDone, nodeID)
+}
+
+// MarkFenceComplete records that nodeID has been fenced, at the generation the
+// fence bumped it to.
+//
+// The reconciliation sweep is authoritative — it fences any known node missing
+// from membership, whether or not a watch event was ever seen — so it needs to
+// tell "departed and already fenced" from "departed and still owed a fence".
+// A completed fence leaves nothing else behind that says so: the intent is
+// cleared, and the generation alone cannot distinguish a node fenced now from
+// one fenced during an earlier departure it has since recovered from.
+//
+// The mark is cleared when the node re-registers, so a node that leaves twice
+// is fenced twice.
+func (s *Store) MarkFenceComplete(ctx context.Context, nodeID string, gen uint64) error {
+	_, err := s.putRaw(ctx, FenceDoneKey(nodeID), []byte(strconv.FormatUint(gen, 10)))
+	if err != nil {
+		return fmt.Errorf("mark fence complete %s: %w", nodeID, err)
+	}
+	return nil
+}
+
+// ClearFenceMark forgets that a node was fenced, so its next departure is
+// fenced again.  Called when the node is seen alive in membership.
+func (s *Store) ClearFenceMark(ctx context.Context, nodeID string) error {
+	if _, err := s.client.Delete(ctx, FenceDoneKey(nodeID)); err != nil {
+		return fmt.Errorf("clear fence mark %s: %w", nodeID, err)
+	}
+	return nil
+}
+
+// ListFencedNodes returns every node currently marked as fenced.
+func (s *Store) ListFencedNodes(ctx context.Context) (map[string]bool, error) {
+	kvs, err := s.GetPrefix(ctx, PrefixFenceDone)
+	if err != nil {
+		return nil, fmt.Errorf("list fenced nodes: %w", err)
+	}
+	out := make(map[string]bool, len(kvs))
+	for _, kv := range kvs {
+		out[string(kv.Key[len(PrefixFenceDone):])] = true
+	}
+	return out, nil
+}
+
+// ListKnownNodes returns every node that has ever started, taken from the
+// gen:<node> keys each one creates before serving anything.  It is the set the
+// sweep compares against live membership.
+func (s *Store) ListKnownNodes(ctx context.Context) ([]string, error) {
+	kvs, err := s.GetPrefix(ctx, PrefixGen)
+	if err != nil {
+		return nil, fmt.Errorf("list known nodes: %w", err)
+	}
+	out := make([]string, 0, len(kvs))
+	for _, kv := range kvs {
+		out = append(out, string(kv.Key[len(PrefixGen):]))
 	}
 	return out, nil
 }

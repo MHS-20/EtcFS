@@ -44,6 +44,7 @@ const (
 	// Fencing control plane — see fence.go.
 	PrefixFencePending = "fence_pending:"
 	PrefixFenceClaim   = "fence_claim:"
+	PrefixFenceDone    = "fence_done:"
 
 	KeyInodeAllocCounter = "inode_alloc_counter"
 )
