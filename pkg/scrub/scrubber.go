@@ -146,16 +146,7 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	nlinkV := s.CheckNlinkConsistency(ctx)
 	unref := s.CheckUnreferencedInodes(ctx)
 
-	s.mu.Lock()
-	s.anomalies = append(s.anomalies, collisions...)
-	s.anomalies = append(s.anomalies, orphans...)
-	s.anomalies = append(s.anomalies, dead...)
-	s.anomalies = append(s.anomalies, rangeV...)
-	s.anomalies = append(s.anomalies, genM...)
-	s.anomalies = append(s.anomalies, nlinkV...)
-	s.anomalies = append(s.anomalies, unref...)
-	s.totalChecked++
-	s.mu.Unlock()
+	s.record(collisions, orphans, dead, rangeV, genM, nlinkV, unref)
 
 	// Reclaim only what this node owns.  An orphan in a peer's arena is that
 	// peer's to clean up, and one in a free-pool arena is cleaned up by whoever
@@ -197,6 +188,43 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 		s.log.Info("scrub pass clean")
 	}
 }
+
+// record folds a pass's findings into the anomaly list.
+//
+// The list is deduplicated by type and key and capped: a permanent anomaly is
+// re-found by every pass, so an append-only list grew without bound for as long
+// as the daemon ran — one finding every 30 seconds, forever, for a condition an
+// operator may well have decided to live with.  Keeping the newest is the right
+// end to keep: the oldest entries describe passes whose findings have since
+// been re-reported anyway.
+func (s *Scrubber) record(passes ...[]Result) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	seen := make(map[string]bool, len(s.anomalies))
+	for _, r := range s.anomalies {
+		seen[r.Type+"\x00"+r.Key] = true
+	}
+	for _, pass := range passes {
+		for _, r := range pass {
+			id := r.Type + "\x00" + r.Key
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			s.anomalies = append(s.anomalies, r)
+		}
+	}
+	if excess := len(s.anomalies) - maxAnomalies; excess > 0 {
+		s.anomalies = append(s.anomalies[:0], s.anomalies[excess:]...)
+	}
+	s.totalChecked++
+}
+
+// maxAnomalies bounds the retained findings.  Large enough that a real burst is
+// still legible in full, small enough that a permanently unfixable anomaly
+// cannot consume the process.
+const maxAnomalies = 1000
 
 // ---- scrub checks ----
 

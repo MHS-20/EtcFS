@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
@@ -27,6 +28,11 @@ type GuardFunc func() (cmp clientv3.Cmp, gen uint64, ok bool)
 type Store struct {
 	client *clientv3.Client
 	nodeID string
+
+	// keepAlives maps a lock's lease to the cancel of its keepalive stream, so
+	// releasing the lock can stop the renewals directly rather than relying on
+	// the revoke to end them.
+	keepAlives sync.Map
 
 	// guard, when set, is prepended to the comparisons of every Txn.  A nil
 	// guard leaves transactions unguarded — correct only for control-plane

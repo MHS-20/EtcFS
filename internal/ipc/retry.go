@@ -123,6 +123,8 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 		return nil, err
 	}
 
+	// Drains until ReleaseLock closes the channel by cancelling the stream's
+	// context.  Nothing here outlives the lock.
 	go func() {
 		for range keepCh {
 		}
@@ -134,7 +136,14 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 		// lingers to its TTL and blocks the next writer for no reason.
 		rctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
 		defer cancel()
-		_ = s.store.ReleaseLock(rctx, ino, leaseID)
+		if err := s.store.ReleaseLock(rctx, ino, leaseID); err != nil {
+			// The keepalive has already been stopped by ReleaseLock, so the
+			// lease expires at its TTL rather than being renewed forever — but
+			// until it does, every writer to this inode is blocked
+			// cluster-wide, which is worth saying out loud.
+			s.log.Error("inode lock not released, it will block writers until its lease expires",
+				"ino", ino, "ttl", inodeLockTTL, "error", err)
+		}
 	}, nil
 }
 

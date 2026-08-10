@@ -1,6 +1,7 @@
 package scrub
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
@@ -89,5 +90,33 @@ func TestExpectedNlink(t *testing.T) {
 	}
 	if got := expectedNlink(file, 0); got != 0 {
 		t.Errorf("unlinked file: expected %d, want 0", got)
+	}
+}
+
+// A permanent anomaly is re-found by every pass, so an append-only list grew by
+// one entry every 30 seconds for as long as the daemon ran.
+func TestAnomalyListDeduplicatesAndStaysBounded(t *testing.T) {
+	s := &Scrubber{}
+	stuck := []Result{{Type: "generation", Key: "extent:1/0"}}
+
+	for i := 0; i < 50; i++ {
+		s.record(stuck)
+	}
+	if got := len(s.Anomalies()); got != 1 {
+		t.Errorf("the same finding was retained %d times", got)
+	}
+
+	overflow := make([]Result, maxAnomalies+10)
+	for i := range overflow {
+		overflow[i] = Result{Type: "orphan", Key: fmt.Sprintf("extent:2/%d", i)}
+	}
+	s.record(overflow)
+	if got := len(s.Anomalies()); got != maxAnomalies {
+		t.Errorf("anomaly list held %d entries, want the %d cap", got, maxAnomalies)
+	}
+	// The cap keeps the newest: the oldest findings have been re-reported since.
+	last := s.Anomalies()[maxAnomalies-1]
+	if last.Key != fmt.Sprintf("extent:2/%d", maxAnomalies+9) {
+		t.Errorf("newest finding was evicted: last key is %s", last.Key)
 	}
 }

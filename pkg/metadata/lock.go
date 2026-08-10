@@ -109,13 +109,21 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 	// is given.  Passing the caller's context here would stop renewing the
 	// lease the moment that context is cancelled — the lock would silently
 	// expire at its TTL while the holder still believed it held it, which is
-	// precisely the stale-holder situation locking exists to prevent.  The
-	// stream ends when the lease is revoked (ReleaseLock) or expires.
-	keepCh, err := s.KeepAlive(context.Background(), leaseID)
+	// precisely the stale-holder situation locking exists to prevent.
+	//
+	// The stream's own context is kept so ReleaseLock can end it directly.
+	// Relying on the revoke to end it made a failed revoke unrecoverable: the
+	// keepalive went on renewing, so the lock was held until the process
+	// exited, blocking every writer to that inode cluster-wide, and the
+	// goroutine draining the stream leaked with it.
+	keepCtx, stopKeepAlive := context.WithCancel(context.Background())
+	keepCh, err := s.KeepAlive(keepCtx, leaseID)
 	if err != nil {
+		stopKeepAlive()
 		_ = s.ReleaseLock(ctx, ino, leaseID)
 		return 0, nil, fmt.Errorf("acquire lock ino %d: keepalive: %w", ino, err)
 	}
+	s.keepAlives.Store(leaseID, stopKeepAlive)
 
 	return leaseID, keepCh, nil
 }
@@ -125,6 +133,13 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 // Revoking the lease deletes that holder's key and only that key, so a shared
 // lock survives with its remaining holders.
 func (s *Store) ReleaseLock(ctx context.Context, ino uint64, leaseID clientv3.LeaseID) error {
+	// Stop renewing first, so that even a failed revoke leaves the lease to
+	// expire at its TTL rather than being kept alive indefinitely.  It also
+	// closes the keepalive channel, which is what ends the caller's drain
+	// goroutine.
+	if stop, ok := s.keepAlives.LoadAndDelete(leaseID); ok {
+		stop.(context.CancelFunc)()
+	}
 	if err := s.RevokeLease(ctx, leaseID); err != nil {
 		return fmt.Errorf("release lock ino %d: %w", ino, err)
 	}

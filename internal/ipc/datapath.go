@@ -9,7 +9,6 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
-	wal "github.com/MHS-20/EtcFS/pkg/walgo"
 )
 
 // Data path: everything that touches the shared block device.
@@ -172,15 +171,6 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 			LogOff: offset + pos, DiskOff: r.DiskOff, Length: extLen,
 			Gen: gen, Seq: seq, Node: s.store.NodeID(),
 		}
-		if s.wal != nil {
-			_ = s.wal.Append(&wal.Entry{
-				Ino:        ino,
-				LogicalOff: ext.LogOff,
-				DiskOff:    r.DiskOff,
-				Length:     extLen,
-				Generation: gen,
-			})
-		}
 		ops = append(ops, clientv3.OpPut(metadata.ExtentKey(ino, chunk), ext.Encode()))
 		chunk++
 		end = ext.End()
@@ -207,10 +197,6 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		s.log.Error("write: rejected, node has been fenced",
 			"ino", ino, "start_generation", s.startGen)
 		return int32Resp(-5), nil
-	}
-
-	if s.wal != nil {
-		_ = s.wal.MarkCommitted(ino, offset)
 	}
 
 	// The write is published, so whatever it covers is now unreadable through

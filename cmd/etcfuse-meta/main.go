@@ -42,7 +42,6 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 	"github.com/MHS-20/EtcFS/pkg/metrics"
 	"github.com/MHS-20/EtcFS/pkg/scrub"
-	wal "github.com/MHS-20/EtcFS/pkg/walgo"
 )
 
 func main() {
@@ -155,19 +154,6 @@ func main() {
 		defer func() { _ = dev.Close() }()
 		svc.SetBlockDevice(dev)
 		_ = svc.ReconstructArenas(ctx)
-
-		w, err := wal.Open("/var/lib/etcfuse/wal")
-		if err == nil {
-			_ = w.Replay(func(e *wal.Entry) error {
-				log.Info("WAL replay: freeing uncommitted block",
-					"ino", e.Ino, "disk_off", e.DiskOff, "length", e.Length)
-				svc.FreeBlock(e.DiskOff, e.Length)
-				return nil
-			})
-			_ = w.Truncate()
-			svc.SetWAL(w)
-			log.Info("WAL opened and replayed")
-		}
 
 		log.Info("block device opened", "path", cfg.BlockDevice,
 			"sector_size", dev.SectorSize(), "total_size", dev.TotalSize(),

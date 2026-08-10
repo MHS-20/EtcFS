@@ -18,7 +18,6 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
-	wal "github.com/MHS-20/EtcFS/pkg/walgo"
 )
 
 // Service handles FUSE operation requests from the C daemon.
@@ -29,7 +28,6 @@ type Service struct {
 	alloc        *arena.Allocator
 	log          *config.Logger
 	dev          *blockio.Device
-	wal          *wal.WAL
 	notifyServer *notifyServer
 
 	// Fencing generation this node started with.  Every data-path commit is
@@ -63,10 +61,6 @@ func (s *Service) SetBlockDevice(dev *blockio.Device) {
 // ReconstructArenas rebuilds the arena free-list from existing extents in etcd.
 func (s *Service) ReconstructArenas(ctx context.Context) error {
 	return s.alloc.Reconstruct(ctx)
-}
-
-func (s *Service) SetWAL(w *wal.WAL) {
-	s.wal = w
 }
 
 // Allocator returns this node's block allocator, so background passes (the
