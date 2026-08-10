@@ -11,7 +11,8 @@
 // This is the same pattern the Kubernetes API server's watch cache uses
 // between etcd and kubelets.
 //
-// Phase 0: types defined.  Implementation in Phase 2.
+// Only the registration types exist so far: nothing constructs a Mux yet, and
+// cache invalidation currently goes over the notify socket instead.
 package watch
 
 import (
@@ -80,8 +81,8 @@ func (m *Mux) Unwatch(prefix string, cb Callback) {
 
 // Run starts the background watch loop.  Blocks until ctx is cancelled.
 func (m *Mux) Run(ctx context.Context) {
-	// Phase 2: consolidate registered prefixes into a minimal set of
-	// etcd watchers, dispatch events to registered callbacks, handle
-	// disconnection and list-then-watch recovery.
+	// Unimplemented: consolidating registered prefixes into a minimal set of
+	// etcd watchers, dispatching events to callbacks, and list-then-watch
+	// recovery after a disconnection all still have to be written.
 	<-ctx.Done()
 }

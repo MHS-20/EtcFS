@@ -526,6 +526,5 @@ const (
 
 // ---- helpers ----
 
+// timeNow is a variable so a test can pin the clock.
 var timeNow = time.Now
-
-func init() { _ = timeNow } // ensure import used

@@ -3,8 +3,6 @@
 // The C daemon (etcfuse) opens a Unix domain socket to this service and
 // sends binary-framed requests for each FUSE operation.  This service
 // translates those requests into etcd operations and returns binary responses.
-//
-// Phase 2: read-only FUSE ops (LOOKUP, GETATTR, READDIR, READLINK, STATFS).
 package ipc
 
 import (

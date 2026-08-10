@@ -391,7 +391,8 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 	case ipcOpMknod:
 		return s.handleMknod(ctx, payload)
 	case ipcOpAlloc, ipcOpCommit:
-		// Block allocation — Phase 6
+		// Block allocation is done inside the WRITE handler, not asked for
+		// separately; these opcodes are unused.
 		return int32Resp(-38), nil // ENOSYS
 	default:
 		return int32Resp(-38), nil // ENOSYS

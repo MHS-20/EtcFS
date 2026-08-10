@@ -212,7 +212,7 @@ func (s *Service) handleStatfs(ctx context.Context, _ []byte) ([]byte, error) {
 	return b.b, nil
 }
 
-// ---- write operation handlers (Phase 3) ----
+// ---- write operation handlers ----
 
 // applyUmask clears the permission bits the caller's umask masks out, leaving
 // the file type alone.  The kernel does not apply it for us on a filesystem
@@ -503,8 +503,7 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 //
 // So both handlers report "no conflict", which leaves the kernel's own local
 // lock bookkeeping in charge: correct within one node, not enforced across
-// nodes.  This matches the documented Phase 3 behaviour.  Reporting a
-// conflict instead would be worse than useless — SETLK cannot grant a lock it
+// nodes.  Reporting a conflict instead would be worse than useless — SETLK cannot grant a lock it
 // does not track, so every caller would spin on EAGAIN forever.
 
 // GETLK and SETLK are deliberately not handled here, and the C daemon does not

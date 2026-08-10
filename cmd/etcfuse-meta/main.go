@@ -1,8 +1,8 @@
 /*
 Package main is the EtcFS metadata backend binary.
 
-It runs a gRPC server on a Unix domain socket, receiving FUSE operation
-requests from the C daemon (etcfuse) and translating them into etcd
+It serves a binary protocol over a Unix domain socket, receiving FUSE
+operation requests from the C daemon (etcfuse) and translating them into etcd
 transactions, leases, and watches.
 
 The binary also runs:
@@ -197,10 +197,11 @@ func main() {
 	}
 	go controller.Run(ctx)
 
-	// POSIX fcntl/flock locks are node-local: GETLK always reports the range
-	// free and SETLK always grants (internal/ipc/handlers.go).  Warned at
-	// startup because a workload relying on cross-node locking gets no other
-	// signal — the calls succeed, they simply exclude nothing on other nodes.
+	// POSIX fcntl/flock locks are node-local: neither daemon implements
+	// GETLK/SETLK, so the kernel enforces them within this node and nothing
+	// enforces them between nodes.  Warned at startup because a workload
+	// relying on cross-node locking gets no other signal — the calls succeed,
+	// they simply exclude nothing on other nodes.
 	log.Warn("POSIX file locks (fcntl/flock) are enforced within this node only, NOT across the " +
 		"cluster; see docs/architecture/metadata/posix-lock-operations.md")
 
