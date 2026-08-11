@@ -43,6 +43,15 @@ N0="${PUB_IPS[0]}"
 N0_ID=$(aws ec2 describe-instances --filters "Name=ip-address,Values=$N0" \
     --query 'Reservations[0].Instances[0].InstanceId' --output text)
 
+# SG_ID/SUBNET_ID are state.sh *env-override* variables, empty unless the
+# caller set ETCFS_SG/ETCFS_SUBNET — create-infra.sh resolves and stores the
+# real values under these keys in the state file instead. Reading them here
+# the same way SCRATCH_VOL_ID etc. are read below, not from the env vars.
+SG_ID=$(state_get sg_id 2>/dev/null | tr -d '"')
+SUBNET_ID=$(state_get subnet_id 2>/dev/null | tr -d '"')
+[[ -n "$SG_ID" && "$SG_ID" != "null" ]] || die "no sg_id in state — run create-infra.sh first"
+[[ -n "$SUBNET_ID" && "$SUBNET_ID" != "null" ]] || die "no subnet_id in state — run create-infra.sh first"
+
 log "=== EtcFS benchmark ==="
 log "Node:        $N0 ($N0_ID)"
 log "Runtime:     ${RUNTIME}s per job"
@@ -209,7 +218,12 @@ if $EFS_ENABLED; then
     run_fio "efs" "/mnt/bench-efs/fio.dat" "1G"
 fi
 
-run_fio "etcfs" "$FUSE_MOUNTPOINT/fio.dat" "256M"
+# 8M, not 256M like the other targets: at etcfs's measured ~40 write
+# IOPS/QD1, fio's own file layout (writing the file out to `size` before
+# the timed jobs start) would take ~27 minutes at 256M. 8M is still far
+# more than a runtime-bounded QD1 job touches, so it doesn't change what's
+# measured — it only avoids paying setup cost nothing needs.
+run_fio "etcfs" "$FUSE_MOUNTPOINT/fio.dat" "8M"
 
 $SSH_CMD "ec2-user@$N0" "sudo rm -f /mnt/bench-ext4/fio.dat /mnt/bench-efs/fio.dat $FUSE_MOUNTPOINT/fio.dat 2>/dev/null || true"
 
