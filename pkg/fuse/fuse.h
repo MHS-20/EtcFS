@@ -100,4 +100,12 @@ void etcfs_log(int level, const char *fmt, ...) __attribute__((format(printf, 2,
 void etcfs_set_log_level(int level);
 int etcfs_run(struct etcfs_context *ctx);
 
+/* Returns the calling thread's IPC socket to the metadata backend, connecting
+ * on first use and reusing it for every later request from that thread.  A
+ * connection is never shared between threads: the protocol is a bare sequence
+ * of frames with no request identifiers, so two threads on one socket would
+ * interleave their frames and read each other's replies.  Returns -1 if the
+ * connection cannot be established, which the handlers surface as EIO. */
+int etcfs_ipc_fd(void);
+
 #endif /* ETCFS_FUSE_H */

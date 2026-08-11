@@ -268,9 +268,19 @@ static void fill_stat(struct stat *st, const struct etcfs_attr *a)
     st->st_ctime = (time_t) a->ctime;
 }
 
-/* ---- helper: get fd from context ---- */
+/* ---- helper: this thread's IPC connection ---- */
 
-#define FD(ctx) (((struct etcfs_context *) fuse_req_userdata(req))->ipc_fd)
+/* The handlers run on FUSE worker threads, each with its own connection to the
+ * backend (see etcfs_ipc_fd).  The context's ipc_fd belongs to the thread that
+ * started the daemon and is not used to serve requests. */
+#define FD(ctx) etcfs_ipc_fd()
+
+/* File handles are only ever handed back to the kernel, but they are still
+ * allocated from one counter by every worker thread at once. */
+static uint64_t next_file_handle(struct etcfs_context *ctx)
+{
+    return __atomic_add_fetch(&ctx->next_fh, 1, __ATOMIC_RELAXED);
+}
 
 /* ---- FUSE operation handlers ---- */
 
@@ -575,7 +585,7 @@ static void ec_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     (void) ino;
     struct etcfs_context *ctx = fuse_req_userdata(req);
-    fi->fh = ++ctx->next_fh;
+    fi->fh = next_file_handle(ctx);
     fi->direct_io = 1;
     fi->keep_cache = 0;
     fuse_reply_open(req, fi);
@@ -585,7 +595,7 @@ static void ec_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 {
     (void) ino;
     struct etcfs_context *ctx = fuse_req_userdata(req);
-    fi->fh = ++ctx->next_fh;
+    fi->fh = next_file_handle(ctx);
     fuse_reply_open(req, fi);
 }
 
@@ -636,7 +646,7 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
         return;
     }
     struct etcfs_context *ctx = fuse_req_userdata(req);
-    fi->fh = ++ctx->next_fh;
+    fi->fh = next_file_handle(ctx);
     fi->direct_io = 1;
     fi->keep_cache = 0;
     if (!rb.ok) {

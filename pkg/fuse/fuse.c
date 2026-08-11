@@ -130,6 +130,65 @@ static int connect_to_meta(const char *socket_path)
     return fd;
 }
 
+/* ---- per-thread IPC connections ---- */
+
+/*
+ * Every FUSE worker thread gets its own connection to the metadata backend.
+ * The wire protocol carries no request identifiers — a reply is whatever
+ * arrives next on the socket — so a shared fd would let two threads interleave
+ * their frames and take each other's replies.  One fd per thread keeps every
+ * exchange in ops.c exactly as synchronous as it was when the daemon ran one
+ * request at a time; the Go side already serves a goroutine per connection.
+ */
+static pthread_key_t ipc_fd_key;
+static pthread_once_t ipc_fd_once = PTHREAD_ONCE_INIT;
+static char ipc_socket_path[108];
+
+/* The path every connection is made to: what etcfs_run resolved, falling back
+ * to the environment so a worker can connect before (or without) the daemon
+ * having run. */
+static const char *ipc_socket(void)
+{
+    if (ipc_socket_path[0] != '\0')
+        return ipc_socket_path;
+    const char *env = getenv("ETCFS_IPC_SOCKET");
+    return env ? env : "/tmp/etcfuse.sock";
+}
+
+static void ipc_fd_destroy(void *value)
+{
+    int fd = (int) (intptr_t) value;
+    if (fd >= 0)
+        close(fd);
+}
+
+static void ipc_fd_key_create(void)
+{
+    if (pthread_key_create(&ipc_fd_key, ipc_fd_destroy) != 0)
+        etcfs_log(ETCFS_LOG_ERROR, "pthread_key_create for IPC connections failed");
+}
+
+int etcfs_ipc_fd(void)
+{
+    pthread_once(&ipc_fd_once, ipc_fd_key_create);
+
+    /* A stored fd is offset by one so that a thread that has not connected yet
+     * (NULL) stays distinguishable from one holding fd 0. */
+    intptr_t stored = (intptr_t) pthread_getspecific(ipc_fd_key);
+    if (stored > 0)
+        return (int) (stored - 1);
+
+    int fd = connect_to_meta(ipc_socket());
+    if (fd < 0)
+        return -1;
+    if (pthread_setspecific(ipc_fd_key, (void *) (intptr_t) (fd + 1)) != 0) {
+        etcfs_log(ETCFS_LOG_ERROR, "cannot store this thread's IPC connection");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 /* ---- FUSE init callback ---- */
 
 static void etcfs_init(void *userdata, struct fuse_conn_info *conn)
@@ -156,6 +215,10 @@ int etcfs_run(struct etcfs_context *ctx)
     const char *socket_path = getenv("ETCFS_IPC_SOCKET");
     if (!socket_path)
         socket_path = "/tmp/etcfuse.sock";
+
+    /* Kept for every worker thread to connect with; the one opened here only
+     * proves the backend is reachable before the mountpoint is taken over. */
+    snprintf(ipc_socket_path, sizeof(ipc_socket_path), "%s", socket_path);
 
     ipc_fd = connect_to_meta(socket_path);
     if (ipc_fd < 0)
@@ -280,16 +343,22 @@ after_cleanup:
     pthread_create(&ntid, NULL, notify_thread, ctx);
 
     /*
-     * Single-threaded on purpose: every handler in ops.c performs a
-     * synchronous exchange over one shared IPC fd with no mutex around it.
-     * Switching to fuse_session_loop_mt() here alone would let two threads
-     * interleave their frames on that fd and steal each other's replies —
-     * corruption of the protocol, not merely a race.  Making the mount
-     * concurrent means giving each FUSE worker its own connection (the Go
-     * side already serves one goroutine per connection), not changing this
-     * line.
+     * Multi-threaded: each worker takes its own IPC connection from
+     * etcfs_ipc_fd(), so the synchronous exchanges in ops.c never share a
+     * socket.  One slow etcd operation now blocks the request that issued it
+     * rather than the whole mount.
+     *
+     * clone_fd gives every worker its own /dev/fuse descriptor, which is what
+     * stops the kernel-side read of the request queue from becoming the next
+     * serialisation point once the IPC one is gone.
      */
-    ret = fuse_session_loop(se);
+    {
+        struct fuse_loop_config loop_config;
+        memset(&loop_config, 0, sizeof(loop_config));
+        loop_config.clone_fd = 1;
+        loop_config.max_idle_threads = ETCFS_MAX_THREADS;
+        ret = fuse_session_loop_mt(se, &loop_config);
+    }
 
     /* cleanup */
     fuse_session_unmount(se);

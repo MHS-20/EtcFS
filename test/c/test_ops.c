@@ -13,8 +13,10 @@
 #include "../../pkg/fuse/ops.c"
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 /* ---- response readers ---- */
 
@@ -157,6 +159,52 @@ static void test_name_bounds_match_the_protocol(void)
     assert(IPC_MAX_FRAME_LEN == (1u << 20));
 }
 
+/* ---- per-thread IPC connections ---- */
+
+static void *ipc_fd_of_this_thread(void *out)
+{
+    int fd = etcfs_ipc_fd();
+    /* Asked twice on purpose: a thread must keep reusing its own connection
+     * rather than opening one per request. */
+    assert(etcfs_ipc_fd() == fd);
+    *(int *) out = fd;
+    return NULL;
+}
+
+/* Two FUSE workers must never end up on one socket: the protocol has no
+ * request identifiers, so they would read each other's replies. */
+static void test_each_thread_gets_its_own_ipc_connection(void)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/etcfs-test-ipc-%d.sock", (int) getpid());
+    unlink(path);
+
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(listener >= 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    assert(bind(listener, (struct sockaddr *) &addr, sizeof(addr)) == 0);
+    assert(listen(listener, 8) == 0);
+    setenv("ETCFS_IPC_SOCKET", path, 1);
+
+    int first = -1, second = -1;
+    pthread_t a, b;
+    assert(pthread_create(&a, NULL, ipc_fd_of_this_thread, &first) == 0);
+    assert(pthread_join(a, NULL) == 0);
+    assert(pthread_create(&b, NULL, ipc_fd_of_this_thread, &second) == 0);
+    assert(pthread_join(b, NULL) == 0);
+
+    assert(first >= 0);
+    assert(second >= 0);
+    assert(first != second);
+
+    close(listener);
+    unlink(path);
+    unsetenv("ETCFS_IPC_SOCKET");
+}
+
 int main(void)
 {
     test_rb_reads_big_endian();
@@ -167,6 +215,7 @@ int main(void)
     test_ipc_sync_refuses_an_oversized_response_frame();
     test_ipc_sync_reports_a_truncated_response();
     test_name_bounds_match_the_protocol();
+    test_each_thread_gets_its_own_ipc_connection();
 
     printf("test/c: all checks passed\n");
     return 0;

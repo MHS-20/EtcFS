@@ -59,7 +59,7 @@ Each node runs two cooperating processes, not one monolith:
                                                    locks, fencing)          Multi-Attach)
 ```
 
-**Why two processes, not one:** FUSE protocol handling needs timely response to kernel upcalls — a single-threaded libfuse event loop, synchronous IPC per request. Metadata and data I/O involve network round trips (etcd) and block device access with variable latency and retryable failures — goroutines, connection pools, retry logic. Splitting them means neither concern's failure/latency model contaminates the other. Full detail: [`docs/architecture/fuse/fuse-architecture.md`](docs/architecture/fuse/fuse-architecture.md).
+**Why two processes, not one:** FUSE protocol handling needs timely response to kernel upcalls — a libfuse event loop, synchronous IPC per request on a connection private to each worker thread. Metadata and data I/O involve network round trips (etcd) and block device access with variable latency and retryable failures — goroutines, connection pools, retry logic. Splitting them means neither concern's failure/latency model contaminates the other. Full detail: [`docs/architecture/fuse/fuse-architecture.md`](docs/architecture/fuse/fuse-architecture.md).
 
 The C daemon owns all FUSE state (session, mount, request handles); the Go daemon owns all etcd state (client connection, lease keepalives, watch channels). The wire protocol is a hand-rolled length-prefixed binary format on a Unix socket (`internal/ipc/socket.go`); there's no gRPC/protobuf in the hot path.
 
