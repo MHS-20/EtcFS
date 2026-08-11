@@ -8,7 +8,7 @@ transactions, leases, and watches.
 The binary also runs:
   - The membership lease heartbeat (keepalive to etcd)
   - The self-fencing watchdog (lease health → stop if expired)
-  - The etcd watch multiplexer (fan-out directory watches to the C side)
+  - The etcd watch that drives cache invalidation on the C side
 
 Usage:
 
