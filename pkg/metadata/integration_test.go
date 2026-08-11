@@ -377,7 +377,12 @@ func TestIntegration_TransactionConflictStorm(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			for attempt := 0; attempt < 20; attempt++ {
+			// A flat 20-attempt budget with uniform backoff is not enough at
+			// this fan-out: with 50 writers on one key a loser can lose every
+			// race and exhaust the budget on a loaded runner. Retry until the
+			// deadline instead, backing off exponentially so the herd thins.
+			deadline := time.Now().Add(60 * time.Second)
+			for backoff := time.Millisecond; time.Now().Before(deadline); {
 				value, err := store.Get(ctx, key)
 				if err != nil {
 					continue
@@ -393,7 +398,10 @@ func TestIntegration_TransactionConflictStorm(t *testing.T) {
 					atomic.AddInt32(&successes, 1)
 					return
 				}
-				time.Sleep(time.Duration(rand.Intn(20)) * time.Millisecond)
+				time.Sleep(time.Duration(rand.Int63n(int64(backoff))) + time.Millisecond)
+				if backoff < 200*time.Millisecond {
+					backoff *= 2
+				}
 			}
 		}()
 	}
