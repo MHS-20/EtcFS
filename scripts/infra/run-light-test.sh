@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/state.sh"
 
-mapfile -t PUB_IPS < <(state_get compute_ips 2>/dev/null | jq -r '.[]' 2>/dev/null)
+mapfile -t PUB_IPS < <(state_get compute_public_ips 2>/dev/null | jq -r '.[]' 2>/dev/null)
 COUNT=${#PUB_IPS[@]}
 DURATION="${1:-60}"
 INTERVAL="${2:-5}"
