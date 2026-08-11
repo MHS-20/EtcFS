@@ -98,19 +98,69 @@ func (s *Service) retryKV(ctx context.Context, fn func(context.Context) error) {
 	}
 }
 
-// lockInode takes a lock on an inode and returns the release function.  The
-// lock is written under the store's session lease, which is renewed for the
-// life of the process, so nothing per-lock is left running past the release.
+// heldLock is an acquired inode lock.
+//
+// Release drops it in a round trip of its own.  A caller that is already
+// committing a transaction can instead put ReleaseOp into it and call Folded
+// once that transaction commits, which releases the lock at the same revision
+// as the work it was protecting and saves the round trip entirely.  Release
+// stays safe to defer either way: after Folded it does nothing.
+type heldLock struct {
+	s        *Service
+	ino      uint64
+	mode     metadata.LockMode
+	holder   string
+	released bool
+}
+
+// ReleaseOp is the deletion that drops this lock, for folding into a caller's
+// own transaction.
+func (l *heldLock) ReleaseOp() clientv3.Op {
+	return clientv3.OpDelete(metadata.LockKey(l.ino, l.mode, l.holder))
+}
+
+// Folded records that a transaction carrying ReleaseOp committed, so the
+// deferred Release becomes a no-op.  Only call it once the transaction is
+// known to have committed — a rejected one released nothing.
+func (l *heldLock) Folded() { l.released = true }
+
+// Release drops the lock, unless a committed transaction already carried it.
+func (l *heldLock) Release() {
+	if l.released {
+		return
+	}
+	// Fresh context rather than the request's: releasing has to work even
+	// when the request deadline has already expired, otherwise the lock
+	// lingers and blocks the next writer for no reason.  Retried, because a
+	// lock key now outlives a failed release for as long as the node does:
+	// the session lease that would have expired it is the one this node
+	// keeps renewing.
+	rctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
+	defer cancel()
+	err := retryEtcd(rctx, func(dctx context.Context) error {
+		return l.s.store.ReleaseLock(dctx, l.ino, l.mode, l.holder)
+	})
+	if err != nil {
+		l.s.log.Error("inode lock not released, it will block writers until this node exits",
+			"ino", l.ino, "mode", l.mode, "error", err)
+		return
+	}
+	l.released = true
+}
+
+// lockInode takes a lock on an inode.  The lock is written under the store's
+// session lease, which is renewed for the life of the process, so nothing
+// per-lock is left running past the release.
 //
 // Each acquisition attempt runs against its own bounded context.  This is the
 // first etcd call on both the read and the write path, so an unbounded one
 // stalls I/O here, before any generation guard is consulted; the caller's ctx
 // still caps the total, so a request that has already run out of time does not
 // start another attempt.
-func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockMode) (release func(), err error) {
+func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockMode) (*heldLock, error) {
 	var holder string
 
-	err = retry(ctx, etcdAttempts, func() error {
+	err := retry(ctx, etcdAttempts, func() error {
 		actx, cancel := context.WithTimeout(ctx, etcdOpTimeout)
 		defer cancel()
 		var aerr error
@@ -121,23 +171,7 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 		return nil, err
 	}
 
-	return func() {
-		// Fresh context rather than the request's: releasing has to work even
-		// when the request deadline has already expired, otherwise the lock
-		// lingers and blocks the next writer for no reason.  Retried, because a
-		// lock key now outlives a failed release for as long as the node does:
-		// the session lease that would have expired it is the one this node
-		// keeps renewing.
-		rctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
-		defer cancel()
-		err := retryEtcd(rctx, func(dctx context.Context) error {
-			return s.store.ReleaseLock(dctx, ino, mode, holder)
-		})
-		if err != nil {
-			s.log.Error("inode lock not released, it will block writers until this node exits",
-				"ino", ino, "mode", mode, "error", err)
-		}
-	}, nil
+	return &heldLock{s: s, ino: ino, mode: mode, holder: holder}, nil
 }
 
 // commitGuarded applies ops in one transaction carrying the caller's

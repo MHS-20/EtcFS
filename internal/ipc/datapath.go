@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"unsafe"
 
@@ -10,6 +11,18 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+)
+
+const (
+	// maxWriteTxnOps bounds what one write's transaction may carry, under
+	// etcd's own --max-txn-ops (128 by default).  The margin covers the ops a
+	// proposal adds outside the reclaim loop: the new extents, the inode's
+	// size, and the lock release.
+	maxWriteTxnOps = 120
+
+	// maxReclaimOps is the most ops one buried extent contributes — the two
+	// puts of a split.
+	maxReclaimOps = 2
 )
 
 // Data path: everything that touches the shared block device.
@@ -95,11 +108,11 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return int32Resp(-5), nil
 	}
 
-	release, err := s.lockInode(ctx, ino, metadata.LockExclusive)
+	lk, err := s.lockInode(ctx, ino, metadata.LockExclusive)
 	if err != nil {
 		return int32Resp(-11), nil // EAGAIN after retries
 	}
-	defer release()
+	defer lk.Release()
 
 	runs, err := s.allocateBlocks(ctx, uint64(dataLen))
 	if err != nil {
@@ -176,10 +189,25 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	// One extent per run, in order, so the logical range stays contiguous even
 	// though the device ranges behind it are not.  Rebuilt on a retry, since
 	// both counters move.
+	//
+	// Everything this write does to metadata goes into this one transaction:
+	// the new extents, the size change, the rewrite of every extent the write
+	// buries, and the release of the inode lock.  Each of those used to be its
+	// own round trip after the commit, and each was a Raft commit on the
+	// critical path of every write.  Folding them also makes the write atomic
+	// in a way it was not: a buried extent stops being referenced at the same
+	// revision the extent burying it appears, and the lock is dropped exactly
+	// when the work it protected becomes visible.
 	end := offset
+	var plans []*reclaimPlan
+	var deferredReclaim []metadata.Extent
+	var nextChunk uint64
+	var foldedRelease bool
 	proposal := func() ([]clientv3.Cmp, []clientv3.Op) {
 		cmps := make([]clientv3.Cmp, 0, len(runs))
-		ops := make([]clientv3.Op, 0, len(runs)+1)
+		ops := make([]clientv3.Op, 0, len(runs)+2)
+		plans = plans[:0]
+		deferredReclaim = deferredReclaim[:0]
 		end = offset
 		pos := uint64(0)
 		next := chunk
@@ -200,15 +228,47 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 			end = ext.End()
 			pos += r.Length
 		}
-		// Commit every extent and any size change together, guarded by this
-		// node's fencing generation.  Data is already durable on the device; if
-		// the guard rejects the commit the bytes stay unreferenced and the
-		// blocks go back to the arena.
+		// Data is already durable on the device; if the guard rejects the
+		// commit the bytes stay unreferenced and the blocks go back to the
+		// arena.
 		if end > rec.Size {
 			sized := *rec
 			sized.Size = end
 			ops = append(ops, clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(&sized))))
 		}
+
+		// The write is about to bury these, so they stop being readable through
+		// the extents that held them.  Reclaiming here rather than leaving it
+		// all to the scrubber keeps an overwrite-heavy workload from holding a
+		// scrub interval's worth of buried blocks alive at all times.
+		for _, old := range existing {
+			if old.LogOff >= end || offset >= old.End() {
+				continue
+			}
+			// etcd caps a transaction's size, and one write can bury many
+			// extents.  What does not fit is reclaimed afterwards, in the round
+			// trips of its own this folding exists to avoid — correct either
+			// way, just not free.
+			if len(ops)+maxReclaimOps+1 > maxWriteTxnOps || len(cmps)+1 > maxWriteTxnOps {
+				deferredReclaim = append(deferredReclaim, old)
+				continue
+			}
+			if p := s.planReclaim(old, offset, end, &next); p != nil {
+				cmps = append(cmps, p.cmp)
+				ops = append(ops, p.ops...)
+				plans = append(plans, p)
+			}
+		}
+
+		// Only when this transaction finishes the write: a reclaim left over
+		// for afterwards still needs the inode held, or another node could
+		// rewrite those extents between the commit and the reclaim and turn a
+		// leak into a lost update.
+		foldedRelease = len(deferredReclaim) == 0
+		if foldedRelease {
+			ops = append(ops, lk.ReleaseOp())
+		}
+		nextChunk = next
 		return cmps, ops
 	}
 
@@ -249,23 +309,23 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return int32Resp(-5), nil
 	}
 	rec.Size = max(rec.Size, end)
-	chunk += uint64(len(runs))
+	if foldedRelease {
+		lk.Folded()
+	}
 
-	// The write is published, so whatever it covers is now unreadable through
-	// the extents that held it.  Reclaim here rather than leaving it all to the
-	// scrubber: an overwrite-heavy workload on one node would otherwise keep a
-	// scrub interval's worth of buried blocks alive at all times.
-	//
 	// Only after the commit — before it, a transaction the generation guard
 	// rejects would have freed blocks the file still refers to.
-	for _, old := range existing {
-		if old.LogOff < end && offset < old.End() {
-			// The write itself is published and correct; failing to reclaim
-			// what it buried only leaks blocks the scrubber will find.
-			if rerr := s.reclaimCovered(ctx, old, offset, end, &chunk); rerr != nil {
-				s.log.Warn("buried extent not reclaimed, the scrubber will pick it up",
-					"ino", ino, "error", rerr)
-			}
+	for _, p := range plans {
+		s.freeReclaimed(p)
+	}
+
+	// What did not fit in the transaction, in a round trip each.  The write
+	// itself is published and correct; failing to reclaim what it buried only
+	// leaks blocks the scrubber will find.
+	for _, old := range deferredReclaim {
+		if rerr := s.reclaimCovered(ctx, old, offset, end, &nextChunk); rerr != nil {
+			s.log.Warn("buried extent not reclaimed, the scrubber will pick it up",
+				"ino", ino, "error", rerr)
 		}
 	}
 
@@ -367,8 +427,8 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	// A shared lock keeps a concurrent writer off the range while it is read.
 	// Best effort: a read that cannot take the lock still returns data, since
 	// the extent list it works from is itself a consistent etcd snapshot.
-	if release, err := s.lockInode(ctx, ino, metadata.LockShared); err == nil {
-		defer release()
+	if lk, err := s.lockInode(ctx, ino, metadata.LockShared); err == nil {
+		defer lk.Release()
 	}
 
 	// Only useful against a cache this read could otherwise be served from: an
@@ -448,7 +508,17 @@ func (s *Service) readInto(dst []byte, diskOff int64) (int, error) {
 // rather than swallowing it: a fenced node's writes are rejected by the
 // generation guard, and a truncate that answered success while every extent
 // stayed in place told the caller its file had shrunk when nothing had.
+// Unlike a write, a truncate takes no inode lock, so an extent it planned to
+// rewrite can be rewritten under it by another node.  Each reclaim refuses to
+// apply in that case; the whole pass is retried from a fresh read, which is the
+// only view a correct plan can be built from.
 func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) error {
+	return retry(ctx, etcdAttempts, func() error {
+		return s.truncateOnce(ctx, ino, newSize)
+	})
+}
+
+func (s *Service) truncateOnce(ctx context.Context, ino uint64, newSize uint64) error {
 	extents, err := s.store.GetExtents(ctx, ino)
 	if err != nil {
 		return fmt.Errorf("truncate ino %d: read extents: %w", ino, err)
@@ -469,8 +539,30 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) erro
 	return nil
 }
 
-// reclaimCovered rewrites old to the part a write over [start, end) leaves
-// readable, and returns the blocks it gives up to the arena.
+// errExtentChanged reports that an extent this node meant to rewrite was
+// modified after it was read, so the rewrite was refused rather than applied
+// from a stale view.  Retryable: the caller re-reads and plans again.
+var errExtentChanged = errors.New("extent changed since it was read")
+
+// reclaimPlan is the metadata rewrite that gives back what a write buried,
+// together with the device range that becomes free once that rewrite commits.
+//
+// It is a plan rather than an action so the write path can fold it into the
+// transaction publishing the write itself — one round trip for both, and the
+// buried extent stops being referenced at the same revision the extent burying
+// it appears.
+type reclaimPlan struct {
+	// cmp requires the record to be untouched since it was read.  Without it a
+	// stale read could resurrect an extent that was deleted in between, since
+	// the rewrite is a blind put of a value derived from that read.
+	cmp     clientv3.Cmp
+	ops     []clientv3.Op
+	freeOff uint64
+	freeLen uint64
+}
+
+// planReclaim builds the rewrite of old into the part a write over
+// [start, end) leaves readable.  Returns nil when there is nothing to do.
 //
 // It is a no-op for a range this node does not own.  The extent record is the
 // only durable reference the owning node's in-memory bitmap is rebuilt from, so
@@ -485,12 +577,7 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) erro
 // extent they were cut from: the key says only which record this is, never how
 // recent it is, so neither piece can outrank a genuinely newer extent
 // overlapping it.
-//
-// Metadata first, then the free: a reader resolving the old record must never
-// be sent to blocks that have already been handed to another allocation.
-func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
-	start, end uint64, nextChunk *uint64) error {
-
+func (s *Service) planReclaim(old metadata.Extent, start, end uint64, nextChunk *uint64) *reclaimPlan {
 	if s.dev == nil || !s.alloc.Owns(old.DiskOff) {
 		return nil
 	}
@@ -503,25 +590,19 @@ func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
 		return nil
 	}
 
+	p := &reclaimPlan{cmp: clientv3.Compare(clientv3.ModRevision(old.Key), "=", old.ModRevision)}
+
 	switch {
 	case head == nil && tail == nil:
-		if err := s.store.Delete(ctx, old.Key); err != nil {
-			return fmt.Errorf("delete covered extent %s: %w", old.Key, err)
-		}
+		p.ops = []clientv3.Op{clientv3.OpDelete(old.Key)}
 
 	case head != nil && tail != nil:
-		// One transaction: a crash between the two puts would leave the middle
-		// described twice, once by each half of a record that no longer exists.
-		ops := []clientv3.Op{
+		// Both pieces in one transaction: applying only one would leave the
+		// middle described twice, once by each half of a record that no longer
+		// exists.
+		p.ops = []clientv3.Op{
 			clientv3.OpPut(old.Key, head.Encode()),
 			clientv3.OpPut(metadata.ExtentKey(old.Ino(), *nextChunk), tail.Encode()),
-		}
-		ok, err := s.store.Txn(ctx, nil, ops, nil)
-		if err != nil {
-			return fmt.Errorf("split covered extent %s: %w", old.Key, err)
-		}
-		if !ok {
-			return fmt.Errorf("split covered extent %s: %w", old.Key, metadata.ErrFenced)
 		}
 		*nextChunk++
 
@@ -530,13 +611,44 @@ func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
 		if survivor == nil {
 			survivor = tail
 		}
-		if _, err := s.store.Put(ctx, old.Key, []byte(survivor.Encode())); err != nil {
-			return fmt.Errorf("trim covered extent %s: %w", old.Key, err)
-		}
+		p.ops = []clientv3.Op{clientv3.OpPut(old.Key, survivor.Encode())}
 	}
 
-	if off, length := metadata.CoveredBlocks(old, head, tail); length > 0 {
-		s.alloc.Free(off, length)
+	p.freeOff, p.freeLen = metadata.CoveredBlocks(old, head, tail)
+	return p
+}
+
+// reclaimCovered applies a plan on its own, for callers with no transaction of
+// their own to fold it into.
+//
+// Metadata first, then the free: a reader resolving the old record must never
+// be sent to blocks that have already been handed to another allocation.
+func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
+	start, end uint64, nextChunk *uint64) error {
+
+	p := s.planReclaim(old, start, end, nextChunk)
+	if p == nil {
+		return nil
 	}
+
+	ok, err := s.store.Txn(ctx, []clientv3.Cmp{p.cmp}, p.ops, nil)
+	if err != nil {
+		return fmt.Errorf("reclaim covered extent %s: %w", old.Key, err)
+	}
+	if !ok {
+		// The guard is checked by the store, which reports a fence as an error
+		// rather than a rejection — so reaching here means the record itself
+		// moved, not that this node was fenced.
+		return fmt.Errorf("reclaim covered extent %s: %w", old.Key, errExtentChanged)
+	}
+
+	s.freeReclaimed(p)
 	return nil
+}
+
+// freeReclaimed returns a committed plan's blocks to the arena.
+func (s *Service) freeReclaimed(p *reclaimPlan) {
+	if p.freeLen > 0 {
+		s.alloc.Free(p.freeOff, p.freeLen)
+	}
 }

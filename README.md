@@ -137,7 +137,7 @@ A secondary split-brain vector — etcd's own partition behavior — already ben
 
 Every node registers a `membership:<node_id>` key backed by an etcd lease (2–5s TTL, tunable). A lease expiry is the liveness-loss signal that kicks off fencing. Because membership is just etcd leases rather than a totem/CPG protocol, nodes join or leave far more cheaply than in DLM: joining is "start heartbeating and read current metadata," leaving is "stop heartbeating" — no cluster-wide stop-the-world recovery step for membership churn itself. Adding or removing a node only affects the locks and arenas that node personally held; etcd's watch mechanism surfaces this incrementally, not as a synchronous global barrier. No manual rebalancing step is needed — arena acquisition happens automatically on a new node's first write.
 
-Verified in practice: `docs/chaos-reports/2026-07-31-elastic-scale-out-in.md` — 3→5→3 node scale-out/scale-in, both local and on real AWS infrastructure.
+Verified in practice: `docs/reports/chaos-reports/2026-07-31-elastic-scale-out-in.md` — 3→5→3 node scale-out/scale-in, both local and on real AWS infrastructure.
 
 ## Journaling — what replaces it
 
@@ -204,13 +204,13 @@ Four tiers, from fast/local to slow/real-infrastructure:
 
 1. **Unit tests** (`go test -race ./...`, `make test`) — per-package, in-memory mock etcd store (`pkg/metadata/mock_store.go`), no network or disk dependency.
 2. **Deterministic simulator** (`test/harness`) — Jepsen-style fault injection against a simulated cluster: node death at every point in the write/allocate/lock-acquire sequence, partition between a node and etcd while the disk path stays alive (the exact scenario self-fencing exists for), etcd leader election or majority loss during in-flight transactions. This was built *before* the fencing/allocator logic it exercises, per the design's stated build order (`init_plan.md` §15) — treat it as a first-class correctness gate, not an afterthought.
-3. **Single-scenario chaos tests** (`scripts/test/chaos-test.sh`), against real AWS infrastructure — a fresh 3-node cluster per scenario: C-daemon SIGKILL, Go-daemon SIGKILL, network partition + self-fence + rejoin, fencing-generation bump + rejection, all-3-simultaneous crash, mid-write crash + WAL replay. Current status and the two product bugs found/fixed to reach 7/7: [`docs/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md`](docs/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md).
+3. **Single-scenario chaos tests** (`scripts/test/chaos-test.sh`), against real AWS infrastructure — a fresh 3-node cluster per scenario: C-daemon SIGKILL, Go-daemon SIGKILL, network partition + self-fence + rejoin, fencing-generation bump + rejection, all-3-simultaneous crash, mid-write crash + WAL replay. Current status and the two product bugs found/fixed to reach 7/7: [`docs/reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md`](docs/reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md).
 4. **Compound chaos tests**, against both local Docker and real AWS, each exercising the *same* cluster across multiple operations rather than a fresh one per test:
    - **Sequential faults** (`scripts/test/chaos-test-single-cluster.sh`) — all six single-scenario faults back to back on one cluster, verifying recovery from repeated unrelated faults in sequence, not just from a fault on a pristine cluster.
    - **Randomized fuzz** (`scripts/test/chaos-fuzz.sh`) — concurrent random read/write/delete/rename/mkdir traffic from all nodes against random files, while a chaos injector randomly kills daemons, partitions nodes, bumps fencing generations, or crashes all nodes simultaneously on a randomized cadence; a liveness monitor asserts the cluster never goes fully unwritable.
    - **Elastic scale-out/scale-in** (`scripts/test/chaos-elastic.sh`) — adds 2 nodes to a running cluster one at a time, verifies each sees pre-existing data and its writes propagate, then removes both gracefully, verifying correctness at every step.
 
-   Results and the harness bugs found along the way (all in test tooling, not the daemons): [`docs/chaos-reports/2026-07-31-single-cluster-and-fuzz.md`](docs/chaos-reports/2026-07-31-single-cluster-and-fuzz.md), [`docs/chaos-reports/2026-07-31-elastic-scale-out-in.md`](docs/chaos-reports/2026-07-31-elastic-scale-out-in.md).
+   Results and the harness bugs found along the way (all in test tooling, not the daemons): [`docs/reports/chaos-reports/2026-07-31-single-cluster-and-fuzz.md`](docs/reports/chaos-reports/2026-07-31-single-cluster-and-fuzz.md), [`docs/reports/chaos-reports/2026-07-31-elastic-scale-out-in.md`](docs/reports/chaos-reports/2026-07-31-elastic-scale-out-in.md).
 
 Chaos scenarios cost real AWS resources and take a few minutes each to provision — iterate against Docker or a single scenario, not `all`, while developing.
 
@@ -247,7 +247,7 @@ Dual-confirmed external fencing (EBS detach + poll before the generation bumps) 
 | Document | Purpose |
 |---|---|
 | `docs/architecture/*.md` | Per-subsystem design docs (~24 files) — fencing, WAL, write ordering, schema, coherence, scrubber |
-| [`docs/chaos-reports/`](docs/chaos-reports/) | Chaos/stress testing results, by date |
+| [`docs/reports/chaos-reports/`](docs/reports/chaos-reports/) | Chaos/stress testing results, by date |
 | [`docs/background/etcd_raft_research.md`](docs/background/etcd_raft_research.md) | etcd/Raft internals research — transactions, leases, watches, scaling limits |
 | [`docs/background/cluster-fs-survey.md`](docs/background/cluster-fs-survey.md) | Cluster/distributed filesystem survey — GFS2, OCFS2, CephFS, GlusterFS, Lustre, EBS Multi-Attach failure modes |
 | [`docs/background/vfs_fuse_block_research.md`](docs/background/vfs_fuse_block_research.md) | Linux VFS, FUSE protocol/operations/capabilities, O_DIRECT alignment, io_uring |

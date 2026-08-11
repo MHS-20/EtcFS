@@ -32,6 +32,13 @@ type Extent struct {
 	// unique within an inode and nothing more; it does not order writes.
 	Chunk uint64
 
+	// ModRevision is the etcd revision the record was last written at, or 0
+	// for an extent that has not been stored yet.  A caller that rewrites an
+	// extent it read earlier compares against it, so that a record which
+	// changed in between fails the transaction instead of being overwritten
+	// from a stale view — see ipc.Service.planReclaim.
+	ModRevision int64
+
 	// Seq orders writes to the same logical bytes: of two extents covering a
 	// range, the one with the higher Seq is the later write, and the one a read
 	// must resolve to.
@@ -161,6 +168,7 @@ func DecodeExtents(kvs []*mvccpb.KeyValue) []Extent {
 	extents := make([]Extent, 0, len(kvs))
 	for _, kv := range kvs {
 		if e, ok := DecodeExtent(string(kv.Key), kv.Value); ok {
+			e.ModRevision = kv.ModRevision
 			extents = append(extents, e)
 		}
 	}

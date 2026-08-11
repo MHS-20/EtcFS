@@ -57,6 +57,25 @@ func TestDecodeExtentsSortsByLogicalOffset(t *testing.T) {
 	}
 }
 
+// A caller that rewrites an extent it read compares against the revision it
+// read it at, so a record that changed in between fails the transaction rather
+// than being overwritten from a stale view.  Losing the revision here would
+// make every such comparison read "= 0" — true only for a key that does not
+// exist — which turns the guard into a rejection of every rewrite.
+func TestDecodeExtentsCarryTheRevisionTheyWereReadAt(t *testing.T) {
+	kvs := []*mvccpb.KeyValue{
+		{Key: []byte("extent:1/0"), Value: []byte("0,0,4096,1,0,node-A"), ModRevision: 91},
+		{Key: []byte("extent:1/1"), Value: []byte("4096,4096,4096,1,1,node-A"), ModRevision: 47},
+	}
+	got := DecodeExtents(kvs)
+	if len(got) != 2 {
+		t.Fatalf("want 2 extents, got %d", len(got))
+	}
+	if got[0].ModRevision != 91 || got[1].ModRevision != 47 {
+		t.Fatalf("revisions %d/%d, want 91/47", got[0].ModRevision, got[1].ModRevision)
+	}
+}
+
 // A write allocates fresh blocks and appends an extent, so overwriting a range
 // leaves two extents covering it.  A reader takes the first one that covers the
 // offset it wants, so the newer — higher sequence — has to sort first, and has
