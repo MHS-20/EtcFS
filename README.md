@@ -248,10 +248,10 @@ Dual-confirmed external fencing (EBS detach + poll before the generation bumps) 
 |---|---|
 | `docs/architecture/*.md` | Per-subsystem design docs (~24 files) — fencing, WAL, write ordering, schema, coherence, scrubber |
 | [`docs/chaos-reports/`](docs/chaos-reports/) | Chaos/stress testing results, by date |
-| [`docs/etcd_raft_research.md`](docs/etcd_raft_research.md) | etcd/Raft internals research — transactions, leases, watches, scaling limits |
-| [`docs/research/cluster-fs-survey.md`](docs/research/cluster-fs-survey.md) | Cluster/distributed filesystem survey — GFS2, OCFS2, CephFS, GlusterFS, Lustre, EBS Multi-Attach failure modes |
-| [`docs/research/vfs_fuse_block_research.md`](docs/research/vfs_fuse_block_research.md) | Linux VFS, FUSE protocol/operations/capabilities, O_DIRECT alignment, io_uring |
-| [`docs/research/userspace_filesystem_research.md`](docs/research/userspace_filesystem_research.md) | FUSE daemon design patterns, metadata caching, language choice, test harnesses |
+| [`docs/background/etcd_raft_research.md`](docs/background/etcd_raft_research.md) | etcd/Raft internals research — transactions, leases, watches, scaling limits |
+| [`docs/background/cluster-fs-survey.md`](docs/background/cluster-fs-survey.md) | Cluster/distributed filesystem survey — GFS2, OCFS2, CephFS, GlusterFS, Lustre, EBS Multi-Attach failure modes |
+| [`docs/background/vfs_fuse_block_research.md`](docs/background/vfs_fuse_block_research.md) | Linux VFS, FUSE protocol/operations/capabilities, O_DIRECT alignment, io_uring |
+| [`docs/background/userspace_filesystem_research.md`](docs/background/userspace_filesystem_research.md) | FUSE daemon design patterns, metadata caching, language choice, test harnesses |
 | `scripts/infra/` | AWS EC2 + EBS Multi-Attach provisioning, etcd deployment, daemon bootstrap, node add/remove |
 | `scripts/test/` | Chaos engineering, fencing validation, elasticity testing |
 | [`AGENTS.md`](AGENTS.md) | Instructions and conventions for AI agents working in this repo |

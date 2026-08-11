@@ -69,7 +69,7 @@ lint-c:
 	clang-format --dry-run --Werror $(C_SRCS) $(C_HDRS) $(C_TEST_SRC)
 
 lint-sh:
-	shellcheck scripts/infra/*.sh scripts/test/*.sh
+	shellcheck scripts/infra/*.sh scripts/test/*.sh scripts/bench/*.sh
 
 fmt: fmt-go fmt-c
 
