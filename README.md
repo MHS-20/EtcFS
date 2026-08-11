@@ -255,3 +255,5 @@ Dual-confirmed external fencing (EBS detach + poll before the generation bumps) 
 | `scripts/infra/` | AWS EC2 + EBS Multi-Attach provisioning, etcd deployment, daemon bootstrap, node add/remove |
 | `scripts/test/` | Chaos engineering, fencing validation, elasticity testing |
 | [`AGENTS.md`](AGENTS.md) | Instructions and conventions for AI agents working in this repo |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build and test setup, the commit convention the release automation reads, and what a change to the safety-critical paths needs |
+| [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, and what is in and out of scope |
