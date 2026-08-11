@@ -223,8 +223,7 @@ func main() {
 
 	// Start Prometheus metrics server if configured
 	if cfg.MetricsAddr != "" {
-		reg := metrics.NewRegistry()
-		go func() { _ = metrics.StartServer(cfg.MetricsAddr, reg) }()
+		go func() { _ = metrics.StartServer(cfg.MetricsAddr) }()
 		log.Info("metrics server listening", "addr", cfg.MetricsAddr)
 	}
 

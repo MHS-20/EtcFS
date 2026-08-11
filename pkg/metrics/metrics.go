@@ -1,137 +1,129 @@
+// Package metrics defines the Prometheus metrics EtcFS exposes on
+// --metrics-addr, and the /metrics server that serves them.
+//
+// The metrics are package-level variables registered with the default
+// Prometheus registry rather than values threaded through every constructor:
+// a subsystem instruments itself by referring to the metric it owns, and
+// nothing has to be wired for a metric to appear. Metric names are an API —
+// dashboards and alert rules are written against them — so they are declared
+// here, in one place, instead of being spelled out at each call site.
 package metrics
 
 import (
-	"fmt"
 	"net/http"
-	"sync"
-	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Registry holds Prometheus-style counters, gauges, and histograms.
-// This is a lightweight in-memory implementation designed for the test harness;
-// in production it would be backed by the Prometheus client library.
-type Registry struct {
-	mu       sync.Mutex
-	counters map[string]*counter
-	gauges   map[string]*gauge
-}
+var (
+	// FuseOps counts FUSE operations served, by operation name.
+	FuseOps = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_fuse_ops_total",
+		Help: "FUSE operations served, by operation.",
+	}, []string{"op"})
 
-type counter struct {
-	labels map[string]float64
-}
-type gauge struct {
-	val float64
-}
+	// FuseErrors counts FUSE operations that returned an errno, by operation.
+	FuseErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_fuse_errors_total",
+		Help: "FUSE operations that failed, by operation.",
+	}, []string{"op"})
 
-func NewRegistry() *Registry {
-	return &Registry{
-		counters: make(map[string]*counter),
-		gauges:   make(map[string]*gauge),
-	}
-}
+	// FuseOpDuration observes end-to-end handler latency, by operation.
+	FuseOpDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "etcfuse_fuse_op_duration_seconds",
+		Help:    "FUSE operation handler latency.",
+		Buckets: prometheus.ExponentialBuckets(0.0001, 3, 10),
+	}, []string{"op"})
 
-// IncCounter increments a labeled counter by 1.
-func (r *Registry) IncCounter(name, label string) {
-	r.AddCounter(name, label, 1)
-}
+	// EtcdTxns counts etcd transactions, by outcome (committed, failed, error).
+	EtcdTxns = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_etcd_txn_total",
+		Help: "etcd transactions attempted, by outcome.",
+	}, []string{"outcome"})
 
-// AddCounter increments a labeled counter by a given value.
-func (r *Registry) AddCounter(name, label string, val float64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if c, ok := r.counters[name]; ok {
-		c.labels[label] += val
-		return
-	}
-	r.counters[name] = &counter{labels: map[string]float64{label: val}}
-}
-
-// SetGauge sets a gauge to an absolute value.
-func (r *Registry) SetGauge(name string, val float64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.gauges[name] = &gauge{val: val}
-}
-
-// CounterValue returns the sum of all label values for a counter.
-func (r *Registry) CounterValue(name string) float64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if c, ok := r.counters[name]; ok {
-		var sum float64
-		for _, v := range c.labels {
-			sum += v
-		}
-		return sum
-	}
-	return 0
-}
-
-// CounterLabels returns all label keys for a counter.
-func (r *Registry) CounterLabels(name string) []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if c, ok := r.counters[name]; ok {
-		keys := make([]string, 0, len(c.labels))
-		for k := range c.labels {
-			keys = append(keys, k)
-		}
-		return keys
-	}
-	return nil
-}
-
-// GaugeValue returns the current value of a gauge.
-func (r *Registry) GaugeValue(name string) float64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if g, ok := r.gauges[name]; ok {
-		return g.val
-	}
-	return 0
-}
-
-// TrackDuration records an observed duration in a histogram-like counter.
-// Count is stored at name+"_count", cumulative seconds at name.
-func (r *Registry) TrackDuration(name, label string, d time.Duration) {
-	r.AddCounter(name+"_count", label, 1)
-	r.AddCounter(name, label, d.Seconds())
-}
-
-// HasCounter checks whether a counter with the given name exists.
-func (r *Registry) HasCounter(name string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, ok := r.counters[name]
-	return ok
-}
-
-// HasGauge checks whether a gauge with the given name exists.
-func (r *Registry) HasGauge(name string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, ok := r.gauges[name]
-	return ok
-}
-
-func (r *Registry) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		w.Header().Set("Content-Type", "text/plain")
-		for name, c := range r.counters {
-			for label, val := range c.labels {
-				_, _ = fmt.Fprintf(w, "%s{label=%q} %g\n", name, label, val)
-			}
-		}
-		for name, g := range r.gauges {
-			_, _ = fmt.Fprintf(w, "%s %g\n", name, g.val)
-		}
+	// EtcdTxnDuration observes etcd transaction round-trip latency. This is
+	// the metric an operator wants percentiles on: it is the dominant term in
+	// every metadata operation's latency.
+	EtcdTxnDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "etcfuse_etcd_txn_duration_seconds",
+		Help:    "etcd transaction round-trip latency.",
+		Buckets: prometheus.ExponentialBuckets(0.0005, 3, 10),
 	})
-}
 
-func StartServer(addr string, reg *Registry) error {
+	// BlockIO counts block-device operations, by direction (read, write).
+	BlockIO = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_block_io_total",
+		Help: "Block device operations, by direction.",
+	}, []string{"op"})
+
+	// BlockIOBytes counts bytes transferred to and from the block device.
+	BlockIOBytes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_block_io_bytes_total",
+		Help: "Bytes transferred to and from the block device, by direction.",
+	}, []string{"op"})
+
+	// ScrubAnomalies counts anomalies found by the scrubber, by type
+	// (collision, orphan, dead, range, generation, nlink).
+	ScrubAnomalies = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_scrub_anomalies_total",
+		Help: "Anomalies detected by the scrubber, by type.",
+	}, []string{"type"})
+
+	// ScrubPasses counts completed scrub passes.
+	ScrubPasses = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "etcfuse_scrub_passes_total",
+		Help: "Completed scrub passes.",
+	})
+
+	// ScrubLastRun holds the Unix timestamp of the last completed scrub pass.
+	// A scrubber that has stopped is invisible in the counters above, which
+	// simply stop rising; this makes staleness directly alertable.
+	ScrubLastRun = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "etcfuse_scrub_last_run_seconds",
+		Help: "Unix timestamp of the last completed scrub pass.",
+	})
+
+	// ArenaUtilization is the fraction of blocks in use across the arenas this
+	// node owns, between 0 and 1.
+	ArenaUtilization = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "etcfuse_arena_utilization",
+		Help: "Fraction of blocks in use across arenas owned by this node.",
+	})
+
+	// ArenasOwned is the number of arenas this node currently owns.
+	ArenasOwned = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "etcfuse_arenas_owned",
+		Help: "Arenas currently owned by this node.",
+	})
+
+	// MembershipCount is the number of live members in the cluster as last
+	// observed by this node.
+	MembershipCount = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "etcfuse_membership_count",
+		Help: "Live cluster members as last observed by this node.",
+	})
+
+	// FencingGeneration is this node's current fencing generation. A step in
+	// this series is a fence, which is the single most important event an
+	// operator can alert on.
+	FencingGeneration = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "etcfuse_fencing_generation",
+		Help: "This node's current fencing generation.",
+	})
+
+	// FencedNodes counts nodes this node's fencing controller has fenced, by
+	// outcome (fenced, failed).
+	FencedNodes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_fenced_nodes_total",
+		Help: "Nodes fenced by this node's fencing controller, by outcome.",
+	}, []string{"outcome"})
+)
+
+// StartServer serves /metrics on addr. It blocks until the server stops.
+func StartServer(addr string) error {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", reg.Handler())
+	mux.Handle("/metrics", promhttp.Handler())
 	return http.ListenAndServe(addr, mux)
 }

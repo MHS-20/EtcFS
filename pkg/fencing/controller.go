@@ -9,6 +9,7 @@ import (
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 // Controller watches etcd membership keys and performs external fencing
@@ -232,6 +233,7 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, f
 	// Every return path below therefore leaves the intent in place.
 	if c.fencer != nil {
 		if err := c.fencer.Fence(ctx, nodeID, instanceID); err != nil {
+			metrics.FencedNodes.WithLabelValues("failed").Inc()
 			c.log.Error("device access not confirmed severed, NOT bumping generation",
 				"node", nodeID, "instance", instanceID, "error", err)
 			return
@@ -289,6 +291,7 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, f
 			"node", nodeID, "error", err)
 	}
 
+	metrics.FencedNodes.WithLabelValues("fenced").Inc()
 	c.log.Info("node fenced", "node_id", nodeID, "generation", newGen, "previous", currentGen)
 }
 
@@ -350,6 +353,9 @@ func (c *Controller) reconcile(ctx context.Context) {
 		candidates[nodeID] = true
 	}
 
+	// This node is alive by construction, so it is counted before the loop that
+	// skips it.
+	live := 1
 	for nodeID := range candidates {
 		if nodeID == c.nodeID {
 			continue // this controller's own node is alive by construction
@@ -363,6 +369,7 @@ func (c *Controller) reconcile(ctx context.Context) {
 			continue
 		}
 		if alive != nil {
+			live++
 			if owed {
 				c.log.Info("node re-registered before its fence completed, dropping intent",
 					"node", nodeID)
@@ -397,6 +404,7 @@ func (c *Controller) reconcile(ctx context.Context) {
 		}
 		c.fenceNode(ctx, nodeID, instanceID, true)
 	}
+	metrics.MembershipCount.Set(float64(live))
 }
 
 // extractNodeID extracts the node ID from a membership key.

@@ -19,6 +19,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 // ArenaSizeBytes is the default arena size (1 GiB).
@@ -334,6 +335,15 @@ func (a *Allocator) LiveRatio() float64 {
 	return float64(used) / float64(total)
 }
 
+// reportUtilization publishes this node's arena occupancy.  Sampled from the
+// reaper's tick rather than updated at every allocation: both values are
+// derived by walking the arena bitmaps under the allocator lock, which is on
+// the write path, and a gauge one tick stale is worth more than contention.
+func (a *Allocator) reportUtilization() {
+	metrics.ArenaUtilization.Set(a.LiveRatio())
+	metrics.ArenasOwned.Set(float64(a.ArenaCount()))
+}
+
 // NodeID returns the owning node.
 func (a *Allocator) NodeID() string { return a.nodeID }
 
@@ -427,6 +437,7 @@ func (a *Allocator) ArenaCount() int {
 // ReapEmptyArenas periodically returns emptied arenas to the global free pool.
 // Blocks until ctx is cancelled.
 func (a *Allocator) ReapEmptyArenas(ctx context.Context, interval time.Duration) {
+	a.reportUtilization()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -435,6 +446,7 @@ func (a *Allocator) ReapEmptyArenas(ctx context.Context, interval time.Duration)
 			return
 		case <-ticker.C:
 			_, _ = a.ReleaseEmptyArenas(ctx)
+			a.reportUtilization()
 		}
 	}
 }

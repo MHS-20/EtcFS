@@ -24,6 +24,7 @@ import (
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 // MetadataStore is the slice of the metadata store the scrubber needs: it
@@ -184,6 +185,16 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 		if r.Length > 0 {
 			s.reclaimer.Free(r.DiskOff, r.Length)
 		}
+	}
+
+	metrics.ScrubPasses.Inc()
+	metrics.ScrubLastRun.SetToCurrentTime()
+	for typ, found := range map[string]int{
+		"collision": len(collisions), "orphan": len(orphans), "dead": len(dead),
+		"range": len(rangeV), "generation": len(genM), "nlink": len(nlinkV),
+		"unreferenced": len(unref),
+	} {
+		metrics.ScrubAnomalies.WithLabelValues(typ).Add(float64(found))
 	}
 
 	total := len(collisions) + len(orphans) + len(dead) + len(rangeV) + len(genM) + len(nlinkV) + len(unref)

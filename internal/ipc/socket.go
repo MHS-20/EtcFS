@@ -10,9 +10,11 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"syscall"
+	"time"
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 // opcodes matching pkg/fuse/ops.c
@@ -46,6 +48,27 @@ const (
 	ipcOpReadDirPlus = 29
 )
 
+// opNames labels metrics with the operation's FUSE name.  An opcode number in
+// a dashboard is a lookup into this file; a name is not.
+var opNames = map[uint16]string{
+	ipcOpLookup: "lookup", ipcOpGetattr: "getattr", ipcOpReaddir: "readdir",
+	ipcOpReadlink: "readlink", ipcOpCreate: "create", ipcOpMkdir: "mkdir",
+	ipcOpUnlink: "unlink", ipcOpRmdir: "rmdir", ipcOpRename: "rename",
+	ipcOpSymlink: "symlink", ipcOpLink: "link", ipcOpSetattr: "setattr",
+	ipcOpOpen: "open", ipcOpRelease: "release", ipcOpOpendir: "opendir",
+	ipcOpReleasedir: "releasedir", ipcOpStatfs: "statfs", ipcOpAlloc: "alloc",
+	ipcOpCommit: "commit", ipcOpRead: "read", ipcOpWrite: "write",
+	ipcOpFsync: "fsync", ipcOpMknod: "mknod", ipcOpFlush: "flush",
+	ipcOpReadDirPlus: "readdirplus",
+}
+
+func opName(op uint16) string {
+	if name, ok := opNames[op]; ok {
+		return name
+	}
+	return "unknown"
+}
+
 // RunSocket starts a raw binary IPC server on the given listener.
 // Each connection is handled in its own goroutine.
 func (s *Service) RunSocket(listener net.Listener) error {
@@ -72,7 +95,7 @@ func (s *Service) handleConn(conn net.Conn) {
 			return
 		}
 
-		resp, err := s.safeDispatch(op, payload)
+		resp, err := s.observedDispatch(op, payload)
 		if err != nil {
 			s.log.Warn("ipc dispatch", "op", op, "error", err)
 			return
@@ -85,6 +108,23 @@ func (s *Service) handleConn(conn net.Conn) {
 			}
 		}
 	}
+}
+
+// observedDispatch records the operation, its latency, and whether it returned
+// an errno.  Wrapped around the whole dispatch rather than added to each
+// handler: every FUSE operation this daemon serves passes through here, so one
+// wrapper instruments all of them and no new handler can forget to.
+func (s *Service) observedDispatch(op uint16, payload []byte) ([]byte, error) {
+	name := opName(op)
+	start := time.Now()
+	resp, err := s.safeDispatch(op, payload)
+	metrics.FuseOps.WithLabelValues(name).Inc()
+	metrics.FuseOpDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
+	// Every response frame starts with an int32 errno, negative on failure.
+	if err != nil || (len(resp) >= 4 && int32(binary.LittleEndian.Uint32(resp)) < 0) {
+		metrics.FuseErrors.WithLabelValues(name).Inc()
+	}
+	return resp, err
 }
 
 // safeDispatch runs a handler and turns a panic into one failed request.

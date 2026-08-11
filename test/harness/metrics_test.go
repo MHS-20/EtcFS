@@ -1,93 +1,87 @@
 package harness
 
 import (
+	"regexp"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/MHS-20/EtcFS/pkg/metrics"
+	"github.com/MHS-20/EtcFS/pkg/scrub"
 )
 
-// ---- C11.3: Metrics completeness ----
+// The metric names below are an API: dashboards and alert rules are written
+// against them, so a rename is a breaking change and this list is what makes
+// one visible.  Registration is checked against the default registry the
+// subsystems instrument, not a private one — a metric declared but never
+// gathered would pass the second kind of test and fail the operator.
+func TestMetrics_DeclaredNamesAreRegistered(t *testing.T) {
+	registered := registeredNames(t)
 
-func TestMetrics_Completeness(t *testing.T) {
-	reg := metrics.NewRegistry()
-
-	namedCounters := []string{
+	for _, name := range []string{
 		"etcfuse_fuse_ops_total",
+		"etcfuse_fuse_errors_total",
+		"etcfuse_fuse_op_duration_seconds",
 		"etcfuse_etcd_txn_total",
-		"etcfuse_block_io_total",
-		"etcfuse_scrub_anomalies_total",
 		"etcfuse_etcd_txn_duration_seconds",
-		"etcfuse_etcd_txn_duration_seconds_count",
-	}
-	for _, name := range namedCounters {
-		reg.IncCounter(name, "test")
-		assert.True(t, reg.HasCounter(name), "counter %s should exist", name)
-	}
-
-	namedGauges := []string{
+		"etcfuse_block_io_total",
+		"etcfuse_block_io_bytes_total",
+		"etcfuse_scrub_anomalies_total",
+		"etcfuse_scrub_passes_total",
+		"etcfuse_scrub_last_run_seconds",
 		"etcfuse_arena_utilization",
-		"etcfuse_inode_count",
+		"etcfuse_arenas_owned",
 		"etcfuse_membership_count",
-		"etcfuse_lock_count",
-		"etcfuse_dirent_count",
-	}
-	for _, name := range namedGauges {
-		reg.SetGauge(name, 42)
-		assert.True(t, reg.HasGauge(name), "gauge %s should exist", name)
+		"etcfuse_fencing_generation",
+		"etcfuse_fenced_nodes_total",
+	} {
+		assert.True(t, registered[name], "metric %q should be registered", name)
 	}
 }
 
-func TestMetrics_IncrementAndRead(t *testing.T) {
-	reg := metrics.NewRegistry()
+// registeredNames returns every metric name in the default registry.
+//
+// Read from the collectors' descriptors rather than from a Gather: a labelled
+// metric with no series yet — which is every counter on a freshly started node —
+// is registered but gathers nothing, so Gather would report the whole surface
+// missing until traffic arrives.
+func registeredNames(t *testing.T) map[string]bool {
+	t.Helper()
 
-	reg.IncCounter("etcfuse_fuse_ops_total", "lookup")
-	reg.IncCounter("etcfuse_fuse_ops_total", "lookup")
-	reg.IncCounter("etcfuse_fuse_ops_total", "getattr")
-	reg.IncCounter("etcfuse_fuse_ops_total", "create")
+	descs := make(chan *prometheus.Desc)
+	go func() {
+		defer close(descs)
+		prometheus.DefaultGatherer.(*prometheus.Registry).Describe(descs)
+	}()
 
-	assert.Equal(t, float64(4), reg.CounterValue("etcfuse_fuse_ops_total")) // sum across all labels
-
-	labels := reg.CounterLabels("etcfuse_fuse_ops_total")
-	assert.Subset(t, labels, []string{"lookup", "getattr", "create"})
+	fqName := regexp.MustCompile(`fqName: "([^"]+)"`)
+	names := make(map[string]bool)
+	for d := range descs {
+		if m := fqName.FindStringSubmatch(d.String()); m != nil {
+			names[m[1]] = true
+		}
+	}
+	require.NotEmpty(t, names, "the default registry describes no metrics at all")
+	return names
 }
 
-func TestMetrics_DurationTracking(t *testing.T) {
-	reg := metrics.NewRegistry()
+// Wiring, not the metric type: a scrub pass must move the scrubber's counters
+// without anyone passing a registry in.  This is the check that fails if the
+// instrumentation is removed from RunScrubPass, which the metric-name test
+// above would not notice.
+func TestMetrics_ScrubPassIsInstrumented(t *testing.T) {
+	cluster := NewCluster(1)
+	sc := scrub.New(cluster.Store, "metrics-node", time.Hour, nullLogger{})
 
-	reg.TrackDuration("etcfuse_etcd_txn_duration_seconds", "txn_commit", 150*time.Millisecond)
-	reg.TrackDuration("etcfuse_etcd_txn_duration_seconds", "txn_commit", 250*time.Millisecond)
+	before := testutil.ToFloat64(metrics.ScrubPasses)
+	sc.RunScrubPass(t.Context())
+	after := testutil.ToFloat64(metrics.ScrubPasses)
 
-	assert.Equal(t, float64(2), reg.CounterValue("etcfuse_etcd_txn_duration_seconds_count"))
-	assert.Greater(t, reg.CounterValue("etcfuse_etcd_txn_duration_seconds"), 0.35)
-	assert.Less(t, reg.CounterValue("etcfuse_etcd_txn_duration_seconds"), 0.45)
-}
-
-func TestMetrics_ScrubAnomalies(t *testing.T) {
-	reg := metrics.NewRegistry()
-
-	reg.IncCounter("etcfuse_scrub_anomalies_total", "collision")
-	reg.IncCounter("etcfuse_scrub_anomalies_total", "collision")
-	reg.IncCounter("etcfuse_scrub_anomalies_total", "orphan")
-	reg.IncCounter("etcfuse_scrub_anomalies_total", "generation")
-	reg.IncCounter("etcfuse_scrub_anomalies_total", "nlink")
-
-	assert.Greater(t, reg.CounterValue("etcfuse_scrub_anomalies_total"), float64(0))
-	labels := reg.CounterLabels("etcfuse_scrub_anomalies_total")
-	assert.Subset(t, labels, []string{"collision", "orphan", "generation", "nlink"})
-}
-
-func TestMetrics_GaugeFluctuation(t *testing.T) {
-	reg := metrics.NewRegistry()
-
-	reg.SetGauge("etcfuse_arena_utilization", 0.75)
-	assert.Equal(t, 0.75, reg.GaugeValue("etcfuse_arena_utilization"))
-
-	reg.SetGauge("etcfuse_arena_utilization", 0.30)
-	assert.Equal(t, 0.30, reg.GaugeValue("etcfuse_arena_utilization"))
-
-	reg.SetGauge("etcfuse_membership_count", 3)
-	assert.Equal(t, float64(3), reg.GaugeValue("etcfuse_membership_count"))
+	assert.Equal(t, before+1, after, "a scrub pass should increment etcfuse_scrub_passes_total")
+	assert.Positive(t, testutil.ToFloat64(metrics.ScrubLastRun),
+		"a scrub pass should stamp etcfuse_scrub_last_run_seconds")
 }

@@ -7,6 +7,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 const (
@@ -112,7 +114,10 @@ func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
 				offset, len(buf), d.sectorSize)
 		}
 	}
-	return unix.Pread(d.fd, buf, offset)
+	n, err := unix.Pread(d.fd, buf, offset)
+	metrics.BlockIO.WithLabelValues("read").Inc()
+	metrics.BlockIOBytes.WithLabelValues("read").Add(float64(n))
+	return n, err
 }
 
 func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
@@ -122,7 +127,10 @@ func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
 				offset, len(buf), d.sectorSize)
 		}
 	}
-	return unix.Pwrite(d.fd, buf, offset)
+	n, err := unix.Pwrite(d.fd, buf, offset)
+	metrics.BlockIO.WithLabelValues("write").Inc()
+	metrics.BlockIOBytes.WithLabelValues("write").Add(float64(n))
+	return n, err
 }
 
 func (d *Device) SyncRange(offset int64, length int64) error {

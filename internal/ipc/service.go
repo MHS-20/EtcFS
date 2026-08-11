@@ -16,6 +16,7 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 // Service handles FUSE operation requests from the C daemon.
@@ -119,6 +120,7 @@ func (s *Service) initGenerationLocked(ctx context.Context) error {
 	}
 	s.startGen = gen
 	s.genInit = true
+	metrics.FencingGeneration.Set(float64(gen))
 	return nil
 }
 

@@ -8,6 +8,8 @@ import (
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 // GuardFunc supplies the fencing-generation comparison that every structural
@@ -117,9 +119,17 @@ func (s *Store) Txn(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clie
 // registration that runs before the generation is known.  Everything else must
 // use Txn.
 func (s *Store) txnRaw(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, error) {
+	start := time.Now()
 	resp, err := s.client.Txn(ctx).If(ifs...).Then(thens...).Else(elses...).Commit()
+	metrics.EtcdTxnDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
+		metrics.EtcdTxns.WithLabelValues("error").Inc()
 		return false, fmt.Errorf("txn: %w", err)
+	}
+	if resp.Succeeded {
+		metrics.EtcdTxns.WithLabelValues("committed").Inc()
+	} else {
+		metrics.EtcdTxns.WithLabelValues("rejected").Inc()
 	}
 	return resp.Succeeded, nil
 }
