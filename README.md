@@ -2,6 +2,9 @@
 
 <https://mhs-20.github.io/EtcFS/>
 
+[![CI](https://github.com/mhs-20/EtcFS/actions/workflows/ci.yml/badge.svg)](https://github.com/mhs-20/EtcFS/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/mhs-20/EtcFS/branch/main/graph/badge.svg)](https://codecov.io/gh/mhs-20/EtcFS)
+
 **A cluster-aware filesystem for shared raw block devices — the piece AWS and Kubernetes tell you to bring yourself.**
 
 AWS EBS Multi-Attach will attach one io2 volume to sixteen instances at once. Kubernetes will hand it to you as a `ReadWriteMany` `volumeMode: Block` volume. Both then stop, and [the EBS CSI driver's documentation says why](https://github.com/kubernetes-sigs/aws-ebs-csi-driver/blob/master/docs/multi-attach.md): using it safely "requires application-level coordination (e.g. via I/O fencing)", and failure to do so "can result in data loss and silent data corruption". Put ext4 on a Multi-Attach volume and mount it twice and you will destroy it. The platform gives you the shared device and declines to make it safe.
