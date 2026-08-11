@@ -33,6 +33,18 @@ pip install -r requirements-docs.txt
 # https://github.com/lycheeverse/lychee/releases
 ```
 
+`golangci-lint` is pinned rather than optional: the version lives in
+`.golangci-version`, CI installs exactly that, and the hook refuses to pass with
+anything else. A different version is not a stricter or looser opinion, it is a
+different set of findings — and one built with an older Go than `go.mod`
+targets refuses to run at all, which is how a green hook turns into a red CI.
+
+```bash
+go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(cat .golangci-version)
+```
+
+Upgrading it means editing `.golangci-version`; both sides follow.
+
 Integration tests need a running etcd and the `integration` build tag:
 
 ```bash

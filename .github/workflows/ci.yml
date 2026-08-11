@@ -21,15 +21,17 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      # Held at v6 with a pinned linter: v7 and later require golangci-lint v2,
-      # which is a config-format migration of its own.  The version is pinned
-      # rather than "latest" because the released binary must be built with a
-      # Go at least as new as go.mod's target, and "latest" silently stops
-      # satisfying that.
+      # The version lives in .golangci-version so CI and the pre-push hook
+      # install the same linter; a local one built with a different Go reports
+      # different findings, or refuses go.mod's target outright.
+      - id: linter
+        run: echo "version=$(cat .golangci-version)" >> "$GITHUB_OUTPUT"
+      # Held at action v6: v7 and later require golangci-lint v2, which is a
+      # config-format migration of its own.
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.64.8
+          version: ${{ steps.linter.outputs.version }}
           args: --timeout=5m
 
   lint-c:

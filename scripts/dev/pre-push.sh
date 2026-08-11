@@ -52,7 +52,23 @@ echo "=== pre-push checks ==="
 run_check "go build"  go build ./...
 run_check "go test"   go test -race -count=1 ./...
 run_check "go vet"    go vet ./...
-run_check "golangci-lint" golangci-lint run --timeout=5m ./...
+# The linter must be the version CI installs.  A different one is not a
+# stricter or looser opinion, it is a different set of findings — and one built
+# with an older Go refuses go.mod's target outright, which is a green hook and
+# a red CI.
+pinned_lint="$(cat .golangci-version)"
+installed_lint="$(golangci-lint --version 2>/dev/null | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)"
+if [[ "$installed_lint" != "$pinned_lint" ]]; then
+    printf "  %-30s " "golangci-lint"
+    echo -e "${RED}FAIL${NC}"
+    failures=$((failures + 1))
+    echo "  installed ${installed_lint:-none}, CI uses ${pinned_lint} (.golangci-version)"
+    echo "  install it with:"
+    echo "    go install github.com/golangci/golangci-lint/cmd/golangci-lint@${pinned_lint}"
+    echo ""
+else
+    run_check "golangci-lint ${pinned_lint}" golangci-lint run --timeout=5m ./...
+fi
 run_check "C build"   make -C cmd/etcfuse
 run_check "C test"    make test-c
 mapfile -d '' c_files < <(find cmd/etcfuse pkg/fuse pkg/block test/c \( -name '*.c' -o -name '*.h' \) -print0)
