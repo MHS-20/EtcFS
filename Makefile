@@ -44,9 +44,16 @@ test: test-go test-c
 test-go:
 	go test -race -count=1 ./...
 
-test-c:
-	# C tests: uses Unity test framework (test/c/)
-	@echo "C tests will be added in subsequent phases"
+# The test binary includes ops.c, so it needs the same flags and libraries the
+# daemon is built with, minus the daemon's own main.
+C_TEST_SRC  := test/c/test_ops.c
+
+test-c: bin/test-c
+	./bin/test-c
+
+bin/test-c: $(C_TEST_SRC) $(C_SRCS) $(C_HDRS)
+	@mkdir -p bin
+	$(CC) $(C_CFLAGS) $(C_TEST_SRC) pkg/fuse/fuse.c pkg/block/block.c -o $@ $(C_LIBS)
 
 test-integration:
 	bash test/e2e/run.sh
@@ -59,7 +66,7 @@ lint-go:
 	golangci-lint run ./...
 
 lint-c:
-	clang-format --dry-run --Werror $(C_SRCS) $(C_HDRS)
+	clang-format --dry-run --Werror $(C_SRCS) $(C_HDRS) $(C_TEST_SRC)
 
 lint-sh:
 	shellcheck scripts/infra/*.sh scripts/test/*.sh
@@ -70,7 +77,7 @@ fmt-go:
 	goimports -w .
 
 fmt-c:
-	clang-format -i $(C_SRCS) $(C_HDRS)
+	clang-format -i $(C_SRCS) $(C_HDRS) $(C_TEST_SRC)
 
 # ---- Docker dev environment ----
 
@@ -104,7 +111,7 @@ hooks:
 help:
 	@echo "EtcFS build targets:"
 	@echo "  make all              build everything"
-	@echo "  make test             run unit tests"
+	@echo "  make test             run unit tests (Go + C)"
 	@echo "  make lint             run all linters"
 	@echo "  make fmt              auto-format code"
 	@echo "  make hooks            install git pre-push hook"
