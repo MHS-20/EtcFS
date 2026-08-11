@@ -207,7 +207,7 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 				"unshared device", "path", cfg.BlockDevice)
 		}
 		defer func() { _ = dev.Close() }()
-		svc.SetBlockDevice(dev)
+		svc.SetBlockDevice(dev, cfg.WriteBarriers)
 		_ = svc.ReconstructArenas(ctx)
 
 		log.Info("block device opened", "path", cfg.BlockDevice,

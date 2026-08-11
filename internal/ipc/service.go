@@ -29,6 +29,10 @@ type Service struct {
 	dev          *blockio.Device
 	notifyServer *notifyServer
 
+	// writeBarriers adds a device flush, a range sync and a readback to every
+	// write, and a device flush to every read.  See writeRun.
+	writeBarriers bool
+
 	// Fencing generation this node started with.  Every data-path commit is
 	// guarded against it, so once the fencing controller bumps gen:<node_id>
 	// this node's commits stop being accepted by etcd.
@@ -50,8 +54,12 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 }
 
 // SetBlockDevice attaches a block device for data I/O.
-func (s *Service) SetBlockDevice(dev *blockio.Device) {
+//
+// barriers is forced on for a device opened without O_DIRECT: there the bytes
+// really do sit in this node's page cache until something pushes them out.
+func (s *Service) SetBlockDevice(dev *blockio.Device, barriers bool) {
 	s.dev = dev
+	s.writeBarriers = barriers || !dev.IsDirect()
 	// The allocator hands out arenas by multiplying an ID by the arena size,
 	// with nothing else to stop it running past the end of the device.
 	s.alloc.SetDeviceSize(uint64(dev.TotalSize()))

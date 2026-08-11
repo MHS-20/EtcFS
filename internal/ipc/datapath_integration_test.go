@@ -66,7 +66,7 @@ func newTestService(t *testing.T) (*Service, *metadata.Store) {
 		t.Fatalf("init generation: %v", err)
 	}
 	svc.InstallStoreGuard()
-	svc.SetBlockDevice(dev)
+	svc.SetBlockDevice(dev, false)
 
 	return svc, store
 }

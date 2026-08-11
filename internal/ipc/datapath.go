@@ -221,16 +221,25 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	return writtenResp(uint32(dataLen)), nil
 }
 
-// writeRun puts one run on the device and makes it visible to the volume's
-// other attachers.
+// writeRun puts one run on the device.
 //
-// The readback is not a verification — the bytes are discarded.  It is the
-// round trip that publishes the write to the other attachers of an EBS
-// Multi-Attach volume.
+// With O_DIRECT on a device that acknowledges a write only once it is durable —
+// an EBS io2 Multi-Attach volume — the pwrite is the whole publication: no cache
+// on this node holds the bytes, so no barrier can make another attacher see them
+// any sooner.  The three extra round trips that used to follow every write are
+// therefore behind writeBarriers, for a device with a volatile write cache and
+// for buffered mode, where the page cache genuinely does hold the bytes back.
+//
+// The barrier readback is not a verification — the bytes are discarded.  It is
+// the round trip itself that matters, so one sector establishes it as well as
+// the whole buffer does.
 func (s *Service) writeRun(buf []byte, diskOff uint64) error {
 	n, err := s.dev.WriteAt(buf, int64(diskOff))
 	if err != nil {
 		return err
+	}
+	if !s.writeBarriers {
+		return nil
 	}
 
 	_ = s.dev.FlushDevice()
@@ -238,7 +247,7 @@ func (s *Service) writeRun(buf []byte, diskOff uint64) error {
 		s.log.Warn("write: sync failed", "error", err)
 	}
 
-	readback, freeReadback := s.ioBuffer(len(buf))
+	readback, freeReadback := s.ioBuffer(min(len(buf), s.dev.SectorSize()))
 	_, _ = s.dev.ReadAt(readback, int64(diskOff))
 	freeReadback()
 	return nil
@@ -311,7 +320,12 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		defer release()
 	}
 
-	_ = s.dev.FlushDevice()
+	// Only useful against a cache this read could otherwise be served from: an
+	// O_DIRECT read consults none, so the ioctl would cost a device round trip
+	// per read to invalidate nothing.
+	if s.writeBarriers {
+		_ = s.dev.FlushDevice()
+	}
 
 	var extents []metadata.Extent
 	s.retryKV(ctx, func(ictx context.Context) error {
