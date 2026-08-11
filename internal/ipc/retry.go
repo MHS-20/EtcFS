@@ -140,36 +140,41 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 	}, nil
 }
 
-// commitGuarded applies ops in one transaction guarded by this node's fencing
-// generation.  Returns (false, nil) when the guard rejected the commit — the
-// node has been fenced and must not mutate metadata again.  Transient etcd
-// errors are retried; a failed guard is not, because a fence is permanent.
+// commitGuarded applies ops in one transaction carrying the caller's
+// comparisons plus this node's fencing generation.  It reports whether the
+// transaction committed and, separately, whether a fence was the reason it did
+// not — a fenced node must not mutate metadata again.  Transient etcd errors
+// are retried; a failed guard is not, because a fence is permanent.
 //
 // The guard itself is applied by the store (see metadata.Store.SetGuard), which
 // covers every mutation path rather than only the ones that remember to ask.
-// This wrapper keeps the retry policy and the boolean "was it a fence" contract
-// its callers are written against.
-func (s *Service) commitGuarded(ctx context.Context, ops []clientv3.Op) (bool, error) {
+// This wrapper keeps the retry policy and the "was it a fence" contract its
+// callers are written against.
+//
+// A caller with no comparisons of its own can treat the two the same way — the
+// guard is then the only thing that can reject the transaction — but a caller
+// that supplies them must not: a comparison miss is contention it can rebuild
+// its proposal from, and a fence is permanent.
+func (s *Service) commitGuarded(ctx context.Context, cmps []clientv3.Cmp, ops []clientv3.Op) (committed, fenced bool, err error) {
 	// Ensure the generation is resolved before committing, so a first write
 	// fails with a real etcd error rather than ErrGuardUnavailable.
 	gctx, gcancel := context.WithTimeout(context.Background(), etcdOpTimeout)
-	_, err := s.guardGeneration(gctx)
+	_, err = s.guardGeneration(gctx)
 	gcancel()
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
-	committed := false
 	err = retryEtcd(ctx, func(tctx context.Context) error {
 		var terr error
-		committed, terr = s.store.Txn(tctx, nil, ops, nil)
+		committed, terr = s.store.Txn(tctx, cmps, ops, nil)
 		return terr
 	})
 	if errors.Is(err, metadata.ErrFenced) {
-		return false, nil
+		return false, true, nil
 	}
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	return committed, nil
+	return committed, false, nil
 }

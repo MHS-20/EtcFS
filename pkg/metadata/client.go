@@ -199,7 +199,14 @@ func (s *Store) GetMany(ctx context.Context, keys []string) (map[string][]byte, 
 
 // GetPrefix reads all keys with the given prefix.
 func (s *Store) GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.KeyValue, error) {
-	resp, err := s.client.Get(ctx, prefix, clientv3.WithPrefix())
+	return s.getPrefix(ctx, prefix)
+}
+
+// getPrefix is GetPrefix with read options, kept off MetadataStore so that
+// asking for a serializable read stays a decision of the few call sites that
+// have established they do not need a leader round trip.
+func (s *Store) getPrefix(ctx context.Context, prefix string, opts ...clientv3.OpOption) ([]*mvccpb.KeyValue, error) {
+	resp, err := s.client.Get(ctx, prefix, append([]clientv3.OpOption{clientv3.WithPrefix()}, opts...)...)
 	if err != nil {
 		return nil, fmt.Errorf("get prefix %s: %w", prefix, err)
 	}

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Extent maps a logical byte range of an inode onto a range of the shared
@@ -255,8 +256,12 @@ func CoveredBlocks(old Extent, head, tail *Extent) (diskOff, length uint64) {
 func blocksFor(n uint64) uint64 { return (n + BlockSize - 1) / BlockSize }
 
 // GetExtents returns all extents of an inode, ordered by logical offset.
-func (s *Store) GetExtents(ctx context.Context, ino uint64) ([]Extent, error) {
-	kvs, err := s.GetPrefix(ctx, ExtentPrefix(ino))
+//
+// Read options are passed through: the write path asks for a serializable read
+// (see handleWriteBlock), which answers from whichever member the client is
+// already connected to instead of costing a leader round trip.
+func (s *Store) GetExtents(ctx context.Context, ino uint64, opts ...clientv3.OpOption) ([]Extent, error) {
+	kvs, err := s.getPrefix(ctx, ExtentPrefix(ino), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("get extents ino %d: %w", ino, err)
 	}

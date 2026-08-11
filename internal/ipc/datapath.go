@@ -130,31 +130,8 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 
 	gen := s.writeGeneration(ctx)
 
-	// One read of the inode's extents answers every question this write has:
-	// which chunk numbers are free, what sequence it takes, and which existing
-	// extents it is about to bury.  Both counters run one past the highest in
-	// use rather than off the extent count — a truncate deletes records from
-	// the middle, and counting would hand back a number that is still live.
-	existing, xerr := s.store.GetExtents(ctx, ino)
-	if xerr != nil {
-		freeRuns()
-		s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
-		return int32Resp(-5), nil
-	}
-	chunk, seq := uint64(0), uint64(0)
-	for _, e := range existing {
-		if e.Chunk >= chunk {
-			chunk = e.Chunk + 1
-		}
-		if e.Seq >= seq {
-			seq = e.Seq + 1
-		}
-	}
-
-	// One extent per run, in order, so the logical range stays contiguous even
-	// though the device ranges behind it are not.
-	ops := make([]clientv3.Op, 0, len(runs)+1)
-	end := offset
+	// The device write is independent of how the extents are numbered, so it
+	// happens once even if the proposal below has to be rebuilt.
 	pos := uint64(0)
 	for _, r := range runs {
 		if werr := s.writeRun(writeData[pos:pos+r.Length], r.DiskOff); werr != nil {
@@ -162,43 +139,117 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 			s.log.Warn("write: block device write failed", "error", werr)
 			return int32Resp(-5), nil
 		}
-
-		// The final run is padded; its extent covers only the real bytes.
-		extLen := min(r.Length, uint64(dataLen)-pos)
-		// Every run of one write shares a sequence: they are one write, and
-		// they cover disjoint logical ranges, so nothing needs to order them
-		// against each other.
-		ext := metadata.Extent{
-			LogOff: offset + pos, DiskOff: r.DiskOff, Length: extLen,
-			Gen: gen, Seq: seq, Node: s.store.NodeID(),
-		}
-		ops = append(ops, clientv3.OpPut(metadata.ExtentKey(ino, chunk), ext.Encode()))
-		chunk++
-		end = ext.End()
 		pos += r.Length
 	}
 
-	// Commit every extent and any size change together, guarded by this node's
-	// fencing generation.  Data is already durable on the device; if the guard
-	// rejects the commit the bytes stay unreferenced and the blocks go back to
-	// the arena.
-	if end > rec.Size {
-		rec.Size = end
-		ops = append(ops, clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(rec))))
+	// One read of the inode's extents answers every question this write has:
+	// which chunk numbers are free, what sequence it takes, and which existing
+	// extents it is about to bury.  Both counters run one past the highest in
+	// use rather than off the extent count — a truncate deletes records from
+	// the middle, and counting would hand back a number that is still live.
+	//
+	// The first read is serializable: it only builds the proposal, and the
+	// commit below refuses to overwrite a chunk that already exists, so a stale
+	// answer costs a retry rather than a buried extent.  That retry re-reads
+	// linearizably, which is the only way to be sure the second attempt is not
+	// working from the same stale view.
+	var existing []metadata.Extent
+	var chunk, seq uint64
+	readExtents := func(opts ...clientv3.OpOption) error {
+		var xerr error
+		existing, xerr = s.store.GetExtents(ctx, ino, opts...)
+		if xerr != nil {
+			return xerr
+		}
+		chunk, seq = 0, 0
+		for _, e := range existing {
+			if e.Chunk >= chunk {
+				chunk = e.Chunk + 1
+			}
+			if e.Seq >= seq {
+				seq = e.Seq + 1
+			}
+		}
+		return nil
 	}
 
-	committed, cerr := s.commitGuarded(ctx, ops)
+	// One extent per run, in order, so the logical range stays contiguous even
+	// though the device ranges behind it are not.  Rebuilt on a retry, since
+	// both counters move.
+	end := offset
+	proposal := func() ([]clientv3.Cmp, []clientv3.Op) {
+		cmps := make([]clientv3.Cmp, 0, len(runs))
+		ops := make([]clientv3.Op, 0, len(runs)+1)
+		end = offset
+		pos := uint64(0)
+		next := chunk
+		for _, r := range runs {
+			// The final run is padded; its extent covers only the real bytes.
+			extLen := min(r.Length, uint64(dataLen)-pos)
+			// Every run of one write shares a sequence: they are one write, and
+			// they cover disjoint logical ranges, so nothing needs to order them
+			// against each other.
+			ext := metadata.Extent{
+				LogOff: offset + pos, DiskOff: r.DiskOff, Length: extLen,
+				Gen: gen, Seq: seq, Node: s.store.NodeID(),
+			}
+			key := metadata.ExtentKey(ino, next)
+			cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(key), "=", 0))
+			ops = append(ops, clientv3.OpPut(key, ext.Encode()))
+			next++
+			end = ext.End()
+			pos += r.Length
+		}
+		// Commit every extent and any size change together, guarded by this
+		// node's fencing generation.  Data is already durable on the device; if
+		// the guard rejects the commit the bytes stay unreferenced and the
+		// blocks go back to the arena.
+		if end > rec.Size {
+			sized := *rec
+			sized.Size = end
+			ops = append(ops, clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(&sized))))
+		}
+		return cmps, ops
+	}
+
+	if xerr := readExtents(clientv3.WithSerializable()); xerr != nil {
+		freeRuns()
+		s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
+		return int32Resp(-5), nil
+	}
+	cmps, ops := proposal()
+	committed, fenced, cerr := s.commitGuarded(ctx, cmps, ops)
+	if cerr == nil && !committed && !fenced {
+		// The serializable read missed a chunk that exists, so this node was
+		// talking to a member that had not caught up.  Re-read from the leader
+		// and propose again.
+		s.log.Debug("write: chunk numbering was stale, retrying linearizably", "ino", ino)
+		if xerr := readExtents(); xerr != nil {
+			freeRuns()
+			s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
+			return int32Resp(-5), nil
+		}
+		cmps, ops = proposal()
+		committed, fenced, cerr = s.commitGuarded(ctx, cmps, ops)
+	}
 	if cerr != nil {
 		freeRuns()
 		s.log.Warn("write: metadata commit failed", "ino", ino, "error", cerr)
 		return int32Resp(-5), nil
 	}
-	if !committed {
+	if fenced {
 		freeRuns()
 		s.log.Error("write: rejected, node has been fenced",
 			"ino", ino, "start_generation", s.startGen)
 		return int32Resp(-5), nil
 	}
+	if !committed {
+		freeRuns()
+		s.log.Error("write: extent numbering still contended after a fresh read", "ino", ino)
+		return int32Resp(-5), nil
+	}
+	rec.Size = max(rec.Size, end)
+	chunk += uint64(len(runs))
 
 	// The write is published, so whatever it covers is now unreadable through
 	// the extents that held it.  Reclaim here rather than leaving it all to the
