@@ -359,16 +359,43 @@ for i in "${!PUB_IPS[@]}"; do
     # Verify from a different node than the writer, round-robin.
     vi=$(( (i + 1) % COUNT ))
     vip="${PUB_IPS[$vi]}"
+    # One SSH round trip per node instead of one per file: with hundreds of
+    # files per node this loop used to be hundreds of sequential SSH
+    # handshakes (no connection multiplexing here), which routinely ran
+    # longer than any reasonable timeout on the caller's side. `xargs -0`
+    # feeds every path from this ledger to one remote `sha256sum` invocation;
+    # a path with no matching output (deleted or unreadable) is caught by the
+    # associative-array lookup below coming up empty.
+    declare -A expect_by_path=()
     while IFS=$'\t' read -r path expect; do
         [[ -z "$path" ]] && continue
-        got=$(ssh -n $SSH_OPTS -q "ec2-user@$vip" "sudo sha256sum '$path' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "")
+        expect_by_path["$path"]="$expect"
+    done < "$ledger"
+    [[ "${#expect_by_path[@]}" -eq 0 ]] && continue
+
+    # No -n here: unlike every other call in this file, this one has to send
+    # data over the SSH session's stdin, and -n would replace that with
+    # /dev/null.
+    remote_out=$(printf '%s\0' "${!expect_by_path[@]}" | \
+        ssh $SSH_OPTS -q "ec2-user@$vip" "xargs -0 sudo sha256sum 2>/dev/null" 2>/dev/null || true)
+
+    declare -A got_by_path=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        got_by_path["${line#*  }"]="${line%%  *}"
+    done <<< "$remote_out"
+
+    for path in "${!expect_by_path[@]}"; do
+        expect="${expect_by_path[$path]}"
+        got="${got_by_path[$path]:-}"
         if [[ "$got" == "$expect" ]]; then
             VERIFY_OK=$((VERIFY_OK+1))
         else
             VERIFY_FAIL=$((VERIFY_FAIL+1))
             fail "cross-node mismatch: $path written on node$((i+1)), read from node$((vi+1)): expected=$expect got=${got:-<unreadable>}"
         fi
-    done < "$ledger"
+    done
+    unset expect_by_path got_by_path
 done
 [[ "$VERIFY_FAIL" -eq 0 ]] && pass "cross-node re-verification: $VERIFY_OK/$VERIFY_OK files match (read from a different node than the writer)"
 
@@ -379,15 +406,26 @@ for i in "${!PUB_IPS[@]}"; do
     [[ -f "$deleted" ]] || continue
     vi=$(( (i + 1) % COUNT ))
     vip="${PUB_IPS[$vi]}"
+    [[ -s "$deleted" ]] || continue
+    total=$(wc -l < "$deleted")
+    # Same one-round-trip-per-node batching as the ledger check above, and the
+    # same reason no -n: the remote loop reads its list of paths from this
+    # session's stdin, NUL-delimited so a path can never be split across
+    # lines. It prints back only the paths that still exist — the bug this
+    # check exists to catch — so an empty result is the expected, silent case.
+    still_present=$(tr '\n' '\0' < "$deleted" | ssh $SSH_OPTS -q "ec2-user@$vip" '
+        while IFS= read -r -d "" p; do
+            sudo test -e "$p" && printf "%s\n" "$p"
+        done
+    ' 2>/dev/null || true)
+    still_count=0
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
-        if ssh -n $SSH_OPTS -q "ec2-user@$vip" "sudo test -e '$path'" 2>/dev/null; then
-            DEL_FAIL=$((DEL_FAIL+1))
-            fail "deleted file still visible from a different node: $path (deleted on node$((i+1)), checked from node$((vi+1)))"
-        else
-            DEL_OK=$((DEL_OK+1))
-        fi
-    done < "$deleted"
+        still_count=$((still_count+1))
+        DEL_FAIL=$((DEL_FAIL+1))
+        fail "deleted file still visible from a different node: $path (deleted on node$((i+1)), checked from node$((vi+1)))"
+    done <<< "$still_present"
+    DEL_OK=$((DEL_OK + total - still_count))
 done
 [[ "$DEL_FAIL" -eq 0 ]] && pass "deletion cross-node verification: $DEL_OK/$DEL_OK confirmed gone"
 
