@@ -156,15 +156,16 @@ func ParseDirentKey(key string) (parent uint64, name string, ok bool) {
 //
 // One key per holder, with the mode in the key rather than the value:
 //
-//	lock:<ino>/<mode>/<lease_id>
+//	lock:<ino>/<mode>/<holder>
 //
 // A shared lock has many holders at once, so a single key cannot represent it —
-// the key carries the lease that backs it, and revoking one holder's lease would
-// drop the lock for every other holder.  A key each fixes that, and putting the
-// mode in the key lets a transaction ask "is any writer holding this?" as a
-// range comparison, with no value to parse.
-func LockKey(ino uint64, mode LockMode, leaseID int64) string {
-	return fmt.Sprintf("%s%d/%s/%d", PrefixLock, ino, mode, leaseID)
+// one key each is what lets a holder release without dropping the lock for the
+// rest.  The holder token is the session lease that backs the key paired with a
+// counter, so two holders on the same node stay distinct even though they share
+// one lease.  Putting the mode in the key lets a transaction ask "is any writer
+// holding this?" as a range comparison, with no value to parse.
+func LockKey(ino uint64, mode LockMode, holder string) string {
+	return fmt.Sprintf("%s%d/%s/%s", PrefixLock, ino, mode, holder)
 }
 
 // LockPrefix covers every holder of an inode's lock, in any mode.

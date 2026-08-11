@@ -51,7 +51,7 @@ func (c *Cluster) FreshListDir(ctx context.Context, parent uint64) []string {
 // API: these tests only need one contended key, not the shared/exclusive
 // bookkeeping metadata.AcquireLock provides.
 func harnessLockKey(ino uint64) string {
-	return metadata.LockKey(ino, metadata.LockExclusive, 0)
+	return metadata.LockKey(ino, metadata.LockExclusive, "harness")
 }
 
 func (c *Cluster) tryAcquireLock(ctx context.Context, ino uint64) bool {

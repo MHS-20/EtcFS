@@ -362,4 +362,13 @@ func leaveCluster(cfg *config.Config, store *metadata.Store,
 	case len(released) > 0:
 		log.Info("released arenas on shutdown", "node", cfg.NodeID, "arenas", released)
 	}
+
+	// Ends the lease backing this node's file locks.  They are released
+	// individually as each operation finishes, so this only clears a key a
+	// failed release left behind — which would otherwise stand until the lease
+	// expires, and the lease is renewed for as long as the process lives.
+	if err := store.CloseLockSession(); err != nil {
+		log.Warn("lock session not closed, stale lock keys expire with its lease",
+			"node", cfg.NodeID, "error", err)
+	}
 }

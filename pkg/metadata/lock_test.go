@@ -7,8 +7,8 @@ import (
 )
 
 func TestLockKeyFormat(t *testing.T) {
-	assert.Equal(t, "lock:1/exclusive/7", LockKey(1, LockExclusive, 7))
-	assert.Equal(t, "lock:999/shared/42", LockKey(999, LockShared, 42))
+	assert.Equal(t, "lock:1/exclusive/7", LockKey(1, LockExclusive, "7"))
+	assert.Equal(t, "lock:999/shared/42", LockKey(999, LockShared, "42"))
 	assert.Equal(t, "lock:1/", LockPrefix(1))
 	assert.Equal(t, "lock:1/shared/", LockModePrefix(1, LockShared))
 }

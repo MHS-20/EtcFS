@@ -47,7 +47,7 @@ func TestIntegration_SchemaKeyFormats(t *testing.T) {
 	_, err = store.Put(ctx, DirentKey(1, "hello"), EncodeUint64(42))
 	require.NoError(t, err)
 
-	_, err = store.Put(ctx, LockKey(1, LockShared, 1), []byte("test"))
+	_, err = store.Put(ctx, LockKey(1, LockShared, "1"), []byte("test"))
 	require.NoError(t, err)
 
 	_, err = store.Put(ctx, GenKey("node-1"), []byte("5"))
@@ -142,17 +142,9 @@ func TestIntegration_LockAcquireRelease(t *testing.T) {
 	ino := uint64(100)
 
 	// Acquire exclusive lock
-	leaseID, keepCh, err := store.AcquireLock(ctx, ino, LockExclusive, 10*time.Second)
+	holder, err := store.AcquireLock(ctx, ino, LockExclusive, 10*time.Second)
 	require.NoError(t, err)
-	require.NotZero(t, leaseID)
-
-	// Consume one keepalive to verify it works
-	select {
-	case resp := <-keepCh:
-		require.NotNil(t, resp)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for keepalive response")
-	}
+	require.NotEmpty(t, holder)
 
 	// Verify lock exists
 	locked, err := store.IsLocked(ctx, ino)
@@ -160,11 +152,10 @@ func TestIntegration_LockAcquireRelease(t *testing.T) {
 	assert.True(t, locked)
 
 	// Release
-	err = store.ReleaseLock(ctx, ino, leaseID)
+	err = store.ReleaseLock(ctx, ino, LockExclusive, holder)
 	require.NoError(t, err)
 
-	// Verify lock is gone (lease revoked)
-	time.Sleep(1 * time.Second)
+	// Verify the holder's key is gone
 	locked, err = store.IsLocked(ctx, ino)
 	require.NoError(t, err)
 	assert.False(t, locked)
@@ -189,14 +180,9 @@ func TestIntegration_LockLeaseExpiry(t *testing.T) {
 	holderCli := etcdtest.Client(t)
 	holder := NewStore(holderCli, "node-b")
 
-	leaseID, keepCh, err := holder.AcquireLock(context.Background(), ino, LockExclusive, 3*time.Second)
+	token, err := holder.AcquireLock(context.Background(), ino, LockExclusive, 3*time.Second)
 	require.NoError(t, err)
-	require.NotZero(t, leaseID)
-
-	go func() {
-		for range keepCh {
-		}
-	}()
+	require.NotEmpty(t, token)
 
 	locked, err := observer.IsLocked(context.Background(), ino)
 	require.NoError(t, err)
@@ -226,14 +212,9 @@ func TestIntegration_LockSurvivesAcquisitionContextCancel(t *testing.T) {
 	ino := uint64(210)
 
 	acquireCtx, cancel := context.WithCancel(context.Background())
-	leaseID, keepCh, err := store.AcquireLock(acquireCtx, ino, LockExclusive, 3*time.Second)
+	holder, err := store.AcquireLock(acquireCtx, ino, LockExclusive, 3*time.Second)
 	require.NoError(t, err)
-	require.NotZero(t, leaseID)
-
-	go func() {
-		for range keepCh {
-		}
-	}()
+	require.NotEmpty(t, holder)
 
 	// The context that acquired the lock goes away; the lock must not.
 	cancel()
@@ -246,7 +227,7 @@ func TestIntegration_LockSurvivesAcquisitionContextCancel(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, locked, "lock must outlive the context used to acquire it")
 
-	require.NoError(t, store.ReleaseLock(context.Background(), ino, leaseID))
+	require.NoError(t, store.ReleaseLock(context.Background(), ino, LockExclusive, holder))
 }
 
 // ---- C1.7: Fencing generation CAS ----
@@ -1032,11 +1013,11 @@ func TestIntegration_SharedLocksAreHeldConcurrently(t *testing.T) {
 	second := NewStore(first.Client(), "reader-2")
 	const ino = 9200
 
-	leaseA, _, err := first.AcquireLock(ctx, ino, LockShared, 10*time.Second)
+	holderA, err := first.AcquireLock(ctx, ino, LockShared, 10*time.Second)
 	require.NoError(t, err)
-	leaseB, _, err := second.AcquireLock(ctx, ino, LockShared, 10*time.Second)
+	holderB, err := second.AcquireLock(ctx, ino, LockShared, 10*time.Second)
 	require.NoError(t, err, "a second reader must not be refused")
-	require.NotEqual(t, leaseA, leaseB, "each holder needs its own lease")
+	require.NotEqual(t, holderA, holderB, "each holder needs its own key")
 
 	rec, err := first.GetLockInfo(ctx, ino)
 	require.NoError(t, err)
@@ -1046,14 +1027,14 @@ func TestIntegration_SharedLocksAreHeldConcurrently(t *testing.T) {
 
 	// One reader leaving must not drop the lock for the other. Revoking the
 	// single shared key is exactly what the old scheme did.
-	require.NoError(t, first.ReleaseLock(ctx, ino, leaseA))
+	require.NoError(t, first.ReleaseLock(ctx, ino, LockShared, holderA))
 
 	rec, err = second.GetLockInfo(ctx, ino)
 	require.NoError(t, err)
 	require.NotNil(t, rec, "the surviving reader still holds the lock")
 	assert.Equal(t, []string{"reader-2"}, rec.Holders)
 
-	require.NoError(t, second.ReleaseLock(ctx, ino, leaseB))
+	require.NoError(t, second.ReleaseLock(ctx, ino, LockShared, holderB))
 	locked, err := second.IsLocked(ctx, ino)
 	require.NoError(t, err)
 	assert.False(t, locked, "the lock is gone once the last holder leaves")
@@ -1066,24 +1047,24 @@ func TestIntegration_SharedAndExclusiveLocksExcludeEachOther(t *testing.T) {
 
 	// A reader blocks a writer.
 	const sharedFirst = 9210
-	readLease, _, err := reader.AcquireLock(ctx, sharedFirst, LockShared, 10*time.Second)
+	readHolder, err := reader.AcquireLock(ctx, sharedFirst, LockShared, 10*time.Second)
 	require.NoError(t, err)
-	_, _, err = writer.AcquireLock(ctx, sharedFirst, LockExclusive, 2*time.Second)
+	_, err = writer.AcquireLock(ctx, sharedFirst, LockExclusive, 2*time.Second)
 	assert.ErrorIs(t, err, ErrConflict, "a writer must wait for readers")
 
-	require.NoError(t, reader.ReleaseLock(ctx, sharedFirst, readLease))
-	writeLease, _, err := writer.AcquireLock(ctx, sharedFirst, LockExclusive, 10*time.Second)
+	require.NoError(t, reader.ReleaseLock(ctx, sharedFirst, LockShared, readHolder))
+	writeHolder, err := writer.AcquireLock(ctx, sharedFirst, LockExclusive, 10*time.Second)
 	require.NoError(t, err, "the writer proceeds once the reader is gone")
-	require.NoError(t, writer.ReleaseLock(ctx, sharedFirst, writeLease))
+	require.NoError(t, writer.ReleaseLock(ctx, sharedFirst, LockExclusive, writeHolder))
 
 	// And a writer blocks both readers and other writers.
 	const exclusiveFirst = 9211
-	writeLease, _, err = writer.AcquireLock(ctx, exclusiveFirst, LockExclusive, 10*time.Second)
+	writeHolder, err = writer.AcquireLock(ctx, exclusiveFirst, LockExclusive, 10*time.Second)
 	require.NoError(t, err)
 
-	_, _, err = reader.AcquireLock(ctx, exclusiveFirst, LockShared, 2*time.Second)
+	_, err = reader.AcquireLock(ctx, exclusiveFirst, LockShared, 2*time.Second)
 	assert.ErrorIs(t, err, ErrConflict, "a reader must not join an exclusive hold")
-	_, _, err = reader.AcquireLock(ctx, exclusiveFirst, LockExclusive, 2*time.Second)
+	_, err = reader.AcquireLock(ctx, exclusiveFirst, LockExclusive, 2*time.Second)
 	assert.ErrorIs(t, err, ErrConflict, "two writers must not both hold it")
 
 	rec, err := reader.GetLockInfo(ctx, exclusiveFirst)
@@ -1091,7 +1072,7 @@ func TestIntegration_SharedAndExclusiveLocksExcludeEachOther(t *testing.T) {
 	require.NotNil(t, rec)
 	assert.Equal(t, string(LockExclusive), rec.Mode)
 
-	require.NoError(t, writer.ReleaseLock(ctx, exclusiveFirst, writeLease))
+	require.NoError(t, writer.ReleaseLock(ctx, exclusiveFirst, LockExclusive, writeHolder))
 }
 
 // A failed acquisition must not leave its lease behind holding a key.
@@ -1101,10 +1082,10 @@ func TestIntegration_RefusedLockLeavesNothingBehind(t *testing.T) {
 	other := NewStore(writer.Client(), "other")
 	const ino = 9220
 
-	lease, _, err := writer.AcquireLock(ctx, ino, LockExclusive, 10*time.Second)
+	holder, err := writer.AcquireLock(ctx, ino, LockExclusive, 10*time.Second)
 	require.NoError(t, err)
 
-	_, _, err = other.AcquireLock(ctx, ino, LockExclusive, 10*time.Second)
+	_, err = other.AcquireLock(ctx, ino, LockExclusive, 10*time.Second)
 	require.ErrorIs(t, err, ErrConflict)
 
 	rec, err := writer.GetLockInfo(ctx, ino)
@@ -1112,7 +1093,7 @@ func TestIntegration_RefusedLockLeavesNothingBehind(t *testing.T) {
 	require.NotNil(t, rec)
 	assert.Equal(t, []string{"writer"}, rec.Holders, "the refused acquirer left no key")
 
-	require.NoError(t, writer.ReleaseLock(ctx, ino, lease))
+	require.NoError(t, writer.ReleaseLock(ctx, ino, LockExclusive, holder))
 }
 
 // ---- lost-update protection on nlink ----

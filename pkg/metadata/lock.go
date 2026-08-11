@@ -6,6 +6,7 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
 // Lock operations: acquire shared/exclusive file locks backed by etcd leases.
@@ -58,29 +59,78 @@ var (
 	ErrPerm = fmt.Errorf("operation not permitted")
 )
 
-// AcquireLock takes a lock on an inode and returns the lease backing it.
+// lockSession returns the lease every lock on this node is written under,
+// granting it on first use.
+//
+// A session that has ended — its lease expired while the node was partitioned,
+// or it was revoked — is replaced rather than reused.  Expiry has already
+// deleted every lock key written under it, which is the guarantee that matters:
+// a node that stopped renewing holds nothing, exactly as when each lock carried
+// its own lease.
+//
+// ttl fixes the session's TTL on the acquisition that creates it and is ignored
+// afterwards, since one lease now backs every lock the store takes.
+func (s *Store) lockSession(ttl time.Duration) (*concurrency.Session, error) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+
+	if s.session != nil {
+		select {
+		case <-s.session.Done():
+			s.session = nil
+		default:
+			return s.session, nil
+		}
+	}
+
+	// Rounded up: etcd's lease TTL is whole seconds, and truncating a
+	// sub-second TTL to zero would be rejected outright.
+	seconds := int((ttl + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	// The session's keepalive deliberately runs on the client's own context
+	// rather than any caller's: a keepalive bound to a request context would
+	// stop renewing when that request ended, and the lock would silently expire
+	// at its TTL while the holder still believed it held it — precisely the
+	// stale-holder situation locking exists to prevent.
+	sess, err := concurrency.NewSession(s.client, concurrency.WithTTL(seconds))
+	if err != nil {
+		return nil, err
+	}
+	s.session = sess
+	return sess, nil
+}
+
+// AcquireLock takes a lock on an inode and returns the holder token that
+// releases it.
 //
 // An exclusive lock is blocked by any holder.  A shared lock is blocked only by
 // an exclusive one, so any number of readers hold it at once — each under its
-// own key and its own lease, which is what lets one of them release without
-// dropping the lock for the rest.
+// own key, which is what lets one of them release without dropping the lock for
+// the rest.
 //
-// The caller must receive from the returned keepalive channel to keep the lock
-// alive.
-//
-// ctx bounds the acquisition RPCs only.  It deliberately does not bound the
-// keepalive stream — see the comment at the KeepAlive call below — so a
-// caller may pass a context with a deadline without the resulting lock
-// quietly expiring once that deadline passes.
-func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl time.Duration) (clientv3.LeaseID, <-chan *clientv3.LeaseKeepAliveResponse, error) {
+// All of a node's locks share one session lease, so an acquisition is a single
+// transaction: the per-lock GrantLease and RevokeLease that used to bracket
+// every write were two Raft commits on the critical path, and the lease TTL is
+// what releases a dead holder's lock whether that lease was granted once or
+// once per write.  This is the shape of an NFSv4 write delegation, with the
+// delegation scoped to the lock rather than to the open — a lock still spans a
+// single operation, so no waiter can be made to wait on another node's close.
+func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl time.Duration) (string, error) {
 	if mode != LockShared && mode != LockExclusive {
-		return 0, nil, fmt.Errorf("acquire lock ino %d: unknown mode %q (%w)", ino, mode, ErrInvalid)
+		return "", fmt.Errorf("acquire lock ino %d: unknown mode %q (%w)", ino, mode, ErrInvalid)
 	}
 
-	leaseID, err := s.GrantLease(ctx, ttl)
+	sess, err := s.lockSession(ttl)
 	if err != nil {
-		return 0, nil, fmt.Errorf("acquire lock ino %d: grant lease: %w", ino, err)
+		return "", fmt.Errorf("acquire lock ino %d: session: %w", ino, err)
 	}
+
+	// The lease is shared, so it cannot identify a holder on its own: two
+	// concurrent readers on this node would write the same key and one
+	// would release the other's lock.
+	holder := fmt.Sprintf("%d-%d", sess.Lease(), s.lockSeq.Add(1))
 
 	// The range that must be empty for this acquisition to be allowed.  Etcd
 	// evaluates a comparison over a range as "true for every key in it", and an
@@ -93,57 +143,42 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 	}
 	cmp := clientv3.Compare(clientv3.CreateRevision(blocked), "=", 0).WithPrefix()
 
-	op := clientv3.OpPut(LockKey(ino, mode, int64(leaseID)), s.nodeID, clientv3.WithLease(leaseID))
+	op := clientv3.OpPut(LockKey(ino, mode, holder), s.nodeID, clientv3.WithLease(sess.Lease()))
 
 	ok, err := s.Txn(ctx, []clientv3.Cmp{cmp}, []clientv3.Op{op}, nil)
 	if err != nil {
-		_ = s.RevokeLease(ctx, leaseID)
-		return 0, nil, fmt.Errorf("acquire lock ino %d: %w", ino, err)
+		return "", fmt.Errorf("acquire lock ino %d: %w", ino, err)
 	}
 	if !ok {
-		_ = s.RevokeLease(ctx, leaseID)
-		return 0, nil, fmt.Errorf("acquire lock ino %d: %w", ino, ErrConflict)
+		return "", fmt.Errorf("acquire lock ino %d: %w", ino, ErrConflict)
 	}
 
-	// Not ctx: clientv3 ties a keepalive stream's lifetime to the context it
-	// is given.  Passing the caller's context here would stop renewing the
-	// lease the moment that context is cancelled — the lock would silently
-	// expire at its TTL while the holder still believed it held it, which is
-	// precisely the stale-holder situation locking exists to prevent.
-	//
-	// The stream's own context is kept so ReleaseLock can end it directly.
-	// Relying on the revoke to end it made a failed revoke unrecoverable: the
-	// keepalive went on renewing, so the lock was held until the process
-	// exited, blocking every writer to that inode cluster-wide, and the
-	// goroutine draining the stream leaked with it.
-	keepCtx, stopKeepAlive := context.WithCancel(context.Background())
-	keepCh, err := s.KeepAlive(keepCtx, leaseID)
-	if err != nil {
-		stopKeepAlive()
-		_ = s.ReleaseLock(ctx, ino, leaseID)
-		return 0, nil, fmt.Errorf("acquire lock ino %d: keepalive: %w", ino, err)
-	}
-	s.keepAlives.Store(leaseID, stopKeepAlive)
-
-	return leaseID, keepCh, nil
+	return holder, nil
 }
 
 // ReleaseLock drops one holder's lock.
 //
-// Revoking the lease deletes that holder's key and only that key, so a shared
-// lock survives with its remaining holders.
-func (s *Store) ReleaseLock(ctx context.Context, ino uint64, leaseID clientv3.LeaseID) error {
-	// Stop renewing first, so that even a failed revoke leaves the lease to
-	// expire at its TTL rather than being kept alive indefinitely.  It also
-	// closes the keepalive channel, which is what ends the caller's drain
-	// goroutine.
-	if stop, ok := s.keepAlives.LoadAndDelete(leaseID); ok {
-		stop.(context.CancelFunc)()
-	}
-	if err := s.RevokeLease(ctx, leaseID); err != nil {
+// Deleting that holder's key and only that key leaves a shared lock standing
+// with its remaining holders — and, now that the lease is shared by every lock
+// the node holds, a delete is the only release that does not drop all of them.
+func (s *Store) ReleaseLock(ctx context.Context, ino uint64, mode LockMode, holder string) error {
+	if err := s.Delete(ctx, LockKey(ino, mode, holder)); err != nil {
 		return fmt.Errorf("release lock ino %d: %w", ino, err)
 	}
 	return nil
+}
+
+// CloseLockSession ends the node's lock session, revoking the lease and with it
+// any lock key still outstanding.  Idempotent.
+func (s *Store) CloseLockSession() error {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if s.session == nil {
+		return nil
+	}
+	err := s.session.Close()
+	s.session = nil
+	return err
 }
 
 // GetLockInfo returns the current lock state for an inode, or nil if it is

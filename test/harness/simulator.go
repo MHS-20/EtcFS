@@ -223,7 +223,7 @@ func (s *Simulator) truncate(ctx context.Context, ino uint64, newSize uint64) {
 
 func (s *Simulator) acquireLock(ctx context.Context, ino uint64) {
 	s.locks[ino] = &metadata.LockRecord{Mode: "exclusive"}
-	_, _ = s.store.Put(ctx, metadata.LockKey(ino, metadata.LockExclusive, 0), []byte("sim-node"))
+	_, _ = s.store.Put(ctx, metadata.LockKey(ino, metadata.LockExclusive, "harness"), []byte("sim-node"))
 }
 
 func (s *Simulator) injectFault(ft FaultType) {

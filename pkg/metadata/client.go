@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
 
 	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
@@ -31,10 +33,12 @@ type Store struct {
 	client *clientv3.Client
 	nodeID string
 
-	// keepAlives maps a lock's lease to the cancel of its keepalive stream, so
-	// releasing the lock can stop the renewals directly rather than relying on
-	// the revoke to end them.
-	keepAlives sync.Map
+	// session is the lease every lock this node holds is written under, granted
+	// once and kept alive for the store's lifetime instead of per acquisition.
+	// lockSeq makes holder tokens unique within it.  See AcquireLock.
+	sessionMu sync.Mutex
+	session   *concurrency.Session
+	lockSeq   atomic.Uint64
 
 	// guard, when set, is prepended to the comparisons of every Txn.  A nil
 	// guard leaves transactions unguarded — correct only for control-plane

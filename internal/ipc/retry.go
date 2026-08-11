@@ -98,10 +98,9 @@ func (s *Service) retryKV(ctx context.Context, fn func(context.Context) error) {
 	}
 }
 
-// lockInode takes a lease-backed lock on an inode and returns the release
-// function.  The lease keepalive stream is drained for the lifetime of the
-// lock — the lease expires on its own once the lock is released, so nothing
-// is left running past the release.
+// lockInode takes a lock on an inode and returns the release function.  The
+// lock is written under the store's session lease, which is renewed for the
+// life of the process, so nothing per-lock is left running past the release.
 //
 // Each acquisition attempt runs against its own bounded context.  This is the
 // first etcd call on both the read and the write path, so an unbounded one
@@ -109,40 +108,34 @@ func (s *Service) retryKV(ctx context.Context, fn func(context.Context) error) {
 // still caps the total, so a request that has already run out of time does not
 // start another attempt.
 func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockMode) (release func(), err error) {
-	var leaseID clientv3.LeaseID
-	var keepCh <-chan *clientv3.LeaseKeepAliveResponse
+	var holder string
 
 	err = retry(ctx, etcdAttempts, func() error {
 		actx, cancel := context.WithTimeout(ctx, etcdOpTimeout)
 		defer cancel()
 		var aerr error
-		leaseID, keepCh, aerr = s.store.AcquireLock(actx, ino, mode, inodeLockTTL)
+		holder, aerr = s.store.AcquireLock(actx, ino, mode, inodeLockTTL)
 		return aerr
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Drains until ReleaseLock closes the channel by cancelling the stream's
-	// context.  Nothing here outlives the lock.
-	go func() {
-		for range keepCh {
-		}
-	}()
-
 	return func() {
 		// Fresh context rather than the request's: releasing has to work even
 		// when the request deadline has already expired, otherwise the lock
-		// lingers to its TTL and blocks the next writer for no reason.
+		// lingers and blocks the next writer for no reason.  Retried, because a
+		// lock key now outlives a failed release for as long as the node does:
+		// the session lease that would have expired it is the one this node
+		// keeps renewing.
 		rctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
 		defer cancel()
-		if err := s.store.ReleaseLock(rctx, ino, leaseID); err != nil {
-			// The keepalive has already been stopped by ReleaseLock, so the
-			// lease expires at its TTL rather than being renewed forever — but
-			// until it does, every writer to this inode is blocked
-			// cluster-wide, which is worth saying out loud.
-			s.log.Error("inode lock not released, it will block writers until its lease expires",
-				"ino", ino, "ttl", inodeLockTTL, "error", err)
+		err := retryEtcd(rctx, func(dctx context.Context) error {
+			return s.store.ReleaseLock(dctx, ino, mode, holder)
+		})
+		if err != nil {
+			s.log.Error("inode lock not released, it will block writers until this node exits",
+				"ino", ino, "mode", mode, "error", err)
 		}
 	}, nil
 }

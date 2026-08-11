@@ -22,7 +22,7 @@ func TestDirentPrefix(t *testing.T) {
 }
 
 func TestLockKey(t *testing.T) {
-	assert.Equal(t, "lock:99/exclusive/3", LockKey(99, LockExclusive, 3))
+	assert.Equal(t, "lock:99/exclusive/3", LockKey(99, LockExclusive, "3"))
 }
 
 func TestArenaOwnerKey(t *testing.T) {
