@@ -48,23 +48,67 @@ const (
 	ipcOpReadDirPlus = 29
 )
 
-// opNames labels metrics with the operation's FUSE name.  An opcode number in
-// a dashboard is a lookup into this file; a name is not.
-var opNames = map[uint16]string{
-	ipcOpLookup: "lookup", ipcOpGetattr: "getattr", ipcOpReaddir: "readdir",
-	ipcOpReadlink: "readlink", ipcOpCreate: "create", ipcOpMkdir: "mkdir",
-	ipcOpUnlink: "unlink", ipcOpRmdir: "rmdir", ipcOpRename: "rename",
-	ipcOpSymlink: "symlink", ipcOpLink: "link", ipcOpSetattr: "setattr",
-	ipcOpOpen: "open", ipcOpRelease: "release", ipcOpOpendir: "opendir",
-	ipcOpReleasedir: "releasedir", ipcOpStatfs: "statfs", ipcOpAlloc: "alloc",
-	ipcOpCommit: "commit", ipcOpRead: "read", ipcOpWrite: "write",
-	ipcOpFsync: "fsync", ipcOpMknod: "mknod", ipcOpFlush: "flush",
-	ipcOpReadDirPlus: "readdirplus",
+// op describes one IPC operation: the name its metrics and logs carry, and the
+// handler that serves it.
+//
+// A table rather than a switch because adding an operation used to mean editing
+// the dispatch switch, its metrics labels, and the opcode list separately, on
+// code that was already tested.  One entry now covers all three, and an opcode
+// with no entry is ENOSYS by construction rather than by a default branch
+// someone has to remember to keep correct.
+//
+// Payload bounds are not declared here: every handler decodes through the
+// reader in frame.go, which refuses to read past the payload it was given and
+// leaves the handler to reply EINVAL.  Declaring an arity per entry as well
+// would be a second copy of that, one that could disagree with the decoder.
+type op struct {
+	name   string
+	handle func(*Service, context.Context, []byte) ([]byte, error)
 }
 
-func opName(op uint16) string {
-	if name, ok := opNames[op]; ok {
-		return name
+// ok answers an operation that has no distributed state to keep: open, close
+// and flush take no locks, and every write is committed before it is
+// acknowledged, so there is nothing left to do at these points.
+func ok(*Service, context.Context, []byte) ([]byte, error) { return okResp(), nil }
+
+// unsupported answers an opcode the backend deliberately does not serve.
+func unsupported(*Service, context.Context, []byte) ([]byte, error) {
+	return int32Resp(-38), nil // ENOSYS
+}
+
+var ops = map[uint16]op{
+	ipcOpLookup:      {"lookup", (*Service).handleLookup},
+	ipcOpGetattr:     {"getattr", (*Service).handleGetattr},
+	ipcOpReaddir:     {"readdir", (*Service).handleReaddir},
+	ipcOpReadDirPlus: {"readdirplus", (*Service).handleReaddirPlus},
+	ipcOpReadlink:    {"readlink", (*Service).handleReadlink},
+	ipcOpStatfs:      {"statfs", (*Service).handleStatfs},
+	ipcOpRead:        {"read", (*Service).handleRead},
+	ipcOpCreate:      {"create", (*Service).handleCreate},
+	ipcOpMkdir:       {"mkdir", (*Service).handleMkdir},
+	ipcOpUnlink:      {"unlink", (*Service).handleUnlink},
+	ipcOpRmdir:       {"rmdir", (*Service).handleRmdir},
+	ipcOpRename:      {"rename", (*Service).handleRename},
+	ipcOpWrite:       {"write", (*Service).handleWrite},
+	ipcOpSetattr:     {"setattr", (*Service).handleSetattr},
+	ipcOpSymlink:     {"symlink", (*Service).handleSymlink},
+	ipcOpLink:        {"link", (*Service).handleLink},
+	ipcOpMknod:       {"mknod", (*Service).handleMknod},
+	ipcOpOpen:        {"open", ok},
+	ipcOpOpendir:     {"opendir", ok},
+	ipcOpRelease:     {"release", ok},
+	ipcOpReleasedir:  {"releasedir", ok},
+	ipcOpFlush:       {"flush", ok},
+	ipcOpFsync:       {"fsync", ok},
+	// Block allocation happens inside the WRITE handler, not as a separate
+	// request; these opcodes are unused.
+	ipcOpAlloc:  {"alloc", unsupported},
+	ipcOpCommit: {"commit", unsupported},
+}
+
+func opName(code uint16) string {
+	if o, found := ops[code]; found {
+		return o.name
 	}
 	return "unknown"
 }
@@ -87,7 +131,7 @@ func (s *Service) handleConn(conn net.Conn) {
 	s.log.Info("ipc connection accepted", "remote", conn.RemoteAddr())
 
 	for {
-		op, payload, err := recvReq(conn)
+		code, payload, err := recvReq(conn)
 		if err != nil {
 			if err != io.EOF {
 				s.log.Warn("ipc recv", "error", err)
@@ -95,9 +139,9 @@ func (s *Service) handleConn(conn net.Conn) {
 			return
 		}
 
-		resp, err := s.observedDispatch(op, payload)
+		resp, err := s.observedDispatch(code, payload)
 		if err != nil {
-			s.log.Warn("ipc dispatch", "op", op, "error", err)
+			s.log.Warn("ipc dispatch", "op", code, "error", err)
 			return
 		}
 
@@ -114,10 +158,10 @@ func (s *Service) handleConn(conn net.Conn) {
 // an errno.  Wrapped around the whole dispatch rather than added to each
 // handler: every FUSE operation this daemon serves passes through here, so one
 // wrapper instruments all of them and no new handler can forget to.
-func (s *Service) observedDispatch(op uint16, payload []byte) ([]byte, error) {
-	name := opName(op)
+func (s *Service) observedDispatch(code uint16, payload []byte) ([]byte, error) {
+	name := opName(code)
 	start := time.Now()
-	resp, err := s.safeDispatch(op, payload)
+	resp, err := s.safeDispatch(code, payload)
 	metrics.FuseOps.WithLabelValues(name).Inc()
 	metrics.FuseOpDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
 	// Every response frame starts with an int32 errno, negative on failure.
@@ -134,15 +178,15 @@ func (s *Service) observedDispatch(op uint16, payload []byte) ([]byte, error) {
 // not just the request that tripped it.  The payload readers make that
 // unreachable through a malformed frame; this is the backstop for everything
 // else, and it logs loudly because reaching it is a bug either way.
-func (s *Service) safeDispatch(op uint16, payload []byte) (resp []byte, err error) {
+func (s *Service) safeDispatch(code uint16, payload []byte) (resp []byte, err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			s.log.Error("ipc handler panicked", "op", op, "payload_len", len(payload),
+			s.log.Error("ipc handler panicked", "op", opName(code), "payload_len", len(payload),
 				"panic", p, "stack", string(debug.Stack()))
 			resp, err = int32Resp(-5), nil // EIO for this request only
 		}
 	}()
-	return s.dispatch(op, payload)
+	return s.dispatch(code, payload)
 }
 
 // ListenPrivate binds a Unix socket only its owner can use.
@@ -379,7 +423,12 @@ func attrResp(rec *metadata.InodeRecord) []byte {
 
 // ---- dispatch ----
 
-func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
+func (s *Service) dispatch(code uint16, payload []byte) ([]byte, error) {
+	o, found := ops[code]
+	if !found {
+		return int32Resp(-38), nil // ENOSYS
+	}
+
 	// Bounded here rather than at each of the ~35 individual store calls the
 	// handlers make: a context without a deadline blocks for as long as the
 	// etcd client will keep retrying, which under a partition is indefinitely,
@@ -390,53 +439,7 @@ func (s *Service) dispatch(op uint16, payload []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
-	switch op {
-	case ipcOpLookup:
-		return s.handleLookup(ctx, payload)
-	case ipcOpGetattr:
-		return s.handleGetattr(ctx, payload)
-	case ipcOpReaddir:
-		return s.handleReaddir(ctx, payload)
-	case ipcOpReadlink:
-		return s.handleReadlink(ctx, payload)
-	case ipcOpStatfs:
-		return s.handleStatfs(ctx, payload)
-	// Open/close and flush have no distributed state to keep: locks are taken
-	// per operation and every write is committed before it is acknowledged.
-	case ipcOpOpen, ipcOpOpendir, ipcOpRelease, ipcOpReleasedir, ipcOpFlush, ipcOpFsync:
-		return okResp(), nil
-	case ipcOpReadDirPlus:
-		return s.handleReaddirPlus(ctx, payload)
-	case ipcOpRead:
-		return s.handleRead(ctx, payload)
-	// Write operations
-	case ipcOpCreate:
-		return s.handleCreate(ctx, payload)
-	case ipcOpMkdir:
-		return s.handleMkdir(ctx, payload)
-	case ipcOpUnlink:
-		return s.handleUnlink(ctx, payload)
-	case ipcOpRmdir:
-		return s.handleRmdir(ctx, payload)
-	case ipcOpRename:
-		return s.handleRename(ctx, payload)
-	case ipcOpWrite:
-		return s.handleWrite(ctx, payload)
-	case ipcOpSetattr:
-		return s.handleSetattr(ctx, payload)
-	case ipcOpSymlink:
-		return s.handleSymlink(ctx, payload)
-	case ipcOpLink:
-		return s.handleLink(ctx, payload)
-	case ipcOpMknod:
-		return s.handleMknod(ctx, payload)
-	case ipcOpAlloc, ipcOpCommit:
-		// Block allocation is done inside the WRITE handler, not asked for
-		// separately; these opcodes are unused.
-		return int32Resp(-38), nil // ENOSYS
-	default:
-		return int32Resp(-38), nil // ENOSYS
-	}
+	return o.handle(s, ctx, payload)
 }
 
 // StartSocketServer is the public entry point: listens on the Unix socket path

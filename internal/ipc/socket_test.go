@@ -51,3 +51,36 @@ func TestApplyModeKeepsTheFileType(t *testing.T) {
 		}
 	}
 }
+
+// Every opcode the C daemon can send must resolve to an entry, and anything
+// else must be ENOSYS rather than a nil handler.  The table is the only place
+// an operation is registered, so a handler added without its entry is
+// unreachable and this is what says so.
+func TestDispatchTableCoversEveryOpcode(t *testing.T) {
+	for _, code := range []uint16{
+		ipcOpLookup, ipcOpGetattr, ipcOpReaddir, ipcOpReadlink, ipcOpCreate,
+		ipcOpMkdir, ipcOpUnlink, ipcOpRmdir, ipcOpRename, ipcOpSymlink,
+		ipcOpLink, ipcOpSetattr, ipcOpOpen, ipcOpRelease, ipcOpOpendir,
+		ipcOpReleasedir, ipcOpStatfs, ipcOpAlloc, ipcOpCommit, ipcOpRead,
+		ipcOpWrite, ipcOpFsync, ipcOpMknod, ipcOpFlush, ipcOpReadDirPlus,
+	} {
+		entry, found := ops[code]
+		if !found {
+			t.Errorf("opcode %d has no dispatch entry", code)
+			continue
+		}
+		if entry.handle == nil || entry.name == "" {
+			t.Errorf("opcode %d has an incomplete entry: %+v", code, entry)
+		}
+	}
+
+	// 27 and 28 were GETLK/SETLK; they must stay unserved.
+	for _, code := range []uint16{0, 27, 28, 999} {
+		if _, found := ops[code]; found {
+			t.Errorf("opcode %d should not be served", code)
+		}
+		if opName(code) != "unknown" {
+			t.Errorf("opcode %d should have no metric name", code)
+		}
+	}
+}
