@@ -150,28 +150,37 @@ $SSH_CMD "ec2-user@$N0" "sudo mkdir -p /mnt/bench-ext4 /mnt/bench-efs; sudo umou
 
 run_fio() {
     local label="$1" filename="$2" size="$3"
-    # etcfs is a single-threaded, synchronous-IPC daemon end to end (see
-    # docs/NEXT_STEPS.md item 24) — one shared fd, no concurrent request
-    # processing. Driving it at iodepth=32/numjobs=4 doesn't measure the
-    # daemon's IOPS, it measures how fast a 128-deep queue drains through a
-    # single serialized path, which produced a run that hadn't finished
-    # after 19 minutes for what should be ~90s of time_based work. QD=1
-    # measures the thing that's actually true of this target: per-op
-    # latency with no concurrency to hide it.
-    local depth=32 jobs=4 sdepth=16 engine=libaio
+    local depth=32 jobs=4 sdepth=16 sjobs=1 engine=libaio
     # libaio needs native filesystem AIO support, which FUSE does not
     # reliably provide — against etcfs it produced a job that hadn't
     # finished after 19 minutes at iodepth=32 nor after 90s at iodepth=1,
     # while a plain O_DIRECT dd against the same mount completed each 4k
-    # write in ~20ms. psync (one syscall, one thread) is what actually
-    # exercises the daemon instead of fio's AIO plumbing.
-    if [[ "$label" == "etcfs" ]]; then depth=1; jobs=1; sdepth=1; engine=psync; fi
+    # write in ~20ms. psync (one syscall per op) is what actually exercises
+    # the daemon instead of fio's AIO plumbing — and with the FUSE daemon
+    # now running fuse_session_loop_mt with a backend connection per worker
+    # thread, iodepth is still the wrong knob (psync ignores queue depth
+    # beyond 1); numjobs is, but only if each thread gets its own file.
+    # fio does NOT split a shared `filename=` across numjobs threads — every
+    # thread of one job opens the same path — so four "concurrent" writers
+    # to etcfs's single fio.dat were really four writers serialized on that
+    # one inode's exclusive lock, which is real contention, just not the one
+    # this benchmark exists to show. `directory=`+`filename_format=` gives
+    # each thread its own file (its own inode, no lock in common), which is
+    # what actually exercises concurrent FUSE workers on separate files —
+    # the case a multi-file workload hits and the raw device / ext4 / EFS
+    # targets already get for free from one shared file at the block layer.
+    local fname_opts="filename=$filename"
+    if [[ "$label" == "etcfs" ]]; then
+        depth=1; jobs="${ETCFS_BENCH_JOBS:-4}"; sdepth=1; sjobs=$jobs; engine=psync
+        fname_opts="directory=$(dirname "$filename")
+filename_format=fio.\$jobname.\$jobnum.\$filenum"
+    fi
     log "--- fio: $label ---"
     local job="
 [global]
 ioengine=$engine
 direct=1
-filename=$filename
+$fname_opts
 size=$size
 runtime=$RUNTIME
 time_based=1
@@ -190,7 +199,7 @@ stonewall
 [seqwrite-128k]
 rw=write
 bs=128k
-numjobs=1
+numjobs=$sjobs
 iodepth=$sdepth
 stonewall
 "
