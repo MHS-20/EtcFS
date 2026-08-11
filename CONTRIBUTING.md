@@ -21,6 +21,18 @@ make fmt          # goimports and clang-format, in place
 make hooks        # install the pre-push hook that runs the checks above
 ```
 
+The pre-push hook runs everything CI does, including the two docs checks: the
+`mkdocs build --strict` that publishes the site, and the `lychee` link check
+that catches a heading renamed out from under a table of contents. Both are
+skipped with a `SKIP` line if `mkdocs` or `lychee` is not installed, so install
+them to get the warning before CI does:
+
+```bash
+pip install -r requirements-docs.txt
+# lychee: cargo install lychee, or a release binary from
+# https://github.com/lycheeverse/lychee/releases
+```
+
 Integration tests need a running etcd and the `integration` build tag:
 
 ```bash
