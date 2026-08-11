@@ -15,6 +15,7 @@ __pycache__/
 test-results/
 chaos-report-*/
 light-test-results/
+benchmark-results/
 vendor/
 *.exe
 .DS_Store

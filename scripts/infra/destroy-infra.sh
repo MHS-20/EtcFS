@@ -28,6 +28,8 @@ VOL_ID=$(state_get volume_id 2>/dev/null || echo "")
 SG_ID=$(state_get sg_id 2>/dev/null || echo "")
 CLUSTER_NAME=$(state_get cluster_name 2>/dev/null || echo "")
 COMPUTE_IDS=$(state_get compute_instance_ids 2>/dev/null | jq -r '.[]' 2>/dev/null || echo "")
+BENCH_VOL_ID=$(state_get bench_scratch_volume_id 2>/dev/null | grep -v '^null$' || echo "")
+BENCH_EFS_ID=$(state_get bench_efs_id 2>/dev/null | grep -v '^null$' || echo "")
 
 # Nodes launched by add_node (scripts/test/chaos-lib.sh, used by every chaos
 # script's elastic-join scenarios) are never written back into this state
@@ -132,6 +134,42 @@ if [[ -n "$VOL_ID" && "$VOL_ID" != "null" ]]; then
     if [[ "$VOL_DELETED" != "true" ]]; then
         log "ERROR: volume $VOL_ID was not confirmed deleted — still billing, check manually"
         FAILED="$FAILED volume:$VOL_ID"
+    fi
+fi
+
+# ---- Step 2b: Delete benchmark.sh's scratch volume and EFS filesystem ----
+# Own state keys, not create-infra.sh's — never covered by step 2 above.
+
+if [[ -n "$BENCH_VOL_ID" ]]; then
+    log "Detaching/deleting benchmark scratch volume $BENCH_VOL_ID..."
+    aws ec2 detach-volume --volume-id "$BENCH_VOL_ID" 2>/dev/null || true
+    aws ec2 wait volume-available --volume-ids "$BENCH_VOL_ID" 2>/dev/null || true
+    if aws ec2 delete-volume --volume-id "$BENCH_VOL_ID" 2>/dev/null; then
+        log "Benchmark scratch volume deleted"
+    else
+        log "ERROR: benchmark scratch volume $BENCH_VOL_ID was not deleted — check manually"
+        FAILED="$FAILED bench-volume:$BENCH_VOL_ID"
+    fi
+fi
+
+if [[ -n "$BENCH_EFS_ID" ]]; then
+    log "Deleting benchmark EFS filesystem $BENCH_EFS_ID..."
+    MT_IDS=$(aws efs describe-mount-targets --file-system-id "$BENCH_EFS_ID" \
+        --query 'MountTargets[].MountTargetId' --output text 2>/dev/null || echo "")
+    for mt in $MT_IDS; do
+        aws efs delete-mount-target --mount-target-id "$mt" 2>/dev/null || true
+    done
+    for i in $(seq 1 15); do
+        REMAINING=$(aws efs describe-mount-targets --file-system-id "$BENCH_EFS_ID" \
+            --query 'MountTargets | length(@)' --output text 2>/dev/null || echo "0")
+        [[ "$REMAINING" == "0" ]] && break
+        sleep 3
+    done
+    if aws efs delete-file-system --file-system-id "$BENCH_EFS_ID" 2>/dev/null; then
+        log "Benchmark EFS filesystem deleted"
+    else
+        log "ERROR: benchmark EFS filesystem $BENCH_EFS_ID was not deleted — check manually"
+        FAILED="$FAILED bench-efs:$BENCH_EFS_ID"
     fi
 fi
 
