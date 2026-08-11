@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
@@ -57,7 +57,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
       - name: Build
         run: go build ./cmd/etcfuse-meta
 
@@ -80,9 +80,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
       - name: Test
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
 
   test-integration:
     name: Test (Integration)
@@ -92,7 +94,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
       - name: Start etcd
         run: |
           curl -sL https://github.com/etcd-io/etcd/releases/download/v3.5.18/etcd-v3.5.18-linux-amd64.tar.gz | tar xz
@@ -104,7 +106,7 @@ jobs:
       - name: Run integration tests
         env:
           ETCD_ENDPOINTS: http://127.0.0.1:2379
-        run: go test -tags=integration -count=1 -timeout 120s ./pkg/metadata/ -run Integration
+        run: go test -tags=integration -count=1 -timeout 600s ./...
 
   release:
     name: Semantic Release
@@ -127,7 +129,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
 
       - name: Run semantic-release
         id: semrel

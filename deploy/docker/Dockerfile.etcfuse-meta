@@ -1,7 +1,8 @@
 # EtcFS metadata backend (Go component)
 #
 # Build:
-#   docker build -f deploy/docker/Dockerfile.etcfuse-meta -t etcfuse-meta .
+#   docker build -f deploy/docker/Dockerfile.etcfuse-meta -t etcfuse-meta \
+#     --build-arg VERSION=$(git describe --tags --always) .
 #
 # Multi-stage: compile in golang image, copy into minimal runtime.
 
@@ -15,7 +16,10 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /usr/local/bin/etcfuse-meta ./cmd/etcfuse-meta
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build \
+    -ldflags="-s -w -X github.com/MHS-20/EtcFS/internal/config.Version=${VERSION}" \
+    -o /usr/local/bin/etcfuse-meta ./cmd/etcfuse-meta
 
 FROM alpine:3.20
 

@@ -11,17 +11,21 @@
 
 .PHONY: all test lint fmt clean dev check
 
-GO_MODULE  := github.com/anomalyco/etcfuse
 GO_ENTRY   := ./cmd/etcfuse-meta
 GO_OUT     := bin/etcfuse-meta
 C_ENTRY    := cmd/etcfuse
 C_OUT      := bin/etcfuse
+
+# Stamped into the binary so `etcfuse-meta --version` reports the tag a bug
+# report was filed against, not the placeholder in the source.
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+GO_LDFLAGS := -X github.com/MHS-20/EtcFS/internal/config.Version=$(VERSION)
 all: $(GO_OUT) $(C_OUT)
 
 # ---- Go build ----
 
 $(GO_OUT): $(shell find . -name '*.go' -not -path './vendor/*' -not -path './test/*')
-	go build -o $(GO_OUT) $(GO_ENTRY)
+	go build -ldflags "$(GO_LDFLAGS)" -o $(GO_OUT) $(GO_ENTRY)
 
 # ---- C build ----
 
