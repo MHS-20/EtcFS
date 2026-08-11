@@ -25,10 +25,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,16 +45,94 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/scrub"
 )
 
+// errSelfFenced reports that the daemon shut down because its own watchdog
+// fenced it, rather than because it was asked to stop.  It reaches the exit
+// status and nothing else: an operator and a supervisor both need to tell the
+// two apart, and the log line alone does not do that.
+var errSelfFenced = errors.New("self-fenced")
+
 func main() {
 	cfg := config.Parse()
 
 	if cfg.ShowVersion {
 		fmt.Println("etcfuse-meta", config.Version)
-		os.Exit(0)
+		return
 	}
 
 	log := config.NewLogger(cfg.LogLevel)
 
+	var err error
+	switch {
+	case cfg.RunFsck:
+		err = runFsck(context.Background(), cfg)
+	case cfg.RunInfo:
+		err = runInfo(context.Background(), cfg)
+	default:
+		err = run(context.Background(), cfg, log)
+	}
+
+	switch {
+	case errors.Is(err, errSelfFenced):
+		os.Exit(fencing.SelfFenceExitCode)
+	case err != nil:
+		log.Error("etcfuse-meta failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+// connect dials etcd with the failover settings the daemon and the one-shot
+// modes both need.
+func connect(cfg *config.Config) (*clientv3.Client, error) {
+	return clientv3.New(clientv3.Config{
+		Endpoints:            cfg.EtcdEndpoints,
+		DialTimeout:          3 * time.Second,
+		DialKeepAliveTime:    1 * time.Second,
+		DialKeepAliveTimeout: 1 * time.Second,
+		PermitWithoutStream:  true,
+		AutoSyncInterval:     30 * time.Second,
+		TLS:                  cfg.EtcdTLSConfig(),
+	})
+}
+
+func runFsck(ctx context.Context, cfg *config.Config) error {
+	cli, err := connect(cfg)
+	if err != nil {
+		return fmt.Errorf("connect to etcd: %w", err)
+	}
+	defer func() { _ = cli.Close() }()
+
+	chk := fsck.New(metadata.NewStore(cli, cfg.NodeID))
+	findings := chk.Run(ctx)
+	fmt.Printf("fsck: %d errors, %d warnings\n", chk.ErrorCount(), chk.WarningCount())
+	for _, f := range findings {
+		fmt.Printf("  [%s] %s\n", f.Level, f.Message)
+	}
+	return nil
+}
+
+func runInfo(ctx context.Context, cfg *config.Config) error {
+	cli, err := connect(cfg)
+	if err != nil {
+		return fmt.Errorf("connect to etcd: %w", err)
+	}
+	defer func() { _ = cli.Close() }()
+
+	info, err := fsinfo.Collect(ctx, metadata.NewStore(cli, cfg.NodeID))
+	if err != nil {
+		return fmt.Errorf("collect filesystem info: %w", err)
+	}
+	fmt.Println(info.String())
+	return nil
+}
+
+// run starts the daemon's subsystems and serves until the process is signalled
+// or self-fences, then shuts down in the order the correctness argument needs.
+//
+// It returns rather than exiting so that every deferred close runs, and so the
+// shutdown ordering below is reachable from a test.  A startup failure is
+// returned for the same reason: os.Exit from inside here would skip the block
+// device close and the etcd client close above it.
+func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	log.Info("etcfuse-meta starting", "version", config.Version)
 	log.Info("listening", "socket", cfg.ListenAddr)
 	log.Info("etcd", "endpoints", cfg.EtcdEndpoints)
@@ -67,31 +145,21 @@ func main() {
 	// Fatal rather than falling back to --block-device: the fallback is what
 	// silently opens someone else's volume.
 	if cfg.VolumeID != "" {
-		path, rerr := blockio.ResolvePath(cfg.VolumeID)
-		if rerr != nil {
-			log.Fatal("cannot resolve volume to a block device",
-				"volume_id", cfg.VolumeID, "error", rerr)
+		path, err := blockio.ResolvePath(cfg.VolumeID)
+		if err != nil {
+			return fmt.Errorf("resolve volume %s to a block device: %w", cfg.VolumeID, err)
 		}
 		log.Info("volume resolved", "volume_id", cfg.VolumeID, "path", path)
 		cfg.BlockDevice = path
 	}
 
-	// Connect to etcd with aggressive failover
-	etcdCli, err := clientv3.New(clientv3.Config{
-		Endpoints:            cfg.EtcdEndpoints,
-		DialTimeout:          3 * time.Second,
-		DialKeepAliveTime:    1 * time.Second,
-		DialKeepAliveTimeout: 1 * time.Second,
-		PermitWithoutStream:  true,
-		AutoSyncInterval:     30 * time.Second,
-		TLS:                  cfg.EtcdTLSConfig(),
-	})
+	etcdCli, err := connect(cfg)
 	if err != nil {
-		log.Fatal("cannot connect to etcd", "error", err)
+		return fmt.Errorf("connect to etcd: %w", err)
 	}
 	defer func() { _ = etcdCli.Close() }()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Membership: register this node with a lease-backed key
@@ -104,21 +172,6 @@ func main() {
 
 	// Metadata store: wraps etcd client with schema-aware helpers
 	store := metadata.NewStore(etcdCli, cfg.NodeID)
-
-	if cfg.RunFsck {
-		chk := fsck.New(store)
-		findings := chk.Run(ctx)
-		fmt.Printf("fsck: %d errors, %d warnings\n", chk.ErrorCount(), chk.WarningCount())
-		for _, f := range findings {
-			fmt.Printf("  [%s] %s\n", f.Level, f.Message)
-		}
-		os.Exit(0)
-	}
-	if cfg.RunInfo {
-		info, _ := fsinfo.Collect(ctx, store)
-		fmt.Println(info.String())
-		os.Exit(0)
-	}
 
 	// Self-fencing watchdog
 	watchdog := fencing.NewWatchdog(membership, cfg.LeaseTTL)
@@ -135,7 +188,7 @@ func main() {
 	// closed, so the daemon could not serve writes anyway — exiting reports the
 	// real cause instead of an unexplained EIO on every mutation.
 	if err := svc.InitGeneration(ctx); err != nil {
-		log.Fatal("cannot initialise fencing generation", "error", err)
+		return fmt.Errorf("initialise fencing generation: %w", err)
 	}
 	svc.InstallStoreGuard()
 
@@ -146,7 +199,7 @@ func main() {
 		}
 		dev, err := openDevice(cfg.BlockDevice)
 		if err != nil {
-			log.Fatal("cannot open block device", "path", cfg.BlockDevice, "error", err)
+			return fmt.Errorf("open block device %s: %w", cfg.BlockDevice, err)
 		}
 		if !dev.IsDirect() {
 			log.Warn("block device opened WITHOUT O_DIRECT: writes are served from this node's "+
@@ -162,38 +215,12 @@ func main() {
 			"direct_io", dev.IsDirect())
 	}
 
-	// Start membership heartbeat
 	go membership.Run(ctx)
-
-	// Start self-fencing watchdog
 	go watchdog.Run(ctx)
 
-	// Start external fencing controller
-	controller := fencing.NewController(store, membership, log)
-	// Fatal rather than degrading silently in either branch: an operator who
-	// asked for device-enforced or dual-confirmed fencing and quietly got the
-	// weaker single-signal guarantee has a gap that only shows up as
-	// corruption during an incident.
-	switch {
-	case cfg.NVMeReservations:
-		fencer, ferr := fencing.NewNVMeFencer(cfg.BlockDevice, cfg.NodeID)
-		if ferr != nil {
-			log.Fatal("cannot initialise NVMe reservation fencing",
-				"device", cfg.BlockDevice, "error", ferr)
-		}
-		controller.SetFencer(fencer)
-		log.Info("external fencing: device-enforced (NVMe reservation preempt)",
-			"device", cfg.BlockDevice)
-	case cfg.EBSVolumeID != "":
-		detacher, derr := fencing.NewEBSDetacher(ctx, cfg.EBSVolumeID)
-		if derr != nil {
-			log.Fatal("cannot initialise EBS fencing", "volume", cfg.EBSVolumeID, "error", derr)
-		}
-		controller.SetFencer(detacher)
-		log.Info("external fencing: dual-confirmed (EBS detach + poll)", "volume", cfg.EBSVolumeID)
-	default:
-		log.Warn("external fencing: single-signal (generation bump on lease expiry only); " +
-			"pass --ebs-volume-id to detach the shared volume before bumping")
+	controller, err := newFencingController(ctx, cfg, store, membership, log)
+	if err != nil {
+		return err
 	}
 	go controller.Run(ctx)
 
@@ -221,31 +248,12 @@ func main() {
 	// and truncates stays reserved to this node and no peer can ever use it.
 	go svc.Allocator().ReapEmptyArenas(ctx, time.Minute)
 
-	// Start Prometheus metrics server if configured
 	if cfg.MetricsAddr != "" {
 		go func() { _ = metrics.StartServer(cfg.MetricsAddr) }()
 		log.Info("metrics server listening", "addr", cfg.MetricsAddr)
 	}
 
-	// Signal handling: graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// A self-fence shuts the node down through the same path a signal does, so
-	// the arena release below still runs.  The watchdog used to call os.Exit
-	// itself, which skipped it: a self-fenced node's arenas leaked, permanently
-	// in single-signal mode, where no fencing controller reclaims them either.
-	var selfFenced atomic.Bool
-	go func() {
-		select {
-		case sig := <-sigCh:
-			log.Info("received signal, shutting down", "signal", sig)
-		case <-watchdog.Fenced():
-			selfFenced.Store(true)
-			log.Error("self-fenced, shutting down")
-		}
-		cancel()
-	}()
+	selfFenced := stopOnSignalOrFence(ctx, cancel, watchdog, log)
 
 	log.Info("binary IPC server starting")
 	svc.StartNotificationServer(ctx)
@@ -257,30 +265,101 @@ func main() {
 				"invalidated until it is restarted", "path", cfg.NotifyAddr, "error", err)
 		}
 	}()
-	if err := ipc.StartSocketServer(ctx, svc, cfg.ListenAddr, log); err != nil {
-		log.Fatal("IPC server failed", "error", err)
-	}
+	serveErr := ipc.StartSocketServer(ctx, svc, cfg.ListenAddr, log)
 
-	// Leave the cluster now that this node is serving nothing.  A departing
-	// node is its own proof of quiescence — the IPC server has stopped, so no
-	// further write can be issued from here — which is what a fenced node needs
-	// an external Fencer to establish.  Skipping this is what made arena space
-	// leak on every departure, graceful or not.
-	//
-	// A context of its own: ctx is already cancelled by the time this runs.
-	relCtx, relCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	released, rerr := membership.Leave(relCtx, store)
-	relCancel()
-	switch {
-	case rerr != nil:
-		log.Warn("arenas not all released on shutdown, that space stays leaked",
-			"node", cfg.NodeID, "released", released, "error", rerr)
-	case len(released) > 0:
-		log.Info("released arenas on shutdown", "node", cfg.NodeID, "arenas", released)
-	}
+	leaveCluster(cfg, store, membership, log)
 
 	log.Info("etcfuse-meta stopped")
-	if selfFenced.Load() {
-		os.Exit(fencing.SelfFenceExitCode)
+	if serveErr != nil {
+		return fmt.Errorf("IPC server failed: %w", serveErr)
+	}
+	select {
+	case <-selfFenced:
+		return errSelfFenced
+	default:
+		return nil
+	}
+}
+
+// newFencingController selects the external fencing backend.
+//
+// A failure is returned rather than degraded in either branch: an operator who
+// asked for device-enforced or dual-confirmed fencing and quietly got the
+// weaker single-signal guarantee has a gap that only shows up as corruption
+// during an incident.
+func newFencingController(ctx context.Context, cfg *config.Config, store *metadata.Store,
+	membership *metadata.Membership, log *config.Logger) (*fencing.Controller, error) {
+	controller := fencing.NewController(store, membership, log)
+
+	switch {
+	case cfg.NVMeReservations:
+		fencer, err := fencing.NewNVMeFencer(cfg.BlockDevice, cfg.NodeID)
+		if err != nil {
+			return nil, fmt.Errorf("initialise NVMe reservation fencing on %s: %w",
+				cfg.BlockDevice, err)
+		}
+		controller.SetFencer(fencer)
+		log.Info("external fencing: device-enforced (NVMe reservation preempt)",
+			"device", cfg.BlockDevice)
+	case cfg.EBSVolumeID != "":
+		detacher, err := fencing.NewEBSDetacher(ctx, cfg.EBSVolumeID)
+		if err != nil {
+			return nil, fmt.Errorf("initialise EBS fencing on %s: %w", cfg.EBSVolumeID, err)
+		}
+		controller.SetFencer(detacher)
+		log.Info("external fencing: dual-confirmed (EBS detach + poll)", "volume", cfg.EBSVolumeID)
+	default:
+		log.Warn("external fencing: single-signal (generation bump on lease expiry only); " +
+			"pass --ebs-volume-id to detach the shared volume before bumping")
+	}
+	return controller, nil
+}
+
+// stopOnSignalOrFence cancels ctx on SIGINT/SIGTERM or on a self-fence, and
+// returns a channel that is closed only in the self-fence case.
+//
+// A self-fence shuts the node down through the same path a signal does, so the
+// arena release in leaveCluster still runs.  The watchdog used to call os.Exit
+// itself, which skipped it: a self-fenced node's arenas leaked, permanently in
+// single-signal mode, where no fencing controller reclaims them either.
+func stopOnSignalOrFence(ctx context.Context, cancel context.CancelFunc,
+	watchdog *fencing.Watchdog, log *config.Logger) <-chan struct{} {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	fenced := make(chan struct{})
+	go func() {
+		defer cancel()
+		select {
+		case <-ctx.Done():
+		case sig := <-sigCh:
+			log.Info("received signal, shutting down", "signal", sig)
+		case <-watchdog.Fenced():
+			log.Error("self-fenced, shutting down")
+			close(fenced)
+		}
+	}()
+	return fenced
+}
+
+// leaveCluster releases this node's arenas once it is serving nothing.
+//
+// A departing node is its own proof of quiescence — the IPC server has stopped,
+// so no further write can be issued from here — which is what a fenced node
+// needs an external Fencer to establish.  Skipping this is what made arena
+// space leak on every departure, graceful or not.
+func leaveCluster(cfg *config.Config, store *metadata.Store,
+	membership *metadata.Membership, log *config.Logger) {
+	// A context of its own: the daemon's is already cancelled by now.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	released, err := membership.Leave(ctx, store)
+	switch {
+	case err != nil:
+		log.Warn("arenas not all released on shutdown, that space stays leaked",
+			"node", cfg.NodeID, "released", released, "error", err)
+	case len(released) > 0:
+		log.Info("released arenas on shutdown", "node", cfg.NodeID, "arenas", released)
 	}
 }
