@@ -87,12 +87,42 @@ if [[ "$MODE" == "docker" ]]; then
     provision_cluster() {
         log "  Building + starting docker-compose cluster..."
         $COMPOSE down -v >/dev/null 2>&1 || true
-        $COMPOSE up -d --build >/dev/null 2>&1
+
+        # The build output is captured rather than discarded.  A failed build
+        # used to be invisible: `up` exited non-zero into a suppressed stream,
+        # the wait loop below then spun for a minute against containers that
+        # had never been created, and the run reported "never mounted" — which
+        # reads as a product failure and is not one.
+        local buildlog
+        buildlog=$(mktemp)
+        if ! $COMPOSE up -d --build >"$buildlog" 2>&1; then
+            log "  ERROR: docker compose up --build failed"
+            tail -30 "$buildlog" | while IFS= read -r line; do log "    $line"; done
+            rm -f "$buildlog"
+            return 1
+        fi
+        rm -f "$buildlog"
+
         log "  Waiting for mounts..."
         for c in "$N1" "$N2" "$N3"; do
             local ok=0
-            for i in $(seq 1 30); do check_mount "$c" && { ok=1; break; }; sleep 2; done
-            [[ "$ok" -eq 1 ]] || { log "  ERROR: $c never mounted"; dump_logs "$c"; return 1; }
+            # 60 x 2s.  The mount itself takes seconds; the budget is this
+            # large because on a cold cache the images are still settling and
+            # the daemons wait on etcd's own health check.
+            for i in $(seq 1 60); do check_mount "$c" && { ok=1; break; }; sleep 2; done
+            if [[ "$ok" -ne 1 ]]; then
+                # Distinguish "the container is gone" from "it is up but has
+                # not mounted": they have completely different causes, and
+                # dump_logs cannot say anything about a container that does
+                # not exist.
+                if ! docker inspect "$c" >/dev/null 2>&1; then
+                    log "  ERROR: $c does not exist — compose never created it, or something removed it"
+                else
+                    log "  ERROR: $c is running but never mounted /mnt/etcfuse"
+                    dump_logs "$c"
+                fi
+                return 1
+            fi
         done
         # One listing per node, so every recorded history actually contains
         # readdir traffic.  The workload is otherwise all writes and reads,
@@ -113,7 +143,12 @@ if [[ "$MODE" == "docker" ]]; then
             docker rm -f "etcfs-fuse$id" "etcfs-meta$id" "etcfs-etcd$id" >/dev/null 2>&1
             docker volume rm "etcfuse-meta${id}-sock" >/dev/null 2>&1
         done
-        $COMPOSE down -v >/dev/null 2>&1 &
+        # Synchronous, deliberately.  Backgrounded, this outlived the script
+        # that started it: the next run's provision would create its
+        # containers and this stale teardown would then delete them, which
+        # surfaced as "No such container" a minute later in the mount wait.
+        # A few seconds at the end of a run is worth not racing the next one.
+        $COMPOSE down -v >/dev/null 2>&1 || true
     }
 
     # add_node <id> / remove_node <id> — join/remove a node (id 4, 5, ...)
