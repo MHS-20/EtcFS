@@ -13,6 +13,8 @@
 
 GO_ENTRY   := ./cmd/etcfuse-meta
 GO_OUT     := bin/etcfuse-meta
+CTL_ENTRY  := ./cmd/etcfsctl
+CTL_OUT    := bin/etcfsctl
 C_ENTRY    := cmd/etcfuse
 C_OUT      := bin/etcfuse
 
@@ -20,12 +22,15 @@ C_OUT      := bin/etcfuse
 # report was filed against, not the placeholder in the source.
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GO_LDFLAGS := -X github.com/MHS-20/EtcFS/internal/config.Version=$(VERSION)
-all: $(GO_OUT) $(C_OUT)
+all: $(GO_OUT) $(CTL_OUT) $(C_OUT)
 
 # ---- Go build ----
 
 $(GO_OUT): $(shell find . -name '*.go' -not -path './vendor/*' -not -path './test/*')
 	go build -ldflags "$(GO_LDFLAGS)" -o $(GO_OUT) $(GO_ENTRY)
+
+$(CTL_OUT): $(shell find . -name '*.go' -not -path './vendor/*' -not -path './test/*')
+	go build -ldflags "$(GO_LDFLAGS)" -o $(CTL_OUT) $(CTL_ENTRY)
 
 # ---- C build ----
 

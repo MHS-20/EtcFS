@@ -1,7 +1,5 @@
 # EtcFS
 
-<https://mhs-20.github.io/EtcFS/>
-
 [![CI](https://github.com/mhs-20/EtcFS/actions/workflows/ci.yml/badge.svg)](https://github.com/mhs-20/EtcFS/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/mhs-20/EtcFS/branch/main/graph/badge.svg)](https://codecov.io/gh/mhs-20/EtcFS)
 
@@ -200,6 +198,21 @@ etcfuse --socket=/tmp/etcfuse.sock --node-id=n1 /mnt/etcfuse
 ```
 
 Full flag reference: `internal/config/config.go` (Go daemon), `etcfuse --help` (C daemon).
+
+### Operate a running filesystem
+
+`etcfsctl` is the operator front door; it talks to etcd directly and needs no daemon.
+
+```
+etcfsctl --etcd-endpoints=http://127.0.0.1:2379 status   # inodes, extents, arenas, members
+etcfsctl members                                          # cluster membership
+etcfsctl arenas                                           # arena ownership and utilization
+etcfsctl fsck                                             # offline consistency check
+etcfsctl scrub                                            # one scrub pass, reporting only
+etcfsctl fence <node-id>                                  # record a fence for a departed node
+```
+
+Every subcommand takes `--json` for scripting.
 
 ## Testing
 
