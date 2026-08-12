@@ -226,6 +226,17 @@ case "$SCENARIO" in
     *) log "unknown scenario: $SCENARIO" ;;
 esac
 
+# Opt-in: VERIFY_HISTORY=1 checks every node's recorded operation history for
+# consistency (see docs/verification/porcupine.md) before the cluster — and
+# the volume the histories live in — goes away. Off by default: it is new,
+# adds a Go build and a checker run to every invocation, and a violation here
+# is a finding worth investigating on its own, not a reason to fail a chaos
+# scenario that was checking something else.
+if [[ "$MODE" == "docker" && "${VERIFY_HISTORY:-0}" == "1" ]]; then
+    log "Checking recorded operation histories..."
+    "$SCRIPT_DIR/verify-chaos-history.sh" | tee -a "$REPORT_DIR/chaos.log" ||         log "WARN: history verification found a violation or could not run"
+fi
+
 teardown_cluster
 
 {

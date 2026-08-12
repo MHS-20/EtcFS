@@ -169,9 +169,11 @@ if [[ "$MODE" == "docker" ]]; then
         local endpoints
         endpoints=$(etcd_client_urls)
         docker run -d --name "etcfs-meta$id" --network docker_etcfuse-net \
-            -v "docker_block_data:/block-device" -v "etcfuse-meta${id}-sock:/var/run" "$META_IMG" \
+            -v "docker_block_data:/block-device" -v "etcfuse-meta${id}-sock:/var/run" \
+            -v "docker_history_data:/var/log/etcfuse" "$META_IMG" \
             --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints="$endpoints" --node-id="n$id" \
-            --cluster-name=docker-chaos --lease-ttl=$CHAOS_LEASE_TTL --block-device=/block-device/etcfuse.img --log-level=1 >/dev/null
+            --cluster-name=docker-chaos --lease-ttl=$CHAOS_LEASE_TTL --block-device=/block-device/etcfuse.img \
+            --log-level=1 --history-log=/var/log/etcfuse/history-n$id.jsonl >/dev/null
 
         sleep 2
         docker run -d --name "etcfs-fuse$id" --network docker_etcfuse-net --privileged --device /dev/fuse \

@@ -144,9 +144,11 @@ services:
       - --lease-ttl=10s
       - --block-device=/block-device/etcfuse.img
       - --log-level=1
+      - --history-log=/var/log/etcfuse/history-n1.jsonl
     volumes:
       - meta1_sock:/var/run
       - block_data:/block-device
+      - history_data:/var/log/etcfuse
     networks:
       - etcfuse-net
     depends_on:
@@ -168,9 +170,11 @@ services:
       - --lease-ttl=10s
       - --block-device=/block-device/etcfuse.img
       - --log-level=1
+      - --history-log=/var/log/etcfuse/history-n2.jsonl
     volumes:
       - meta2_sock:/var/run
       - block_data:/block-device
+      - history_data:/var/log/etcfuse
     networks:
       - etcfuse-net
     depends_on:
@@ -192,9 +196,11 @@ services:
       - --lease-ttl=10s
       - --block-device=/block-device/etcfuse.img
       - --log-level=1
+      - --history-log=/var/log/etcfuse/history-n3.jsonl
     volumes:
       - meta3_sock:/var/run
       - block_data:/block-device
+      - history_data:/var/log/etcfuse
     networks:
       - etcfuse-net
     depends_on:
@@ -268,6 +274,11 @@ services:
       - etcfuse-meta3
 
 volumes:
+  # Per-node operation histories (--history-log), for the Porcupine checks in
+  # test/verify — see docs/verification/porcupine.md.  One volume shared by
+  # every node rather than one per node: each node writes its own file inside
+  # it, and scripts/test/verify-chaos-history.sh only has one mount to read.
+  history_data:
   etcd1_data:
   etcd2_data:
   etcd3_data:
