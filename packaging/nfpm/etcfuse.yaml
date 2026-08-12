@@ -1,0 +1,36 @@
+# nfpm package spec for etcfuse (C FUSE frontend). See etcfuse-meta.yaml for
+# the build/test invocation — identical, different binary and dependency.
+name: etcfuse
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: Muhamad Huseyn Salman
+homepage: https://github.com/MHS-20/EtcFS
+license: Apache-2.0
+description: |
+  EtcFS FUSE frontend — mounts the cluster filesystem and forwards VFS
+  operations to etcfuse-meta over a Unix socket. See
+  https://mhs-20.github.io/EtcFS/deployment/binaries/.
+
+depends:
+  - libfuse3-3
+
+contents:
+  - src: dist/etcfuse
+    dst: /usr/local/bin/etcfuse
+    file_info:
+      mode: 0755
+  - src: deploy/systemd/etcfuse.service
+    dst: /usr/lib/systemd/system/etcfuse.service
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: packaging/nfpm/scripts/postinstall.sh
+
+overrides:
+  rpm:
+    depends:
+      - fuse3-libs

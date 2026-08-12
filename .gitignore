@@ -28,3 +28,4 @@ site/
 *.tfstate.*
 crash.log
 *.tfvars
+dist/

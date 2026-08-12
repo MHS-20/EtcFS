@@ -154,3 +154,95 @@ jobs:
             @semantic-release/github
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-assets:
+    name: Release assets (binaries, packages, containers)
+    runs-on: ubuntu-latest
+    needs: [release]
+    if: needs.release.outputs.released == 'true'
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: v${{ env.VERSION }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2
+
+      # Both Go binaries are CGO_ENABLED=0: static, no glibc version to match
+      # against whatever distro the .deb/.rpm lands on. etcfuse links
+      # libfuse3 dynamically — deb/rpm depend on it (see packaging/nfpm/).
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w -X github.com/MHS-20/EtcFS/internal/config.Version=${VERSION}"
+          CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o dist/etcfuse-meta ./cmd/etcfuse-meta
+          CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o dist/etcfsctl ./cmd/etcfsctl
+          cc -I. -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g \
+            cmd/etcfuse/main.c pkg/fuse/fuse.c pkg/fuse/ops.c pkg/block/block.c \
+            -o dist/etcfuse -lfuse3 -lpthread
+
+      - name: Package tarballs
+        run: |
+          for bin in etcfuse etcfuse-meta etcfsctl; do
+            tar czf "dist/${bin}-${VERSION}-linux-amd64.tar.gz" -C dist "$bin"
+          done
+
+      - name: Package deb/rpm
+        run: |
+          for spec in etcfuse etcfuse-meta etcfsctl; do
+            nfpm package -f "packaging/nfpm/${spec}.yaml" -p deb -t dist/
+            nfpm package -f "packaging/nfpm/${spec}.yaml" -p rpm -t dist/
+          done
+
+      - name: Checksums
+        run: |
+          cd dist
+          rm -f etcfuse etcfuse-meta etcfsctl  # raw binaries stay out of the release, only the archives/packages do
+          sha256sum *.tar.gz *.deb *.rpm > checksums.txt
+          cat checksums.txt
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "v${VERSION}" dist/*.tar.gz dist/*.deb dist/*.rpm dist/checksums.txt --clobber
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push etcfuse-meta image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.etcfuse-meta
+          build-args: VERSION=${{ env.VERSION }}
+          push: true
+          tags: |
+            ghcr.io/mhs-20/etcfs/etcfuse-meta:${{ env.VERSION }}
+            ghcr.io/mhs-20/etcfs/etcfuse-meta:latest
+
+      - name: Build and push etcfuse image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.etcfuse
+          push: true
+          tags: |
+            ghcr.io/mhs-20/etcfs/etcfuse:${{ env.VERSION }}
+            ghcr.io/mhs-20/etcfs/etcfuse:latest

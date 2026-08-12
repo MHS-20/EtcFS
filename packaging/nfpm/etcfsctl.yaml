@@ -1,0 +1,21 @@
+# nfpm package spec for etcfsctl (Go operator CLI). No systemd unit, no
+# runtime dependency — a static binary talking to etcd over the network.
+name: etcfsctl
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: Muhamad Huseyn Salman
+homepage: https://github.com/MHS-20/EtcFS
+license: Apache-2.0
+description: |
+  EtcFS operator CLI — status, members, arenas, fsck, scrub, fencing and
+  quota commands against a running cluster. See
+  https://mhs-20.github.io/EtcFS/deployment/etcfsctl/.
+
+contents:
+  - src: dist/etcfsctl
+    dst: /usr/local/bin/etcfsctl
+    file_info:
+      mode: 0755
