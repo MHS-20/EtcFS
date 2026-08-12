@@ -37,7 +37,7 @@ var (
 		Buckets: prometheus.ExponentialBuckets(0.0001, 3, 10),
 	}, []string{"op"})
 
-	// EtcdTxns counts etcd transactions, by outcome (committed, failed, error).
+	// EtcdTxns counts etcd transactions, by outcome (committed, rejected, error).
 	EtcdTxns = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "etcfuse_etcd_txn_total",
 		Help: "etcd transactions attempted, by outcome.",

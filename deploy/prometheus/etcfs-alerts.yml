@@ -1,0 +1,44 @@
+groups:
+  - name: etcfs
+    rules:
+      - alert: EtcFSScrubAnomalies
+        expr: rate(etcfuse_scrub_anomalies_total{type!~"orphan|dead"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "EtcFS scrub finding a non-routine anomaly ({{ $labels.type }})"
+          description: "Orphan and dead findings are routine and auto-remediated; anything else needs a human."
+
+      - alert: EtcFSNodeFenced
+        expr: changes(etcfuse_fencing_generation[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "EtcFS node {{ $labels.instance }} was fenced"
+          description: "The fencing generation stepped in the last 10 minutes."
+
+      - alert: EtcFSFenceFailed
+        expr: increase(etcfuse_fenced_nodes_total{outcome="failed"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "EtcFS fence attempt failed on {{ $labels.instance }}"
+          description: "A fence was attempted and could not be confirmed, leaving the target node in limbo."
+
+      - alert: EtcFSArenaUtilizationHigh
+        expr: etcfuse_arena_utilization > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EtcFS node {{ $labels.instance }} is low on arena space"
+          description: "Arena utilization above 90% for 10 minutes; the node may not be able to claim a new arena."
+
+      - alert: EtcFSScrubStalled
+        expr: time() - etcfuse_scrub_last_run_seconds > 300
+        labels:
+          severity: warning
+        annotations:
+          summary: "EtcFS scrubber stalled on {{ $labels.instance }}"
+          description: "No completed scrub pass in over 5 minutes; the anomaly counters cannot show this since they simply stop rising."
