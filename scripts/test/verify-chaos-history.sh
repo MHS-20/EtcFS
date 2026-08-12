@@ -29,8 +29,11 @@ if ! docker volume inspect "$VOLUME" >/dev/null 2>&1; then
 fi
 
 echo "[verify-history] copying histories out of $VOLUME"
+# The daemon writes its history file 0600 as the container's root, so the copy
+# has to run as root too; chown the copies to us afterward or nothing outside
+# the container can read them back.
 docker run --rm -v "$VOLUME:/history" -v "$OUT:/out" alpine:3.20 \
-    sh -c 'cp /history/history-*.jsonl /out/ 2>/dev/null || true'
+    sh -c "cp /history/history-*.jsonl /out/ 2>/dev/null; chown $(id -u):$(id -g) /out/*.jsonl 2>/dev/null || true"
 
 files=("$OUT"/history-*.jsonl)
 if [[ ! -e "${files[0]}" ]]; then
