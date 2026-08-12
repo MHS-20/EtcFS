@@ -1369,3 +1369,57 @@ func TestIntegration_UnlinkRemovesTheSymlinkTarget(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, target, "the target key must go with the inode")
 }
+
+// ---- Directory timestamps ----
+
+// Adding or removing an entry has to mark the containing directory changed:
+// every namespace operation used to leave the parent record untouched, so
+// anything that watches a directory's mtime (make, rsync) never saw new files.
+func TestIntegration_NamespaceOpsTouchTheParentDirectory(t *testing.T) {
+	store := testStore(t, "test-node")
+	ctx := context.Background()
+	parent := uint64(1)
+
+	_, err := store.CreateInode(ctx, parent, ModeDir|0755, 0, 0)
+	require.NoError(t, err)
+
+	// Backdate the directory so the update is visible despite the one-second
+	// resolution of the stored timestamps.
+	backdate := func() {
+		rec, err := store.GetInode(ctx, parent)
+		require.NoError(t, err)
+		rec.Mtime = time.Now().Add(-time.Hour)
+		rec.Ctime = rec.Mtime
+		_, err = store.Put(ctx, InodeKey(parent), EncodeInode(rec))
+		require.NoError(t, err)
+	}
+	assertTouched := func(what string) {
+		rec, err := store.GetInode(ctx, parent)
+		require.NoError(t, err)
+		assert.WithinDuration(t, time.Now(), rec.Mtime, time.Minute, "%s left the parent mtime alone", what)
+		assert.WithinDuration(t, time.Now(), rec.Ctime, time.Minute, "%s left the parent ctime alone", what)
+	}
+
+	backdate()
+	_, err = store.AtomicCreateFile(ctx, parent, "f", 900, ModeFile|0644, 0, 0)
+	require.NoError(t, err)
+	assertTouched("create")
+
+	backdate()
+	_, err = store.AtomicLink(ctx, 900, parent, "f-link")
+	require.NoError(t, err)
+	assertTouched("link")
+
+	backdate()
+	require.NoError(t, store.AtomicRename(ctx, parent, "f-link", parent, "f-moved", 900, 0))
+	assertTouched("rename")
+
+	backdate()
+	require.NoError(t, store.AtomicUnlink(ctx, parent, "f-moved"))
+	assertTouched("unlink")
+
+	// Removing one of two names is a status change of the file itself.
+	rec, err := store.GetInode(ctx, 900)
+	require.NoError(t, err)
+	assert.WithinDuration(t, time.Now(), rec.Ctime, time.Minute, "unlink left the target ctime alone")
+}

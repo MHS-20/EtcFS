@@ -117,7 +117,34 @@ func (s *Store) atomicCreate(ctx context.Context, parent uint64, name string, re
 	if !ok {
 		return fmt.Errorf("atomic create %d/%q: %w", parent, name, ErrExists)
 	}
+	s.touchDir(ctx, parent)
 	return nil
+}
+
+// touchDir marks a directory changed, as POSIX requires of every operation
+// that adds or removes an entry in it.
+//
+// It runs after the transaction that changed the namespace rather than inside
+// it: folding it in would pin the parent's record in every create and unlink,
+// so two nodes making unrelated entries in one directory would abort each
+// other. A timestamp one commit late is a better trade than a namespace
+// operation that fails under concurrency, which is also why a failure here is
+// reported to the caller's log and not to the caller.
+func (s *Store) touchDir(ctx context.Context, ino uint64) {
+	_ = retryCAS(ctx, fmt.Sprintf("touch dir %d", ino), func() (bool, error) {
+		rec, rev, err := s.GetInodeRev(ctx, ino)
+		if err != nil {
+			return false, err
+		}
+		if rec == nil {
+			return true, nil
+		}
+		rec.Mtime = time.Now()
+		rec.Ctime = rec.Mtime
+		return s.Txn(ctx,
+			[]clientv3.Cmp{InodeUnchanged(ino, rev)},
+			[]clientv3.Op{clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec)))}, nil)
+	})
 }
 
 // AtomicCreateFile creates a regular file and its directory entry in a single
@@ -175,6 +202,9 @@ func (s *Store) AtomicLink(ctx context.Context, ino, parent uint64, name string)
 			return false, fmt.Errorf("atomic link %d/%q: %w", parent, name, ErrPerm)
 		}
 		rec.Nlink++
+		// The link count is part of the inode's status, so adding a name to it
+		// is a status change of the file itself, not only of the directory.
+		rec.Ctime = time.Now()
 
 		direntKey := DirentKey(parent, name)
 		cmps := []clientv3.Cmp{
@@ -203,6 +233,7 @@ func (s *Store) AtomicLink(ctx context.Context, ino, parent uint64, name string)
 	if err != nil {
 		return nil, err
 	}
+	s.touchDir(ctx, parent)
 	return linked, nil
 }
 
@@ -245,7 +276,11 @@ func (s *Store) AtomicUnlink(ctx context.Context, parent uint64, name string) er
 			InodeUnchanged(ino, rev),
 		}
 		ops := append([]clientv3.Op{DeleteDirent(parent, name)}, s.unlinkInodeOps(rec)...)
-		return s.Txn(ctx, cmps, ops, nil)
+		ok, err := s.Txn(ctx, cmps, ops, nil)
+		if ok && err == nil {
+			s.touchDir(ctx, parent)
+		}
+		return ok, err
 	})
 }
 
@@ -300,6 +335,7 @@ func (s *Store) AtomicRmdir(ctx context.Context, parent uint64, name string) err
 			return fail("%w", err)
 		}
 		if ok {
+			s.touchDir(ctx, parent)
 			return true, nil
 		}
 		// Losing a revision comparison is contention worth retrying; an entry
@@ -385,6 +421,7 @@ func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName stri
 		if err := s.commitRename(ctx, cmps, ops); err != nil {
 			return fail("%w", err)
 		}
+		s.touchRenameDirs(ctx, oldParent, newParent)
 		return nil
 	}
 
@@ -432,7 +469,17 @@ func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName stri
 	if err := s.commitRename(ctx, cmps, ops); err != nil {
 		return fail("%w", err)
 	}
+	s.touchRenameDirs(ctx, oldParent, newParent)
 	return nil
+}
+
+// touchRenameDirs marks both ends of a rename changed, once when they are the
+// same directory.
+func (s *Store) touchRenameDirs(ctx context.Context, oldParent, newParent uint64) {
+	s.touchDir(ctx, oldParent)
+	if newParent != oldParent {
+		s.touchDir(ctx, newParent)
+	}
 }
 
 // unlinkInodeOp is the write that drops one reference to rec: a smaller nlink,
@@ -458,6 +505,7 @@ func (s *Store) unlinkInodeOps(rec *InodeRecord) []clientv3.Op {
 	if rec.Nlink > 1 {
 		reduced := *rec
 		reduced.Nlink--
+		reduced.Ctime = time.Now()
 		return []clientv3.Op{clientv3.OpPut(InodeKey(rec.Ino), string(EncodeInode(&reduced)))}
 	}
 	ops := []clientv3.Op{
