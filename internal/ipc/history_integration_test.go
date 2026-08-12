@@ -288,7 +288,7 @@ func TestIntegration_RecordedDataPathHistoryIsConsistent(t *testing.T) {
 	if len(locks) == 0 {
 		t.Fatal("no lock events were recorded")
 	}
-	if res := verify.CheckLocks(locks, 60*time.Second); res != porcupine.Ok {
+	if res := verify.CheckLocks(locks, verify.DefaultLockLeaseTTL, 60*time.Second); res != porcupine.Ok {
 		t.Fatalf("recorded lock history admits a mutual-exclusion violation (%v)", res)
 	}
 

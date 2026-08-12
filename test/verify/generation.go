@@ -80,27 +80,44 @@ func guardOperations(ops []GuardOp) []porcupine.Operation {
 	return out
 }
 
-// guardState is whether this node has ever been fenced. Once true, it never
-// goes back to false within one recorded run — a node that rejoins after a
-// fence does so as a fresh generation and a fresh history, not by reversing
-// this state, so treating it as one-way here is correct for a single run's
-// history.
-type guardState bool
+// guardState is the highest generation this node is known to have been
+// fenced at, and whether it has been fenced at all.
+//
+// Tracking the generation rather than a bare "fenced" flag is what keeps a
+// legitimate restart from reading as a violation. A fenced node that comes
+// back adopts the cluster's new generation and resumes writing, which is the
+// design working -- the fence is an epoch boundary, not a permanent ban -- and
+// the recorder appends to the same file under the same node ID across that
+// restart, so the resumed commits arrive in the same partition as the fenced
+// ones. A flag alone cannot tell them apart and reports the restart as a
+// write from the fenced incarnation.
+//
+// The generation can, because it is monotone: once generation G has been
+// fenced, no later incarnation ever carries G again. So a commit is a
+// violation exactly when it carries a generation that has already been
+// fenced -- which is also strictly stronger than the flag, since it rejects
+// any commit at or below a fenced generation rather than only those after a
+// fence was observed.
+type guardState struct {
+	fenced   bool
+	fencedAt uint64
+}
 
 func (s guardState) step(op GuardOp) (bool, guardState) {
 	switch {
-	case bool(s) && op.Committed:
-		// A commit succeeded after this node is known to have been fenced.
+	case op.Committed && s.fenced && op.Gen <= s.fencedAt:
+		// A commit carrying a generation already known to be dead.
 		return false, s
-	case op.Fenced:
-		return true, true
+	case op.Fenced && (!s.fenced || op.Gen > s.fencedAt):
+		return true, guardState{fenced: true, fencedAt: op.Gen}
 	default:
 		return true, s
 	}
 }
 
-// GenerationModel checks that no node writes after it has been fenced,
-// partitioned per node since fencing is a per-node fact.
+// GenerationModel checks that no node commits metadata under a generation it
+// has already been fenced at, partitioned per node since fencing is a per-node
+// fact.
 var GenerationModel = porcupine.Model{
 	Partition: func(h []porcupine.Operation) [][]porcupine.Operation {
 		byNode := map[int][]porcupine.Operation{}
@@ -113,7 +130,7 @@ var GenerationModel = porcupine.Model{
 		}
 		return out
 	},
-	Init: func() interface{} { return guardState(false) },
+	Init: func() interface{} { return guardState{} },
 	Step: func(state, input, output interface{}) (bool, interface{}) {
 		ok, next := state.(guardState).step(input.(GuardOp))
 		return ok, next

@@ -6,13 +6,15 @@ import (
 	"github.com/anishathalye/porcupine"
 )
 
+// lop builds a lock event over a narrow interval around at, standing in for
+// the etcd transaction that moved the lock.
 func lop(node string, ino uint64, kind lockOpKind, at int64) LockOp {
-	return LockOp{Node: node, Ino: ino, Kind: kind, At: at}
+	return LockOp{Node: node, Ino: ino, Kind: kind, Call: at, Ret: at + 1}
 }
 
 func lockOK(t *testing.T, ops []LockOp) bool {
 	t.Helper()
-	res := CheckLocks(ops, timeout)
+	res := CheckLocks(ops, DefaultLockLeaseTTL, timeout)
 	if res == porcupine.Unknown {
 		t.Fatal("checker timed out")
 	}

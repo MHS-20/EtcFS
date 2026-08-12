@@ -27,10 +27,12 @@ const (
 // is mutual exclusion, and it is checked as exactly that: a state machine over
 // acquire/release events, each recorded at the precise instant it happened
 // (the etcd transaction that granted or dropped it), not over an interval. A
-// zero-width [t, t] operation is what tells Porcupine "this took effect at
-// exactly this instant" rather than "sometime in this window" — which is the
-// truth here, since AcquireLock and Release/Folded are each one etcd
-// transaction.
+// Each event is checked over the interval its own etcd transaction spanned,
+// not as a point: the transaction commits at a single revision, but nothing
+// in the daemon observes that revision's wall-clock instant — only the call
+// and return around it. Recording the interval is the honest statement of
+// what is known, and it is what keeps ordinary clock offset between two
+// hosts from reading as two holders of one lock.
 
 // lockOpKind distinguishes the two events a lock's lifetime is made of.
 type lockOpKind int
@@ -42,12 +44,18 @@ const (
 	lockReleaseShared
 )
 
-// LockOp is one endpoint of a lock's hold interval.
+// LockOp is one endpoint of a lock's hold interval, over the interval the
+// operation that moved it actually spanned.
 type LockOp struct {
 	Node string
 	Ino  uint64
 	Kind lockOpKind
-	At   int64
+	// Call and Ret bracket the etcd transaction that granted or dropped the
+	// lock. The instant itself is somewhere inside; nothing observes it
+	// directly, and pretending otherwise is what made clock offset between
+	// two hosts look like two holders of one lock.
+	Call int64
+	Ret  int64
 }
 
 func (k lockOpKind) String() string {
@@ -99,13 +107,16 @@ func DecodeLocks(entries []history.Entry) ([]LockOp, error) {
 		default:
 			return nil, fmt.Errorf("lock event at %d: unknown event/mode %d/%d", e.CallNs, event, mode)
 		}
-		ops = append(ops, LockOp{Node: e.Node, Ino: ino, Kind: kind, At: e.CallNs})
+		ops = append(ops, LockOp{
+			Node: e.Node, Ino: ino, Kind: kind,
+			Call: e.CallNs, Ret: e.ReturnNs,
+		})
 	}
 	return ops, nil
 }
 
-// lockOps turns decoded LockOps into zero-width Porcupine operations,
-// partitioned by inode.
+// lockOperations turns decoded LockOps into Porcupine operations, each over
+// the interval its etcd transaction spanned.
 func lockOperations(ops []LockOp) []porcupine.Operation {
 	clients := map[string]int{}
 	out := make([]porcupine.Operation, 0, len(ops))
@@ -116,7 +127,7 @@ func lockOperations(ops []LockOp) []porcupine.Operation {
 			clients[op.Node] = id
 		}
 		out = append(out, porcupine.Operation{
-			ClientId: id, Input: op, Output: nil, Call: op.At, Return: op.At,
+			ClientId: id, Input: op, Output: nil, Call: op.Call, Return: op.Ret,
 		})
 	}
 	return out
@@ -177,7 +188,75 @@ var LockModel = porcupine.Model{
 	},
 }
 
+// DefaultLockLeaseTTL is the session TTL the lock keys are written under, and
+// so the window inside which etcd drops the locks of a node that stopped
+// renewing. It matches the daemon's default --lease-ttl.
+const DefaultLockLeaseTTL = 5 * time.Second
+
+// withLeaseExpiryReleases appends a release for every lock a node still holds
+// at the end of the history.
+//
+// A node killed mid-hold never records one: its locks are written under a
+// session lease, and it is etcd that drops them when the lease stops being
+// renewed, inside a process that no longer exists to log anything. Without
+// this the lock is modelled as held forever and the next holder -- which
+// acquired it perfectly legitimately -- reads as a mutual-exclusion
+// violation. The chaos suite SIGKILLs daemons, so this is the common case,
+// not an exotic one.
+//
+// The synthetic release spans [last event from that node, + leaseTTL], which
+// is the honest bound: the lease cannot have expired before the node's last
+// observed activity, and cannot survive a TTL past it. That interval also
+// keeps a genuinely leaked lock a violation -- a node that stayed alive and
+// simply failed to release goes on emitting events, so its synthetic release
+// lands after them, well after any conflicting acquire.
+func withLeaseExpiryReleases(ops []LockOp, leaseTTL time.Duration) []LockOp {
+	lastSeen := map[string]int64{}
+	for _, op := range ops {
+		if op.Ret > lastSeen[op.Node] {
+			lastSeen[op.Node] = op.Ret
+		}
+	}
+
+	type holding struct {
+		node string
+		ino  uint64
+		excl bool
+	}
+	held := map[holding]int{}
+	for _, op := range ops {
+		key := holding{node: op.Node, ino: op.Ino,
+			excl: op.Kind == lockAcquireExclusive || op.Kind == lockReleaseExclusive}
+		switch op.Kind {
+		case lockAcquireExclusive, lockAcquireShared:
+			held[key]++
+		case lockReleaseExclusive, lockReleaseShared:
+			held[key]--
+		}
+	}
+
+	out := ops
+	for key, n := range held {
+		for i := 0; i < n; i++ {
+			kind := lockReleaseShared
+			if key.excl {
+				kind = lockReleaseExclusive
+			}
+			out = append(out, LockOp{
+				Node: key.node, Ino: key.ino, Kind: kind,
+				Call: lastSeen[key.node],
+				Ret:  lastSeen[key.node] + int64(leaseTTL),
+			})
+		}
+	}
+	return out
+}
+
 // CheckLocks checks a decoded lock history for mutual-exclusion violations.
-func CheckLocks(ops []LockOp, timeout time.Duration) porcupine.CheckResult {
-	return porcupine.CheckOperationsTimeout(LockModel, lockOperations(ops), timeout)
+//
+// leaseTTL is the session TTL the locks were written under; pass
+// DefaultLockLeaseTTL unless the cluster was configured otherwise.
+func CheckLocks(ops []LockOp, leaseTTL, timeout time.Duration) porcupine.CheckResult {
+	return porcupine.CheckOperationsTimeout(
+		LockModel, lockOperations(withLeaseExpiryReleases(ops, leaseTTL)), timeout)
 }

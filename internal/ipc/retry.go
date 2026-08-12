@@ -122,12 +122,15 @@ func (s *Service) retryKV(ctx context.Context, fn func(context.Context) error) {
 // as the work it was protecting and saves the round trip entirely.  Release
 // stays safe to defer either way: after Folded it does nothing.
 type heldLock struct {
-	s          *Service
-	ino        uint64
-	mode       metadata.LockMode
-	holder     string
-	released   bool
-	acquiredAt time.Time
+	s        *Service
+	ino      uint64
+	mode     metadata.LockMode
+	holder   string
+	released bool
+	// releaseQueuedAt is when ReleaseOp put this lock's deletion into a
+	// caller's transaction: a lower bound on when a folded release took
+	// effect, since the commit that carries it cannot precede it.
+	releaseQueuedAt time.Time
 }
 
 // lockModeByte encodes a LockMode as the single byte the lock history payload
@@ -140,26 +143,33 @@ func lockModeByte(mode metadata.LockMode) byte {
 }
 
 // recordLockEvent appends one endpoint of a lock's hold interval to the
-// history: an acquire at the instant AcquireLock returned success, a release
-// at the instant the key was actually deleted (or, when folded, the instant
-// the transaction carrying it committed). Recording both endpoints as their
-// own zero-width events — rather than one event spanning the hold — is what
-// lets the model in test/verify/lock.go treat each as an exact instant instead
-// of an interval, which is what it actually is: an etcd transaction commits at
-// a single revision, not over a span of time.
-func (l *heldLock) recordLockEvent(kind byte, at time.Time) {
+// history, as the interval the operation actually spanned.
+//
+// The instant a lock changes hands is the revision of one etcd transaction,
+// and nothing here observes that instant directly — only the call and the
+// return around it.  Recording that surrounding interval says exactly as much
+// as is known, and lets the checker place the linearization point anywhere
+// inside it.
+//
+// An earlier version recorded a single point taken after the call returned,
+// which claimed a precision this code does not have: it placed the event
+// strictly later than it happened, and left no room at all for clock offset
+// between hosts, so ordinary skew between two nodes read as two holders of
+// one lock.
+func (l *heldLock) recordLockEvent(kind byte, call, ret time.Time) {
 	if l.s == nil || l.s.history == nil {
 		return
 	}
 	var b buf
 	b.b = append(b.b, kind, lockModeByte(l.mode))
 	b.w64(l.ino)
-	l.s.history.Record("lock_hold", historyOpLockHold, at, at, b.b, nil)
+	l.s.history.Record("lock_hold", historyOpLockHold, call, ret, b.b, nil)
 }
 
 // ReleaseOp is the deletion that drops this lock, for folding into a caller's
 // own transaction.
 func (l *heldLock) ReleaseOp() clientv3.Op {
+	l.releaseQueuedAt = time.Now()
 	return clientv3.OpDelete(metadata.LockKey(l.ino, l.mode, l.holder))
 }
 
@@ -168,7 +178,7 @@ func (l *heldLock) ReleaseOp() clientv3.Op {
 // known to have committed — a rejected one released nothing.
 func (l *heldLock) Folded() {
 	l.released = true
-	l.recordLockEvent(lockEventRelease, time.Now())
+	l.recordLockEvent(lockEventRelease, l.releaseQueuedAt, time.Now())
 }
 
 // Release drops the lock, unless a committed transaction already carried it.
@@ -184,6 +194,7 @@ func (l *heldLock) Release() {
 	// keeps renewing.
 	rctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
 	defer cancel()
+	call := time.Now()
 	err := retryEtcd(rctx, func(dctx context.Context) error {
 		return l.s.store.ReleaseLock(dctx, l.ino, l.mode, l.holder)
 	})
@@ -193,7 +204,7 @@ func (l *heldLock) Release() {
 		return
 	}
 	l.released = true
-	l.recordLockEvent(lockEventRelease, time.Now())
+	l.recordLockEvent(lockEventRelease, call, time.Now())
 }
 
 // lockInode takes a lock on an inode.  The lock is written under the store's
@@ -208,6 +219,7 @@ func (l *heldLock) Release() {
 func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockMode) (*heldLock, error) {
 	var holder string
 
+	call := time.Now()
 	err := retry(ctx, etcdAttempts, func() error {
 		actx, cancel := context.WithTimeout(ctx, etcdOpTimeout)
 		defer cancel()
@@ -219,8 +231,8 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 		return nil, err
 	}
 
-	held := &heldLock{s: s, ino: ino, mode: mode, holder: holder, acquiredAt: time.Now()}
-	held.recordLockEvent(lockEventAcquire, held.acquiredAt)
+	held := &heldLock{s: s, ino: ino, mode: mode, holder: holder}
+	held.recordLockEvent(lockEventAcquire, call, time.Now())
 	return held, nil
 }
 

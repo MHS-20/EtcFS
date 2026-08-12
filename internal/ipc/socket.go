@@ -204,7 +204,11 @@ func (s *Service) observedDispatch(code uint16, payload []byte) ([]byte, error) 
 	metrics.FuseOps.WithLabelValues(name).Inc()
 	metrics.FuseOpDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
 	// Every response frame starts with an int32 errno, negative on failure.
-	if err != nil || (len(resp) >= 4 && int32(binary.LittleEndian.Uint32(resp)) < 0) {
+	// Big-endian, like every other integer on this wire: read little-endian
+	// this happened to give the right sign for errnos up to 128, because the
+	// 0xFF bytes land where the sign bit is read from, and the wrong one for
+	// everything above it.
+	if err != nil || (len(resp) >= 4 && int32(binary.BigEndian.Uint32(resp)) < 0) {
 		metrics.FuseErrors.WithLabelValues(name).Inc()
 	}
 	return resp, err

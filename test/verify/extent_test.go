@@ -7,11 +7,11 @@ import (
 )
 
 func wop(node string, ino, off uint64, data []byte, call, ret int64) ExtentOp {
-	return ExtentOp{Node: node, Ino: ino, Write: true, Off: off, Data: data, Call: call, Ret: ret}
+	return ExtentOp{Node: node, Ino: ino, Kind: ExtentWrite, Off: off, Data: data, Call: call, Ret: ret}
 }
 
 func rop(node string, ino, off uint64, data []byte, call, ret int64) ExtentOp {
-	return ExtentOp{Node: node, Ino: ino, Write: false, Off: off, Data: data, Call: call, Ret: ret}
+	return ExtentOp{Node: node, Ino: ino, Kind: ExtentRead, Off: off, Data: data, Call: call, Ret: ret}
 }
 
 func extentOK(t *testing.T, ops []ExtentOp) bool {
@@ -115,7 +115,7 @@ func TestExtentPartialOverlapConstrainsOnlyTheWrittenBytes(t *testing.T) {
 func TestExtentRejectedWriteIsIgnored(t *testing.T) {
 	ops := []ExtentOp{
 		wop("n1", 1, 0, []byte("hello"), 10, 20),
-		{Node: "n2", Ino: 1, Write: true, Off: 0, Data: []byte("world"), Errno: 5, Call: 25, Ret: 28},
+		{Node: "n2", Ino: 1, Kind: ExtentWrite, Off: 0, Data: []byte("world"), Errno: 5, Call: 25, Ret: 28},
 		rop("n3", 1, 0, []byte("hello"), 30, 40),
 	}
 	if !extentOK(t, ops) {

@@ -80,7 +80,7 @@ func checkModel(model string, entries []history.Entry, timeout time.Duration) (b
 			return false, err
 		}
 		fmt.Printf("lock: checking %d events\n", len(ops))
-		return report("lock", verify.CheckLocks(ops, timeout))
+		return report("lock", verify.CheckLocks(ops, verify.DefaultLockLeaseTTL, timeout))
 	case "generation":
 		ops, err := verify.DecodeGuardedCommits(entries)
 		if err != nil {
