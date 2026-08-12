@@ -214,7 +214,11 @@ etcfsctl arenas                                           # arena ownership and 
 etcfsctl fsck                                             # offline consistency check
 etcfsctl scrub                                            # one scrub pass, reporting only
 etcfsctl fence <node-id>                                  # record a fence for a departed node
+etcfsctl quota                                            # usage against every quota root
+etcfsctl quota set <ino> --bytes=N --inodes=N             # make a directory a quota root
 ```
+
+Subtree quotas are **soft**: usage is computed by walking the namespace when asked, and nothing rejects a write. See [`docs/architecture/metadata/metadata-schema.md`](docs/architecture/metadata/metadata-schema.md) for why enforcing them inline would cost a Raft round trip on every write.
 
 Every subcommand takes `--json` for scripting.
 

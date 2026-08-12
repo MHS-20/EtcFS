@@ -19,6 +19,9 @@ Commands:
 	fsck             Run the offline filesystem checker
 	scrub            Run one scrub pass and report anomalies
 	fence <node-id>  Record a fence intent for a departed node
+	quota            Report usage against every quota root
+	quota set <ino> --bytes=N --inodes=N   Make a directory a quota root
+	quota clear <ino>                      Remove a quota root
 
 Flags (before the command):
 
@@ -110,6 +113,8 @@ func main() {
 			fatalf("fence requires exactly one node-id argument")
 		}
 		runErr = runFence(ctx, store, rest[0])
+	case "quota":
+		runErr = runQuota(ctx, store, rest, asJSON)
 	default:
 		usage()
 		os.Exit(2)
@@ -120,7 +125,8 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: etcfsctl [flags] <status|members|arenas|fsck|scrub|fence <node-id>>")
+	fmt.Fprintln(os.Stderr,
+		"usage: etcfsctl [flags] <status|members|arenas|fsck|scrub|fence <node-id>|quota [set|clear] ...>")
 	flag.PrintDefaults()
 }
 

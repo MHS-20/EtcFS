@@ -34,6 +34,7 @@ const (
 	PrefixInode      = "inode:"
 	PrefixDirent     = "dirent:"
 	PrefixXattr      = "xattr:"
+	PrefixQuota      = "quota:"
 	PrefixLock       = "lock:"
 	PrefixArena      = "arena:"
 	PrefixExtent     = "extent:"
@@ -190,6 +191,24 @@ func ParseXattrKey(key string) (ino uint64, name string, ok bool) {
 		return 0, "", false
 	}
 	return ino, name, true
+}
+
+// QuotaKey names the limits attached to a directory that is a quota root.
+func QuotaKey(ino uint64) string {
+	return fmt.Sprintf("%s%d", PrefixQuota, ino)
+}
+
+// ParseQuotaKey returns the inode a quota key belongs to.
+func ParseQuotaKey(key string) (ino uint64, ok bool) {
+	rest, found := strings.CutPrefix(key, PrefixQuota)
+	if !found {
+		return 0, false
+	}
+	ino, err := strconv.ParseUint(rest, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return ino, true
 }
 
 // Lock keys.
