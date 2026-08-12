@@ -11,6 +11,22 @@ import (
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
+// Synthetic history opcodes for events that never cross the IPC socket, kept
+// far above the real wire opcodes (which top out at 35) so a decoder can never
+// confuse one for the other. See test/verify/lock.go and generation.go for the
+// matching decoders — deliberately separate code reading the same bytes, for
+// the same reason the IPC history is decoded independently of the daemon that
+// wrote it.
+const (
+	historyOpLockHold      = 1000
+	historyOpGuardedCommit = 1001
+)
+
+const (
+	lockEventAcquire = 0
+	lockEventRelease = 1
+)
+
 // etcd operations on the data path are retried a few times before being
 // reported to the kernel as an error, so that a leader election or a dropped
 // connection during failover shows up as a brief stall rather than an EIO.
@@ -106,11 +122,39 @@ func (s *Service) retryKV(ctx context.Context, fn func(context.Context) error) {
 // as the work it was protecting and saves the round trip entirely.  Release
 // stays safe to defer either way: after Folded it does nothing.
 type heldLock struct {
-	s        *Service
-	ino      uint64
-	mode     metadata.LockMode
-	holder   string
-	released bool
+	s          *Service
+	ino        uint64
+	mode       metadata.LockMode
+	holder     string
+	released   bool
+	acquiredAt time.Time
+}
+
+// lockModeByte encodes a LockMode as the single byte the lock history payload
+// carries.
+func lockModeByte(mode metadata.LockMode) byte {
+	if mode == metadata.LockExclusive {
+		return 1
+	}
+	return 0
+}
+
+// recordLockEvent appends one endpoint of a lock's hold interval to the
+// history: an acquire at the instant AcquireLock returned success, a release
+// at the instant the key was actually deleted (or, when folded, the instant
+// the transaction carrying it committed). Recording both endpoints as their
+// own zero-width events — rather than one event spanning the hold — is what
+// lets the model in test/verify/lock.go treat each as an exact instant instead
+// of an interval, which is what it actually is: an etcd transaction commits at
+// a single revision, not over a span of time.
+func (l *heldLock) recordLockEvent(kind byte, at time.Time) {
+	if l.s == nil || l.s.history == nil {
+		return
+	}
+	var b buf
+	b.b = append(b.b, kind, lockModeByte(l.mode))
+	b.w64(l.ino)
+	l.s.history.Record("lock_hold", historyOpLockHold, at, at, b.b, nil)
 }
 
 // ReleaseOp is the deletion that drops this lock, for folding into a caller's
@@ -122,7 +166,10 @@ func (l *heldLock) ReleaseOp() clientv3.Op {
 // Folded records that a transaction carrying ReleaseOp committed, so the
 // deferred Release becomes a no-op.  Only call it once the transaction is
 // known to have committed — a rejected one released nothing.
-func (l *heldLock) Folded() { l.released = true }
+func (l *heldLock) Folded() {
+	l.released = true
+	l.recordLockEvent(lockEventRelease, time.Now())
+}
 
 // Release drops the lock, unless a committed transaction already carried it.
 func (l *heldLock) Release() {
@@ -146,6 +193,7 @@ func (l *heldLock) Release() {
 		return
 	}
 	l.released = true
+	l.recordLockEvent(lockEventRelease, time.Now())
 }
 
 // lockInode takes a lock on an inode.  The lock is written under the store's
@@ -171,7 +219,9 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 		return nil, err
 	}
 
-	return &heldLock{s: s, ino: ino, mode: mode, holder: holder}, nil
+	held := &heldLock{s: s, ino: ino, mode: mode, holder: holder, acquiredAt: time.Now()}
+	held.recordLockEvent(lockEventAcquire, held.acquiredAt)
+	return held, nil
 }
 
 // commitGuarded applies ops in one transaction carrying the caller's
@@ -190,10 +240,11 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 // that supplies them must not: a comparison miss is contention it can rebuild
 // its proposal from, and a fence is permanent.
 func (s *Service) commitGuarded(ctx context.Context, cmps []clientv3.Cmp, ops []clientv3.Op) (committed, fenced bool, err error) {
+	call := time.Now()
 	// Ensure the generation is resolved before committing, so a first write
 	// fails with a real etcd error rather than ErrGuardUnavailable.
 	gctx, gcancel := context.WithTimeout(context.Background(), etcdOpTimeout)
-	_, err = s.guardGeneration(gctx)
+	gen, err := s.guardGeneration(gctx)
 	gcancel()
 	if err != nil {
 		return false, false, err
@@ -204,11 +255,35 @@ func (s *Service) commitGuarded(ctx context.Context, cmps []clientv3.Cmp, ops []
 		committed, terr = s.store.Txn(tctx, cmps, ops, nil)
 		return terr
 	})
-	if errors.Is(err, metadata.ErrFenced) {
+	fenced = errors.Is(err, metadata.ErrFenced)
+	s.recordGuardedCommit(gen, committed, fenced, call, time.Now())
+	if fenced {
 		return false, true, nil
 	}
 	if err != nil {
 		return false, false, err
 	}
 	return committed, false, nil
+}
+
+// recordGuardedCommit appends one guarded-commit attempt to the history: the
+// generation this node believed it held, and whether the transaction
+// committed. See test/verify/generation.go — the property it checks is that
+// no commit succeeds once one has been rejected for a fence, which is the
+// single most safety-critical invariant this codebase has.
+func (s *Service) recordGuardedCommit(gen uint64, committed, fenced bool, call, ret time.Time) {
+	if s.history == nil {
+		return
+	}
+	var b buf
+	b.w64(gen)
+	flag := byte(0)
+	if committed {
+		flag |= 1
+	}
+	if fenced {
+		flag |= 2
+	}
+	b.b = append(b.b, flag)
+	s.history.Record("guarded_commit", historyOpGuardedCommit, call, ret, b.b, nil)
 }

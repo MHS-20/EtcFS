@@ -16,11 +16,16 @@ import (
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/internal/history"
+	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 	"github.com/MHS-20/EtcFS/test/etcdtest"
 	"github.com/MHS-20/EtcFS/test/verify"
 )
+
+// historyDeviceBytes is one arena plus room to grow, sparse on disk — the same
+// size the datapath integration tests use.
+const historyDeviceBytes = 2 << 30
 
 // Two nodes contending over one directory, recorded through the daemon's own
 // dispatch path and checked for linearizability.
@@ -177,5 +182,143 @@ func lookupPayload(parent uint64, name string) []byte {
 	b.w64(parent)
 	b.w32(uint32(len(name)))
 	b.b = append(b.b, name...)
+	return b.b
+}
+
+// Two nodes, one shared etcd, one shared block device, contending on writes
+// and reads to the same inodes and taking real locks against each other.
+// The recorded history is checked against all three models this session
+// added: does a read ever disagree with the writes that could have produced
+// it, does the exclusive/shared lock ever admit two holders that should have
+// excluded each other, and does any commit succeed after this node's own
+// fencing generation says it should not.
+func TestIntegration_RecordedDataPathHistoryIsConsistent(t *testing.T) {
+	cli := etcdtest.Client(t)
+	ctx := context.Background()
+	historyPath := filepath.Join(t.TempDir(), "history.jsonl")
+	devPath := filepath.Join(t.TempDir(), "device.img")
+
+	f, err := os.Create(devPath)
+	if err != nil {
+		t.Fatalf("create device file: %v", err)
+	}
+	if err := f.Truncate(historyDeviceBytes); err != nil {
+		t.Fatalf("size device file: %v", err)
+	}
+	_ = f.Close()
+
+	if _, err := metadata.NewStore(cli, "n1").CreateInode(ctx, metadata.RootIno, metadata.ModeDir|0755, 0, 0); err != nil {
+		t.Fatalf("seed root: %v", err)
+	}
+
+	const inos = 3
+	names := make([]string, inos)
+	for i := range names {
+		names[i] = fmt.Sprintf("shared-%d", i)
+		if _, err := metadata.NewStore(cli, "n1").AtomicCreateFile(ctx, metadata.RootIno, names[i],
+			uint64(900+i), metadata.ModeFile|0644, 0, 0); err != nil {
+			t.Fatalf("seed inode %d: %v", i, err)
+		}
+	}
+
+	services := make([]*Service, 0, 2)
+	for _, node := range []string{"n1", "n2"} {
+		dev, err := blockio.OpenBuffered(devPath)
+		if err != nil {
+			t.Fatalf("open device for %s: %v", node, err)
+		}
+		t.Cleanup(func() { _ = dev.Close() })
+
+		st := metadata.NewStore(cli, node)
+		membership := metadata.NewMembership(cli, node, "verify", 10*time.Second)
+		svc := NewService(st, membership, fencing.NewWatchdog(membership, 10*time.Second), config.NewLogger(0))
+		if err := svc.InitGeneration(ctx); err != nil {
+			t.Fatalf("init generation for %s: %v", node, err)
+		}
+		svc.InstallStoreGuard()
+		svc.SetBlockDevice(dev, false)
+
+		rec, err := history.NewRecorder(historyPath, node)
+		if err != nil {
+			t.Fatalf("open recorder for %s: %v", node, err)
+		}
+		t.Cleanup(func() { _ = rec.Close() })
+		svc.SetHistoryRecorder(rec)
+		services = append(services, svc)
+	}
+
+	const rounds = 15
+	var wg sync.WaitGroup
+	for i, svc := range services {
+		wg.Add(1)
+		go func(i int, svc *Service) {
+			defer wg.Done()
+			for round := 0; round < rounds; round++ {
+				ino := uint64(900 + round%inos)
+				data := []byte(fmt.Sprintf("node-%d-round-%d", i, round))
+				_, _ = svc.observedDispatch(ipcOpWrite, writePayloadFor(ino, 0, data, 0))
+				_, _ = svc.observedDispatch(ipcOpRead, readPayloadFor(ino, 0, 4096))
+			}
+		}(i, svc)
+	}
+	wg.Wait()
+
+	entries, err := history.Load(historyPath)
+	if err != nil {
+		t.Fatalf("load history: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("no operations were recorded")
+	}
+
+	extents, err := verify.DecodeExtents(entries)
+	if err != nil {
+		t.Fatalf("decode extents: %v", err)
+	}
+	t.Logf("checking %d extent operations", len(extents))
+	if res := verify.CheckExtents(extents, 60*time.Second); res != porcupine.Ok {
+		t.Fatalf("recorded extent history is not consistent (%v)", res)
+	}
+
+	locks, err := verify.DecodeLocks(entries)
+	if err != nil {
+		t.Fatalf("decode locks: %v", err)
+	}
+	t.Logf("checking %d lock events", len(locks))
+	if len(locks) == 0 {
+		t.Fatal("no lock events were recorded")
+	}
+	if res := verify.CheckLocks(locks, 60*time.Second); res != porcupine.Ok {
+		t.Fatalf("recorded lock history admits a mutual-exclusion violation (%v)", res)
+	}
+
+	guards, err := verify.DecodeGuardedCommits(entries)
+	if err != nil {
+		t.Fatalf("decode guarded commits: %v", err)
+	}
+	t.Logf("checking %d guarded commits", len(guards))
+	if len(guards) == 0 {
+		t.Fatal("no guarded commits were recorded")
+	}
+	if res := verify.CheckGenerations(guards, 60*time.Second); res != porcupine.Ok {
+		t.Fatalf("recorded generation history admits a write after a fence (%v)", res)
+	}
+}
+
+func writePayloadFor(ino, offset uint64, data []byte, uid uint32) []byte {
+	var b buf
+	b.w64(ino)
+	b.w64(offset)
+	b.w32(uint32(len(data)))
+	b.b = append(b.b, data...)
+	b.w32(uid)
+	return b.b
+}
+
+func readPayloadFor(ino, offset uint64, size uint32) []byte {
+	var b buf
+	b.w64(ino)
+	b.w64(offset)
+	b.w32(size)
 	return b.b
 }
