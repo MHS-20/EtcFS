@@ -33,6 +33,7 @@ import (
 const (
 	PrefixInode      = "inode:"
 	PrefixDirent     = "dirent:"
+	PrefixXattr      = "xattr:"
 	PrefixLock       = "lock:"
 	PrefixArena      = "arena:"
 	PrefixExtent     = "extent:"
@@ -150,6 +151,45 @@ func ParseDirentKey(key string) (parent uint64, name string, ok bool) {
 		return 0, "", false
 	}
 	return parent, name, true
+}
+
+// Extended attribute keys.
+//
+//	xattr:<ino>/<name>
+//
+// Deliberately the same shape as a dirent key, and for the same reason: one
+// key per attribute makes a single attribute readable, writable and removable
+// without rewriting the others, and makes "every attribute of this inode" a
+// prefix scan.  A single packed value per inode would turn every setxattr into
+// a read-modify-write of the whole set, which is both slower and a lost-update
+// race between two nodes setting different attributes at once.
+//
+// An attribute name may contain any byte but '/' and NUL — the same constraint
+// a dirent name carries — so the split below is unambiguous.
+func XattrKey(ino uint64, name string) string {
+	return fmt.Sprintf("%s%d/%s", PrefixXattr, ino, name)
+}
+
+// XattrPrefix covers every attribute of one inode.
+func XattrPrefix(ino uint64) string {
+	return fmt.Sprintf("%s%d/", PrefixXattr, ino)
+}
+
+// ParseXattrKey splits an xattr key back into its inode and attribute name.
+func ParseXattrKey(key string) (ino uint64, name string, ok bool) {
+	rest, found := strings.CutPrefix(key, PrefixXattr)
+	if !found {
+		return 0, "", false
+	}
+	inoStr, name, found := strings.Cut(rest, "/")
+	if !found {
+		return 0, "", false
+	}
+	ino, err := strconv.ParseUint(inoStr, 10, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	return ino, name, true
 }
 
 // Lock keys.

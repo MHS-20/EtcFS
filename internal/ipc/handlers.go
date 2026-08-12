@@ -38,6 +38,10 @@ func errnoFor(err error, fallback int32) int32 {
 		return -39 // ENOTEMPTY
 	case errors.Is(err, metadata.ErrPerm):
 		return -1 // EPERM
+	case errors.Is(err, metadata.ErrNoData):
+		return -61 // ENODATA
+	case errors.Is(err, metadata.ErrTooBig):
+		return -7 // E2BIG
 	}
 	return fallback
 }

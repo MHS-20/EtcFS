@@ -45,6 +45,10 @@
 #define IPC_OP_MKNOD       25
 #define IPC_OP_FLUSH       26
 #define IPC_OP_READDIRPLUS 29
+#define IPC_OP_SETXATTR    30
+#define IPC_OP_GETXATTR    31
+#define IPC_OP_LISTXATTR   32
+#define IPC_OP_REMOVEXATTR 33
 
 /* Must match maxFrameLen in internal/ipc/socket.go. */
 #define IPC_MAX_FRAME_LEN (1u << 20)
@@ -52,6 +56,12 @@
 #define MAX_NAME_LEN 255
 /* A symlink target is a path, not a name: bounded by PATH_MAX, not NAME_MAX. */
 #define MAX_TARGET_LEN 4095
+
+/* Extended attributes: the kernel's own XATTR_NAME_MAX and XATTR_SIZE_MAX.
+ * The Go side enforces the same two numbers, because it is etcd -- not this
+ * process -- that an oversized value would actually hurt. */
+#define MAX_XATTR_NAME_LEN  255
+#define MAX_XATTR_VALUE_LEN 65536
 
 static int send_full(int fd, const void *buf, size_t len)
 {
@@ -1090,6 +1100,180 @@ static void ec_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
     fuse_reply_err(req, ENOSYS);
 }
 
+/* ---- extended attributes ----
+ *
+ * getxattr and listxattr are each called twice by the kernel: once with
+ * size 0, which asks only how many bytes the answer needs, and again with a
+ * buffer of that size.  The backend does not know which call this is and
+ * always returns the whole answer; deciding between fuse_reply_xattr (the
+ * size) and fuse_reply_buf (the bytes) is this side's job, and so is the
+ * ERANGE that a buffer too small for the answer earns.
+ */
+
+static void reply_xattr_buf(fuse_req_t req, const uint8_t *data, uint32_t len, size_t size)
+{
+    if (size == 0) {
+        fuse_reply_xattr(req, len);
+        return;
+    }
+    if (size < len) {
+        fuse_reply_err(req, ERANGE);
+        return;
+    }
+    fuse_reply_buf(req, (const char *) data, len);
+}
+
+static void ec_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value,
+                        size_t size, int flags)
+{
+    size_t nlen = strlen(name);
+    if (nlen > MAX_XATTR_NAME_LEN) {
+        fuse_reply_err(req, ERANGE);
+        return;
+    }
+    if (size > MAX_XATTR_VALUE_LEN) {
+        fuse_reply_err(req, E2BIG);
+        return;
+    }
+
+    /* Heap rather than stack: a value may be 64 KiB, which is far past what
+     * this thread's stack should be carrying per request. */
+    uint32_t plen = 8 + 4 + (uint32_t) nlen + 4 + (uint32_t) size + 4 + 4 * 2;
+    uint8_t *payload = malloc(plen);
+    if (!payload) {
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+    uint32_t off = 0;
+    off += wb_u64(payload + off, ino);
+    off += wb_u32(payload + off, (uint32_t) nlen);
+    memcpy(payload + off, name, nlen);
+    off += (uint32_t) nlen;
+    off += wb_u32(payload + off, (uint32_t) size);
+    memcpy(payload + off, value, size);
+    off += (uint32_t) size;
+    off += wb_u32(payload + off, (uint32_t) flags);
+    off += wb_creds(payload + off, req);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    int rc = ipc_sync(FD(ctx), IPC_OP_SETXATTR, payload, off, &resp, &rlen);
+    free(payload);
+    if (rc < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
+    free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    fuse_reply_err(req, -e);
+}
+
+static void ec_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
+{
+    size_t nlen = strlen(name);
+    if (nlen > MAX_XATTR_NAME_LEN) {
+        fuse_reply_err(req, ERANGE);
+        return;
+    }
+    uint8_t payload[8 + 4 + MAX_XATTR_NAME_LEN];
+    uint32_t off = 0;
+    off += wb_u64(payload + off, ino);
+    off += wb_u32(payload + off, (uint32_t) nlen);
+    memcpy(payload + off, name, nlen);
+    off += (uint32_t) nlen;
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_GETXATTR, payload, off, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
+    if (e != 0) {
+        fuse_reply_err(req, -e);
+        free(resp);
+        return;
+    }
+    uint32_t vlen = rb_u32(&rb);
+    const uint8_t *value = rb_bytes(&rb, vlen);
+    if (!value) {
+        fuse_reply_err(req, EIO);
+        free(resp);
+        return;
+    }
+    reply_xattr_buf(req, value, vlen, size);
+    free(resp);
+}
+
+static void ec_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
+{
+    uint8_t payload[8];
+    wb_u64(payload, ino);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_LISTXATTR, payload, 8, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
+    if (e != 0) {
+        fuse_reply_err(req, -e);
+        free(resp);
+        return;
+    }
+    uint32_t nlen = rb_u32(&rb);
+    /* An inode with no attributes answers zero bytes, which rb_bytes reports
+     * as NULL without it being a decoding failure -- the empty list is a
+     * perfectly ordinary answer and must not become EIO. */
+    const uint8_t *names = nlen > 0 ? rb_bytes(&rb, nlen) : (const uint8_t *) "";
+    if (!names) {
+        fuse_reply_err(req, EIO);
+        free(resp);
+        return;
+    }
+    reply_xattr_buf(req, names, nlen, size);
+    free(resp);
+}
+
+static void ec_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
+{
+    size_t nlen = strlen(name);
+    if (nlen > MAX_XATTR_NAME_LEN) {
+        fuse_reply_err(req, ERANGE);
+        return;
+    }
+    uint8_t payload[8 + 4 + MAX_XATTR_NAME_LEN + 4 * 2];
+    uint32_t off = 0;
+    off += wb_u64(payload + off, ino);
+    off += wb_u32(payload + off, (uint32_t) nlen);
+    memcpy(payload + off, name, nlen);
+    off += (uint32_t) nlen;
+    off += wb_creds(payload + off, req);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_REMOVEXATTR, payload, off, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
+    free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    fuse_reply_err(req, -e);
+}
+
 /* ---- op table ---- */
 
 struct fuse_lowlevel_ops *etcfs_fuse_ops(void)
@@ -1121,6 +1305,10 @@ struct fuse_lowlevel_ops *etcfs_fuse_ops(void)
     ops.fsyncdir = ec_fsyncdir;
     ops.read = ec_read;
     ops.fallocate = ec_fallocate;
+    ops.setxattr = ec_setxattr;
+    ops.getxattr = ec_getxattr;
+    ops.listxattr = ec_listxattr;
+    ops.removexattr = ec_removexattr;
     /* getlk/setlk are deliberately left unset. libfuse: "if the locking
      * methods are not implemented, the kernel will still allow file locking
      * to work locally." Implementing them takes that job away from the

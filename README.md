@@ -150,7 +150,7 @@ Node restart is therefore cheap versus GFS2-style recovery: reconnect to etcd, r
 
 ## POSIX semantics: what's supported, what's not
 
-Supported: standard file/directory CRUD, `read`/`write`/`truncate`, `rename` (including cross-directory), hard links, symlinks, `flock`/`fcntl` byte-range and whole-file locks (data-lock class above), directory listing via `readdir`/`readdirplus`.
+Supported: standard file/directory CRUD, `read`/`write`/`truncate`, `rename` (including cross-directory), hard links, symlinks, `flock`/`fcntl` byte-range and whole-file locks (data-lock class above), directory listing via `readdir`/`readdirplus`, extended attributes (`getfattr`/`setfattr`, SELinux labels, POSIX ACLs stored as attributes).
 
 Not supported: shared writable `mmap` across nodes (see [Locking](#locking)) — an explicit rejected case, not an ambiguous gap. Multi-node coherence for other unusual access patterns is documented per-subsystem in `docs/architecture/`; when in doubt, check [`docs/architecture/consistency/multi-node-coherence.md`](docs/architecture/consistency/multi-node-coherence.md) and [`docs/architecture/consistency/cache-coherence.md`](docs/architecture/consistency/cache-coherence.md) before assuming a POSIX guarantee holds identically to a local filesystem.
 

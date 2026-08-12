@@ -57,6 +57,12 @@ var (
 	// ErrPerm: the operation is not permitted on this kind of inode, such as a
 	// hard link to a directory.
 	ErrPerm = fmt.Errorf("operation not permitted")
+	// ErrNoData: the named extended attribute does not exist.  Distinct from
+	// ErrNotFound, which says the inode itself is missing — getxattr(2)
+	// separates the two as ENODATA and ENOENT.
+	ErrNoData = fmt.Errorf("no such attribute")
+	// ErrTooBig: the value exceeds the size the store accepts for it.
+	ErrTooBig = fmt.Errorf("value too large")
 )
 
 // lockSession returns the lease every lock on this node is written under,

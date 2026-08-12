@@ -18,7 +18,7 @@ in public.
 ## Reporting
 
 Report unacceptable behaviour privately to the maintainers at
-<mhs061118@gmail.com>. Reports are handled confidentially, and the reporter's
+<muhamad.salman2001@gmail.com>. Reports are handled confidentially, and the reporter's
 identity is not shared with the person reported.
 
 Maintainers who do not follow or enforce this code in good faith are subject to

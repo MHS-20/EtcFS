@@ -46,6 +46,11 @@ const (
 	ipcOpMknod       = 25
 	ipcOpFlush       = 26
 	ipcOpReadDirPlus = 29
+
+	ipcOpSetxattr    = 30
+	ipcOpGetxattr    = 31
+	ipcOpListxattr   = 32
+	ipcOpRemovexattr = 33
 )
 
 // op describes one IPC operation: the name its metrics and logs carry, and the
@@ -94,6 +99,10 @@ var ops = map[uint16]op{
 	ipcOpSymlink:     {"symlink", (*Service).handleSymlink},
 	ipcOpLink:        {"link", (*Service).handleLink},
 	ipcOpMknod:       {"mknod", (*Service).handleMknod},
+	ipcOpSetxattr:    {"setxattr", (*Service).handleSetxattr},
+	ipcOpGetxattr:    {"getxattr", (*Service).handleGetxattr},
+	ipcOpListxattr:   {"listxattr", (*Service).handleListxattr},
+	ipcOpRemovexattr: {"removexattr", (*Service).handleRemovexattr},
 	ipcOpOpen:        {"open", ok},
 	ipcOpOpendir:     {"opendir", ok},
 	ipcOpRelease:     {"release", ok},
@@ -111,16 +120,18 @@ var ops = map[uint16]op{
 // is safe to serve: it changes no metadata and touches the device only to
 // read it.
 var mutatingOps = map[uint16]bool{
-	ipcOpCreate:  true,
-	ipcOpMkdir:   true,
-	ipcOpUnlink:  true,
-	ipcOpRmdir:   true,
-	ipcOpRename:  true,
-	ipcOpSymlink: true,
-	ipcOpLink:    true,
-	ipcOpMknod:   true,
-	ipcOpSetattr: true,
-	ipcOpWrite:   true,
+	ipcOpCreate:      true,
+	ipcOpMkdir:       true,
+	ipcOpUnlink:      true,
+	ipcOpRmdir:       true,
+	ipcOpRename:      true,
+	ipcOpSymlink:     true,
+	ipcOpLink:        true,
+	ipcOpMknod:       true,
+	ipcOpSetattr:     true,
+	ipcOpWrite:       true,
+	ipcOpSetxattr:    true,
+	ipcOpRemovexattr: true,
 }
 
 func opName(code uint16) string {

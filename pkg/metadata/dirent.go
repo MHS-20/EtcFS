@@ -448,14 +448,25 @@ func (s *Store) unlinkInodeOps(rec *InodeRecord) []clientv3.Op {
 	// removes it outright.  Decrementing instead would leave the record behind
 	// with a count no path can ever bring back to zero.
 	if rec.Mode&S_IFMT == ModeDir {
-		return []clientv3.Op{clientv3.OpDelete(InodeKey(rec.Ino))}
+		return []clientv3.Op{
+			clientv3.OpDelete(InodeKey(rec.Ino)),
+			clientv3.OpDelete(XattrPrefix(rec.Ino), clientv3.WithPrefix()),
+		}
 	}
+	// A surviving hard link keeps the inode, and the attributes belong to the
+	// inode rather than to the name being removed, so they stay.
 	if rec.Nlink > 1 {
 		reduced := *rec
 		reduced.Nlink--
 		return []clientv3.Op{clientv3.OpPut(InodeKey(rec.Ino), string(EncodeInode(&reduced)))}
 	}
-	ops := []clientv3.Op{clientv3.OpDelete(InodeKey(rec.Ino))}
+	ops := []clientv3.Op{
+		clientv3.OpDelete(InodeKey(rec.Ino)),
+		// Extended attributes are owned outright by the inode, so they go with
+		// it.  Left behind they would leak a key per attribute, and — worse —
+		// a later inode reusing this number would inherit them.
+		clientv3.OpDelete(XattrPrefix(rec.Ino), clientv3.WithPrefix()),
+	}
 	// A symlink's target lives in its own key, which nothing else references —
 	// leaving it behind leaks a key per deleted symlink, and no check looks for
 	// one.
