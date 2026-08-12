@@ -3,6 +3,8 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -247,6 +249,22 @@ func (s *Store) AtomicLink(ctx context.Context, ino, parent uint64, name string)
 // freed. Losing either comparison is contention, so the work is redone against
 // fresh state rather than reported as a failure.
 func (s *Store) AtomicUnlink(ctx context.Context, parent uint64, name string) error {
+	return s.AtomicUnlinkKeepingOpen(ctx, parent, name, nil)
+}
+
+// AtomicUnlinkKeepingOpen is AtomicUnlink with a say in what happens to an
+// inode that loses its last name: when heldOpen reports the inode still has a
+// descriptor on this node, the record survives with a link count of zero and an
+// orphan:<node>/<ino> key marking who must finish the job.
+//
+// POSIX requires the file to stay readable through an open descriptor after its
+// last name is gone. Only this node's descriptors are known here — a peer
+// unlinking a file this node holds open still takes it away, which is the
+// limitation an open-count in etcd would close at the cost of a round trip on
+// every open.
+func (s *Store) AtomicUnlinkKeepingOpen(ctx context.Context, parent uint64, name string,
+	heldOpen func(ino uint64) bool) error {
+
 	return retryCAS(ctx, fmt.Sprintf("atomic unlink %d/%q", parent, name), func() (bool, error) {
 		fail := func(format string, args ...any) (bool, error) {
 			prefix := fmt.Sprintf("atomic unlink %d/%q: ", parent, name)
@@ -275,7 +293,19 @@ func (s *Store) AtomicUnlink(ctx context.Context, parent uint64, name string) er
 			clientv3.Compare(clientv3.ModRevision(direntKey), "=", direntKvs[0].ModRevision),
 			InodeUnchanged(ino, rev),
 		}
-		ops := append([]clientv3.Op{DeleteDirent(parent, name)}, s.unlinkInodeOps(rec)...)
+		var tail []clientv3.Op
+		if rec.Nlink <= 1 && rec.Mode&S_IFMT != ModeDir && heldOpen != nil && heldOpen(ino) {
+			orphaned := *rec
+			orphaned.Nlink = 0
+			orphaned.Ctime = time.Now()
+			tail = []clientv3.Op{
+				clientv3.OpPut(InodeKey(ino), string(EncodeInode(&orphaned))),
+				clientv3.OpPut(OrphanKey(s.NodeID(), ino), ""),
+			}
+		} else {
+			tail = s.unlinkInodeOps(rec)
+		}
+		ops := append([]clientv3.Op{DeleteDirent(parent, name)}, tail...)
 		ok, err := s.Txn(ctx, cmps, ops, nil)
 		if ok && err == nil {
 			s.touchDir(ctx, parent)
@@ -522,6 +552,42 @@ func (s *Store) unlinkInodeOps(rec *InodeRecord) []clientv3.Op {
 		ops = append(ops, clientv3.OpDelete(InodeSymlinkKey(rec.Ino)))
 	}
 	return ops
+}
+
+// DeleteOrphan removes an inode this node was keeping alive for an open
+// descriptor, once the last one closes. The extents are left to the scrubber,
+// exactly as an ordinary unlink leaves them.
+func (s *Store) DeleteOrphan(ctx context.Context, ino uint64) error {
+	rec, err := s.GetInode(ctx, ino)
+	if err != nil {
+		return fmt.Errorf("delete orphan %d: %w", ino, err)
+	}
+	ops := []clientv3.Op{clientv3.OpDelete(OrphanKey(s.NodeID(), ino))}
+	if rec != nil && rec.Nlink == 0 {
+		ops = append(ops, s.unlinkInodeOps(rec)...)
+	}
+	if _, err := s.Txn(ctx, nil, ops, nil); err != nil {
+		return fmt.Errorf("delete orphan %d: %w", ino, err)
+	}
+	return nil
+}
+
+// ListOrphans returns the inodes a node left behind, which is non-empty only
+// after that node died holding an unlinked file open.
+func (s *Store) ListOrphans(ctx context.Context, node string) ([]uint64, error) {
+	kvs, err := s.GetPrefix(ctx, OrphanPrefix(node))
+	if err != nil {
+		return nil, fmt.Errorf("list orphans of %q: %w", node, err)
+	}
+	inos := make([]uint64, 0, len(kvs))
+	for _, kv := range kvs {
+		ino, perr := strconv.ParseUint(strings.TrimPrefix(string(kv.Key), OrphanPrefix(node)), 10, 64)
+		if perr != nil {
+			continue
+		}
+		inos = append(inos, ino)
+	}
+	return inos, nil
 }
 
 func (s *Store) commitRename(ctx context.Context, cmps []clientv3.Cmp, ops []clientv3.Op) error {

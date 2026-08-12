@@ -597,33 +597,30 @@ static void ec_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     struct etcfs_context *ctx = fuse_req_userdata(req);
 
-    /* Open needs no shared state, so it is answered locally — except for
-     * O_TRUNC, which empties the file and is therefore metadata work.  Sending
-     * the request unconditionally would put a round trip in front of every
-     * reader for a flag almost none of them set. */
-    if (fi->flags & O_TRUNC) {
-        uint8_t payload[8 + 4];
-        uint32_t off = 0;
-        off += wb_u64(payload + off, ino);
-        off += wb_u32(payload + off, (uint32_t) fi->flags);
+    /* The backend has to see every open: O_TRUNC empties the file, and the
+     * descriptor is counted there so that unlinking the file's last name can
+     * keep the record alive until the last close. */
+    uint8_t payload[8 + 4];
+    uint32_t off = 0;
+    off += wb_u64(payload + off, ino);
+    off += wb_u32(payload + off, (uint32_t) fi->flags);
 
-        uint8_t *resp;
-        uint32_t rlen;
-        if (ipc_sync(FD(ctx), IPC_OP_OPEN, payload, off, &resp, &rlen) < 0) {
-            fuse_reply_err(req, EIO);
-            return;
-        }
-        struct rbuf rb = rb_new(resp, rlen);
-        int32_t e = rb_i32(&rb);
-        free(resp);
-        if (!rb.ok) {
-            fuse_reply_err(req, EIO);
-            return;
-        }
-        if (e != 0) {
-            fuse_reply_err(req, -e);
-            return;
-        }
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_OPEN, payload, off, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
+    free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    if (e != 0) {
+        fuse_reply_err(req, -e);
+        return;
     }
 
     fi->fh = next_file_handle(ctx);
@@ -1058,10 +1055,21 @@ static void ec_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
 
 /* ---- no-op handlers ---- */
 
+/* Release is where an unlinked-but-open file finally goes: the backend counts
+ * this node's descriptors, so it is the only place that knows the last one has
+ * closed.  A failure is not reported — the descriptor is gone either way, and
+ * the leftover record is reclaimed at the next startup. */
 static void ec_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    (void) ino;
     (void) fi;
+    uint8_t payload[8];
+    uint32_t off = wb_u64(payload, ino);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_RELEASE, payload, off, &resp, &rlen) == 0)
+        free(resp);
+
     fuse_reply_err(req, 0);
 }
 static void ec_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)

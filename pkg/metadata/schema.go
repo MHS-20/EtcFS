@@ -42,6 +42,9 @@ const (
 	PrefixMembership = "membership:"
 	PrefixGen        = "gen:"
 	PrefixArenaLog   = "arena_alloc_log"
+	// PrefixOrphan names a file whose last directory entry is gone but which a
+	// node still holds open, so it may not be deleted yet.
+	PrefixOrphan = "orphan:"
 
 	// Fencing control plane — see fence.go.
 	PrefixFencePending = "fence_pending:"
@@ -139,6 +142,16 @@ func ClearSetIDOnWrite(mode, uid uint32) uint32 {
 }
 
 // Key helpers — build etcd keys from components.
+
+// OrphanKey names an inode a node is keeping alive past its last unlink.
+func OrphanKey(node string, ino uint64) string {
+	return fmt.Sprintf("%s%s/%d", PrefixOrphan, node, ino)
+}
+
+// OrphanPrefix is every inode one node is keeping alive.
+func OrphanPrefix(node string) string {
+	return fmt.Sprintf("%s%s/", PrefixOrphan, node)
+}
 
 func InodeKey(ino uint64) string {
 	return fmt.Sprintf("%s%d", PrefixInode, ino)

@@ -109,7 +109,7 @@ var ops = map[uint16]op{
 	ipcOpFallocate:   {"fallocate", (*Service).handleFallocate},
 	ipcOpOpen:        {"open", (*Service).handleOpen},
 	ipcOpOpendir:     {"opendir", ok},
-	ipcOpRelease:     {"release", ok},
+	ipcOpRelease:     {"release", (*Service).handleRelease},
 	ipcOpReleasedir:  {"releasedir", ok},
 	ipcOpFlush:       {"flush", ok},
 	ipcOpFsync:       {"fsync", ok},

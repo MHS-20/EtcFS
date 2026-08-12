@@ -486,3 +486,77 @@ func TestIntegration_WriteClearsSetIDBits(t *testing.T) {
 		t.Errorf("a write by root cleared the set-user-ID bit: mode = %#o", rec.Mode)
 	}
 }
+
+// A file with an open descriptor has to survive the unlink of its last name:
+// the record used to go immediately, so a read through the descriptor came
+// back ENOENT and tmpfile(3)-style scratch files were unusable.
+func TestIntegration_UnlinkKeepsAnOpenFileAlive(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino = 7008
+	name := t.Name()
+	seedFile(t, store, ino, metadata.ModeFile|0644)
+
+	var oq buf
+	oq.w64(ino)
+	oq.w32(0)
+	if _, err := svc.handleOpen(ctx, oq.b); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	payloadData := []byte("still here")
+	if _, err := svc.handleWrite(ctx, writePayload(ino, 0, payloadData, 0)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var uq buf
+	uq.w64(metadata.RootIno)
+	uq.w32(uint32(len(name)))
+	uq.b = append(uq.b, name...)
+	if _, err := svc.handleUnlink(ctx, uq.b); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+
+	rec, err := store.GetInode(ctx, ino)
+	if err != nil {
+		t.Fatalf("read back inode: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("unlink deleted an inode that was still open")
+	}
+	if rec.Nlink != 0 {
+		t.Errorf("nlink = %d after the last name went, want 0", rec.Nlink)
+	}
+
+	var rq buf
+	rq.w64(ino)
+	rq.w64(0)
+	rq.w32(4096)
+	resp, err := svc.handleRead(ctx, rq.b)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := readPayload(t, resp); !bytes.Equal(got, payloadData) {
+		t.Errorf("read through the open descriptor returned %q, want %q", got, payloadData)
+	}
+
+	// The last close is what finally removes it.
+	var rel buf
+	rel.w64(ino)
+	if _, err := svc.handleRelease(ctx, rel.b); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	rec, err = store.GetInode(ctx, ino)
+	if err != nil {
+		t.Fatalf("read back inode: %v", err)
+	}
+	if rec != nil {
+		t.Error("the last release left the inode behind")
+	}
+	orphans, err := store.ListOrphans(ctx, store.NodeID())
+	if err != nil {
+		t.Fatalf("list orphans: %v", err)
+	}
+	if len(orphans) != 0 {
+		t.Errorf("orphan marker survived the last release: %v", orphans)
+	}
+}

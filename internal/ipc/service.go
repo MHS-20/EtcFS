@@ -40,6 +40,14 @@ type Service struct {
 	// rather than a call site to remember.
 	readOnly bool
 
+	// openFiles counts this node's open descriptors per inode, so an unlink of
+	// the last name can keep the record alive until the last one closes.
+	openMu    sync.Mutex
+	openCount map[uint64]int
+	// orphaned holds inodes this node unlinked while it still had them open:
+	// the last release deletes the record.
+	orphaned map[uint64]bool
+
 	// Fencing generation this node started with.  Every data-path commit is
 	// guarded against it, so once the fencing controller bumps gen:<node_id>
 	// this node's commits stop being accepted by etcd.
@@ -57,6 +65,8 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		watchdog:   watchdog,
 		alloc:      arena.NewAllocator(membership.NodeID(), store),
 		log:        log,
+		openCount:  make(map[uint64]int),
+		orphaned:   make(map[uint64]bool),
 	}
 }
 
@@ -70,6 +80,24 @@ func (s *Service) SetBlockDevice(dev *blockio.Device, barriers bool) {
 	// The allocator hands out arenas by multiplying an ID by the arena size,
 	// with nothing else to stop it running past the end of the device.
 	s.alloc.SetDeviceSize(uint64(dev.TotalSize()))
+}
+
+// ReclaimOrphans deletes the inodes a previous incarnation of this node was
+// keeping alive for open descriptors that died with it. Nothing names them and
+// no descriptor survives a restart, so they are pure leak from here on.
+func (s *Service) ReclaimOrphans(ctx context.Context) {
+	inos, err := s.store.ListOrphans(ctx, s.membership.NodeID())
+	if err != nil {
+		s.log.Warn("cannot list orphaned inodes", "error", err)
+		return
+	}
+	for _, ino := range inos {
+		if err := s.store.DeleteOrphan(ctx, ino); err != nil {
+			s.log.Warn("cannot delete orphaned inode", "ino", ino, "error", err)
+			continue
+		}
+		s.log.Info("reclaimed an inode left open by a previous run", "ino", ino)
+	}
 }
 
 // SetReadOnly rejects every mutating opcode with EROFS. Intended for mounting

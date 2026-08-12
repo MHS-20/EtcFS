@@ -313,6 +313,10 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errnoFor(err, -17)), nil // EEXIST unless fenced
 	}
 
+	// A create hands back an open descriptor, and the release that closes it
+	// arrives like any other, so it has to be counted like any other.
+	s.retain(rec.Ino)
+
 	return entryResp(rec.Ino, rec), nil
 }
 
@@ -322,23 +326,81 @@ const oTrunc = 0x200
 // OPEN payload: [u64:ino][u32:flags]
 // Response: [i32:error]
 //
-// The C daemon answers open locally and sends this request only for O_TRUNC:
-// truncating is metadata work, but a round trip on every open would make each
-// reader pay for a case almost none of them hit.
+// Two things happen here that cannot be answered on the C side: O_TRUNC empties
+// the file, and the descriptor is counted so that unlinking the file's last
+// name keeps the record alive until the last close.
 func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error) {
 	r := newReader(payload)
 	ino, flags := r.u64(), r.u32()
 	if !r.ok {
 		return int32Resp(-22), nil
 	}
-	if flags&oTrunc == 0 {
-		return okResp(), nil
+	if flags&oTrunc != 0 {
+		if err := s.truncateToZero(ctx, ino); err != nil {
+			s.log.Warn("open: truncate failed", "ino", ino, "error", err)
+			return int32Resp(errnoFor(err, -5)), nil
+		}
 	}
-	if err := s.truncateToZero(ctx, ino); err != nil {
-		s.log.Warn("open: truncate failed", "ino", ino, "error", err)
-		return int32Resp(errnoFor(err, -5)), nil
+	s.retain(ino)
+	return okResp(), nil
+}
+
+// RELEASE payload: [u64:ino]
+// Response: [i32:error]
+func (s *Service) handleRelease(ctx context.Context, payload []byte) ([]byte, error) {
+	r := newReader(payload)
+	ino := r.u64()
+	if !r.ok {
+		return int32Resp(-22), nil
+	}
+	if s.release(ino) {
+		// The last descriptor on a file whose names are all gone: nothing can
+		// reach it any more, so the record and its attributes go now. Its
+		// extents are left to the scrubber, exactly as an ordinary unlink
+		// leaves them.
+		if err := s.store.DeleteOrphan(ctx, ino); err != nil {
+			s.log.Warn("release: cannot delete orphaned inode", "ino", ino, "error", err)
+		}
 	}
 	return okResp(), nil
+}
+
+// retain records one more open descriptor for an inode on this node.
+func (s *Service) retain(ino uint64) {
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+	s.openCount[ino]++
+}
+
+// release drops one descriptor and reports whether the inode was the last one
+// standing for a file that has already lost its name.
+func (s *Service) release(ino uint64) bool {
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+	if s.openCount[ino] > 1 {
+		s.openCount[ino]--
+		return false
+	}
+	delete(s.openCount, ino)
+	if s.orphaned[ino] {
+		delete(s.orphaned, ino)
+		return true
+	}
+	return false
+}
+
+// heldOpen reports whether this node still has the inode open, and remembers
+// that its deletion is now this node's responsibility.  Called from inside the
+// unlink transaction's planning, under the same lock a release takes, so a
+// close racing the unlink cannot leave the record with nobody to remove it.
+func (s *Service) heldOpen(ino uint64) bool {
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+	if s.openCount[ino] == 0 {
+		return false
+	}
+	s.orphaned[ino] = true
+	return true
 }
 
 // MKDIR payload:  [u64:parent][u32:name_len][name][u32:mode][u32:umask][u32:uid][u32:gid]
@@ -373,7 +435,7 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(-22), nil
 	}
 
-	err := s.store.AtomicUnlink(ctx, parent, name)
+	err := s.store.AtomicUnlinkKeepingOpen(ctx, parent, name, s.heldOpen)
 	if err != nil {
 		return int32Resp(errnoFor(err, -2)), nil // ENOENT unless fenced
 	}
