@@ -211,6 +211,87 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, f
 		}
 	}
 
+	// Capture the incarnation this fence is acting against, and re-check it
+	// before every step that cannot be taken back.
+	//
+	// fenceNode's gate -- the membership check in the sweep, or the DELETE
+	// event on the watch path -- establishes the node is gone at the moment
+	// the fence begins, and nothing re-established it afterwards.  A node that
+	// restarts inside the fence was fenced anyway: cut off from the device,
+	// left with a cached startGen one behind the cluster's so every write
+	// failed EIO for the life of the process, and -- once it had legitimately
+	// re-claimed an arena -- that arena released out from under it to a peer,
+	// putting two live nodes in one range.  Found by TLC, not by fault
+	// injection, which had never produced the interleaving; the trace is in
+	// docs/verification/tla-plus.md.
+	//
+	// The check is on incarnation rather than liveness because liveness is
+	// not enough, and the model rejects it: a node can depart, restart,
+	// re-claim an arena and depart again, and be equally absent at both ends
+	// while being a different node in between.  The intent's create-revision
+	// distinguishes them -- it survives the re-recording of an intent for the
+	// same departure, and changes when the node came back (Membership drops
+	// the intent as it re-registers) and then left again.
+	intentRev, intentExists, err := c.store.FenceIntentRevision(ctx, nodeID)
+	if err != nil {
+		c.log.Error("cannot read fence intent revision, skipping this attempt",
+			"node", nodeID, "error", err)
+		return
+	}
+
+	// Reports whether this fence is still acting on the incarnation it started
+	// against.  A false answer means the node came back: the intent was
+	// dropped as it re-registered, or dropped and re-made for a later
+	// departure that is a different fence's business.
+	//
+	// A missing intent at the start is NOT treated as "nothing to fence".  On
+	// the watch path fenceNode runs even when RecordFenceIntent failed, and
+	// refusing to fence without one would turn a fence that merely cannot be
+	// retried into a fence that never happens -- trading a duplicate for a
+	// miss, which is the worse of the two.  Instead the check degrades to the
+	// weaker question the intent would otherwise answer precisely: is the node
+	// live again right now.  That misses the depart-restart-depart case, which
+	// is why it is the fallback and not the mechanism.
+	sameIncarnation := func(step string) bool {
+		if !intentExists {
+			alive, aerr := c.store.Get(ctx, metadata.MembershipKey(nodeID))
+			if aerr != nil {
+				c.log.Error("cannot re-check membership, continuing without the check",
+					"node", nodeID, "step", step, "error", aerr)
+				return true
+			}
+			if alive != nil {
+				c.log.Info("node is live again mid-fence, abandoning it",
+					"node", nodeID, "step", step)
+				return false
+			}
+			return true
+		}
+
+		rev, ok, rerr := c.store.FenceIntentRevision(ctx, nodeID)
+		switch {
+		case rerr != nil:
+			c.log.Error("cannot re-check fence intent, abandoning this attempt",
+				"node", nodeID, "step", step, "error", rerr)
+			return false
+		case !ok:
+			c.log.Info("node came back mid-fence, abandoning it", "node", nodeID, "step", step)
+			return false
+		case rev != intentRev:
+			c.log.Info("node left and returned mid-fence, abandoning this incarnation's fence",
+				"node", nodeID, "step", step, "started_at", intentRev, "now", rev)
+			return false
+		}
+		return true
+	}
+
+	// Severing is irreversible too: it cuts a node off from the device, and
+	// doing that to one that has already come back is how a healthy node ends
+	// up unable to write.
+	if !sameIncarnation("before severing device access") {
+		return
+	}
+
 	c.log.Info("fencing node", "node_id", nodeID, "instance_id", instanceID)
 
 	// Cut the node off from the device *before* bumping the generation, and
@@ -241,6 +322,10 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, f
 		c.log.Info("device access severance confirmed", "node", nodeID, "instance", instanceID)
 	}
 
+	if !sameIncarnation("before generation bump") {
+		return
+	}
+
 	// Get current generation
 	currentGen, err := c.store.GetGeneration(ctx, nodeID)
 	if err != nil {
@@ -267,7 +352,7 @@ func (c *Controller) fenceNode(ctx context.Context, nodeID, instanceID string, f
 	// metadata mutations are rejected, but its kernel may still be writing
 	// bytes, and handing its arena to a live node would put both of them in
 	// the same range.  Leaking the arena is the correct trade there.
-	if c.fencer != nil {
+	if c.fencer != nil && sameIncarnation("before arena release") {
 		released, err := c.store.ReleaseArena(ctx, nodeID)
 		switch {
 		case err != nil:

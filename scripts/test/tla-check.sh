@@ -43,7 +43,7 @@ CHECKS=(
     "FencingNoFencer:pass:"
     "FencingUnreliableFencer:pass:"
     "FencingGuardIsBackstop:pass:"
-    "FencingAsImplemented:fail:NoHealthyNodeSevered"
+    "FencingNoIncarnationCheck:fail:NoHealthyNodeSevered"
     "FencingNoGuard:fail:StaleWriteRejected"
     "FencingArenaBug:fail:ReleasedArenaHasNoLiveWriter"
 )

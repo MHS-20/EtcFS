@@ -67,6 +67,28 @@ func (s *Store) ClearFenceIntent(ctx context.Context, nodeID string) error {
 	return nil
 }
 
+// FenceIntentRevision returns the create-revision of a node's fence intent,
+// and whether the intent exists at all.
+//
+// This is the fence's incarnation marker.  etcd keeps a key's create-revision
+// stable across overwrites, so re-recording an intent for the same departure
+// leaves it unchanged; it moves only when the key has been deleted and made
+// again, which happens exactly when the node came back and then left once
+// more.  A fence that captures this at its start and re-checks it before each
+// irreversible step is therefore comparing incarnations, not liveness -- and
+// liveness is not enough, because a node that departs, restarts, and departs
+// again is absent at both ends while being a different node in between.
+func (s *Store) FenceIntentRevision(ctx context.Context, nodeID string) (int64, bool, error) {
+	resp, err := s.client.Get(ctx, FencePendingKey(nodeID))
+	if err != nil {
+		return 0, false, fmt.Errorf("read fence intent revision %s: %w", nodeID, err)
+	}
+	if len(resp.Kvs) == 0 {
+		return 0, false, nil
+	}
+	return resp.Kvs[0].CreateRevision, true, nil
+}
+
 // ListFenceIntents returns every node currently owed a fence, mapped to the
 // instance ID recorded for it (empty where none was known).
 func (s *Store) ListFenceIntents(ctx context.Context) (map[string]string, error) {

@@ -371,3 +371,85 @@ func TestController_SweepFencesANodeNoEventWasSeenFor(t *testing.T) {
 	c.reconcile(ctx)
 	assert.Equal(t, 2, stub.called, "a second departure is a second fence")
 }
+
+// restartingFencer simulates the node coming back while the fence is in
+// flight: the restart lands between the controller's gate and the steps that
+// cannot be taken back.  Membership.grantAndRegister drops the node's fence
+// intent as it re-registers, so that is what this does too.
+type restartingFencer struct {
+	called int
+	store  *metadata.Store
+	cli    *clientv3.Client
+	nodeID string
+	// leaveAgain re-creates the intent afterwards, modelling the node that
+	// departs, restarts, and departs once more -- absent at both ends, and a
+	// different incarnation in between.
+	leaveAgain bool
+	t          *testing.T
+}
+
+func (f *restartingFencer) Fence(ctx context.Context, _, _ string) error {
+	f.called++
+	_, err := f.cli.Put(ctx, metadata.MembershipKey(f.nodeID), `{"node_id":"`+f.nodeID+`"}`)
+	require.NoError(f.t, err)
+	require.NoError(f.t, f.store.ClearFenceIntent(ctx, f.nodeID))
+	if f.leaveAgain {
+		_, err = f.cli.Delete(ctx, metadata.MembershipKey(f.nodeID))
+		require.NoError(f.t, err)
+		require.NoError(f.t, f.store.RecordFenceIntent(ctx, f.nodeID, "i-second-life"))
+	}
+	return nil
+}
+
+// A node that restarts mid-fence must not be fenced for the departure it has
+// already recovered from.  Before the incarnation check, the fence ran to
+// completion against it: the node came back healthy, was cut off from the
+// device, and was left with a cached startGen one behind the cluster's, so
+// every write it made failed EIO for the life of the process while nothing
+// reported it as unhealthy.  Found by TLC, not by fault injection -- see
+// docs/verification/tla-plus.md.
+func TestController_AbandonsFenceWhenNodeRestartsMidFence(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	cli := etcdtest.Client(t)
+	const victim = "flapping-node"
+
+	require.NoError(t, store.RecordFenceIntent(ctx, victim, "i-0123456789"))
+	c.SetFencer(&restartingFencer{store: store, cli: cli, nodeID: victim, t: t})
+
+	c.fenceNode(ctx, victim, "i-0123456789", false)
+
+	gen, err := store.GetGeneration(ctx, victim)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), gen,
+		"a node that came back must not have its generation bumped out from under it")
+}
+
+// The same, for the case a liveness check cannot catch: the node departs,
+// restarts, and departs again.  It is equally absent at both ends, so only
+// the incarnation the fence started against distinguishes them.  TLC rejected
+// the liveness-only version of this fix on exactly this trace.
+func TestController_AbandonsFenceWhenNodeLeftAndReturned(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	cli := etcdtest.Client(t)
+	const victim = "flapping-node"
+
+	require.NoError(t, store.RecordFenceIntent(ctx, victim, "i-0123456789"))
+	c.SetFencer(&restartingFencer{store: store, cli: cli, nodeID: victim, leaveAgain: true, t: t})
+
+	// The arena this incarnation legitimately re-claimed after restarting.
+	// Releasing it is what would put a peer into a range the node is writing.
+	_, err := cli.Put(ctx, metadata.ArenaOwnerKey(victim, 7), string(metadata.EncodeUint64(7)))
+	require.NoError(t, err)
+
+	c.fenceNode(ctx, victim, "i-0123456789", false)
+
+	gen, gerr := store.GetGeneration(ctx, victim)
+	require.NoError(t, gerr)
+	assert.Equal(t, uint64(0), gen,
+		"the fence must not bump a generation it no longer has the right incarnation for")
+
+	owned, oerr := cli.Get(ctx, metadata.ArenaOwnerKey(victim, 7))
+	require.NoError(t, oerr)
+	assert.Len(t, owned.Kvs, 1,
+		"the arena the restarted node re-claimed must not be released to a peer")
+}

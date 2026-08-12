@@ -158,6 +158,25 @@ func (m *Membership) grantAndRegister(ctx context.Context) (clientv3.LeaseID, er
 		return 0, fmt.Errorf("membership: put key: %w", err)
 	}
 
+	// This node is alive again, so any fence owed for an earlier departure is
+	// moot -- and, more importantly, any fence still in flight for it is now
+	// acting on an incarnation that no longer exists.  Dropping the intent
+	// here is what makes that visible: a fence re-checks the intent's
+	// create-revision before every irreversible step, so clearing it aborts
+	// the stale attempt instead of letting it sever, bump and reclaim a node
+	// that has already come back.  The reconciliation sweep does the same
+	// thing, but only every 30 s, and the window this closes is the one a
+	// fast restart lands in.  See docs/verification/tla-plus.md.
+	//
+	// Best effort: a failure here costs one stale fence that the sweep will
+	// still correct, and must not stop the node registering.
+	if _, derr := m.client.Delete(ctx, FencePendingKey(m.nodeID)); derr != nil {
+		m.reportf("membership: could not drop stale fence intent: %v", derr)
+	}
+	if _, derr := m.client.Delete(ctx, FenceDoneKey(m.nodeID)); derr != nil {
+		m.reportf("membership: could not drop stale fence mark: %v", derr)
+	}
+
 	m.mu.Lock()
 	m.leaseID = resp.ID
 	m.alive = true
