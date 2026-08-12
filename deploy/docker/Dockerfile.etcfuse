@@ -18,7 +18,11 @@ RUN make -C cmd/etcfuse
 
 FROM amazonlinux:2023
 
-RUN dnf install -y fuse3-libs && dnf clean all
+# libfuse shells out to /bin/mount (util-linux) rather than calling mount(2)
+# itself, so a runtime image without it fails fuse_session_mount with ENOENT
+# on every attempt, not a permissions error — easy to misread as a missing
+# CAP_SYS_ADMIN.
+RUN dnf install -y fuse3-libs util-linux && dnf clean all
 
 COPY --from=builder /build/bin/etcfuse /usr/local/bin/etcfuse
 
