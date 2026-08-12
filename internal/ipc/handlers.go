@@ -316,6 +316,31 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 	return entryResp(rec.Ino, rec), nil
 }
 
+// oTrunc is O_TRUNC as the kernel passes it in fuse_file_info.flags.
+const oTrunc = 0x200
+
+// OPEN payload: [u64:ino][u32:flags]
+// Response: [i32:error]
+//
+// The C daemon answers open locally and sends this request only for O_TRUNC:
+// truncating is metadata work, but a round trip on every open would make each
+// reader pay for a case almost none of them hit.
+func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error) {
+	r := newReader(payload)
+	ino, flags := r.u64(), r.u32()
+	if !r.ok {
+		return int32Resp(-22), nil
+	}
+	if flags&oTrunc == 0 {
+		return okResp(), nil
+	}
+	if err := s.truncateToZero(ctx, ino); err != nil {
+		s.log.Warn("open: truncate failed", "ino", ino, "error", err)
+		return int32Resp(errnoFor(err, -5)), nil
+	}
+	return okResp(), nil
+}
+
 // MKDIR payload:  [u64:parent][u32:name_len][name][u32:mode][u32:umask][u32:uid][u32:gid]
 // Response: same as CREATE
 func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 	"unsafe"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -516,6 +517,41 @@ func (s *Service) truncate(ctx context.Context, ino uint64, newSize uint64) erro
 	return retry(ctx, etcdAttempts, func() error {
 		return s.truncateOnce(ctx, ino, newSize)
 	})
+}
+
+// truncateToZero empties a regular file and publishes the new size, with the
+// mtime/ctime update POSIX requires of a truncating open.  Opening a directory
+// or a device node with O_TRUNC changes nothing, and neither does opening a
+// file that is already empty.
+func (s *Service) truncateToZero(ctx context.Context, ino uint64) error {
+	rec, rev, err := s.store.GetInodeRev(ctx, ino)
+	if err != nil {
+		return fmt.Errorf("open truncate ino %d: %w", ino, err)
+	}
+	if rec == nil {
+		return metadata.ErrNotFound
+	}
+	if rec.Mode&metadata.S_IFMT != metadata.ModeFile || rec.Size == 0 {
+		return nil
+	}
+
+	if terr := s.truncate(ctx, ino, 0); terr != nil {
+		return terr
+	}
+
+	rec.Size = 0
+	rec.Mtime = time.Now()
+	rec.Ctime = rec.Mtime
+	ok, err := s.store.Txn(ctx,
+		[]clientv3.Cmp{metadata.InodeUnchanged(ino, rev)},
+		[]clientv3.Op{clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(rec)))}, nil)
+	if err != nil {
+		return fmt.Errorf("open truncate ino %d: %w", ino, err)
+	}
+	if !ok {
+		return fmt.Errorf("open truncate ino %d: %w", ino, metadata.ErrConflict)
+	}
+	return nil
 }
 
 func (s *Service) truncateOnce(ctx context.Context, ino uint64, newSize uint64) error {

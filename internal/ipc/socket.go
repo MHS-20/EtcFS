@@ -107,7 +107,7 @@ var ops = map[uint16]op{
 	ipcOpRemovexattr: {"removexattr", (*Service).handleRemovexattr},
 	ipcOpLseek:       {"lseek", (*Service).handleLseek},
 	ipcOpFallocate:   {"fallocate", (*Service).handleFallocate},
-	ipcOpOpen:        {"open", ok},
+	ipcOpOpen:        {"open", (*Service).handleOpen},
 	ipcOpOpendir:     {"opendir", ok},
 	ipcOpRelease:     {"release", ok},
 	ipcOpReleasedir:  {"releasedir", ok},
@@ -120,9 +120,10 @@ var ops = map[uint16]op{
 }
 
 // mutatingOps are the opcodes a read-only mount rejects with EROFS instead of
-// dispatching. Everything else (lookups, reads, open/release/flush, statfs)
-// is safe to serve: it changes no metadata and touches the device only to
-// read it.
+// dispatching. Everything else (lookups, reads, release/flush, statfs) is safe
+// to serve: it changes no metadata and touches the device only to read it.
+// Open is here because the daemon sends it only for O_TRUNC, which empties the
+// file.
 var mutatingOps = map[uint16]bool{
 	ipcOpCreate:      true,
 	ipcOpMkdir:       true,
@@ -137,6 +138,7 @@ var mutatingOps = map[uint16]bool{
 	ipcOpSetxattr:    true,
 	ipcOpRemovexattr: true,
 	ipcOpFallocate:   true,
+	ipcOpOpen:        true,
 }
 
 func opName(code uint16) string {

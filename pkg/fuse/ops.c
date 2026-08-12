@@ -595,8 +595,37 @@ static void ec_statfs(fuse_req_t req, fuse_ino_t ino)
 
 static void ec_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    (void) ino;
     struct etcfs_context *ctx = fuse_req_userdata(req);
+
+    /* Open needs no shared state, so it is answered locally — except for
+     * O_TRUNC, which empties the file and is therefore metadata work.  Sending
+     * the request unconditionally would put a round trip in front of every
+     * reader for a flag almost none of them set. */
+    if (fi->flags & O_TRUNC) {
+        uint8_t payload[8 + 4];
+        uint32_t off = 0;
+        off += wb_u64(payload + off, ino);
+        off += wb_u32(payload + off, (uint32_t) fi->flags);
+
+        uint8_t *resp;
+        uint32_t rlen;
+        if (ipc_sync(FD(ctx), IPC_OP_OPEN, payload, off, &resp, &rlen) < 0) {
+            fuse_reply_err(req, EIO);
+            return;
+        }
+        struct rbuf rb = rb_new(resp, rlen);
+        int32_t e = rb_i32(&rb);
+        free(resp);
+        if (!rb.ok) {
+            fuse_reply_err(req, EIO);
+            return;
+        }
+        if (e != 0) {
+            fuse_reply_err(req, -e);
+            return;
+        }
+    }
+
     fi->fh = next_file_handle(ctx);
     fi->direct_io = 1;
     fi->keep_cache = 0;

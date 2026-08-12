@@ -394,3 +394,61 @@ func TestIntegration_ReadStopsAtTheEndOfTheFile(t *testing.T) {
 		t.Fatalf("read at EOF returned %d bytes", len(got))
 	}
 }
+
+// O_TRUNC used to be dropped on the floor: the C daemon answered open locally
+// and never told the backend, so `> file` left the old contents in place.
+func TestIntegration_OpenWithTruncEmptiesTheFile(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino = 7005
+	seedFile(t, store, ino, metadata.ModeFile|0644)
+
+	payloadData := []byte("before")
+	var wq buf
+	wq.w64(ino)
+	wq.w64(0)
+	wq.w32(uint32(len(payloadData)))
+	wq.b = append(wq.b, payloadData...)
+	if _, err := svc.handleWrite(ctx, wq.b); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	before, err := store.GetInode(ctx, ino)
+	if err != nil || before == nil {
+		t.Fatalf("read back inode: %v", err)
+	}
+
+	var oq buf
+	oq.w64(ino)
+	oq.w32(oTrunc)
+	resp, err := svc.handleOpen(ctx, oq.b)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if code := int32(uint32(resp[0])<<24 | uint32(resp[1])<<16 | uint32(resp[2])<<8 | uint32(resp[3])); code != 0 {
+		t.Fatalf("open returned errno %d", -code)
+	}
+
+	rec, err := store.GetInode(ctx, ino)
+	if err != nil || rec == nil {
+		t.Fatalf("read back inode: %v", err)
+	}
+	if rec.Size != 0 {
+		t.Errorf("size = %d after O_TRUNC, want 0", rec.Size)
+	}
+	if rec.Mtime.Before(before.Mtime) || rec.Ctime.Before(before.Ctime) {
+		t.Errorf("O_TRUNC moved mtime/ctime backwards: %v/%v", rec.Mtime, rec.Ctime)
+	}
+
+	var rq buf
+	rq.w64(ino)
+	rq.w64(0)
+	rq.w32(4096)
+	resp, err = svc.handleRead(ctx, rq.b)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := readPayload(t, resp); len(got) != 0 {
+		t.Fatalf("read after O_TRUNC returned %d bytes (%q)", len(got), got)
+	}
+}
