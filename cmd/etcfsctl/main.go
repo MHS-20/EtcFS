@@ -56,6 +56,16 @@ func main() {
 	var asJSON bool
 	var timeout time.Duration
 
+	// --json is pulled out of os.Args before flag.Parse rather than declared
+	// as an ordinary flag. flag.Parse stops at the first positional argument,
+	// so a flag placed after the subcommand — "etcfsctl status --json", the
+	// natural way to type it, or "quota set 10 --json --bytes=5" — would
+	// otherwise sit unparsed in the leftover args and be silently ignored
+	// instead of honoured or rejected. Stripping it wherever it appears, before
+	// any positional parsing happens, is what makes it order-independent.
+	rawArgs, jsonRequested := stripJSONFlag(os.Args[1:])
+	asJSON = jsonRequested
+
 	flag.StringVar(&etcdEndpoints, "etcd-endpoints", "http://localhost:2379",
 		"Comma-separated etcd client endpoints")
 	flag.StringVar(&etcdCert, "etcd-cert", "", "Path to etcd client certificate")
@@ -63,9 +73,11 @@ func main() {
 	flag.StringVar(&etcdCA, "etcd-ca", "", "Path to etcd CA certificate")
 	flag.DurationVar(&timeout, "timeout", 10*time.Second,
 		"Bound on the etcd work behind one command; a partitioned cluster would otherwise hang it indefinitely")
-	flag.BoolVar(&asJSON, "json", false, "Emit JSON instead of text")
+	flag.BoolVar(&asJSON, "json", asJSON, "Emit JSON instead of text")
 	flag.Usage = usage
-	flag.Parse()
+	if err := flag.CommandLine.Parse(rawArgs); err != nil {
+		os.Exit(2)
+	}
 
 	args := flag.Args()
 	if len(args) == 0 {
@@ -122,6 +134,22 @@ func main() {
 	if runErr != nil {
 		fatalf("%v", runErr)
 	}
+}
+
+// stripJSONFlag removes every "--json" / "-json" token from args, wherever it
+// appears, and reports whether one was found. The remaining tokens keep their
+// relative order, so a value-bearing flag adjacent to --json (e.g.
+// "--bytes=5 --json") is untouched.
+func stripJSONFlag(args []string) (rest []string, found bool) {
+	rest = make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "--json" || a == "-json" {
+			found = true
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return rest, found
 }
 
 func usage() {
