@@ -178,8 +178,13 @@ jobs:
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
 
+      # GOTOOLCHAIN=auto, not the job-wide `local` setup-go pins: nfpm's go.mod
+      # requires a newer Go than go.mod's 1.24 (itself pinned for
+      # golangci-lint compat, see go.mod). `local` refuses to fetch it and
+      # fails the install outright; `auto` downloads the toolchain nfpm
+      # needs for this one command without touching go.mod.
       - name: Install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2
+        run: GOTOOLCHAIN=auto go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2
 
       # Both Go binaries are CGO_ENABLED=0: static, no glibc version to match
       # against whatever distro the .deb/.rpm lands on. etcfuse links
