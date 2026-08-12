@@ -15,6 +15,8 @@ GO_ENTRY   := ./cmd/etcfuse-meta
 GO_OUT     := bin/etcfuse-meta
 CTL_ENTRY  := ./cmd/etcfsctl
 CTL_OUT    := bin/etcfsctl
+CSI_ENTRY  := ./cmd/etcfs-csi
+CSI_OUT    := bin/etcfs-csi
 C_ENTRY    := cmd/etcfuse
 C_OUT      := bin/etcfuse
 
@@ -22,7 +24,7 @@ C_OUT      := bin/etcfuse
 # report was filed against, not the placeholder in the source.
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GO_LDFLAGS := -X github.com/MHS-20/EtcFS/internal/config.Version=$(VERSION)
-all: $(GO_OUT) $(CTL_OUT) $(C_OUT)
+all: $(GO_OUT) $(CTL_OUT) $(CSI_OUT) $(C_OUT)
 
 # ---- Go build ----
 
@@ -31,6 +33,11 @@ $(GO_OUT): $(shell find . -name '*.go' -not -path './vendor/*' -not -path './tes
 
 $(CTL_OUT): $(shell find . -name '*.go' -not -path './vendor/*' -not -path './test/*')
 	go build -ldflags "$(GO_LDFLAGS)" -o $(CTL_OUT) $(CTL_ENTRY)
+
+# The CSI driver builds from the nested module, whose version variable is its
+# own rather than internal/config's.
+$(CSI_OUT): $(shell find csi -name '*.go')
+	cd csi && go build -ldflags "-X main.version=$(VERSION)" -o ../$(CSI_OUT) $(CSI_ENTRY)
 
 # ---- C build ----
 
@@ -44,10 +51,16 @@ $(C_OUT): $(C_SRCS) $(C_HDRS)
 
 # ---- Testing ----
 
-test: test-go test-c
+test: test-go test-csi test-c
 
 test-go:
 	go test -race -count=1 ./...
+
+# The CSI driver is a separate module (csi/go.mod) so its gRPC and CSI-spec
+# dependencies stay out of every other binary; ./... in the root does not
+# reach it.
+test-csi:
+	cd csi && go test -race -count=1 ./...
 
 # The test binary includes ops.c, so it needs the same flags and libraries the
 # daemon is built with, minus the daemon's own main.
@@ -69,6 +82,7 @@ lint: lint-go lint-c lint-sh
 
 lint-go:
 	golangci-lint run ./...
+	cd csi && golangci-lint run ./...
 
 lint-c:
 	clang-format --dry-run --Werror $(C_SRCS) $(C_HDRS) $(C_TEST_SRC)
@@ -116,7 +130,7 @@ hooks:
 help:
 	@echo "EtcFS build targets:"
 	@echo "  make all              build everything"
-	@echo "  make test             run unit tests (Go + C)"
+	@echo "  make test             run unit tests (Go, CSI module, C)"
 	@echo "  make lint             run all linters"
 	@echo "  make fmt              auto-format code"
 	@echo "  make hooks            install git pre-push hook"
