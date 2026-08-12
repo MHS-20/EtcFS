@@ -19,16 +19,23 @@ import (
 type Kind string
 
 const (
-	KindLookup Kind = "lookup"
-	KindCreate Kind = "create"
-	KindMkdir  Kind = "mkdir"
-	KindMknod  Kind = "mknod"
-	KindSymlnk Kind = "symlink"
-	KindUnlink Kind = "unlink"
-	KindRmdir  Kind = "rmdir"
-	KindRename Kind = "rename"
-	KindLink   Kind = "link"
+	KindLookup  Kind = "lookup"
+	KindCreate  Kind = "create"
+	KindMkdir   Kind = "mkdir"
+	KindMknod   Kind = "mknod"
+	KindSymlnk  Kind = "symlink"
+	KindUnlink  Kind = "unlink"
+	KindRmdir   Kind = "rmdir"
+	KindRename  Kind = "rename"
+	KindLink    Kind = "link"
+	KindReaddir Kind = "readdir"
 )
+
+// DirEntry is one entry of a directory listing.
+type DirEntry struct {
+	Name string
+	Ino  uint64
+}
 
 // Op is one decoded namespace operation, with the interval it took effect in.
 type Op struct {
@@ -43,6 +50,14 @@ type Op struct {
 	// carries one: the created inode for a create, the linked inode for a link,
 	// the resolved inode for a lookup.
 	Ino uint64
+	// Entries is the page of a directory listing a readdir returned, in the
+	// order it returned them -- which is sorted, because the listing comes
+	// straight out of an etcd prefix scan.
+	Entries []DirEntry
+	// Offset is the position in the directory that page started at. A readdir
+	// is paginated, so a response is a window into the listing and not the
+	// listing itself.
+	Offset uint64
 	// Errno is 0 on success and the positive errno otherwise.
 	Errno int32
 	Call  int64
@@ -77,6 +92,15 @@ func (r *reader) u32() uint32 {
 	v := binary.BigEndian.Uint32(r.b[r.pos:])
 	r.pos += 4
 	return v
+}
+
+// skip advances past n bytes of a field this decoder does not model.
+func (r *reader) skip(n int) {
+	if !r.ok || r.pos+n > len(r.b) {
+		r.ok = false
+		return
+	}
+	r.pos += n
 }
 
 func (r *reader) str() string {
@@ -115,6 +139,48 @@ var namespaceOps = map[uint16]Kind{
 	10: KindSymlnk,
 	11: KindLink,
 	25: KindMknod,
+	3:  KindReaddir,
+	29: KindReaddir,
+}
+
+// readdirPlusTail is the fixed block READDIRPLUS appends to every entry: the
+// 84-byte attr written by buf.wAttr, plus the entry and attr timeouts.
+const readdirPlusTail = 84 + 4 + 4
+
+// readdirPlusOpcode is READDIRPLUS, whose entries carry that extra tail.
+const readdirPlusOpcode = 29
+
+// decodeDirEntries reads a readdir response body: a count, then that many
+// entries of [u64:ino][u32:name_len][name][u32:type][u64:off], each followed
+// by a fixed attr block when the call was READDIRPLUS.
+//
+// "." and ".." are skipped if the wire ever carries them: they are not
+// directory entries the namespace model knows about, and a listing that
+// included them would otherwise look like it held two names nothing created.
+func decodeDirEntries(body []byte, plus bool) ([]DirEntry, error) {
+	r := newReader(body)
+	count := r.u32()
+	if !r.ok {
+		return nil, fmt.Errorf("response too short to hold an entry count")
+	}
+	entries := make([]DirEntry, 0, count)
+	for i := uint32(0); i < count; i++ {
+		ino := r.u64()
+		name := r.str()
+		r.u32() // type
+		r.u64() // cookie
+		if plus {
+			r.skip(readdirPlusTail)
+		}
+		if !r.ok {
+			return nil, fmt.Errorf("entry %d of %d is truncated", i, count)
+		}
+		if name == "." || name == ".." {
+			continue
+		}
+		entries = append(entries, DirEntry{Name: name, Ino: ino})
+	}
+	return entries, nil
 }
 
 // DecodeNamespace turns a recorded history into the namespace operations it
@@ -137,6 +203,24 @@ func DecodeNamespace(entries []history.Entry) ([]Op, error) {
 
 		op := Op{Kind: kind, Node: e.Node, Errno: errno, Call: e.CallNs, Ret: e.ReturnNs}
 		r := newReader(req)
+
+		if kind == KindReaddir {
+			// READDIR payload: [u64:ino][u64:offset][u32:size]
+			op.Parent, op.Offset = r.u64(), r.u64()
+			if !r.ok {
+				return nil, fmt.Errorf("readdir at %d: request payload is truncated", e.CallNs)
+			}
+			if op.Errno == 0 {
+				entries, derr := decodeDirEntries(resp[4:], e.Opcode == readdirPlusOpcode)
+				if derr != nil {
+					return nil, fmt.Errorf("readdir at %d: %w", e.CallNs, derr)
+				}
+				op.Entries = entries
+			}
+			ops = append(ops, op)
+			continue
+		}
+
 		switch kind {
 		case KindLookup, KindCreate, KindMkdir, KindMknod, KindSymlnk, KindUnlink, KindRmdir:
 			op.Parent, op.Name = r.u64(), r.str()

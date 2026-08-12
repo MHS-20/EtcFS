@@ -99,3 +99,94 @@ func TestAuditExtentHandlesTruncation(t *testing.T) {
 		t.Fatal("a read after truncation was reported as contradicting the pre-truncation bytes")
 	}
 }
+
+// rdop builds one page of a directory listing starting at offset.
+func rdop(node string, parent, offset uint64, call, ret int64, entries ...DirEntry) Op {
+	return Op{
+		Kind: KindReaddir, Node: node, Parent: parent, Offset: offset,
+		Entries: entries, Call: call, Ret: ret,
+	}
+}
+
+// A readdir is paginated, so a page that stops short of a name the model knows
+// about proves nothing about it: the name is simply on a later page. Treating
+// a page as a complete listing would report every large directory as missing
+// entries.
+func TestAuditReaddirPageIsNotACompleteListing(t *testing.T) {
+	ops := []Op{
+		op(KindCreate, "n1", 1, "aaa", 41, ok, 10, 20),
+		op(KindCreate, "n1", 1, "zzz", 42, ok, 25, 30),
+		// A page covering only the start of the directory. "zzz" sorts past
+		// its last entry, so its absence here says nothing.
+		rdop("n1", 1, 0, 40, 50, DirEntry{Name: "aaa", Ino: 41}),
+	}
+	if !check(t, ops, AllLinearizable, 0) {
+		t.Fatal("a partial readdir page was treated as a complete listing")
+	}
+}
+
+// The entries of a page are a contiguous run in sorted order, because the
+// listing comes straight out of an etcd prefix scan. A name that sorts inside
+// that run and is missing from it has been dropped by the listing.
+func TestAuditReaddirDroppedEntryIsRejected(t *testing.T) {
+	ops := []Op{
+		op(KindCreate, "n1", 1, "aaa", 41, ok, 10, 20),
+		op(KindCreate, "n1", 1, "mmm", 42, ok, 25, 30),
+		op(KindCreate, "n1", 1, "zzz", 43, ok, 32, 35),
+		// "mmm" sorts between "aaa" and "zzz" and must be on this page.
+		rdop("n1", 1, 0, 40, 50,
+			DirEntry{Name: "aaa", Ino: 41}, DirEntry{Name: "zzz", Ino: 43}),
+	}
+	if check(t, ops, AllLinearizable, 0) {
+		t.Fatal("a listing that dropped an entry from inside its own range was accepted")
+	}
+}
+
+// A listing must not resurrect a name that was removed.
+func TestAuditReaddirListingAnUnlinkedNameIsRejected(t *testing.T) {
+	ops := []Op{
+		op(KindCreate, "n1", 1, "f", 42, ok, 10, 20),
+		op(KindUnlink, "n1", 1, "f", 0, ok, 30, 40),
+		rdop("n2", 1, 0, 50, 60, DirEntry{Name: "f", Ino: 42}),
+	}
+	if check(t, ops, AllLinearizable, 0) {
+		t.Fatal("a listing returned a name that had been unlinked")
+	}
+}
+
+// A listing must agree with the rest of the history about which inode a name
+// refers to.
+func TestAuditReaddirWrongInodeIsRejected(t *testing.T) {
+	ops := []Op{
+		op(KindCreate, "n1", 1, "f", 42, ok, 10, 20),
+		rdop("n2", 1, 0, 30, 40, DirEntry{Name: "f", Ino: 99}),
+	}
+	if check(t, ops, AllLinearizable, 0) {
+		t.Fatal("a listing named an inode the rest of the history contradicts")
+	}
+}
+
+// An empty listing at offset 0 is a directory with nothing in it, which a
+// live name contradicts.
+func TestAuditReaddirEmptyListingWithLiveNameIsRejected(t *testing.T) {
+	ops := []Op{
+		op(KindCreate, "n1", 1, "f", 42, ok, 10, 20),
+		rdop("n2", 1, 0, 30, 40),
+	}
+	if check(t, ops, AllLinearizable, 0) {
+		t.Fatal("an empty listing was accepted for a directory holding a live name")
+	}
+}
+
+// A create that overlaps the listing is not a violation: the checker is free
+// to order it after, which is the whole reason this is a linearizability
+// question and not a sorted scan.
+func TestAuditReaddirConcurrentCreateIsAccepted(t *testing.T) {
+	ops := []Op{
+		op(KindCreate, "n1", 1, "f", 42, ok, 10, 60),
+		rdop("n2", 1, 0, 20, 50),
+	}
+	if !check(t, ops, AllLinearizable, 0) {
+		t.Fatal("a create overlapping the listing was reported as a violation")
+	}
+}

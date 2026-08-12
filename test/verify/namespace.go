@@ -60,6 +60,9 @@ func (d dirState) step(op Op) (bool, dirState) {
 	matches := func(want uint64) bool { return ino == unknownIno || ino == want }
 
 	switch op.Kind {
+	case KindReaddir:
+		return d.stepReaddir(op)
+
 	case KindLookup:
 		switch op.Errno {
 		case 0:
@@ -124,6 +127,78 @@ func (d dirState) step(op Op) (bool, dirState) {
 	return true, d
 }
 
+// stepReaddir applies one page of a directory listing.
+//
+// A readdir is paginated, so a response is a window into the listing rather
+// than the listing itself, and treating it as complete would report a
+// perfectly ordinary large directory as missing half its entries. What makes
+// it useful anyway is that the entries come straight out of an etcd prefix
+// scan and are therefore a *contiguous run in sorted order*: every name that
+// sorts between the first and last of a page must be on that page. A name the
+// model knows exists and that falls inside that range, but is absent from the
+// page, has been dropped by the listing.
+//
+// Nothing is concluded about names sorting past the end of the page: they are
+// on a later page this response says nothing about. The one exception is a
+// page that starts at offset 0, whose first entry is the smallest name in the
+// whole directory -- so a known name sorting before it cannot exist either.
+func (d dirState) stepReaddir(op Op) (bool, dirState) {
+	if op.Errno != 0 {
+		return true, d
+	}
+
+	listed := make(map[string]uint64, len(op.Entries))
+	for _, e := range op.Entries {
+		listed[e.Name] = e.Ino
+	}
+
+	// Every name the page returned has to exist, and to be the inode the page
+	// says it is.
+	next := d
+	for _, e := range op.Entries {
+		if ino, present := next.entries[e.Name]; present && ino != unknownIno && ino != e.Ino {
+			return false, d
+		}
+		if next.known[e.Name] && !hasName(next, e.Name) {
+			return false, d
+		}
+		next = next.with(e.Name, e.Ino)
+	}
+
+	// An empty page at offset 0 is a directory with nothing in it at all; one
+	// at any other offset only says the listing has run out, which says
+	// nothing about what came before it.
+	if len(op.Entries) == 0 {
+		if op.Offset == 0 && len(d.entries) > 0 {
+			return false, d
+		}
+		return true, next
+	}
+
+	lo := op.Entries[0].Name
+	hi := op.Entries[len(op.Entries)-1].Name
+	for name := range d.entries {
+		if _, ok := listed[name]; ok {
+			continue
+		}
+		switch {
+		case name > lo && name < hi:
+			// Inside the contiguous run the page covers, and missing from it.
+			return false, d
+		case op.Offset == 0 && name < lo:
+			// Nothing can sort before the first entry of the whole directory.
+			return false, d
+		}
+	}
+	return true, next
+}
+
+// hasName reports whether the state records this name as present.
+func hasName(d dirState, name string) bool {
+	_, present := d.entries[name]
+	return present
+}
+
 // with records that a name is taken, by ino when the history says which.
 func (d dirState) with(name string, ino uint64) dirState {
 	next := d.clone()
@@ -163,6 +238,10 @@ var NamespaceModel = porcupine.Model{
 		if op.Kind == KindRename {
 			return fmt.Sprintf("%s(%d/%q → %d/%q) -> errno %d",
 				op.Kind, op.Parent, op.Name, op.NewParent, op.NewName, op.Errno)
+		}
+		if op.Kind == KindReaddir {
+			return fmt.Sprintf("readdir(%d, off %d) -> %d entries, errno %d",
+				op.Parent, op.Offset, len(op.Entries), op.Errno)
 		}
 		return fmt.Sprintf("%s(%d/%q) -> ino %d, errno %d", op.Kind, op.Parent, op.Name, op.Ino, op.Errno)
 	},

@@ -94,6 +94,13 @@ if [[ "$MODE" == "docker" ]]; then
             for i in $(seq 1 30); do check_mount "$c" && { ok=1; break; }; sleep 2; done
             [[ "$ok" -eq 1 ]] || { log "  ERROR: $c never mounted"; dump_logs "$c"; return 1; }
         done
+        # One listing per node, so every recorded history actually contains
+        # readdir traffic.  The workload is otherwise all writes and reads,
+        # which never list a directory, and the namespace model's readdir
+        # checks would then be exercised by nothing at chaos scale.
+        for c in "$N1" "$N2" "$N3"; do
+            docker exec "$c" ls -la /mnt/etcfuse >/dev/null 2>&1 || true
+        done
         log "  Cluster up: $N1 $N2 $N3"
     }
     teardown_cluster() {

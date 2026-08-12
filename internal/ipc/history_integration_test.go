@@ -322,3 +322,92 @@ func readPayloadFor(ino, offset uint64, size uint32) []byte {
 	b.w32(size)
 	return b.b
 }
+
+func readdirPayloadFor(ino, offset uint64, size uint32) []byte {
+	var b buf
+	b.w64(ino)
+	b.w64(offset)
+	b.w32(size)
+	return b.b
+}
+
+// The readdir decoder in test/verify is written against the wire format, not
+// shared with the encoder that produces it, so the only thing that proves the
+// two agree is decoding a response the real handler actually wrote. Both
+// framings are exercised: READDIRPLUS appends a fixed attr block to every
+// entry, and getting its width wrong turns every entry after the first into
+// garbage without failing loudly.
+func TestIntegration_ReaddirDecodesWhatTheHandlerEncoded(t *testing.T) {
+	cli := etcdtest.Client(t)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+
+	store := metadata.NewStore(cli, "n1")
+	if _, err := store.CreateInode(ctx, metadata.RootIno, metadata.ModeDir|0755, 0, 0); err != nil {
+		t.Fatalf("seed root: %v", err)
+	}
+
+	membership := metadata.NewMembership(cli, "n1", "verify", 10*time.Second)
+	svc := NewService(store, membership, fencing.NewWatchdog(membership, 10*time.Second), config.NewLogger(0))
+	if err := svc.InitGeneration(ctx); err != nil {
+		t.Fatalf("init generation: %v", err)
+	}
+	svc.InstallStoreGuard()
+	rec, err := history.NewRecorder(path, "n1")
+	if err != nil {
+		t.Fatalf("recorder: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+	svc.SetHistoryRecorder(rec)
+
+	want := map[string]bool{"alpha": true, "beta": true, "gamma": true}
+	for name := range want {
+		if _, _ = svc.observedDispatch(ipcOpCreate, createPayload(metadata.RootIno, name, 0)); false {
+			t.Fatal("unreachable")
+		}
+	}
+
+	// A full listing, then the same through READDIRPLUS.
+	_, _ = svc.observedDispatch(ipcOpReaddir, readdirPayloadFor(metadata.RootIno, 0, 4096))
+	_, _ = svc.observedDispatch(ipcOpReadDirPlus, readdirPayloadFor(metadata.RootIno, 0, 4096))
+
+	entries, err := history.Load(path)
+	if err != nil {
+		t.Fatalf("load history: %v", err)
+	}
+	ops, err := verify.DecodeNamespace(entries)
+	if err != nil {
+		t.Fatalf("decode history: %v", err)
+	}
+
+	listings := 0
+	for _, op := range ops {
+		if op.Kind != verify.KindReaddir {
+			continue
+		}
+		listings++
+		got := map[string]bool{}
+		for _, e := range op.Entries {
+			got[e.Name] = true
+			if e.Ino == 0 {
+				t.Errorf("entry %q decoded with inode 0, so the entry framing is misaligned", e.Name)
+			}
+		}
+		for name := range want {
+			if !got[name] {
+				t.Errorf("listing is missing %q; decoded %v", name, got)
+			}
+		}
+		if len(got) != len(want) {
+			t.Errorf("decoded %d entries, want %d: %v", len(got), len(want), got)
+		}
+	}
+	if listings != 2 {
+		t.Fatalf("decoded %d readdir operations, want 2 (readdir and readdirplus)", listings)
+	}
+
+	if res := verify.Check(verify.NamespaceModel, verify.Operations(ops),
+		verify.AllLinearizable, 0, 60*time.Second); res != porcupine.Ok {
+		t.Fatalf("a history containing real listings was rejected (%v)", res)
+	}
+}
