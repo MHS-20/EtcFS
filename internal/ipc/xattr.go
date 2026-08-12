@@ -89,7 +89,11 @@ func (s *Service) handleListxattr(ctx context.Context, payload []byte) ([]byte, 
 		return int32Resp(errnoFor(err, -5)), nil
 	}
 
-	var packed []byte
+	size := 0
+	for _, n := range names {
+		size += len(n) + 1
+	}
+	packed := make([]byte, 0, size)
 	for _, n := range names {
 		packed = append(packed, n...)
 		packed = append(packed, 0)

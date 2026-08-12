@@ -1,7 +1,6 @@
 package quota
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -144,7 +143,7 @@ func TestOverLimitReporting(t *testing.T) {
 
 func TestUsageStringMarksUnlimited(t *testing.T) {
 	u := Usage{Root: 7, Limits: Limits{Bytes: 500}, Bytes: 100, Inodes: 2}
-	want := fmt.Sprintf("root=7 bytes=100/500 inodes=2/unlimited")
+	want := "root=7 bytes=100/500 inodes=2/unlimited"
 	if got := u.String(); got != want {
 		t.Errorf("String() = %q, want %q", got, want)
 	}
