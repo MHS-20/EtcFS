@@ -1,0 +1,36 @@
+# Overlay for hosts where Docker's bridge network is unavailable — a kernel
+# without the veth module fails every container start with
+# "failed to add the host (veth…) <=> sandbox (veth…) pair interfaces".
+#
+# Applied automatically by scripts/test/pjdfstest.sh when a bridge-networked
+# probe container fails to start. Service names do not resolve under host
+# networking, so etcd is addressed on the loopback interface instead.
+
+services:
+  etcd:
+    network_mode: host
+    # Under host networking the service name does not resolve, so the URLs
+    # etcd advertises to itself have to be loopback ones.
+    command:
+      - etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://127.0.0.1:2379
+      - --advertise-client-urls=http://127.0.0.1:2379
+      - --listen-peer-urls=http://127.0.0.1:2380
+      - --initial-advertise-peer-urls=http://127.0.0.1:2380
+      - --initial-cluster=etcd1=http://127.0.0.1:2380
+      - --initial-cluster-state=new
+      - --auto-compaction-mode=revision
+      - --auto-compaction-retention=100000
+      - --quota-backend-bytes=8589934592
+
+  block-init:
+    network_mode: host
+
+  pjdfstest:
+    build:
+      network: host
+    network_mode: host
+    environment:
+      ETCD_ENDPOINTS: http://127.0.0.1:2379

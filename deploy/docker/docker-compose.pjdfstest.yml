@@ -1,0 +1,61 @@
+# POSIX conformance environment: single-node EtcFS plus the pjdfstest suite.
+#
+# Usage:
+#   scripts/test/pjdfstest.sh
+#
+# A single node is deliberate: pjdfstest checks POSIX semantics of one mount,
+# not cluster behaviour, which the chaos suite already covers.
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    command:
+      - etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=etcd1=http://etcd:2380
+      - --initial-cluster-state=new
+      - --auto-compaction-mode=revision
+      - --auto-compaction-retention=100000
+      - --quota-backend-bytes=8589934592
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  block-init:
+    image: alpine:3.20
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - truncate -s 8G /block-device/etcfuse.img && chmod 666 /block-device/etcfuse.img
+    volumes:
+      - block_data:/block-device
+
+  pjdfstest:
+    build:
+      context: ../..
+      dockerfile: test/pjdfstest/Dockerfile
+    container_name: etcfs-pjdfstest
+    privileged: true
+    devices:
+      - /dev/fuse
+    environment:
+      ETCD_ENDPOINTS: http://etcd:2379
+      ONLY: "${ONLY:-}"
+    volumes:
+      - block_data:/block-device
+      - ./pjdfstest-results:/results
+    depends_on:
+      etcd:
+        condition: service_healthy
+      block-init:
+        condition: service_completed_successfully
+
+volumes:
+  block_data:

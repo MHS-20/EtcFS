@@ -76,6 +76,11 @@ bin/test-c: $(C_TEST_SRC) $(C_SRCS) $(C_HDRS)
 test-integration:
 	bash test/e2e/run.sh
 
+# POSIX conformance: upstream pjdfstest against a live mount in Docker.
+# Results in deploy/docker/pjdfstest-results/.
+test-conformance:
+	bash scripts/test/pjdfstest.sh
+
 # ---- Linting & formatting ----
 
 lint: lint-go lint-c lint-sh
