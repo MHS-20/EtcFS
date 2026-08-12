@@ -9,7 +9,7 @@
 #   make dev         start docker-compose development environment
 #   make check       lint + test (CI entry point)
 
-.PHONY: all test lint fmt clean dev check
+.PHONY: all test lint fmt clean dev check test-tla test-conformance test-integration
 
 GO_ENTRY   := ./cmd/etcfuse-meta
 GO_OUT     := bin/etcfuse-meta
@@ -80,6 +80,12 @@ test-integration:
 # Results in deploy/docker/pjdfstest-results/.
 test-conformance:
 	bash scripts/test/pjdfstest.sh
+
+# TLA+ model checking of the fencing protocol.  Three of the model
+# configurations are supposed to produce a counterexample; the script asserts
+# that they still do.  DEEP=1 adds the 3-node model.
+test-tla:
+	bash scripts/test/tla-check.sh
 
 # ---- Linting & formatting ----
 
