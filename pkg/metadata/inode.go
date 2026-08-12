@@ -158,10 +158,19 @@ func casBackoff(ctx context.Context, attempt int) error {
 
 // ---- serialisation ----
 
-// EncodeInode serialises an InodeRecord to a binary format.
-// Format: fixed-length fields in big-endian byte order, 72 bytes total.
+// Record sizes. The nanosecond fields were appended rather than folded into
+// the timestamps, so a record written before they existed still decodes: it is
+// inodeBytesV1 long and its sub-second parts read as zero, which is exactly
+// what it recorded.
+const (
+	inodeBytesV1 = 72
+	inodeBytes   = inodeBytesV1 + 12
+)
+
+// EncodeInode serialises an InodeRecord to a binary format: fixed-length
+// fields in big-endian byte order.
 func EncodeInode(rec *InodeRecord) []byte {
-	buf := make([]byte, 72)
+	buf := make([]byte, inodeBytes)
 	pos := 0
 
 	binary.BigEndian.PutUint64(buf[pos:], rec.Ino)
@@ -187,13 +196,19 @@ func EncodeInode(rec *InodeRecord) []byte {
 	binary.BigEndian.PutUint64(buf[pos:], uint64(rec.Mtime.Unix()))
 	pos += 8
 	binary.BigEndian.PutUint64(buf[pos:], uint64(rec.Ctime.Unix()))
+	pos += 8
+	binary.BigEndian.PutUint32(buf[pos:], uint32(rec.Atime.Nanosecond()))
+	pos += 4
+	binary.BigEndian.PutUint32(buf[pos:], uint32(rec.Mtime.Nanosecond()))
+	pos += 4
+	binary.BigEndian.PutUint32(buf[pos:], uint32(rec.Ctime.Nanosecond()))
 
 	return buf
 }
 
 // DecodeInode deserialises binary data back to an InodeRecord.
 func DecodeInode(data []byte) *InodeRecord {
-	if len(data) < 72 {
+	if len(data) < inodeBytesV1 {
 		return nil
 	}
 
@@ -223,6 +238,15 @@ func DecodeInode(data []byte) *InodeRecord {
 	rec.Mtime = time.Unix(int64(binary.BigEndian.Uint64(data[pos:])), 0)
 	pos += 8
 	rec.Ctime = time.Unix(int64(binary.BigEndian.Uint64(data[pos:])), 0)
+	pos += 8
+
+	if len(data) >= inodeBytes {
+		rec.Atime = rec.Atime.Add(time.Duration(binary.BigEndian.Uint32(data[pos:])))
+		pos += 4
+		rec.Mtime = rec.Mtime.Add(time.Duration(binary.BigEndian.Uint32(data[pos:])))
+		pos += 4
+		rec.Ctime = rec.Ctime.Add(time.Duration(binary.BigEndian.Uint32(data[pos:])))
+	}
 
 	return rec
 }

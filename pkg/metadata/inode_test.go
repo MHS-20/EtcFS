@@ -8,7 +8,7 @@ import (
 )
 
 func TestEncodeDecodeInode(t *testing.T) {
-	now := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 7, 27, 10, 0, 0, 123_456_789, time.UTC)
 
 	rec := &InodeRecord{
 		Ino:     42,
@@ -26,7 +26,7 @@ func TestEncodeDecodeInode(t *testing.T) {
 	}
 
 	encoded := EncodeInode(rec)
-	assert.Len(t, encoded, 72, "encoded inode should be 72 bytes")
+	assert.Len(t, encoded, inodeBytes, "encoded inode should be %d bytes", inodeBytes)
 
 	decoded := DecodeInode(encoded)
 	assert.NotNil(t, decoded)
@@ -39,9 +39,21 @@ func TestEncodeDecodeInode(t *testing.T) {
 	assert.Equal(t, rec.GID, decoded.GID)
 	assert.Equal(t, rec.Rdev, decoded.Rdev)
 	assert.Equal(t, rec.Blksize, decoded.Blksize)
-	assert.Equal(t, rec.Atime.Unix(), decoded.Atime.Unix())
-	assert.Equal(t, rec.Mtime.Unix(), decoded.Mtime.Unix())
-	assert.Equal(t, rec.Ctime.Unix(), decoded.Ctime.Unix())
+	assert.True(t, rec.Atime.Equal(decoded.Atime), "atime lost its sub-second part")
+	assert.True(t, rec.Mtime.Equal(decoded.Mtime), "mtime lost its sub-second part")
+	assert.True(t, rec.Ctime.Equal(decoded.Ctime), "ctime lost its sub-second part")
+}
+
+// A record written before the nanosecond fields existed still has to decode,
+// with its sub-second parts reading as the zero they were stored as.
+func TestDecodeInodeWithoutNanoseconds(t *testing.T) {
+	now := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
+	rec := &InodeRecord{Ino: 42, Mode: 0644, Nlink: 1, Atime: now, Mtime: now, Ctime: now}
+
+	decoded := DecodeInode(EncodeInode(rec)[:inodeBytesV1])
+	assert.NotNil(t, decoded)
+	assert.True(t, now.Equal(decoded.Mtime))
+	assert.Equal(t, 0, decoded.Mtime.Nanosecond())
 }
 
 func TestDecodeInodeTooShort(t *testing.T) {

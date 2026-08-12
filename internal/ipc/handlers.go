@@ -484,7 +484,7 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 // SETATTR payload:
 //
 //	[u64:ino][u64:fh][u32:valid][u64:size][u32:mode][u32:uid][u32:gid]
-//	[u64:atime][u64:mtime][u64:ctime]
+//	[u64:atime][u64:mtime][u64:ctime][u32:atime_nsec][u32:mtime_nsec][u32:ctime_nsec]
 //
 // Response: [i32:error][attr:84][u32:attr_timeout]
 //
@@ -503,7 +503,7 @@ const (
 	fattrCtime    = 1 << 10
 )
 
-const setattrPayloadLen = 8 + 8 + 4 + 8 + 4 + 4 + 4 + 8 + 8 + 8
+const setattrPayloadLen = 8 + 8 + 4 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 4
 
 func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, error) {
 	r := newReader(payload)
@@ -513,6 +513,7 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	newSize := r.u64()
 	mode, uid, gid := r.u32(), r.u32(), r.u32()
 	atime, mtime, ctime := r.u64(), r.u64(), r.u64()
+	atimeNsec, mtimeNsec, ctimeNsec := r.u32(), r.u32(), r.u32()
 	if !r.ok {
 		return int32Resp(-22), nil
 	}
@@ -552,13 +553,13 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 		rec.GID = gid
 	}
 	if valid&fattrAtime != 0 {
-		rec.Atime = time.Unix(int64(atime), 0)
+		rec.Atime = time.Unix(int64(atime), int64(atimeNsec))
 	}
 	if valid&fattrMtime != 0 {
-		rec.Mtime = time.Unix(int64(mtime), 0)
+		rec.Mtime = time.Unix(int64(mtime), int64(mtimeNsec))
 	}
 	if valid&fattrCtime != 0 {
-		rec.Ctime = time.Unix(int64(ctime), 0)
+		rec.Ctime = time.Unix(int64(ctime), int64(ctimeNsec))
 	}
 	if valid&fattrAtimeNow != 0 {
 		rec.Atime = now

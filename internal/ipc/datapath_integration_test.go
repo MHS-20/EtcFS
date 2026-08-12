@@ -96,6 +96,9 @@ func setattrPayload(ino uint64, valid uint32, size uint64, mode, uid, gid uint32
 	b.w64(atime)
 	b.w64(mtime)
 	b.w64(ctime)
+	b.w32(0) // atime_nsec
+	b.w32(0) // mtime_nsec
+	b.w32(0) // ctime_nsec
 	return b.b
 }
 

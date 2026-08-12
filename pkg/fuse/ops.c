@@ -872,7 +872,7 @@ static void ec_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t siz
 static void ec_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set,
                        struct fuse_file_info *fi)
 {
-    uint8_t payload[64];
+    uint8_t payload[76];
     uint32_t off = 0;
     off += wb_u64(payload + off, ino);
     off += wb_u64(payload + off, (fi ? fi->fh : 0));
@@ -881,11 +881,12 @@ static void ec_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
     off += wb_u32(payload + off, (uint32_t) attr->st_mode);
     off += wb_u32(payload + off, (uint32_t) attr->st_uid);
     off += wb_u32(payload + off, (uint32_t) attr->st_gid);
-    /* Only whole seconds are stored, so the nanosecond halves are dropped
-     * here rather than sent and discarded on the other side. */
     off += wb_u64(payload + off, (uint64_t) attr->st_atime);
     off += wb_u64(payload + off, (uint64_t) attr->st_mtime);
     off += wb_u64(payload + off, (uint64_t) attr->st_ctime);
+    off += wb_u32(payload + off, (uint32_t) attr->st_atim.tv_nsec);
+    off += wb_u32(payload + off, (uint32_t) attr->st_mtim.tv_nsec);
+    off += wb_u32(payload + off, (uint32_t) attr->st_ctim.tv_nsec);
 
     uint8_t *resp;
     uint32_t rlen;

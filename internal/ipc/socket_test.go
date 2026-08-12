@@ -24,8 +24,9 @@ func TestAttrBlockMatchesCDaemonWidth(t *testing.T) {
 // two are hand-encoded on opposite sides of the socket, so a field added to one
 // and not the other shifts every field after it.
 func TestSetattrPayloadMatchesCDaemonWidth(t *testing.T) {
-	// ino, fh, size, atime, mtime, ctime are u64; valid, mode, uid, gid are u32.
-	const cSideWidth = 6*8 + 4*4
+	// ino, fh, size, atime, mtime, ctime are u64; valid, mode, uid, gid and the
+	// three nanosecond fields are u32.
+	const cSideWidth = 6*8 + 7*4
 	if setattrPayloadLen != cSideWidth {
 		t.Fatalf("setattrPayloadLen is %d, ec_setattr writes %d", setattrPayloadLen, cSideWidth)
 	}
