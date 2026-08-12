@@ -278,6 +278,13 @@ static void fill_stat(struct stat *st, const struct etcfs_attr *a)
     st->st_atime = (time_t) a->atime;
     st->st_mtime = (time_t) a->mtime;
     st->st_ctime = (time_t) a->ctime;
+    /* The backend keeps timestamps to the nanosecond, and st_atime and
+     * st_atim.tv_sec are the same field: writing only the seconds leaves the
+     * sub-second half at the zero memset put there, which is what made every
+     * utimensat with a fractional time read back rounded down. */
+    st->st_atim.tv_nsec = (long) a->atime_nsec;
+    st->st_mtim.tv_nsec = (long) a->mtime_nsec;
+    st->st_ctim.tv_nsec = (long) a->ctime_nsec;
 }
 
 /* ---- helper: this thread's IPC connection ---- */
