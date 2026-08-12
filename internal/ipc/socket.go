@@ -197,6 +197,10 @@ func (s *Service) observedDispatch(code uint16, payload []byte) ([]byte, error) 
 	name := opName(code)
 	start := time.Now()
 	resp, err := s.safeDispatch(code, payload)
+	// The history is recorded here for the same reason the metrics are: every
+	// operation this daemon serves passes through this one wrapper, so no
+	// handler can be added that forgets to appear in it.
+	s.history.Record(name, code, start, time.Now(), payload, resp)
 	metrics.FuseOps.WithLabelValues(name).Inc()
 	metrics.FuseOpDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
 	// Every response frame starts with an int32 errno, negative on failure.

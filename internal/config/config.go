@@ -70,6 +70,12 @@ type Config struct {
 	// daemons on one host need two paths.
 	NotifyAddr string
 
+	// HistoryLog records every served operation to a file, as the input the
+	// consistency checkers take. Off unless set: it writes one line per
+	// operation, which is a measurable cost on a busy mount and is meant for
+	// test runs rather than production.
+	HistoryLog string
+
 	// ReadOnly rejects every mutating FUSE operation with EROFS. Lets a node
 	// mount the shared filesystem for backup or inspection while another node
 	// writes, and gives fsck a safe way to run against a live volume.
@@ -155,6 +161,8 @@ func Parse() *Config {
 		"Flush the device cache, sync the range and read it back after every write; needed only on a device with a volatile write cache that does not publish an acknowledged O_DIRECT write to its other attachers (always on without O_DIRECT)")
 	flag.StringVar(&cfg.EC2InstanceID, "ec2-instance-id", "",
 		"This node's EC2 instance ID, recorded in its membership key so peers can detach the volume when it expires")
+	flag.StringVar(&cfg.HistoryLog, "history-log", "",
+		"Append every served operation to this file, for offline consistency checking (see docs/verification/porcupine.md)")
 	flag.BoolVar(&cfg.ReadOnly, "read-only", false,
 		"Reject every mutating FUSE operation with EROFS; for backup/inspection mounts and running fsck against a live volume")
 

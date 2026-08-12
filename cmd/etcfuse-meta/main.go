@@ -35,6 +35,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/internal/config"
+	"github.com/MHS-20/EtcFS/internal/history"
 	"github.com/MHS-20/EtcFS/internal/ipc"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
@@ -195,6 +196,16 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	// A previous run may have died holding an unlinked file open, leaving a
 	// record nothing names and no descriptor can reach.
 	svc.ReclaimOrphans(ctx)
+
+	if cfg.HistoryLog != "" {
+		rec, herr := history.NewRecorder(cfg.HistoryLog, cfg.NodeID)
+		if herr != nil {
+			return fmt.Errorf("open history log: %w", herr)
+		}
+		defer func() { _ = rec.Close() }()
+		svc.SetHistoryRecorder(rec)
+		log.Info("recording an operation history", "path", cfg.HistoryLog)
+	}
 
 	if cfg.ReadOnly {
 		svc.SetReadOnly(true)

@@ -12,6 +12,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/internal/config"
+	"github.com/MHS-20/EtcFS/internal/history"
 	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/blockio"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
@@ -39,6 +40,10 @@ type Service struct {
 	// servable at all, at which point read-only coverage is a one-line review
 	// rather than a call site to remember.
 	readOnly bool
+
+	// history records every served operation for offline consistency checking.
+	// Nil unless --history-log was given, and a nil recorder records nothing.
+	history *history.Recorder
 
 	// openFiles counts this node's open descriptors per inode, so an unlink of
 	// the last name can keep the record alive until the last one closes.
@@ -98,6 +103,11 @@ func (s *Service) ReclaimOrphans(ctx context.Context) {
 		}
 		s.log.Info("reclaimed an inode left open by a previous run", "ino", ino)
 	}
+}
+
+// SetHistoryRecorder attaches a recorder that logs every served operation.
+func (s *Service) SetHistoryRecorder(r *history.Recorder) {
+	s.history = r
 }
 
 // SetReadOnly rejects every mutating opcode with EROFS. Intended for mounting
