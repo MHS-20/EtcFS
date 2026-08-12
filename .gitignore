@@ -21,3 +21,10 @@ vendor/
 .DS_Store
 .claude/
 site/
+
+# terraform (local state — contains resource IDs, not committed)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
