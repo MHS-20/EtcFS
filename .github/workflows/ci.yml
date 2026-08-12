@@ -81,6 +81,28 @@ jobs:
       - name: Test
         run: make test-c
 
+  build-csi:
+    name: Build & Test (CSI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: csi/go.mod
+      # The CSI driver is a nested module: the root job's ./... never reaches
+      # it, and its gRPC/CSI-spec dependency graph never reaches the root.
+      - name: Vet
+        working-directory: csi
+        run: go vet ./...
+      - name: Build
+        working-directory: csi
+        run: go build ./...
+      - name: Test
+        working-directory: csi
+        run: go test -race -count=1 ./...
+      - name: Helm lint
+        run: helm lint csi/deploy/helm/etcfs-csi --set etcd.endpoints=https://etcd:2379
+
   test-go:
     name: Test (Go)
     runs-on: ubuntu-latest
@@ -126,7 +148,7 @@ jobs:
   release:
     name: Semantic Release
     runs-on: ubuntu-latest
-    needs: [lint-go, lint-c, lint-sh, build-go, build-c, test-go, test-integration]
+    needs: [lint-go, lint-c, lint-sh, build-go, build-c, build-csi, test-go, test-integration]
     if: github.event_name == 'push'
     outputs:
       released: ${{ steps.semrel.outputs.new_release_published }}
@@ -251,3 +273,16 @@ jobs:
           tags: |
             ghcr.io/mhs-20/etcfs/etcfuse:${{ env.VERSION }}
             ghcr.io/mhs-20/etcfs/etcfuse:latest
+
+      - name: Build and push etcfs-csi image
+        uses: docker/build-push-action@v6
+        with:
+          # Root context: the nested csi module replaces the root module with
+          # ../, so the build needs both halves of the repository.
+          context: .
+          file: deploy/docker/Dockerfile.etcfs-csi
+          build-args: VERSION=${{ env.VERSION }}
+          push: true
+          tags: |
+            ghcr.io/mhs-20/etcfs/etcfs-csi:${{ env.VERSION }}
+            ghcr.io/mhs-20/etcfs/etcfs-csi:latest
