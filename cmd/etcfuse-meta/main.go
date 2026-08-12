@@ -192,6 +192,11 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	}
 	svc.InstallStoreGuard()
 
+	if cfg.ReadOnly {
+		svc.SetReadOnly(true)
+		log.Info("mounted read-only: every mutating FUSE operation will be rejected with EROFS")
+	}
+
 	if cfg.BlockDevice != "" {
 		openDevice := blockio.Open
 		if cfg.AllowBufferedIO {

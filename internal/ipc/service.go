@@ -33,6 +33,13 @@ type Service struct {
 	// write, and a device flush to every read.  See writeRun.
 	writeBarriers bool
 
+	// readOnly rejects every mutating opcode with EROFS before it reaches a
+	// handler. Checked in dispatch rather than per-handler so a new mutating
+	// operation is safe by default: it must be added to mutatingOps to be
+	// servable at all, at which point read-only coverage is a one-line review
+	// rather than a call site to remember.
+	readOnly bool
+
 	// Fencing generation this node started with.  Every data-path commit is
 	// guarded against it, so once the fencing controller bumps gen:<node_id>
 	// this node's commits stop being accepted by etcd.
@@ -63,6 +70,13 @@ func (s *Service) SetBlockDevice(dev *blockio.Device, barriers bool) {
 	// The allocator hands out arenas by multiplying an ID by the arena size,
 	// with nothing else to stop it running past the end of the device.
 	s.alloc.SetDeviceSize(uint64(dev.TotalSize()))
+}
+
+// SetReadOnly rejects every mutating opcode with EROFS. Intended for mounting
+// a filesystem for backup or inspection while another node writes, and for
+// giving fsck a safe way to run against a live volume.
+func (s *Service) SetReadOnly(ro bool) {
+	s.readOnly = ro
 }
 
 // ReconstructArenas rebuilds the arena free-list from existing extents in etcd.

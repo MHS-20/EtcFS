@@ -69,6 +69,11 @@ type Config struct {
 	// notifications.  Configurable for the same reason ListenAddr is: two
 	// daemons on one host need two paths.
 	NotifyAddr string
+
+	// ReadOnly rejects every mutating FUSE operation with EROFS. Lets a node
+	// mount the shared filesystem for backup or inspection while another node
+	// writes, and gives fsck a safe way to run against a live volume.
+	ReadOnly bool
 }
 
 // Default socket paths.
@@ -150,6 +155,8 @@ func Parse() *Config {
 		"Flush the device cache, sync the range and read it back after every write; needed only on a device with a volatile write cache that does not publish an acknowledged O_DIRECT write to its other attachers (always on without O_DIRECT)")
 	flag.StringVar(&cfg.EC2InstanceID, "ec2-instance-id", "",
 		"This node's EC2 instance ID, recorded in its membership key so peers can detach the volume when it expires")
+	flag.BoolVar(&cfg.ReadOnly, "read-only", false,
+		"Reject every mutating FUSE operation with EROFS; for backup/inspection mounts and running fsck against a live volume")
 
 	flag.Parse()
 

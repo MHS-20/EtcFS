@@ -197,6 +197,8 @@ etcfuse-meta --listen=/tmp/etcfuse.sock --etcd-endpoints=http://127.0.0.1:2379 \
 etcfuse --socket=/tmp/etcfuse.sock --node-id=n1 /mnt/etcfuse
 ```
 
+Adding `--read-only` makes the node reject every mutating operation with `EROFS` at the IPC boundary. It is the safe way to mount a filesystem another node is actively writing — for backup, for inspection, or to run a check against a live volume.
+
 Full flag reference: `internal/config/config.go` (Go daemon), `etcfuse --help` (C daemon).
 
 ### Operate a running filesystem

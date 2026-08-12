@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
@@ -48,6 +49,25 @@ func TestApplyModeKeepsTheFileType(t *testing.T) {
 		got := (c.stored & metadata.S_IFMT) | (c.incoming &^ metadata.S_IFMT)
 		if got != c.want {
 			t.Errorf("%s: got %#o, want %#o", c.name, got, c.want)
+		}
+	}
+}
+
+// A read-only mount must reject every mutating opcode with EROFS before the
+// request reaches a handler — dispatch must not touch the store to decide
+// this, since the zero-value Service here has none.
+func TestReadOnlyRejectsMutatingOpsWithEROFS(t *testing.T) {
+	s := &Service{readOnly: true}
+	for code := range mutatingOps {
+		resp, err := s.dispatch(code, nil)
+		if err != nil {
+			t.Fatalf("op %s: unexpected error %v", opName(code), err)
+		}
+		if len(resp) < 4 {
+			t.Fatalf("op %s: response too short: %v", opName(code), resp)
+		}
+		if got := int32(binary.BigEndian.Uint32(resp)); got != -30 {
+			t.Errorf("op %s: got errno %d, want -30 (EROFS)", opName(code), got)
 		}
 	}
 }

@@ -106,6 +106,23 @@ var ops = map[uint16]op{
 	ipcOpCommit: {"commit", unsupported},
 }
 
+// mutatingOps are the opcodes a read-only mount rejects with EROFS instead of
+// dispatching. Everything else (lookups, reads, open/release/flush, statfs)
+// is safe to serve: it changes no metadata and touches the device only to
+// read it.
+var mutatingOps = map[uint16]bool{
+	ipcOpCreate:  true,
+	ipcOpMkdir:   true,
+	ipcOpUnlink:  true,
+	ipcOpRmdir:   true,
+	ipcOpRename:  true,
+	ipcOpSymlink: true,
+	ipcOpLink:    true,
+	ipcOpMknod:   true,
+	ipcOpSetattr: true,
+	ipcOpWrite:   true,
+}
+
 func opName(code uint16) string {
 	if o, found := ops[code]; found {
 		return o.name
@@ -427,6 +444,9 @@ func (s *Service) dispatch(code uint16, payload []byte) ([]byte, error) {
 	o, found := ops[code]
 	if !found {
 		return int32Resp(-38), nil // ENOSYS
+	}
+	if s.readOnly && mutatingOps[code] {
+		return int32Resp(-30), nil // EROFS
 	}
 
 	// Bounded here rather than at each of the ~35 individual store calls the
