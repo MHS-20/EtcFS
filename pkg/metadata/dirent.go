@@ -103,24 +103,103 @@ func extractNameFromKey(key string, parent uint64) string {
 // The transaction asserts both that the name is free and that the inode number
 // is unused, so a create that loses either race writes nothing at all.
 func (s *Store) atomicCreate(ctx context.Context, parent uint64, name string, rec *InodeRecord, extra ...clientv3.Op) error {
-	cmps := []clientv3.Cmp{
-		clientv3.Compare(clientv3.CreateRevision(DirentKey(parent, name)), "=", 0),
-		clientv3.Compare(clientv3.CreateRevision(InodeKey(rec.Ino)), "=", 0),
-	}
-	ops := append([]clientv3.Op{
-		PutDirent(parent, name, rec.Ino),
-		clientv3.OpPut(InodeKey(rec.Ino), string(EncodeInode(rec))),
-	}, extra...)
-
-	ok, err := s.Txn(ctx, cmps, ops, nil)
-	if err != nil {
+	fail := func(err error) error {
 		return fmt.Errorf("atomic create %d/%q: %w", parent, name, err)
 	}
-	if !ok {
-		return fmt.Errorf("atomic create %d/%q: %w", parent, name, ErrExists)
+	build := func() ([]clientv3.Cmp, []clientv3.Op, error) {
+		cmps := []clientv3.Cmp{
+			clientv3.Compare(clientv3.CreateRevision(DirentKey(parent, name)), "=", 0),
+			clientv3.Compare(clientv3.CreateRevision(InodeKey(rec.Ino)), "=", 0),
+		}
+		ops := append([]clientv3.Op{
+			PutDirent(parent, name, rec.Ino),
+			clientv3.OpPut(InodeKey(rec.Ino), string(EncodeInode(rec))),
+		}, extra...)
+		if rec.Mode&S_IFMT != ModeDir {
+			return cmps, ops, nil
+		}
+		// A new directory's ".." is a reference to its parent, so the parent's
+		// link count has to rise with it, in the same transaction: a count that
+		// is a commit late is simply a wrong count.
+		bump, err := s.adjustDirNlink(ctx, parent, +1)
+		if err != nil {
+			return nil, nil, err
+		}
+		return append(cmps, bump.cmps...), append(ops, bump.ops...), nil
 	}
-	s.touchDir(ctx, parent)
+
+	// Only a directory needs the parent pinned, so an ordinary file create
+	// still commits without one and two nodes making unrelated files in one
+	// directory still never abort each other. Concurrent mkdirs in the *same*
+	// directory do contend, and that is what the retry is for.
+	err := retryCAS(ctx, fmt.Sprintf("atomic create %d/%q", parent, name), func() (bool, error) {
+		cmps, ops, berr := build()
+		if berr != nil {
+			return false, berr
+		}
+		ok, terr := s.Txn(ctx, cmps, ops, nil)
+		if terr != nil || ok {
+			return ok, terr
+		}
+		// The name being taken is the caller's answer; anything else is the
+		// parent having moved under us, which is contention worth retrying.
+		if existing, lerr := s.LookupDirent(ctx, parent, name); lerr == nil && existing != 0 {
+			return false, ErrExists
+		}
+		if rec.Mode&S_IFMT != ModeDir {
+			return false, ErrExists
+		}
+		return false, nil
+	})
+	if err != nil {
+		return fail(err)
+	}
+	if rec.Mode&S_IFMT != ModeDir {
+		s.touchDir(ctx, parent)
+	}
 	return nil
+}
+
+// nlinkAdjust is the comparison and write that move a directory's link count,
+// ready to be folded into the transaction that makes the move true.
+type nlinkAdjust struct {
+	cmps []clientv3.Cmp
+	ops  []clientv3.Op
+}
+
+// adjustDirNlink prepares a change to a directory's link count, which counts
+// its own "." and the ".." of every subdirectory it holds — so it moves only
+// when a subdirectory arrives or leaves.
+//
+// A missing record yields nothing to do rather than an error: a create under a
+// parent that no longer exists is already failing on its own comparisons, and
+// the root of a filesystem seeded by an older version may predate the record.
+func (s *Store) adjustDirNlink(ctx context.Context, ino uint64, delta int) (nlinkAdjust, error) {
+	rec, rev, err := s.GetInodeRev(ctx, ino)
+	if err != nil {
+		return nlinkAdjust{}, err
+	}
+	if rec == nil {
+		return nlinkAdjust{}, nil
+	}
+	switch {
+	case delta > 0:
+		rec.Nlink += uint32(delta)
+	case delta < 0 && rec.Nlink >= uint32(-delta):
+		rec.Nlink -= uint32(-delta)
+	default:
+		// A count that cannot absorb the decrement is already wrong; fsck
+		// reports it, and taking it below zero here would make it worse.
+		return nlinkAdjust{}, nil
+	}
+	// The same write carries the timestamps touchDir would have set, so a
+	// directory operation does not pay for a second commit to record them.
+	rec.Mtime = time.Now()
+	rec.Ctime = rec.Mtime
+	return nlinkAdjust{
+		cmps: []clientv3.Cmp{InodeUnchanged(ino, rev)},
+		ops:  []clientv3.Op{clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec)))},
+	}, nil
 }
 
 // touchDir marks a directory changed, as POSIX requires of every operation
@@ -157,7 +236,9 @@ func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string
 }
 
 // AtomicCreateDir creates a directory (mkdir) in a single etcd transaction.
-// Same pattern as AtomicCreateFile but with nlink=2 (. and ..) and S_IFDIR mode.
+// Same pattern as AtomicCreateFile, but with nlink=2 (its own "." and its entry
+// in its parent), S_IFDIR mode, and the parent's own count raised for the ".."
+// the new directory brings with it.
 func (s *Store) AtomicCreateDir(ctx context.Context, parent uint64, name string, ino uint64, mode uint32, uid, gid uint32) (*InodeRecord, error) {
 	rec := NewInodeRecord(ino, mode|ModeDir, uid, gid)
 	rec.Size = 4096
@@ -360,12 +441,19 @@ func (s *Store) AtomicRmdir(ctx context.Context, parent uint64, name string) err
 			DeleteDirent(parent, name),
 			clientv3.OpDelete(InodeKey(ino)),
 		}
+		// The ".." this directory pointed at its parent goes with it.
+		drop, err := s.adjustDirNlink(ctx, parent, -1)
+		if err != nil {
+			return fail("%w", err)
+		}
+		cmps = append(cmps, drop.cmps...)
+		ops = append(ops, drop.ops...)
+
 		ok, err := s.Txn(ctx, cmps, ops, nil)
 		if err != nil {
 			return fail("%w", err)
 		}
 		if ok {
-			s.touchDir(ctx, parent)
 			return true, nil
 		}
 		// Losing a revision comparison is contention worth retrying; an entry
@@ -448,6 +536,9 @@ func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName stri
 	if len(targetKvs) == 0 {
 		// Nothing there now, and nothing may appear before the commit lands.
 		cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(targetKey), "=", 0))
+		if err := s.applyRenameNlink(ctx, oldParent, newParent, srcIsDir, false, &cmps, &ops); err != nil {
+			return fail("%w", err)
+		}
 		if err := s.commitRename(ctx, cmps, ops); err != nil {
 			return fail("%w", err)
 		}
@@ -464,6 +555,7 @@ func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName stri
 	// silently replaced by it.
 	cmps = append(cmps, clientv3.Compare(clientv3.ModRevision(targetKey), "=", targetKvs[0].ModRevision))
 
+	victimIsDirectory := false
 	victimIno := DecodeUint64(targetKvs[0].Value)
 	victim, victimRev, err := s.GetInodeRev(ctx, victimIno)
 	if err != nil {
@@ -494,12 +586,50 @@ func (s *Store) AtomicRename(ctx context.Context, oldParent uint64, oldName stri
 		// the rename rather than be overwritten by it.
 		cmps = append(cmps, InodeUnchanged(victimIno, victimRev))
 		ops = append(ops, s.unlinkInodeOps(victim)...)
+		victimIsDirectory = victimIsDir
 	}
 
+	if err := s.applyRenameNlink(ctx, oldParent, newParent, srcIsDir, victimIsDirectory, &cmps, &ops); err != nil {
+		return fail("%w", err)
+	}
 	if err := s.commitRename(ctx, cmps, ops); err != nil {
 		return fail("%w", err)
 	}
 	s.touchRenameDirs(ctx, oldParent, newParent)
+	return nil
+}
+
+// applyRenameNlink folds into a rename the link-count moves its directories
+// cause: a directory arriving raises its new parent's count and lowers its old
+// one, and a directory it replaces lowers the new parent's again. Both land in
+// the rename's own transaction, so no interleaving can leave a count that
+// describes neither the state before nor the state after.
+//
+// The two parents are read here, one revision at a time, and pinned: a
+// concurrent mkdir in either of them aborts this rename rather than losing its
+// increment to it.
+func (s *Store) applyRenameNlink(ctx context.Context, oldParent, newParent uint64,
+	srcIsDir, victimIsDir bool, cmps *[]clientv3.Cmp, ops *[]clientv3.Op) error {
+
+	deltas := map[uint64]int{}
+	if srcIsDir && oldParent != newParent {
+		deltas[oldParent]--
+		deltas[newParent]++
+	}
+	if victimIsDir {
+		deltas[newParent]--
+	}
+	for ino, delta := range deltas {
+		if delta == 0 {
+			continue
+		}
+		adj, err := s.adjustDirNlink(ctx, ino, delta)
+		if err != nil {
+			return err
+		}
+		*cmps = append(*cmps, adj.cmps...)
+		*ops = append(*ops, adj.ops...)
+	}
 	return nil
 }
 
@@ -520,10 +650,11 @@ func (s *Store) touchRenameDirs(ctx context.Context, oldParent, newParent uint64
 // only node that may, since its in-memory free list is rebuilt from exactly
 // those records.
 func (s *Store) unlinkInodeOps(rec *InodeRecord) []clientv3.Op {
-	// A directory carries a fixed count of 2 for its whole life, so the count
-	// says nothing about whether it is still referenced: losing its one name
-	// removes it outright.  Decrementing instead would leave the record behind
-	// with a count no path can ever bring back to zero.
+	// A directory's count is its own "." plus the ".." of each subdirectory it
+	// holds, so it says nothing about how many names refer to it — a directory
+	// has exactly one, and losing it removes the directory outright.
+	// Decrementing instead would leave the record behind with a count no path
+	// can ever bring back to zero.
 	if rec.Mode&S_IFMT == ModeDir {
 		return []clientv3.Op{
 			clientv3.OpDelete(InodeKey(rec.Ino)),

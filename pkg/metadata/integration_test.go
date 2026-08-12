@@ -1423,3 +1423,82 @@ func TestIntegration_NamespaceOpsTouchTheParentDirectory(t *testing.T) {
 	require.NoError(t, err)
 	assert.WithinDuration(t, time.Now(), rec.Ctime, time.Minute, "unlink left the target ctime alone")
 }
+
+// A directory is referred to by the ".." of every subdirectory it holds, so its
+// link count moves as subdirectories arrive and leave. It used to be fixed at
+// 2 for the directory's whole life.
+func TestIntegration_DirectoryNlinkCountsSubdirectories(t *testing.T) {
+	store := testStore(t, "test-node")
+	ctx := context.Background()
+	parent := uint64(1)
+
+	_, err := store.CreateInode(ctx, parent, ModeDir|0755, 0, 0)
+	require.NoError(t, err)
+
+	nlink := func(ino uint64) uint32 {
+		rec, err := store.GetInode(ctx, ino)
+		require.NoError(t, err)
+		require.NotNil(t, rec)
+		return rec.Nlink
+	}
+
+	_, err = store.AtomicCreateDir(ctx, parent, "a", 800, 0755, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(3), nlink(parent), "parent gained a subdirectory")
+	assert.Equal(t, uint32(2), nlink(800), "a new directory holds none of its own")
+
+	// A file is not a subdirectory and must leave the count alone — this is
+	// also the path that must stay free of a pin on the parent.
+	_, err = store.AtomicCreateFile(ctx, parent, "f", 801, ModeFile|0644, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(3), nlink(parent), "a file changed the parent's count")
+
+	_, err = store.AtomicCreateDir(ctx, 800, "b", 802, 0755, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(3), nlink(800))
+	assert.Equal(t, uint32(3), nlink(parent), "a grandchild moved the grandparent's count")
+
+	// Moving a directory takes its reference with it.
+	require.NoError(t, store.AtomicRename(ctx, 800, "b", parent, "b", 802, 0))
+	assert.Equal(t, uint32(2), nlink(800), "the old parent kept the reference")
+	assert.Equal(t, uint32(4), nlink(parent), "the new parent did not gain it")
+
+	require.NoError(t, store.AtomicRmdir(ctx, parent, "b"))
+	assert.Equal(t, uint32(3), nlink(parent), "rmdir left the count behind")
+
+	// Renaming within one directory moves nothing.
+	require.NoError(t, store.AtomicRename(ctx, parent, "a", parent, "a2", 800, 0))
+	assert.Equal(t, uint32(3), nlink(parent))
+}
+
+// Concurrent mkdirs in one directory each have to land: they contend on the
+// parent's record, and a lost increment would be a permanently wrong count.
+func TestIntegration_ConcurrentMkdirKeepsTheParentCount(t *testing.T) {
+	store := testStore(t, "test-node")
+	ctx := context.Background()
+	parent := uint64(1)
+
+	_, err := store.CreateInode(ctx, parent, ModeDir|0755, 0, 0)
+	require.NoError(t, err)
+
+	const concurrent = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, concurrent)
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			_, err := store.AtomicCreateDir(ctx, parent, fmt.Sprintf("d-%d", id), uint64(850+id), 0755, 0, 0)
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	rec, err := store.GetInode(ctx, parent)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2+concurrent), rec.Nlink, "an increment was lost to contention")
+}

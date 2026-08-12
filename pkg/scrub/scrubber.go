@@ -258,6 +258,9 @@ type Snapshot struct {
 	Inodes map[uint64]*metadata.InodeRecord
 	// DirentRefs counts the directory entries pointing at each inode.
 	DirentRefs map[uint64]uint32
+	// SubdirRefs counts the subdirectories each directory holds, which is what
+	// its link count is made of beyond its own ".".
+	SubdirRefs map[uint64]uint32
 	// Generations is each node's current fencing generation.
 	Generations map[string]uint64
 }
@@ -296,6 +299,7 @@ func Scan(ctx context.Context, store Reader) (*Snapshot, error) {
 		Extents:     metadata.DecodeExtents(extKvs),
 		Inodes:      make(map[uint64]*metadata.InodeRecord, len(inodeKvs)),
 		DirentRefs:  make(map[uint64]uint32, len(direntKvs)),
+		SubdirRefs:  make(map[uint64]uint32, len(direntKvs)),
 		Generations: make(map[string]uint64, len(genKvs)),
 	}
 	for _, kv := range inodeKvs {
@@ -303,8 +307,18 @@ func Scan(ctx context.Context, store Reader) (*Snapshot, error) {
 			snap.Inodes[rec.Ino] = rec
 		}
 	}
+	// Second pass over the dirents, after the inodes: whether an entry names a
+	// directory is a property of the record it points at.
 	for _, kv := range direntKvs {
-		snap.DirentRefs[metadata.DecodeUint64(kv.Value)]++
+		child := metadata.DecodeUint64(kv.Value)
+		snap.DirentRefs[child]++
+		parent, _, ok := metadata.ParseDirentKey(string(kv.Key))
+		if !ok {
+			continue
+		}
+		if rec := snap.Inodes[child]; rec != nil && rec.Mode&metadata.S_IFMT == metadata.ModeDir {
+			snap.SubdirRefs[parent]++
+		}
 	}
 	for _, kv := range genKvs {
 		n := uint64(0)
@@ -510,13 +524,15 @@ func CheckGenerationConsistency(snap *Snapshot) []Result {
 	return results
 }
 
-// CheckNlinkConsistency verifies every inode's nlink matches its dirent count.
+// CheckNlinkConsistency verifies every inode's nlink matches what the namespace
+// says it should be: its dirent count for a file, and 2 plus its subdirectories
+// for a directory.
 func (s *Scrubber) CheckNlinkConsistency(snap *Snapshot) []Result { return CheckNlinkConsistency(snap) }
 
 func CheckNlinkConsistency(snap *Snapshot) []Result {
 	results := make([]Result, 0, len(snap.Inodes))
 	for ino, rec := range snap.Inodes {
-		expected := expectedNlink(rec, snap.DirentRefs[ino])
+		expected := expectedNlink(rec, snap.DirentRefs[ino], snap.SubdirRefs[ino])
 		if rec.Nlink != expected {
 			results = append(results, Result{
 				Type:   "nlink",
@@ -570,9 +586,16 @@ func CheckUnreferencedInodes(snap *Snapshot) []Result {
 // subdirectory would contribute to its parent, so every directory keeps the
 // count it was created with — counting dirents instead would flag every
 // directory in the filesystem.
-func expectedNlink(rec *metadata.InodeRecord, dirents uint32) uint32 {
+// expectedNlink is what an inode's link count should read.
+//
+// A directory is referred to by its own ".", by its entry in its parent, and by
+// the ".." of every subdirectory it holds. The first two are the 2 it is
+// created with; the third is why the count moves at all. A filesystem written
+// before directory counts were maintained reports 2 everywhere, so this check
+// is also what finds those, and fsck is what repairs them.
+func expectedNlink(rec *metadata.InodeRecord, dirents, subdirs uint32) uint32 {
 	if rec.Mode&metadata.S_IFMT == metadata.ModeDir {
-		return metadata.InitialNlink(rec.Mode)
+		return metadata.InitialNlink(rec.Mode) + subdirs
 	}
 	return dirents
 }
