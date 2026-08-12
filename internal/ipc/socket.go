@@ -51,6 +51,8 @@ const (
 	ipcOpGetxattr    = 31
 	ipcOpListxattr   = 32
 	ipcOpRemovexattr = 33
+	ipcOpLseek       = 34
+	ipcOpFallocate   = 35
 )
 
 // op describes one IPC operation: the name its metrics and logs carry, and the
@@ -103,6 +105,8 @@ var ops = map[uint16]op{
 	ipcOpGetxattr:    {"getxattr", (*Service).handleGetxattr},
 	ipcOpListxattr:   {"listxattr", (*Service).handleListxattr},
 	ipcOpRemovexattr: {"removexattr", (*Service).handleRemovexattr},
+	ipcOpLseek:       {"lseek", (*Service).handleLseek},
+	ipcOpFallocate:   {"fallocate", (*Service).handleFallocate},
 	ipcOpOpen:        {"open", ok},
 	ipcOpOpendir:     {"opendir", ok},
 	ipcOpRelease:     {"release", ok},
@@ -132,6 +136,7 @@ var mutatingOps = map[uint16]bool{
 	ipcOpWrite:       true,
 	ipcOpSetxattr:    true,
 	ipcOpRemovexattr: true,
+	ipcOpFallocate:   true,
 }
 
 func opName(code uint16) string {

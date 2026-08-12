@@ -320,3 +320,77 @@ func (s *Store) AppendExtent(ctx context.Context, ino, logicalOff, diskOff, leng
 	}
 	return nil
 }
+
+// DataRanges resolves an inode's extents into the logical byte ranges that
+// hold data, merged, clamped to size, and in ascending order. The gaps between
+// them — and everything from the last range to size — are holes.
+//
+// It walks the extent list exactly as a read does, and deliberately so: the
+// list is sorted by logical offset with the newest extent first where two share
+// one, so taking the first extent that reaches the cursor resolves an overwrite
+// to the later write. Any other traversal here would let SEEK_HOLE and SEEK_DATA
+// disagree with what a read of the same offset actually returns, which is a
+// worse failure than not supporting them at all — a backup tool would skip a
+// range that has data in it.
+//
+// Extents must be ordered as GetExtents returns them.
+func DataRanges(extents []Extent, size uint64) [][2]uint64 {
+	var ranges [][2]uint64
+	pos := uint64(0)
+	for _, ext := range extents {
+		if pos >= size {
+			break
+		}
+		if ext.End() <= pos {
+			continue // entirely behind the cursor, or buried by a newer extent
+		}
+		start := max(ext.LogOff, pos)
+		end := min(ext.End(), size)
+		if start >= end {
+			continue
+		}
+		// Merge with the previous range when they meet, so a file written in
+		// many small appends reports one run rather than one range per write.
+		if n := len(ranges); n > 0 && ranges[n-1][1] >= start {
+			ranges[n-1][1] = max(ranges[n-1][1], end)
+		} else {
+			ranges = append(ranges, [2]uint64{start, end})
+		}
+		pos = end
+	}
+	return ranges
+}
+
+// SeekData returns the offset of the first byte of data at or after offset.
+// ok is false when there is none, which lseek(2) reports as ENXIO.
+func SeekData(extents []Extent, size, offset uint64) (uint64, bool) {
+	if offset >= size {
+		return 0, false
+	}
+	for _, r := range DataRanges(extents, size) {
+		if r[1] > offset {
+			return max(r[0], offset), true
+		}
+	}
+	return 0, false
+}
+
+// SeekHole returns the offset of the first byte of a hole at or after offset.
+// ok is false only when offset is at or past the end of the file.
+//
+// A file always ends in a hole as far as lseek(2) is concerned, so an offset
+// inside the file always has an answer: at worst, size itself.
+func SeekHole(extents []Extent, size, offset uint64) (uint64, bool) {
+	if offset >= size {
+		return 0, false
+	}
+	for _, r := range DataRanges(extents, size) {
+		if offset < r[0] {
+			return offset, true // already in the hole before this range
+		}
+		if offset < r[1] {
+			offset = r[1] // inside data: the hole starts where this run ends
+		}
+	}
+	return offset, true
+}

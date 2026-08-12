@@ -150,7 +150,9 @@ Node restart is therefore cheap versus GFS2-style recovery: reconnect to etcd, r
 
 ## POSIX semantics: what's supported, what's not
 
-Supported: standard file/directory CRUD, `read`/`write`/`truncate`, `rename` (including cross-directory), hard links, symlinks, `flock`/`fcntl` byte-range and whole-file locks (data-lock class above), directory listing via `readdir`/`readdirplus`, extended attributes (`getfattr`/`setfattr`, SELinux labels, POSIX ACLs stored as attributes).
+Supported: standard file/directory CRUD, `read`/`write`/`truncate`, `rename` (including cross-directory), hard links, symlinks, `flock`/`fcntl` byte-range and whole-file locks (data-lock class above), directory listing via `readdir`/`readdirplus`, extended attributes (`getfattr`/`setfattr`, SELinux labels, POSIX ACLs stored as attributes), sparse-file queries via `lseek(SEEK_HOLE)`/`lseek(SEEK_DATA)`, and `fallocate` for preallocation and `FALLOC_FL_PUNCH_HOLE`.
+
+`fallocate` in its plain form publishes the larger size but does not reserve blocks — space is claimed from the arena when a write lands, so a later write into a preallocated range can still fail with `ENOSPC`. `FALLOC_FL_ZERO_RANGE` and `FALLOC_FL_COLLAPSE_RANGE` return `EOPNOTSUPP` rather than an approximation.
 
 Not supported: shared writable `mmap` across nodes (see [Locking](#locking)) — an explicit rejected case, not an ambiguous gap. Multi-node coherence for other unusual access patterns is documented per-subsystem in `docs/architecture/`; when in doubt, check [`docs/architecture/consistency/multi-node-coherence.md`](docs/architecture/consistency/multi-node-coherence.md) and [`docs/architecture/consistency/cache-coherence.md`](docs/architecture/consistency/cache-coherence.md) before assuming a POSIX guarantee holds identically to a local filesystem.
 

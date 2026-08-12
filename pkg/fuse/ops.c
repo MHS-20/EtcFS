@@ -49,6 +49,8 @@
 #define IPC_OP_GETXATTR    31
 #define IPC_OP_LISTXATTR   32
 #define IPC_OP_REMOVEXATTR 33
+#define IPC_OP_LSEEK       34
+#define IPC_OP_FALLOCATE   35
 
 /* Must match maxFrameLen in internal/ipc/socket.go. */
 #define IPC_MAX_FRAME_LEN (1u << 20)
@@ -1092,12 +1094,70 @@ static void ec_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 static void ec_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t length,
                          struct fuse_file_info *fi)
 {
-    (void) ino;
-    (void) mode;
-    (void) offset;
-    (void) length;
     (void) fi;
-    fuse_reply_err(req, ENOSYS);
+    if (offset < 0 || length <= 0) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    uint8_t payload[8 + 4 + 8 + 8];
+    uint32_t off = 0;
+    off += wb_u64(payload + off, ino);
+    off += wb_u32(payload + off, (uint32_t) mode);
+    off += wb_u64(payload + off, (uint64_t) offset);
+    off += wb_u64(payload + off, (uint64_t) length);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_FALLOCATE, payload, off, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
+    free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    fuse_reply_err(req, -e);
+}
+
+/* SEEK_DATA and SEEK_HOLE only. The kernel resolves SEEK_SET, SEEK_CUR and
+ * SEEK_END itself and never calls this for them. */
+static void ec_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
+                     struct fuse_file_info *fi)
+{
+    (void) fi;
+    if (off < 0) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    uint8_t payload[8 + 8 + 4];
+    uint32_t p = 0;
+    p += wb_u64(payload + p, ino);
+    p += wb_u64(payload + p, (uint64_t) off);
+    p += wb_u32(payload + p, (uint32_t) whence);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_LSEEK, payload, p, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    struct rbuf rb = rb_new(resp, rlen);
+    int32_t e = rb_i32(&rb);
+    if (e != 0) {
+        fuse_reply_err(req, -e);
+        free(resp);
+        return;
+    }
+    uint64_t found = rb_u64(&rb);
+    free(resp);
+    if (!rb.ok) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    fuse_reply_lseek(req, (off_t) found);
 }
 
 /* ---- extended attributes ----
@@ -1309,6 +1369,7 @@ struct fuse_lowlevel_ops *etcfs_fuse_ops(void)
     ops.getxattr = ec_getxattr;
     ops.listxattr = ec_listxattr;
     ops.removexattr = ec_removexattr;
+    ops.lseek = ec_lseek;
     /* getlk/setlk are deliberately left unset. libfuse: "if the locking
      * methods are not implemented, the kernel will still allow file locking
      * to work locally." Implementing them takes that job away from the
