@@ -63,12 +63,17 @@ func (s *Service) directSafe(buf []byte) bool {
 	return uintptr(len(buf))%ss == 0 && uintptr(unsafe.Pointer(&buf[0]))%ss == 0
 }
 
-// WRITE payload: [u64:ino][u64:offset][u32:data_len][data]
+// WRITE payload: [u64:ino][u64:offset][u32:data_len][data][u32:uid]
 // Response: [i32:error][u32:written]
+//
+// The caller's uid rides along because a write by an unprivileged user has to
+// drop the file's set-user-ID and set-group-ID bits, and the mode lives in
+// EtcFS's own inode record rather than anywhere the kernel can clear it.
 func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, error) {
 	r := newReader(payload)
 	ino, offset := r.u64(), r.u64()
 	data := r.blob()
+	uid := r.u32()
 	if !r.ok {
 		return int32Resp(-22), nil
 	}
@@ -80,13 +85,15 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 	}
 
 	if s.dev != nil {
-		return s.handleWriteBlock(ctx, ino, offset, data, rec)
+		return s.handleWriteBlock(ctx, ino, offset, data, uid, rec)
 	}
 
-	// No block device — update size only (metadata-only mode)
+	// No block device — update size and mode only (metadata-only mode)
 	newEnd := offset + uint64(dataLen)
-	if newEnd > rec.Size {
-		rec.Size = newEnd
+	mode := metadata.ClearSetIDOnWrite(rec.Mode, uid)
+	if newEnd > rec.Size || mode != rec.Mode {
+		rec.Size = max(rec.Size, newEnd)
+		rec.Mode = mode
 		_, _ = s.store.Put(ctx, metadata.InodeKey(ino), metadata.EncodeInode(rec))
 	}
 
@@ -94,7 +101,7 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 }
 
 func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint64,
-	data []byte, rec *metadata.InodeRecord) ([]byte, error) {
+	data []byte, uid uint32, rec *metadata.InodeRecord) ([]byte, error) {
 
 	dataLen := len(data)
 	if dataLen == 0 {
@@ -232,10 +239,14 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		// Data is already durable on the device; if the guard rejects the
 		// commit the bytes stay unreferenced and the blocks go back to the
 		// arena.
-		if end > rec.Size {
-			sized := *rec
-			sized.Size = end
-			ops = append(ops, clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(&sized))))
+		// The inode is rewritten when the write grows the file, and also when it
+		// costs the file its set-user-ID bits — both ride the transaction that
+		// publishes the write rather than a round trip of their own.
+		if mode := metadata.ClearSetIDOnWrite(rec.Mode, uid); end > rec.Size || mode != rec.Mode {
+			updated := *rec
+			updated.Size = max(rec.Size, end)
+			updated.Mode = mode
+			ops = append(ops, clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(&updated))))
 		}
 
 		// The write is about to bury these, so they stop being readable through

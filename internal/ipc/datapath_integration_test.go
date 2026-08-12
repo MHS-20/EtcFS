@@ -99,6 +99,17 @@ func setattrPayload(ino uint64, valid uint32, size uint64, mode, uid, gid uint32
 	return b.b
 }
 
+// writePayload builds a WRITE request from the given caller's uid.
+func writePayload(ino, offset uint64, data []byte, uid uint32) []byte {
+	var b buf
+	b.w64(ino)
+	b.w64(offset)
+	b.w32(uint32(len(data)))
+	b.b = append(b.b, data...)
+	b.w32(uid)
+	return b.b
+}
+
 func mustSetattr(t *testing.T, svc *Service, payload []byte) {
 	t.Helper()
 	resp, err := svc.handleSetattr(context.Background(), payload)
@@ -200,12 +211,7 @@ func TestIntegration_ReadFillsHolesAroundData(t *testing.T) {
 	const dataOff, dataLen, readLen = 8192, 4096, 16384
 	payloadData := bytes.Repeat([]byte{0xAB}, dataLen)
 
-	var wq buf
-	wq.w64(ino)
-	wq.w64(dataOff)
-	wq.w32(dataLen)
-	wq.b = append(wq.b, payloadData...)
-	if _, err := svc.handleWrite(ctx, wq.b); err != nil {
+	if _, err := svc.handleWrite(ctx, writePayload(ino, dataOff, payloadData, 0)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -359,12 +365,7 @@ func TestIntegration_ReadStopsAtTheEndOfTheFile(t *testing.T) {
 	seedFile(t, store, ino, metadata.ModeFile|0644)
 
 	payloadData := []byte("s1-data")
-	var wq buf
-	wq.w64(ino)
-	wq.w64(0)
-	wq.w32(uint32(len(payloadData)))
-	wq.b = append(wq.b, payloadData...)
-	if _, err := svc.handleWrite(ctx, wq.b); err != nil {
+	if _, err := svc.handleWrite(ctx, writePayload(ino, 0, payloadData, 0)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -404,12 +405,7 @@ func TestIntegration_OpenWithTruncEmptiesTheFile(t *testing.T) {
 	seedFile(t, store, ino, metadata.ModeFile|0644)
 
 	payloadData := []byte("before")
-	var wq buf
-	wq.w64(ino)
-	wq.w64(0)
-	wq.w32(uint32(len(payloadData)))
-	wq.b = append(wq.b, payloadData...)
-	if _, err := svc.handleWrite(ctx, wq.b); err != nil {
+	if _, err := svc.handleWrite(ctx, writePayload(ino, 0, payloadData, 0)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -450,5 +446,43 @@ func TestIntegration_OpenWithTruncEmptiesTheFile(t *testing.T) {
 	}
 	if got := readPayload(t, resp); len(got) != 0 {
 		t.Fatalf("read after O_TRUNC returned %d bytes (%q)", len(got), got)
+	}
+}
+
+// A write by an unprivileged user has to cost the file its set-user-ID bits,
+// or an ordinary user can change what a setuid binary does while it keeps
+// running as its owner.
+func TestIntegration_WriteClearsSetIDBits(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino = 7006
+	seedFile(t, store, ino, metadata.ModeFile|metadata.S_ISUID|metadata.S_ISGID|0777)
+
+	if _, err := svc.handleWrite(ctx, writePayload(ino, 0, []byte("x"), 65534)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	rec, err := store.GetInode(ctx, ino)
+	if err != nil || rec == nil {
+		t.Fatalf("read back inode: %v", err)
+	}
+	if got := rec.Mode & ^metadata.S_IFMT; got != 0777 {
+		t.Errorf("mode = %#o after an unprivileged write, want 0777", got)
+	}
+
+	// Root keeps them, the way a process holding CAP_FSETID does.
+	const rootIno = 7007
+	if _, err := store.AtomicCreateFile(ctx, metadata.RootIno, t.Name()+"-root", rootIno,
+		metadata.ModeFile|metadata.S_ISUID|0777, 0, 0); err != nil {
+		t.Fatalf("seed inode: %v", err)
+	}
+	if _, err := svc.handleWrite(ctx, writePayload(rootIno, 0, []byte("x"), 0)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	rec, err = store.GetInode(ctx, rootIno)
+	if err != nil || rec == nil {
+		t.Fatalf("read back inode: %v", err)
+	}
+	if rec.Mode&metadata.S_ISUID == 0 {
+		t.Errorf("a write by root cleared the set-user-ID bit: mode = %#o", rec.Mode)
 	}
 }

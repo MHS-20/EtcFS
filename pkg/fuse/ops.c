@@ -839,13 +839,16 @@ static void ec_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t siz
                      struct fuse_file_info *fi)
 {
     (void) fi;
-    uint8_t *payload = malloc(20 + size);
+    uint8_t *payload = malloc(24 + size);
     uint32_t pos = 0;
     pos += wb_u64(payload + pos, ino);
     pos += wb_u64(payload + pos, (uint64_t) off);
     pos += wb_u32(payload + pos, (uint32_t) size);
     memcpy(payload + pos, buf, size);
     pos += (uint32_t) size;
+    /* The backend owns the mode, so it is the only place that can drop the
+     * set-user-ID bits this write costs the file. */
+    pos += wb_u32(payload + pos, fuse_req_ctx(req)->uid);
 
     uint8_t *resp;
     uint32_t rlen;

@@ -109,10 +109,34 @@ const (
 	ModeSymlink = uint32(0120000) // S_IFLNK
 	ModeFile    = uint32(0100000) // S_IFREG
 
+	S_ISUID = uint32(0004000)
+	S_ISGID = uint32(0002000)
+	S_IXGRP = uint32(0000010)
+
 	DirentTypeDir     = 4  // DT_DIR
 	DirentTypeFile    = 8  // DT_REG
 	DirentTypeSymlink = 10 // DT_LNK
 )
+
+// ClearSetIDOnWrite returns mode with the set-user-ID and set-group-ID bits a
+// write by uid must drop.
+//
+// Otherwise an unprivileged user who may write a setuid binary can change what
+// it does while it keeps running as its owner. Root keeps the bits, the way a
+// process holding CAP_FSETID does on a local filesystem: that is what lets an
+// installer write a setuid binary without having to re-set the mode. The
+// set-group-ID bit means mandatory locking rather than privilege on a file
+// with no group-execute bit, so it is cleared only when that bit is set.
+func ClearSetIDOnWrite(mode, uid uint32) uint32 {
+	if uid == 0 {
+		return mode
+	}
+	mode &^= S_ISUID
+	if mode&S_IXGRP != 0 {
+		mode &^= S_ISGID
+	}
+	return mode
+}
 
 // Key helpers — build etcd keys from components.
 
