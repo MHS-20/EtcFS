@@ -9,19 +9,23 @@ Baseline (1000-IOPS io2): etcfs 237 randwrite / 208 randread, raw 1033/1006.
 
 ## 0. Measure first
 
-- [ ] Per-stage timing on read + write path via `pkg/metrics` histograms
-      (etcd read, etcd commit, device, FUSE/IPC). No decomposition exists —
-      everything below is aimed at a guess until this lands.
+- [x] Per-stage timing on read + write path via `pkg/metrics` histograms
+      (etcd read, etcd commit, device, FUSE/IPC). Added `EtcdReadDuration`
+      (`Store.Get`/`getPrefix`/`GetRevision`) and `BlockIODuration`
+      (`Device.ReadAt`/`WriteAt`); `EtcdTxnDuration` and `FuseOpDuration`
+      already existed and cover commit + end-to-end.
+- [ ] Re-run the 1000-IOPS io2 benchmark with the new histograms scraped and
+      confirm the decomposition sums close to end-to-end handler latency.
 
 ## 1. Cheap wins (no new invariants)
 
-- [ ] `WithSerializable()` on read path's `GetInode` + `GetExtents`
-      (`datapath.go:415`, `:439`). Write path already does this.
-- [ ] Pin serializable reads to the local colocated etcd member; client
-      currently round-robins all 3 endpoints, so a serializable read can still
-      be a network hop.
-- [ ] Fold inode + extents into one unconditional `Txn` — reuse the `GetMany`
-      pattern (`client.go:167`). 2 RPCs → 1.
+- [x] `WithSerializable()` on read path's `GetInode` + `GetExtents` — done as
+      part of the fold below (`Store.GetInodeAndExtents`).
+- [x] Pin serializable reads to the local colocated etcd member:
+      `-etcd-local-endpoint` + `Store.SetLocalClient`; every read tries the
+      pinned client first and falls back to the round-robin one.
+- [x] Fold inode + extents into one unconditional `Txn` (`Store.readTxn`,
+      also now used by `GetMany`). 2 RPCs → 1.
 - [ ] Re-benchmark. Expect most of the win here.
 
 ## 2. Lock coverage gap (prerequisite for 3, and a latent bug now)

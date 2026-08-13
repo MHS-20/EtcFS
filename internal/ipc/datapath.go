@@ -406,23 +406,6 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		return int32Resp(-5), nil
 	}
 
-	// Clamp to the file's size before anything else.  A read is answered with
-	// the whole requested range, holes included, so a request reaching past the
-	// end would otherwise come back as a full buffer of zeroes instead of a
-	// short read — and a reader that never sees a short read never sees EOF.
-	// The kernel usually clamps for us, from the size it last cached; it does
-	// not always, and "usually" is not what a read loop terminates on.
-	rec, err := s.store.GetInode(ctx, ino)
-	if err != nil || rec == nil {
-		return int32Resp(-2), nil
-	}
-	if offset >= rec.Size {
-		return dataResp(nil), nil
-	}
-	if remaining := rec.Size - offset; uint64(size) > remaining {
-		size = uint32(remaining)
-	}
-
 	// A shared lock keeps a concurrent writer off the range while it is read.
 	// Best effort: a read that cannot take the lock still returns data, since
 	// the extent list it works from is itself a consistent etcd snapshot.
@@ -437,12 +420,34 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		_ = s.dev.FlushDevice()
 	}
 
+	// The record and the extents come back together, from one revision: the
+	// record clamps the request to the file's size, the extents resolve it.
+	var rec *metadata.InodeRecord
 	var extents []metadata.Extent
-	s.retryKV(ctx, func(ictx context.Context) error {
+	if err := retryEtcd(ctx, func(ictx context.Context) error {
 		var gerr error
-		extents, gerr = s.store.GetExtents(ictx, ino)
+		rec, extents, gerr = s.store.GetInodeAndExtents(ictx, ino)
 		return gerr
-	})
+	}); err != nil {
+		s.log.Warn("read: cannot read metadata", "ino", ino, "error", err)
+		return int32Resp(-5), nil
+	}
+	if rec == nil {
+		return int32Resp(-2), nil
+	}
+
+	// A read is answered with the whole requested range, holes included, so a
+	// request reaching past the end would otherwise come back as a full buffer
+	// of zeroes instead of a short read — and a reader that never sees a short
+	// read never sees EOF.  The kernel usually clamps for us, from the size it
+	// last cached; it does not always, and "usually" is not what a read loop
+	// terminates on.
+	if offset >= rec.Size {
+		return dataResp(nil), nil
+	}
+	if remaining := rec.Size - offset; uint64(size) > remaining {
+		size = uint32(remaining)
+	}
 	s.log.Debug("READ extents", "ino", ino, "count", len(extents))
 
 	// The buffer starts zeroed, so a hole costs nothing: only the ranges an

@@ -52,6 +52,16 @@ var (
 		Buckets: prometheus.ExponentialBuckets(0.0005, 3, 10),
 	})
 
+	// EtcdReadDuration observes etcd read round-trip latency (Get/prefix
+	// reads), separate from EtcdTxnDuration's guarded-commit path — the read
+	// and write paths spend this budget differently and item 0 of the
+	// round-trip-reduction plan needs them decomposed.
+	EtcdReadDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "etcfuse_etcd_read_duration_seconds",
+		Help:    "etcd read round-trip latency.",
+		Buckets: prometheus.ExponentialBuckets(0.0005, 3, 10),
+	})
+
 	// BlockIO counts block-device operations, by direction (read, write).
 	BlockIO = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "etcfuse_block_io_total",
@@ -62,6 +72,13 @@ var (
 	BlockIOBytes = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "etcfuse_block_io_bytes_total",
 		Help: "Bytes transferred to and from the block device, by direction.",
+	}, []string{"op"})
+
+	// BlockIODuration observes block device operation latency, by direction.
+	BlockIODuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "etcfuse_block_io_duration_seconds",
+		Help:    "Block device operation latency, by direction.",
+		Buckets: prometheus.ExponentialBuckets(0.0001, 3, 10),
 	}, []string{"op"})
 
 	// ScrubAnomalies counts anomalies found by the scrubber, by type

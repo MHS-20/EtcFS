@@ -276,6 +276,35 @@ func (s *Store) GetExtents(ctx context.Context, ino uint64, opts ...clientv3.OpO
 	return DecodeExtents(kvs), nil
 }
 
+// GetInodeAndExtents reads an inode record together with its extent list, as
+// one serializable transaction.  A nil record means the inode is gone.
+//
+// The read path needs both before it can answer: the record to clamp the
+// request to the file's size, the extents to resolve the range.  Read
+// separately they cost two round trips and can straddle a revision; read this
+// way they cost one and are a consistent snapshot.
+//
+// Serializable because the shared lock, not the read's placement in etcd's
+// linear order, is what keeps a concurrent writer off the range — and a read
+// that could not take the lock is already best effort.
+func (s *Store) GetInodeAndExtents(ctx context.Context, ino uint64) (*InodeRecord, []Extent, error) {
+	resp, err := s.readTxn(ctx,
+		clientv3.OpGet(InodeKey(ino), clientv3.WithSerializable()),
+		clientv3.OpGet(ExtentPrefix(ino), clientv3.WithPrefix(), clientv3.WithSerializable()),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get inode and extents ino %d: %w", ino, err)
+	}
+	if len(resp.Responses) != 2 {
+		return nil, nil, fmt.Errorf("get inode and extents ino %d: %d responses", ino, len(resp.Responses))
+	}
+	inodeKvs := resp.Responses[0].GetResponseRange().Kvs
+	if len(inodeKvs) == 0 {
+		return nil, nil, nil
+	}
+	return DecodeInode(inodeKvs[0].Value), DecodeExtents(resp.Responses[1].GetResponseRange().Kvs), nil
+}
+
 // AllExtents returns every extent in the filesystem, ordered by logical
 // offset within no particular inode.  Used by the whole-filesystem scanners
 // (fsck, scrubber, arena reconstruction).
