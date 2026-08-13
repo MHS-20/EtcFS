@@ -3,6 +3,8 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -114,29 +116,59 @@ func (s *Store) lockSession(ttl time.Duration) (*concurrency.Session, error) {
 	return sess, nil
 }
 
-// LockSessionAlive reports whether the lease every lock this node holds was
-// written under is still valid.
+// LockSessionLease returns the lease every lock this node currently holds is
+// written under, and whether there is a live session at all.
 //
-// False means the node holds nothing, whatever it believes: expiry deletes
-// every key written under the lease at once. A caller that keeps state behind
-// a lock — a cached lock key, or metadata cached under it — has to drop that
-// state when this goes false, because a peer is now free to take the lock and
-// change what the state describes.
+// It answers identity, not liveness, and the difference is the whole point.
+// A dead session is replaced lazily by the next acquisition, so "is the
+// current session alive" is true again the moment any other inode takes a
+// lock — while a key written under the *previous* session is already gone,
+// deleted with its lease. A caller holding state behind a lock has to compare
+// the lease its key was written under against this value, and drop the state
+// when they differ, not merely when there is no session.
 //
-// It never grants a session: a node that has taken no lock holds none, and
-// answering "not alive" is the correct answer for it.
-func (s *Store) LockSessionAlive() bool {
+// It never grants a session: a node that has taken no lock holds none.
+func (s *Store) LockSessionLease() (clientv3.LeaseID, bool) {
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	if s.session == nil {
-		return false
+		return 0, false
 	}
 	select {
 	case <-s.session.Done():
-		return false
+		return 0, false
 	default:
-		return true
+		return s.session.Lease(), true
 	}
+}
+
+// LockHolderLease returns the lease a holder token was minted under.
+//
+// It lives next to the code that builds the token (see AcquireLock) so the
+// format has exactly one definition and one reader.
+func LockHolderLease(holder string) (clientv3.LeaseID, bool) {
+	lease, _, found := strings.Cut(holder, "-")
+	if !found {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(lease, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return clientv3.LeaseID(id), true
+}
+
+// LockHeldBy reports whether one specific holder's key exists.
+//
+// Used to settle an acquisition whose response was lost: the transaction may
+// have committed, and the key's own name says whether it did.  A linearizable
+// point read, because the answer decides whether this node holds a lock.
+func (s *Store) LockHeldBy(ctx context.Context, ino uint64, mode LockMode, holder string) (bool, error) {
+	value, err := s.Get(ctx, LockKey(ino, mode, holder))
+	if err != nil {
+		return false, fmt.Errorf("lock held by ino %d: %w", ino, err)
+	}
+	return value != nil, nil
 }
 
 // AcquireLock takes a lock on an inode and returns the holder token that
@@ -184,10 +216,13 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 
 	ok, err := s.Txn(ctx, []clientv3.Cmp{cmp}, []clientv3.Op{op}, nil)
 	if err != nil {
-		return "", fmt.Errorf("acquire lock ino %d: %w", ino, err)
+		// The holder is returned alongside the error on purpose: this call may
+		// have committed and lost its response, and the token names the key
+		// that would prove it.  See LockHeldBy.
+		return holder, fmt.Errorf("acquire lock ino %d: %w", ino, err)
 	}
 	if !ok {
-		return "", fmt.Errorf("acquire lock ino %d: %w", ino, ErrConflict)
+		return holder, fmt.Errorf("acquire lock ino %d: %w", ino, ErrConflict)
 	}
 
 	return holder, nil
@@ -256,6 +291,11 @@ func (s *Store) WatchLockWants(ctx context.Context) clientv3.WatchChan {
 
 // GetLockInfo returns the current lock state for an inode, or nil if it is
 // unlocked.  A single exclusive holder makes the whole lock exclusive.
+//
+// Observation only — for tooling and tests.  No lock decision may be made from
+// this or from IsLocked: whether a lock can be taken is decided inside
+// AcquireLock's transaction, atomically with taking it, and a preceding read
+// reopens exactly the window that transaction closes.
 func (s *Store) GetLockInfo(ctx context.Context, ino uint64) (*LockRecord, error) {
 	kvs, err := s.GetPrefix(ctx, LockPrefix(ino))
 	if err != nil {
@@ -275,7 +315,8 @@ func (s *Store) GetLockInfo(ctx context.Context, ino uint64) (*LockRecord, error
 	return rec, nil
 }
 
-// IsLocked returns true if any lock is held on the inode.
+// IsLocked returns true if any lock is held on the inode.  Observation only,
+// for the same reason as GetLockInfo.
 func (s *Store) IsLocked(ctx context.Context, ino uint64) (bool, error) {
 	kvs, err := s.GetPrefix(ctx, LockPrefix(ino))
 	if err != nil {

@@ -15,6 +15,7 @@
 # Usage:
 #   ./benchmark-etcfs.sh                    # 30s per job (default)
 #   ETCFS_BENCH_RUNTIME=60 ./benchmark-etcfs.sh
+#   ETCFS_BENCH_READONLY=1 ./benchmark-etcfs.sh   # randread-4k only
 #
 # Output: JSON fio results + Markdown summary in
 # $PROJECT_ROOT/benchmark-results/.
@@ -46,6 +47,7 @@ $SSH_CMD "ec2-user@$N0" "sudo dnf install -y fio >/dev/null 2>&1 || sudo yum ins
 # separate inodes instead of serializing on one shared file's lock. 8M size
 # keeps fio's own file-layout pass short at etcfs's QD1 write rate.
 JOBS="${ETCFS_BENCH_JOBS:-4}"
+READONLY="${ETCFS_BENCH_READONLY:-0}"
 JOB="
 [global]
 ioengine=psync
@@ -56,13 +58,16 @@ size=8M
 runtime=$RUNTIME
 time_based=1
 group_reporting=1
-[randwrite-4k]
-rw=randwrite
+[randread-4k]
+rw=randread
 bs=4k
 numjobs=$JOBS
 iodepth=1
-[randread-4k]
-rw=randread
+"
+if [[ "$READONLY" != "1" ]]; then
+JOB="$JOB
+[randwrite-4k]
+rw=randwrite
 bs=4k
 numjobs=$JOBS
 iodepth=1
@@ -74,6 +79,7 @@ numjobs=1
 iodepth=1
 stonewall
 "
+fi
 echo "$JOB" | $SSH_CMD "ec2-user@$N0" "cat > /tmp/etcfs.fio"
 $SSH_CMD "ec2-user@$N0" \
     "sudo fio /tmp/etcfs.fio --output-format=json --output=/tmp/etcfs.json"
@@ -81,16 +87,24 @@ scp $SSH_OPTS "ec2-user@$N0:/tmp/etcfs.json" "$RESULTS_DIR/etcfs.json" >/dev/nul
 $SSH_CMD "ec2-user@$N0" "sudo rm -f $FUSE_MOUNTPOINT/fio.* 2>/dev/null || true"
 
 SUMMARY="$RESULTS_DIR/summary-etcfs.md"
+f="$RESULTS_DIR/etcfs.json"
 {
-    echo "| Target | randwrite-4k IOPS | randwrite-4k p99 (us) | randread-4k IOPS | randread-4k p99 (us) | seqwrite-128k MiB/s |"
-    echo "|---|---|---|---|---|---|"
-    f="$RESULTS_DIR/etcfs.json"
-    wiops=$(jq -r '.jobs[0].write.iops // 0 | floor' "$f")
-    wp99=$(jq -r '.jobs[0].write.clat_ns.percentile."99.000000" // 0 | . / 1000 | floor' "$f")
-    riops=$(jq -r '.jobs[1].read.iops // 0 | floor' "$f")
-    rp99=$(jq -r '.jobs[1].read.clat_ns.percentile."99.000000" // 0 | . / 1000 | floor' "$f")
-    seqbw=$(jq -r '.jobs[2].write.bw // 0 | . / 1024 | floor' "$f")
-    echo "| etcfs | $wiops | $wp99 | $riops | $rp99 | $seqbw |"
+    if [[ "$READONLY" == "1" ]]; then
+        echo "| Target | randread-4k IOPS | randread-4k p99 (us) |"
+        echo "|---|---|---|"
+        riops=$(jq -r '.jobs[0].read.iops // 0 | floor' "$f")
+        rp99=$(jq -r '.jobs[0].read.clat_ns.percentile."99.000000" // 0 | . / 1000 | floor' "$f")
+        echo "| etcfs | $riops | $rp99 |"
+    else
+        echo "| Target | randwrite-4k IOPS | randwrite-4k p99 (us) | randread-4k IOPS | randread-4k p99 (us) | seqwrite-128k MiB/s |"
+        echo "|---|---|---|---|---|---|"
+        riops=$(jq -r '.jobs[0].read.iops // 0 | floor' "$f")
+        rp99=$(jq -r '.jobs[0].read.clat_ns.percentile."99.000000" // 0 | . / 1000 | floor' "$f")
+        wiops=$(jq -r '.jobs[1].write.iops // 0 | floor' "$f")
+        wp99=$(jq -r '.jobs[1].write.clat_ns.percentile."99.000000" // 0 | . / 1000 | floor' "$f")
+        seqbw=$(jq -r '.jobs[2].write.bw // 0 | . / 1024 | floor' "$f")
+        echo "| etcfs | $wiops | $wp99 | $riops | $rp99 | $seqbw |"
+    fi
     echo ""
     echo "Data volume: ${VOLUME_IOPS} IOPS (io2)."
 } | tee "$SUMMARY"

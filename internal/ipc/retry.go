@@ -304,11 +304,21 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 	// what bounds how long a partitioned node can serve from its caches: the
 	// lock session's TTL, not the self-fencing watchdog's much longer window.
 	//
+	// The comparison is against the lease this entry's key was written under,
+	// not merely against there being a live session.  A dead session is
+	// replaced lazily by the next acquisition on any inode, so "a session is
+	// alive" goes true again while this entry's key — written under the
+	// previous lease, and deleted with it — is already gone.  Liveness would
+	// let exactly the stale holder this check exists to catch through.
+	//
 	// It costs a mutex and a channel poll, no round trip, so every operation
 	// pays it.
-	if e.holder != "" && !s.store.LockSessionAlive() {
-		s.log.Warn("lock session lost, dropping this node's cached lock", "ino", e.ino)
-		e.holder, e.meta, e.metaFor = "", nil, ""
+	if e.holder != "" {
+		if lease, ok := s.store.LockSessionLease(); !ok || lease != e.lease {
+			s.log.Warn("lock session lost, dropping this node's cached lock",
+				"ino", e.ino, "key_lease", e.lease, "session_lease", lease)
+			e.holder, e.lease, e.meta, e.metaFor = "", 0, nil, ""
+		}
 	}
 
 	if e.holder != "" && covers(e.mode, mode) {
@@ -326,7 +336,8 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 	if err != nil {
 		return err
 	}
-	e.holder, e.mode, e.acquiredAt = holder, mode, time.Now()
+	lease, _ := metadata.LockHolderLease(holder)
+	e.holder, e.lease, e.mode, e.acquiredAt = holder, lease, mode, time.Now()
 	return nil
 }
 
@@ -337,13 +348,32 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 func (s *Service) acquireLockKey(ctx context.Context, ino uint64, mode metadata.LockMode) (string, error) {
 	var holder string
 	announced := false
+	var attempted []string
 
 	err := retry(ctx, lockAttempts, func() error {
 		actx, cancel := context.WithTimeout(ctx, etcdOpTimeout)
 		defer cancel()
 
+		// An earlier attempt may have committed and lost its response, in which
+		// case this node already holds the lock under that attempt's token —
+		// and, for an exclusive lock, is now blocked by its own key forever,
+		// since the token is fresh per attempt and the key lives as long as the
+		// session.  Each token names exactly one key, so a point read settles
+		// it.  Only reachable from the second attempt on, so an uncontended
+		// acquisition never pays for this.
+		if adopted, ok := s.adoptOwnLock(actx, ino, mode, attempted); ok {
+			holder = adopted
+			return nil
+		}
+
 		var aerr error
 		holder, aerr = s.store.AcquireLock(actx, ino, mode, inodeLockTTL)
+		if holder != "" {
+			attempted = append(attempted, holder)
+		}
+		if aerr != nil {
+			holder = ""
+		}
 		if errors.Is(aerr, metadata.ErrConflict) && !announced {
 			announced = true
 			if werr := s.store.AnnounceLockWant(actx, ino); werr != nil {
@@ -368,6 +398,36 @@ func (s *Service) acquireLockKey(ctx context.Context, ino uint64, mode metadata.
 		}()
 	}
 	return holder, err
+}
+
+// adoptOwnLock settles an acquisition whose response was lost.
+//
+// AcquireLock mints a fresh holder token per attempt, so a transaction that
+// committed but never reported back leaves a key nothing will ever release —
+// and, for an exclusive lock, one that blocks this node's own retries, since
+// the acquisition comparison rejects any holder including us.  Each token
+// names exactly one key, so checking the tokens this call has already tried
+// tells us whether we hold the lock without guessing.
+//
+// Only this call's own tokens are ever adopted.  A key belonging to another
+// operation on this node is left alone: two shared holders on one node are
+// legitimate and separately owned, and adopting one would let this operation
+// release a lock it never took.
+func (s *Service) adoptOwnLock(ctx context.Context, ino uint64,
+	mode metadata.LockMode, attempted []string) (string, bool) {
+
+	for _, holder := range attempted {
+		held, err := s.store.LockHeldBy(ctx, ino, mode, holder)
+		if err != nil {
+			return "", false
+		}
+		if held {
+			s.log.Warn("adopted a lock key from an acquisition whose reply was lost",
+				"ino", ino, "mode", mode)
+			return holder, true
+		}
+	}
+	return "", false
 }
 
 // commitGuarded applies ops in one transaction carrying the caller's

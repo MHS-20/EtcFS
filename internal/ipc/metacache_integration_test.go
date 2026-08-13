@@ -5,9 +5,12 @@ package ipc
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/test/etcdtest"
 )
 
 // The metadata a node caches under a held inode lock is what its next read is
@@ -116,7 +119,7 @@ func TestIntegration_MutationsThatDoNotPublishDropTheCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setattr: %v", err)
 	}
-	if code := int32(resp[0]) | int32(resp[1])<<8 | int32(resp[2])<<16 | int32(resp[3])<<24; code != 0 {
+	if code := respCode(resp); code != 0 {
 		t.Fatalf("setattr returned %d", code)
 	}
 	if m := cachedMetaFor(svc, ino); m != nil {
@@ -130,6 +133,11 @@ func TestIntegration_MutationsThatDoNotPublishDropTheCache(t *testing.T) {
 	assertCacheMatchesEtcd(t, svc, store, ino, "read after truncate")
 }
 
+// respCode reads the errno a handler's response opens with.
+func respCode(resp []byte) int32 {
+	return int32(binary.BigEndian.Uint32(resp[:4]))
+}
+
 // readRequest builds a READ payload.
 func readRequest(ino, offset uint64, size uint32) []byte {
 	var b buf
@@ -137,4 +145,82 @@ func readRequest(ino, offset uint64, size uint32) []byte {
 	b.w64(offset)
 	b.w32(size)
 	return b.b
+}
+
+// A cached lock key is only valid while the lease it was written under is
+// still this node's.  The session is replaced lazily by the next acquisition
+// on any inode, so "a session is alive" comes back true while a key written
+// under the previous lease is already gone — and a node that trusted liveness
+// would go on serving reads for an inode a peer has since taken.
+func TestIntegration_CachedLockIsDroppedWhenItsSessionIsReplaced(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino, other = 9201, 9202
+	seedFile(t, store, ino, 0o100644)
+
+	block := make([]byte, 4096)
+	if _, err := svc.handleWrite(ctx, writePayload(ino, 0, block, 0)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if cachedMetaFor(svc, ino) == nil {
+		t.Fatal("write left nothing cached")
+	}
+
+	// End the session the lock key was written under.  etcd deletes the key
+	// with the lease, exactly as an expiry during a partition would.
+	if err := store.CloseLockSession(); err != nil {
+		t.Fatalf("close lock session: %v", err)
+	}
+
+	// Any acquisition on any inode now mints a fresh session, which is what
+	// makes a liveness check answer "yes" again.
+	if _, err := store.AtomicCreateFile(ctx, metadata.RootIno, t.Name()+"-other", other, 0o100644, 1000, 1000); err != nil {
+		t.Fatalf("seed second inode: %v", err)
+	}
+	if _, err := svc.handleWrite(ctx, writePayload(other, 0, block, 0)); err != nil {
+		t.Fatalf("write to second inode: %v", err)
+	}
+
+	// A peer takes the first inode.  This can only succeed if our key really
+	// is gone, so it doubles as the check that the setup did what it claims.
+	peer := metadata.NewStore(etcdtest.Client(t), "peer-node")
+	if _, err := peer.AcquireLock(ctx, ino, metadata.LockExclusive, 10*time.Second); err != nil {
+		t.Fatalf("peer could not take the inode, so this node's key outlived its lease: %v", err)
+	}
+
+	// The read must now go and fail to acquire, not answer from a snapshot
+	// whose lock belongs to someone else.
+	resp, err := svc.handleRead(ctx, readRequest(ino, 0, 4096))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if code := respCode(resp); code != -11 {
+		t.Fatalf("read returned %d, want -11 (EAGAIN): it was served from a lock this node no longer holds", code)
+	}
+}
+
+// An acquisition whose reply is lost leaves a key nothing will release, and
+// for an exclusive lock the retry is then blocked by this node's own key.
+// The tokens the call already tried are what settle it.
+func TestIntegration_AcquisitionAdoptsItsOwnOrphanedKey(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino = 9203
+
+	// Stands in for the attempt that committed and lost its response.
+	holder, err := store.AcquireLock(ctx, ino, metadata.LockExclusive, 10*time.Second)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	got, ok := svc.adoptOwnLock(ctx, ino, metadata.LockExclusive, []string{holder})
+	if !ok || got != holder {
+		t.Fatalf("own key not adopted: got %q, ok=%v", got, ok)
+	}
+
+	// A token this call never wrote must never be adopted, or an operation
+	// would release a lock it does not own.
+	if _, ok := svc.adoptOwnLock(ctx, ino, metadata.LockExclusive, []string{"999-999"}); ok {
+		t.Fatal("adopted a key this acquisition never wrote")
+	}
 }

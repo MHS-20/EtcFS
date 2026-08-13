@@ -6,6 +6,7 @@ import (
 	"time"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -73,7 +74,8 @@ type lockEntry struct {
 	keyMu      sync.Mutex
 	mode       metadata.LockMode // meaningful only while holder is set
 	holder     string
-	acquiredAt time.Time // when holder was taken, for minHoldTime
+	lease      clientv3.LeaseID // the session lease holder was written under
+	acquiredAt time.Time        // when holder was taken, for minHoldTime
 
 	// meta is the inode's record and extent list as last read or written by
 	// this node, and metaFor is the holder token they were read under.  A
@@ -217,7 +219,7 @@ func (s *Service) dropCachedLock(e *lockEntry) {
 // shared to exclusive and shutdown all release the key through here.
 func (s *Service) releaseKeyLocked(e *lockEntry) {
 	holder, mode := e.holder, e.mode
-	e.holder = ""
+	e.holder, e.lease = "", 0
 	e.meta, e.metaFor = nil, ""
 	if holder == "" {
 		return
