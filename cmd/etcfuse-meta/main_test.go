@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/MHS-20/EtcFS/internal/config"
+	"github.com/MHS-20/EtcFS/internal/ipc"
 	"github.com/MHS-20/EtcFS/pkg/fencing"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -23,7 +24,8 @@ func TestStopOnSignalOrFence_SelfFenceCancelsAndReports(t *testing.T) {
 	watchdog := fencing.NewWatchdog(membership, time.Millisecond)
 	go watchdog.Run(ctx)
 
-	fenced := stopOnSignalOrFence(ctx, cancel, watchdog, config.NewLogger(0))
+	svc := ipc.NewService(nil, membership, watchdog, config.NewLogger(0))
+	fenced := stopOnSignalOrFence(ctx, cancel, svc, watchdog, config.NewLogger(0))
 
 	select {
 	case <-fenced:
@@ -45,7 +47,8 @@ func TestStopOnSignalOrFence_OrdinaryShutdownIsNotAFence(t *testing.T) {
 	membership := metadata.NewMembership(nil, "node-a", "test", time.Hour)
 	watchdog := fencing.NewWatchdog(membership, time.Hour)
 
-	fenced := stopOnSignalOrFence(ctx, cancel, watchdog, config.NewLogger(0))
+	svc := ipc.NewService(nil, membership, watchdog, config.NewLogger(0))
+	fenced := stopOnSignalOrFence(ctx, cancel, svc, watchdog, config.NewLogger(0))
 	cancel()
 
 	select {

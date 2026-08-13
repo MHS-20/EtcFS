@@ -4,8 +4,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
+
+func testLogger() *config.Logger { return config.NewLogger(0) }
 
 // The whole point of caching a lock is that a second acquisition of a mode the
 // cached one already satisfies costs no etcd round trip — and that an exclusive
@@ -95,4 +98,55 @@ func TestEvictionSkipsBusyEntries(t *testing.T) {
 		t.Fatalf("cache still at %d entries, eviction made no room", len(s.locks))
 	}
 	busy.rw.Unlock()
+}
+
+// A recall must demote the entry, not remove it.  Removing it lets the next
+// caller build a second entry for the same inode and take a different mutex,
+// so two of this node's own operations would run against one inode believing
+// each holds it — the exclusion the cached etcd key no longer provides.
+func TestRecallKeepsTheEntryInTheCache(t *testing.T) {
+	s := &Service{locks: make(map[uint64]*lockEntry), log: testLogger()}
+	e := s.lockEntryFor(7)
+
+	s.recallLock(7)
+
+	if got := s.lockEntryFor(7); got != e {
+		t.Fatal("recall replaced the cache entry; the node-local lock no longer excludes anything")
+	}
+	if e.holder != "" {
+		t.Fatal("recall left the etcd lock key in place")
+	}
+}
+
+// A recall waits out the minimum hold time before taking the lock away, so
+// contention on one inode cannot turn every operation into a recall.
+func TestRecallHonoursTheMinimumHoldTime(t *testing.T) {
+	s := &Service{locks: make(map[uint64]*lockEntry), log: testLogger()}
+	e := s.lockEntryFor(7)
+	e.acquiredAt = time.Now()
+
+	start := time.Now()
+	s.recallLock(7)
+	if elapsed := time.Since(start); elapsed < minHoldTime {
+		t.Fatalf("recall yielded after %v, before the %v minimum hold", elapsed, minHoldTime)
+	}
+}
+
+// An operation holding an entry that has since been evicted must not proceed
+// on it: the entry excludes nothing once it is out of the cache.
+func TestEvictedEntryIsNotCurrent(t *testing.T) {
+	s := &Service{locks: make(map[uint64]*lockEntry)}
+	e := s.lockEntryFor(7)
+
+	if !s.isCurrent(e) {
+		t.Fatal("a freshly cached entry reports as stale")
+	}
+
+	s.lockMu.Lock()
+	delete(s.locks, 7)
+	s.lockMu.Unlock()
+
+	if s.isCurrent(e) {
+		t.Fatal("an evicted entry still reports as the cache's entry for its inode")
+	}
 }

@@ -273,7 +273,7 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 		log.Info("metrics server listening", "addr", cfg.MetricsAddr)
 	}
 
-	selfFenced := stopOnSignalOrFence(ctx, cancel, watchdog, log)
+	selfFenced := stopOnSignalOrFence(ctx, cancel, svc, watchdog, log)
 
 	log.Info("binary IPC server starting")
 	svc.StartNotificationServer(ctx)
@@ -344,7 +344,7 @@ func newFencingController(ctx context.Context, cfg *config.Config, store *metada
 // itself, which skipped it: a self-fenced node's arenas leaked, permanently in
 // single-signal mode, where no fencing controller reclaims them either.
 func stopOnSignalOrFence(ctx context.Context, cancel context.CancelFunc,
-	watchdog *fencing.Watchdog, log *config.Logger) <-chan struct{} {
+	svc *ipc.Service, watchdog *fencing.Watchdog, log *config.Logger) <-chan struct{} {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -357,6 +357,12 @@ func stopOnSignalOrFence(ctx context.Context, cancel context.CancelFunc,
 			log.Info("received signal, shutting down", "signal", sig)
 		case <-watchdog.Fenced():
 			log.Error("self-fenced, shutting down")
+			// Ahead of the orderly shutdown below, because a fenced node's
+			// cached lock keys are the one piece of shared state its own
+			// generation guard does not neutralise: its commits are already
+			// being rejected, but a lock it is still holding blocks a healthy
+			// peer for as long as it takes this process to exit.
+			svc.ReleaseCachedLocks()
 			close(fenced)
 		}
 	}()

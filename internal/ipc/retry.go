@@ -189,21 +189,31 @@ func (l *heldLock) Release() {
 // the retry budget; keeping that shape means a pathologically slow holder
 // still cannot pin a FUSE request open indefinitely.
 func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockMode) (*heldLock, error) {
-	e := s.lockEntryFor(ino)
-
 	call := time.Now()
-	if err := lockLocal(ctx, e, mode); err != nil {
-		return nil, err
-	}
 
-	if err := s.ensureLockKey(ctx, e, mode); err != nil {
-		unlockLocal(e, mode)
-		return nil, err
-	}
+	for attempt := 0; attempt < lockAttempts; attempt++ {
+		e := s.lockEntryFor(ino)
+		if err := lockLocal(ctx, e, mode); err != nil {
+			return nil, err
+		}
+		// The entry can be evicted between the lookup and the local lock, and an
+		// evicted entry excludes nothing: the next caller builds a fresh one and
+		// takes a different mutex.  Start over on the entry that replaced it.
+		if !s.isCurrent(e) {
+			unlockLocal(e, mode)
+			continue
+		}
 
-	held := &heldLock{s: s, e: e, mode: mode}
-	held.recordLockEvent(lockEventAcquire, call, time.Now())
-	return held, nil
+		if err := s.ensureLockKey(ctx, e, mode); err != nil {
+			unlockLocal(e, mode)
+			return nil, err
+		}
+
+		held := &heldLock{s: s, e: e, mode: mode}
+		held.recordLockEvent(lockEventAcquire, call, time.Now())
+		return held, nil
+	}
+	return nil, metadata.ErrConflict
 }
 
 // lockLocal takes the entry's node-local lock, giving up rather than waiting
@@ -251,7 +261,7 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 	if err != nil {
 		return err
 	}
-	e.holder, e.mode = holder, mode
+	e.holder, e.mode, e.acquiredAt = holder, mode, time.Now()
 	return nil
 }
 

@@ -47,6 +47,17 @@ const (
 	// another node to notice a want key and yield, not merely for an operation
 	// to finish.
 	lockAttempts = 6
+
+	// minHoldTime is how long a freshly acquired lock is kept before a peer's
+	// recall is honoured.  Without it, sustained contention on one inode costs a
+	// recall and a want key per operation — two extra commits where the
+	// per-operation acquire this cache replaced cost one, so the cache would
+	// make the contended case worse than the case it was built to fix.
+	//
+	// This is GFS2's gl_hold_time and it makes the same trade: a bounded extra
+	// wait for the peer, in exchange for a bound on how often a lock can change
+	// hands.  It costs nothing when uncontended, since nothing recalls.
+	minHoldTime = 10 * time.Millisecond
 )
 
 // lockEntry is one inode's cached lock.
@@ -59,9 +70,10 @@ type lockEntry struct {
 	ino uint64
 	rw  sync.RWMutex
 
-	keyMu  sync.Mutex
-	mode   metadata.LockMode // meaningful only while holder is set
-	holder string
+	keyMu      sync.Mutex
+	mode       metadata.LockMode // meaningful only while holder is set
+	holder     string
+	acquiredAt time.Time // when holder was taken, for minHoldTime
 
 	lastUsed time.Time // guarded by Service.lockMu
 }
@@ -88,6 +100,16 @@ func (s *Service) lockEntryFor(ino uint64) *lockEntry {
 	}
 	e.lastUsed = time.Now()
 	return e
+}
+
+// isCurrent reports whether e is still the cache's entry for its inode.  An
+// operation that has taken e's local lock must check this before proceeding:
+// an entry evicted out from under it excludes nothing, because the next caller
+// builds a fresh entry and takes a different mutex.
+func (s *Service) isCurrent(e *lockEntry) bool {
+	s.lockMu.Lock()
+	defer s.lockMu.Unlock()
+	return s.locks[e.ino] == e
 }
 
 // evictLocksLocked drops cached locks until the cache has room, oldest first.
@@ -177,17 +199,30 @@ func (s *Service) StartLockRevocation(ctx context.Context) {
 	}()
 }
 
-// recallLock yields a cached lock to a peer that has asked for it.  Taking the
-// entry's write lock waits for whatever operation is using it; nothing else
-// needs to be interrupted, since an operation holds a lock only for its own
-// duration either way.
+// recallLock yields a cached lock to a peer that has asked for it — the
+// blocking-AST half of the delegation.
+//
+// The entry stays in the cache: only the etcd key is given up, the way a GFS2
+// glock is demoted rather than destroyed.  Removing the entry would leave any
+// operation currently running under it holding a mutex the next caller no
+// longer looks at, and the node-local exclusion that the cached key no longer
+// provides would be gone with it.
 func (s *Service) recallLock(ino uint64) {
 	s.lockMu.Lock()
 	e := s.locks[ino]
-	delete(s.locks, ino)
 	s.lockMu.Unlock()
 	if e == nil {
 		return
+	}
+
+	// A lock taken moments ago is held to its minimum before being given up, so
+	// that contention on one inode cannot turn every single operation into a
+	// recall.  The holder keeps making progress during the wait.
+	e.keyMu.Lock()
+	held := time.Since(e.acquiredAt)
+	e.keyMu.Unlock()
+	if held < minHoldTime {
+		time.Sleep(minHoldTime - held)
 	}
 
 	e.rw.Lock()
