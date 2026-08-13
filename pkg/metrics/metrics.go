@@ -53,14 +53,24 @@ var (
 	})
 
 	// EtcdReadDuration observes etcd read round-trip latency (Get/prefix
-	// reads), separate from EtcdTxnDuration's guarded-commit path — the read
-	// and write paths spend this budget differently and item 0 of the
-	// round-trip-reduction plan needs them decomposed.
+	// reads), separate from EtcdTxnDuration's guarded-commit path: the read and
+	// write paths spend their budgets differently, and telling a read's cost
+	// from a commit's is what makes a slow operation attributable.
 	EtcdReadDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "etcfuse_etcd_read_duration_seconds",
 		Help:    "etcd read round-trip latency.",
 		Buckets: prometheus.ExponentialBuckets(0.0005, 3, 10),
 	})
+
+	// MetaCache counts data-path metadata lookups served from the snapshot
+	// cached under a held inode lock ("hit") against those that had to read
+	// etcd ("miss").  A workload whose working set fits the lock cache should
+	// sit near all hits; a collapse to misses means locks are being recalled or
+	// evicted, which is the first thing to look at when latency rises.
+	MetaCache = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_metadata_cache_total",
+		Help: "Data-path metadata lookups, by whether the lock-held cache answered them.",
+	}, []string{"result"})
 
 	// BlockIO counts block-device operations, by direction (read, write).
 	BlockIO = promauto.NewCounterVec(prometheus.CounterOpts{

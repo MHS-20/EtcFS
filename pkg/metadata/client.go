@@ -143,11 +143,21 @@ func (s *Store) NodeID() string {
 // two demand opposite responses.  A CAS miss is retryable contention; a fence
 // is permanent and the caller must stop mutating metadata.
 func (s *Store) Txn(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, error) {
+	ok, _, err := s.TxnRev(ctx, ifs, thens, elses)
+	return ok, err
+}
+
+// TxnRev is Txn, also returning the revision the transaction committed at —
+// which is the ModRevision etcd stamped on every key it wrote.
+//
+// A caller that keeps its own copy of what it just wrote needs that number: it
+// is what a later compare-and-set on those keys must compare against.
+func (s *Store) TxnRev(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, int64, error) {
 	guarded := ifs
 	if s.guard != nil {
 		cmp, _, ok := s.guard()
 		if !ok {
-			return false, fmt.Errorf("txn: %w", ErrGuardUnavailable)
+			return false, 0, fmt.Errorf("txn: %w", ErrGuardUnavailable)
 		}
 		// Prepend so the guard is evaluated with the caller's comparisons in
 		// one atomic evaluation, not as a separate round trip that could race
@@ -155,16 +165,16 @@ func (s *Store) Txn(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clie
 		guarded = append([]clientv3.Cmp{cmp}, ifs...)
 	}
 
-	ok, err := s.txnRaw(ctx, guarded, thens, elses)
+	ok, rev, err := s.txnRaw(ctx, guarded, thens, elses)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if !ok && s.guard != nil {
 		if fenced, ferr := s.guardFailed(ctx); ferr == nil && fenced {
-			return false, fmt.Errorf("txn: %w", ErrFenced)
+			return false, 0, fmt.Errorf("txn: %w", ErrFenced)
 		}
 	}
-	return ok, nil
+	return ok, rev, nil
 }
 
 // txnRaw executes a transaction without the fencing guard.
@@ -174,20 +184,20 @@ func (s *Store) Txn(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clie
 // be guarded by the generation it is changing), and bootstrap membership
 // registration that runs before the generation is known.  Everything else must
 // use Txn.
-func (s *Store) txnRaw(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, error) {
+func (s *Store) txnRaw(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, int64, error) {
 	start := time.Now()
 	resp, err := s.client.Txn(ctx).If(ifs...).Then(thens...).Else(elses...).Commit()
 	metrics.EtcdTxnDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
 		metrics.EtcdTxns.WithLabelValues("error").Inc()
-		return false, fmt.Errorf("txn: %w", err)
+		return false, 0, fmt.Errorf("txn: %w", err)
 	}
 	if resp.Succeeded {
 		metrics.EtcdTxns.WithLabelValues("committed").Inc()
 	} else {
 		metrics.EtcdTxns.WithLabelValues("rejected").Inc()
 	}
-	return resp.Succeeded, nil
+	return resp.Succeeded, resp.Header.Revision, nil
 }
 
 // guardFailed reports whether the installed guard no longer matches the stored

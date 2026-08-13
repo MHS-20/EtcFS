@@ -75,7 +75,7 @@ func (s *Store) ReleaseArena(ctx context.Context, nodeID string) ([]uint64, erro
 // definition: its device access has already been confirmed severed.
 func (s *Store) ReleaseArenaID(ctx context.Context, nodeID string, arenaID uint64) (bool, error) {
 	key := ArenaOwnerKey(nodeID, arenaID)
-	won, err := s.txnRaw(ctx,
+	won, _, err := s.txnRaw(ctx,
 		[]clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "!=", 0)},
 		[]clientv3.Op{
 			clientv3.OpDelete(key),
@@ -106,7 +106,7 @@ func (s *Store) ClaimFreeArena(ctx context.Context) (uint64, bool, error) {
 		if perr != nil {
 			continue
 		}
-		won, err := s.txnRaw(ctx,
+		won, _, err := s.txnRaw(ctx,
 			[]clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "!=", 0)},
 			[]clientv3.Op{clientv3.OpDelete(key)}, nil)
 		if err != nil {

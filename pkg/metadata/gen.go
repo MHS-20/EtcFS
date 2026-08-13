@@ -70,7 +70,7 @@ func (s *Store) BumpGeneration(ctx context.Context, nodeID string, expectedOld u
 	// by the generation it changes would make the fencing controller unable to
 	// fence a node once that node's own store carried a guard.
 	valCmp := clientv3.Compare(clientv3.Value(key), "=", strconv.FormatUint(expectedOld, 10))
-	ok, err := s.txnRaw(ctx, []clientv3.Cmp{valCmp}, []clientv3.Op{op}, nil)
+	ok, _, err := s.txnRaw(ctx, []clientv3.Cmp{valCmp}, []clientv3.Op{op}, nil)
 	if err != nil {
 		return 0, fmt.Errorf("bump generation %s: %w", nodeID, err)
 	}
@@ -81,7 +81,7 @@ func (s *Store) BumpGeneration(ctx context.Context, nodeID string, expectedOld u
 	// accept that too, atomically, before treating it as a real CAS failure.
 	if !ok && expectedOld == 0 {
 		absentCmp := clientv3.Compare(clientv3.CreateRevision(key), "=", 0)
-		ok, err = s.txnRaw(ctx, []clientv3.Cmp{absentCmp}, []clientv3.Op{op}, nil)
+		ok, _, err = s.txnRaw(ctx, []clientv3.Cmp{absentCmp}, []clientv3.Op{op}, nil)
 		if err != nil {
 			return 0, fmt.Errorf("bump generation %s: %w", nodeID, err)
 		}
@@ -107,7 +107,7 @@ func (s *Store) EnsureGenerationKey(ctx context.Context, nodeID string) (uint64,
 	// Unguarded: creates the very key the guard compares against.  A guarded
 	// call here could never succeed on a fresh node — the guard would compare
 	// against a key that does not exist yet, which always evaluates false.
-	created, err := s.txnRaw(ctx,
+	created, _, err := s.txnRaw(ctx,
 		[]clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "=", 0)},
 		[]clientv3.Op{clientv3.OpPut(key, "0")}, nil)
 	if err != nil {

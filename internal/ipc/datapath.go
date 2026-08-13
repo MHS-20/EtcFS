@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"unsafe"
 
+	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/pkg/arena"
@@ -79,13 +81,15 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 	}
 	dataLen := uint32(len(data))
 
+	// The record is read under the inode lock on the block-device path, so that
+	// a lock this node already holds can answer it without a round trip.
+	if s.dev != nil {
+		return s.handleWriteBlock(ctx, ino, offset, data, uid)
+	}
+
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
 		return int32Resp(-2), nil
-	}
-
-	if s.dev != nil {
-		return s.handleWriteBlock(ctx, ino, offset, data, uid, rec)
 	}
 
 	// No block device — update size and mode only (metadata-only mode)
@@ -101,7 +105,7 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 }
 
 func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint64,
-	data []byte, uid uint32, rec *metadata.InodeRecord) ([]byte, error) {
+	data []byte, uid uint32) ([]byte, error) {
 
 	dataLen := len(data)
 	if dataLen == 0 {
@@ -121,6 +125,20 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return int32Resp(-11), nil // EAGAIN after retries
 	}
 	defer lk.Release()
+
+	// One lookup answers everything this write needs to know about the inode:
+	// the record it may have to rewrite, and the extents that decide the chunk
+	// numbering and what this write buries.  Served from the lock's own cache
+	// when nothing has given the lock up since the last operation.
+	meta, err := lk.meta(ctx)
+	if err != nil {
+		s.log.Warn("write: cannot read metadata", "ino", ino, "error", err)
+		return int32Resp(-5), nil
+	}
+	if meta.rec == nil {
+		return int32Resp(-2), nil
+	}
+	rec := meta.rec
 
 	runs, err := s.allocateBlocks(ctx, uint64(dataLen))
 	if err != nil {
@@ -163,25 +181,20 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		pos += r.Length
 	}
 
-	// One read of the inode's extents answers every question this write has:
-	// which chunk numbers are free, what sequence it takes, and which existing
-	// extents it is about to bury.  Both counters run one past the highest in
-	// use rather than off the extent count — a truncate deletes records from
-	// the middle, and counting would hand back a number that is still live.
+	// The extent list answers the rest of what this write needs: which chunk
+	// numbers are free, what sequence it takes, and which existing extents it
+	// is about to bury.  Both counters run one past the highest in use rather
+	// than off the extent count — a truncate deletes records from the middle,
+	// and counting would hand back a number that is still live.
 	//
-	// The first read is serializable: it only builds the proposal, and the
-	// commit below refuses to overwrite a chunk that already exists, so a stale
-	// answer costs a retry rather than a buried extent.  That retry re-reads
-	// linearizably, which is the only way to be sure the second attempt is not
-	// working from the same stale view.
-	var existing []metadata.Extent
+	// The list the lock cached is used as-is, and so is a serializable re-read:
+	// both only build a proposal, and the commit below refuses to overwrite a
+	// chunk that already exists, so a stale answer costs a retry rather than a
+	// buried extent.  That retry re-reads linearizably, which is the only way
+	// to be sure the second attempt is not working from the same stale view.
 	var chunk, seq uint64
-	readExtents := func(opts ...clientv3.OpOption) error {
-		var xerr error
-		existing, xerr = s.store.GetExtents(ctx, ino, opts...)
-		if xerr != nil {
-			return xerr
-		}
+	existing := meta.extents
+	countFrom := func() {
 		chunk, seq = 0, 0
 		for _, e := range existing {
 			if e.Chunk >= chunk {
@@ -191,6 +204,15 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 				seq = e.Seq + 1
 			}
 		}
+	}
+	countFrom()
+	readExtents := func(opts ...clientv3.OpOption) error {
+		var xerr error
+		existing, xerr = s.store.GetExtents(ctx, ino, opts...)
+		if xerr != nil {
+			return xerr
+		}
+		countFrom()
 		return nil
 	}
 
@@ -274,17 +296,13 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return cmps, ops
 	}
 
-	if xerr := readExtents(clientv3.WithSerializable()); xerr != nil {
-		freeRuns()
-		s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
-		return int32Resp(-5), nil
-	}
 	cmps, ops := proposal()
-	committed, fenced, cerr := s.commitGuarded(ctx, cmps, ops)
+	committed, fenced, rev, cerr := s.commitGuarded(ctx, cmps, ops)
 	if cerr == nil && !committed && !fenced {
-		// The serializable read missed a chunk that exists, so this node was
-		// talking to a member that had not caught up.  Re-read from the leader
-		// and propose again.
+		// The list this proposal was built from missed a chunk that exists, so
+		// either the cached view is behind or the serializable read was served
+		// by a member that had not caught up.  Re-read from the leader and
+		// propose again.
 		s.log.Debug("write: chunk numbering was stale, retrying linearizably", "ino", ino)
 		if xerr := readExtents(); xerr != nil {
 			freeRuns()
@@ -292,7 +310,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 			return int32Resp(-5), nil
 		}
 		cmps, ops = proposal()
-		committed, fenced, cerr = s.commitGuarded(ctx, cmps, ops)
+		committed, fenced, rev, cerr = s.commitGuarded(ctx, cmps, ops)
 	}
 	if cerr != nil {
 		freeRuns()
@@ -310,7 +328,15 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		s.log.Error("write: extent numbering still contended after a fresh read", "ino", ino)
 		return int32Resp(-5), nil
 	}
-	rec.Size = max(rec.Size, end)
+	// The lock is still held, so what this transaction wrote is still the whole
+	// truth about the inode, and telling the cache saves the next operation on
+	// this file a read.  A transaction carrying anything this cannot account
+	// for publishes nothing and the cache is dropped on release instead.
+	if len(deferredReclaim) == 0 {
+		if m := afterCommit(ino, existing, rec, ops, rev); m != nil {
+			lk.publishMeta(m)
+		}
+	}
 
 	// Only after the commit — before it, a transaction the generation guard
 	// rejects would have freed blocks the file still refers to.
@@ -329,6 +355,59 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	}
 
 	return writtenResp(uint32(dataLen)), nil
+}
+
+// afterCommit returns an inode's metadata as a committed transaction left it,
+// by replaying that transaction's operations over the state it was built from.
+//
+// Replaying the operations, rather than describing the outcome a second time,
+// is what keeps the cached view from drifting: there is only one statement of
+// what the write did — the transaction — and this reads it back.  Every key the
+// transaction wrote now carries its revision, which is what a later
+// compare-and-set on those extents has to compare against.
+//
+// Returns nil if the transaction contains an operation this cannot account
+// for, which the caller must treat as "do not cache".
+func afterCommit(ino uint64, existing []metadata.Extent, rec *metadata.InodeRecord,
+	ops []clientv3.Op, rev int64) *inodeMeta {
+
+	type entry struct {
+		value  string
+		modRev int64
+	}
+	kvs := make(map[string]entry, len(existing)+len(ops))
+	for _, e := range existing {
+		kvs[e.Key] = entry{e.Encode(), e.ModRevision}
+	}
+
+	inodeKey := metadata.InodeKey(ino)
+	extentPrefix := metadata.ExtentPrefix(ino)
+	updated := rec
+	for _, op := range ops {
+		key := string(op.KeyBytes())
+		switch {
+		case op.IsDelete() && strings.HasPrefix(key, extentPrefix):
+			delete(kvs, key)
+		case !op.IsPut():
+			return nil
+		case key == inodeKey:
+			if updated = metadata.DecodeInode(op.ValueBytes()); updated == nil {
+				return nil
+			}
+		case strings.HasPrefix(key, extentPrefix):
+			kvs[key] = entry{string(op.ValueBytes()), rev}
+		default:
+			return nil
+		}
+	}
+
+	decoded := make([]*mvccpb.KeyValue, 0, len(kvs))
+	for key, e := range kvs {
+		decoded = append(decoded, &mvccpb.KeyValue{
+			Key: []byte(key), Value: []byte(e.value), ModRevision: e.modRev,
+		})
+	}
+	return &inodeMeta{rec: updated, extents: metadata.DecodeExtents(decoded)}
 }
 
 // writeRun puts one run on the device.
@@ -386,8 +465,15 @@ func (s *Service) allocateBlocks(ctx context.Context, size uint64) ([]arena.Run,
 // is a decode failure rather than a zero — and the floor put every extent
 // written by a never-fenced node one generation ahead of the node itself, which
 // the scrubber correctly reports as an extent from the future.
+// It is the generation the commit will be guarded against, not a fresh read of
+// the key: the two are the same number, and a write whose stamp disagreed with
+// its own guard could not commit anyway.  Reading it here cost an etcd round
+// trip on the critical path of every single write.
 func (s *Service) writeGeneration(ctx context.Context) uint64 {
-	gen, _ := s.store.GetMyGeneration(ctx)
+	gen, err := s.guardGeneration(ctx)
+	if err != nil {
+		return 0
+	}
 	return gen
 }
 
@@ -406,10 +492,12 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		return int32Resp(-5), nil
 	}
 
-	// A shared lock keeps a concurrent writer off the range while it is read.
-	// Best effort: a read that cannot take the lock still returns data, since
-	// the extent list it works from is itself a consistent etcd snapshot.
-	if lk, err := s.lockInode(ctx, ino, metadata.LockShared); err == nil {
+	// A shared lock keeps a concurrent writer off the range while it is read,
+	// and is what makes the metadata below cacheable at all.  Best effort: a
+	// read that cannot take the lock still returns data, from a fresh etcd
+	// snapshot, since a snapshot no lock protects cannot be cached or reused.
+	lk, lerr := s.lockInode(ctx, ino, metadata.LockShared)
+	if lerr == nil {
 		defer lk.Release()
 	}
 
@@ -420,18 +508,26 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		_ = s.dev.FlushDevice()
 	}
 
-	// The record and the extents come back together, from one revision: the
-	// record clamps the request to the file's size, the extents resolve it.
-	var rec *metadata.InodeRecord
-	var extents []metadata.Extent
-	if err := retryEtcd(ctx, func(ictx context.Context) error {
-		var gerr error
-		rec, extents, gerr = s.store.GetInodeAndExtents(ictx, ino)
-		return gerr
-	}); err != nil {
-		s.log.Warn("read: cannot read metadata", "ino", ino, "error", err)
+	// The record and the extents come together, from one revision: the record
+	// clamps the request to the file's size, the extents resolve it.  Under a
+	// lock this node already held they cost nothing at all.
+	var meta *inodeMeta
+	var merr error
+	if lerr == nil {
+		meta, merr = lk.meta(ctx)
+	} else {
+		meta = &inodeMeta{}
+		merr = retryEtcd(ctx, func(ictx context.Context) error {
+			var gerr error
+			meta.rec, meta.extents, gerr = s.store.GetInodeAndExtents(ictx, ino)
+			return gerr
+		})
+	}
+	if merr != nil {
+		s.log.Warn("read: cannot read metadata", "ino", ino, "error", merr)
 		return int32Resp(-5), nil
 	}
+	rec, extents := meta.rec, meta.extents
 	if rec == nil {
 		return int32Resp(-2), nil
 	}

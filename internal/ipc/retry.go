@@ -9,6 +9,7 @@ import (
 
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 // Synthetic history opcodes for events that never cross the IPC socket, kept
@@ -124,6 +125,46 @@ type heldLock struct {
 	e        *lockEntry
 	mode     metadata.LockMode
 	released bool
+
+	// metaPublished records that the holder has already told the entry what
+	// the inode's metadata is now, after changing it.  Without it, an exclusive
+	// hold drops the cache on release — see Release.
+	metaPublished bool
+}
+
+// meta returns the inode's record and extent list, from the cache when this
+// node has held the lock key continuously since they were read, and from etcd
+// otherwise.  A nil record means the inode does not exist.
+//
+// The returned value is shared with other holders and must not be mutated.
+func (l *heldLock) meta(ctx context.Context) (*inodeMeta, error) {
+	if m := l.e.cachedMeta(); m != nil {
+		metrics.MetaCache.WithLabelValues("hit").Inc()
+		return m, nil
+	}
+	metrics.MetaCache.WithLabelValues("miss").Inc()
+
+	var m inodeMeta
+	if err := retryEtcd(ctx, func(ictx context.Context) error {
+		var gerr error
+		m.rec, m.extents, gerr = l.s.store.GetInodeAndExtents(ictx, l.e.ino)
+		return gerr
+	}); err != nil {
+		return nil, err
+	}
+	l.e.setMeta(&m)
+	return &m, nil
+}
+
+// publishMeta replaces what the entry has cached with the state this operation
+// has just committed, so the next operation on the inode still needs no read.
+//
+// Only a caller that knows the whole post-commit state may use it: an
+// operation that changes the inode and does not publish gets the cache dropped
+// on release instead, which costs a read and cannot be wrong.
+func (l *heldLock) publishMeta(m *inodeMeta) {
+	l.e.setMeta(m)
+	l.metaPublished = true
 }
 
 // lockModeByte encodes a LockMode as the single byte the lock history payload
@@ -166,11 +207,21 @@ func (l *heldLock) recordLockEvent(kind byte, call, ret time.Time) {
 
 // Release drops the node-local hold.  Idempotent, so a deferred Release is
 // safe next to an explicit one.
+//
+// An exclusive hold that did not publish what it changed drops the entry's
+// cached metadata on the way out.  That is the fail-safe direction: every
+// mutation runs under this lock, so a path that has never heard of the cache —
+// or one that gave up halfway — still cannot leave a stale snapshot behind.
+// The cost of being wrong here is one read; the cost of the opposite default
+// is serving a file's old extent list after it was rewritten.
 func (l *heldLock) Release() {
 	if l.released {
 		return
 	}
 	l.released = true
+	if l.mode == metadata.LockExclusive && !l.metaPublished {
+		l.e.dropMeta()
+	}
 	call := time.Now()
 	if l.mode == metadata.LockExclusive {
 		l.e.rw.Unlock()
@@ -246,6 +297,20 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 	e.keyMu.Lock()
 	defer e.keyMu.Unlock()
 
+	// A cached key is only as good as the lease it was written under.  If that
+	// lease is gone — expired during a partition, or revoked — etcd deleted the
+	// key with it and a peer may already hold the inode, so both the key and
+	// anything cached under it are dropped here rather than trusted.  This is
+	// what bounds how long a partitioned node can serve from its caches: the
+	// lock session's TTL, not the self-fencing watchdog's much longer window.
+	//
+	// It costs a mutex and a channel poll, no round trip, so every operation
+	// pays it.
+	if e.holder != "" && !s.store.LockSessionAlive() {
+		s.log.Warn("lock session lost, dropping this node's cached lock", "ino", e.ino)
+		e.holder, e.meta, e.metaFor = "", nil, ""
+	}
+
 	if e.holder != "" && covers(e.mode, mode) {
 		return nil
 	}
@@ -307,8 +372,9 @@ func (s *Service) acquireLockKey(ctx context.Context, ino uint64, mode metadata.
 
 // commitGuarded applies ops in one transaction carrying the caller's
 // comparisons plus this node's fencing generation.  It reports whether the
-// transaction committed and, separately, whether a fence was the reason it did
-// not — a fenced node must not mutate metadata again.  Transient etcd errors
+// transaction committed, the revision it committed at — the ModRevision every
+// key it wrote now carries — and, separately, whether a fence was the reason it
+// did not — a fenced node must not mutate metadata again.  Transient etcd errors
 // are retried; a failed guard is not, because a fence is permanent.
 //
 // The guard itself is applied by the store (see metadata.Store.SetGuard), which
@@ -320,7 +386,7 @@ func (s *Service) acquireLockKey(ctx context.Context, ino uint64, mode metadata.
 // guard is then the only thing that can reject the transaction — but a caller
 // that supplies them must not: a comparison miss is contention it can rebuild
 // its proposal from, and a fence is permanent.
-func (s *Service) commitGuarded(ctx context.Context, cmps []clientv3.Cmp, ops []clientv3.Op) (committed, fenced bool, err error) {
+func (s *Service) commitGuarded(ctx context.Context, cmps []clientv3.Cmp, ops []clientv3.Op) (committed, fenced bool, rev int64, err error) {
 	call := time.Now()
 	// Ensure the generation is resolved before committing, so a first write
 	// fails with a real etcd error rather than ErrGuardUnavailable.
@@ -328,23 +394,23 @@ func (s *Service) commitGuarded(ctx context.Context, cmps []clientv3.Cmp, ops []
 	gen, err := s.guardGeneration(gctx)
 	gcancel()
 	if err != nil {
-		return false, false, err
+		return false, false, 0, err
 	}
 
 	err = retryEtcd(ctx, func(tctx context.Context) error {
 		var terr error
-		committed, terr = s.store.Txn(tctx, cmps, ops, nil)
+		committed, rev, terr = s.store.TxnRev(tctx, cmps, ops, nil)
 		return terr
 	})
 	fenced = errors.Is(err, metadata.ErrFenced)
 	s.recordGuardedCommit(gen, committed, fenced, call, time.Now())
 	if fenced {
-		return false, true, nil
+		return false, true, 0, nil
 	}
 	if err != nil {
-		return false, false, err
+		return false, false, 0, err
 	}
-	return committed, false, nil
+	return committed, false, rev, nil
 }
 
 // recordGuardedCommit appends one guarded-commit attempt to the history: the

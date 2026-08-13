@@ -114,6 +114,31 @@ func (s *Store) lockSession(ttl time.Duration) (*concurrency.Session, error) {
 	return sess, nil
 }
 
+// LockSessionAlive reports whether the lease every lock this node holds was
+// written under is still valid.
+//
+// False means the node holds nothing, whatever it believes: expiry deletes
+// every key written under the lease at once. A caller that keeps state behind
+// a lock — a cached lock key, or metadata cached under it — has to drop that
+// state when this goes false, because a peer is now free to take the lock and
+// change what the state describes.
+//
+// It never grants a session: a node that has taken no lock holds none, and
+// answering "not alive" is the correct answer for it.
+func (s *Store) LockSessionAlive() bool {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if s.session == nil {
+		return false
+	}
+	select {
+	case <-s.session.Done():
+		return false
+	default:
+		return true
+	}
+}
+
 // AcquireLock takes a lock on an inode and returns the holder token that
 // releases it.
 //

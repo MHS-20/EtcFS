@@ -75,7 +75,63 @@ type lockEntry struct {
 	holder     string
 	acquiredAt time.Time // when holder was taken, for minHoldTime
 
+	// meta is the inode's record and extent list as last read or written by
+	// this node, and metaFor is the holder token they were read under.  A
+	// cached lock takes the etcd round trip off an operation; without this the
+	// metadata read is what is left on the data path, and a read that owns the
+	// lock would still cost one.
+	//
+	// Validity is exactly "this node has held the key continuously since the
+	// read": while the key is held no peer can write the inode, so nothing the
+	// snapshot describes can have changed underneath.  Every path that gives
+	// the key up clears metaFor with it (releaseKeyLocked), and a re-acquired
+	// key carries a new holder token, so a snapshot from before a recall can
+	// never be mistaken for a current one.
+	//
+	// Guarded by keyMu, which every operation already takes once through
+	// ensureLockKey.  The value is shared with concurrent shared-lock holders
+	// and must be treated as immutable — a mutation publishes a new one.
+	meta    *inodeMeta
+	metaFor string
+
 	lastUsed time.Time // guarded by Service.lockMu
+}
+
+// inodeMeta is an inode's metadata as of one revision: the record and the
+// extent list, which every data-path operation needs together.  Immutable once
+// published into a lockEntry.
+type inodeMeta struct {
+	rec     *metadata.InodeRecord
+	extents []metadata.Extent
+}
+
+// cachedMeta returns the metadata cached under the currently held key, or nil
+// when there is none to trust.
+func (e *lockEntry) cachedMeta() *inodeMeta {
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+	if e.holder == "" || e.metaFor != e.holder {
+		return nil
+	}
+	return e.meta
+}
+
+// setMeta publishes metadata read or written under the currently held key.
+// A no-op when no key is held: there would be nothing keeping it true.
+func (e *lockEntry) setMeta(m *inodeMeta) {
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+	if e.holder == "" {
+		return
+	}
+	e.meta, e.metaFor = m, e.holder
+}
+
+// dropMeta forgets the cached metadata, leaving the lock itself alone.
+func (e *lockEntry) dropMeta() {
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+	e.meta, e.metaFor = nil, ""
 }
 
 // covers reports whether a lock already held in mode satisfies a request for
@@ -155,9 +211,14 @@ func (s *Service) dropCachedLock(e *lockEntry) {
 }
 
 // releaseKeyLocked deletes an entry's etcd key with keyMu already held.
+//
+// The metadata cached under that key goes with it, and this is the single
+// place that obligation is discharged: recall, eviction, an upgrade from
+// shared to exclusive and shutdown all release the key through here.
 func (s *Service) releaseKeyLocked(e *lockEntry) {
 	holder, mode := e.holder, e.mode
 	e.holder = ""
+	e.meta, e.metaFor = nil, ""
 	if holder == "" {
 		return
 	}

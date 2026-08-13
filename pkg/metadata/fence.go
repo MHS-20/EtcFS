@@ -178,7 +178,7 @@ func (s *Store) ClaimFence(ctx context.Context, nodeID string, ttl time.Duration
 		return 0, false, fmt.Errorf("claim fence %s: %w", nodeID, err)
 	}
 	key := FenceClaimKey(nodeID)
-	won, err := s.txnRaw(ctx,
+	won, _, err := s.txnRaw(ctx,
 		[]clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(key), "=", 0)},
 		[]clientv3.Op{clientv3.OpPut(key, s.nodeID, clientv3.WithLease(leaseID))}, nil)
 	if err != nil || !won {
