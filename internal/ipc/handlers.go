@@ -336,6 +336,18 @@ func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error
 		return int32Resp(-22), nil
 	}
 	if flags&oTrunc != 0 {
+		// O_TRUNC deletes every extent of the file and publishes the new size,
+		// which is the same class of mutation a write makes and needs the same
+		// exclusive lock: without it a concurrent write commits an extent this
+		// truncate has already read past, and the file keeps data it was told
+		// to drop.
+		lk, lerr := s.lockInode(ctx, ino, metadata.LockExclusive)
+		if lerr != nil {
+			s.log.Warn("open: cannot lock inode for truncate", "ino", ino, "error", lerr)
+			return int32Resp(-11), nil // EAGAIN
+		}
+		defer lk.Release()
+
 		if err := s.truncateToZero(ctx, ino); err != nil {
 			s.log.Warn("open: truncate failed", "ino", ino, "error", err)
 			return int32Resp(errnoFor(err, -5)), nil
@@ -516,6 +528,19 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	atimeNsec, mtimeNsec, ctimeNsec := r.u32(), r.u32(), r.u32()
 	if !r.ok {
 		return int32Resp(-22), nil
+	}
+
+	// A size change rewrites extents and republishes the size, so it is held
+	// against concurrent writers by the same exclusive lock the write path
+	// takes.  The other attributes are settled by the record's own
+	// compare-and-set below and need no lock.
+	if valid&fattrSize != 0 {
+		lk, lerr := s.lockInode(ctx, ino, metadata.LockExclusive)
+		if lerr != nil {
+			s.log.Warn("setattr: cannot lock inode for size change", "ino", ino, "error", lerr)
+			return int32Resp(-11), nil // EAGAIN
+		}
+		defer lk.Release()
 	}
 
 	rec, rev, err := s.store.GetInodeRev(ctx, ino)

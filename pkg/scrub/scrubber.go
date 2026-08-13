@@ -22,6 +22,7 @@ import (
 	"time"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 	"github.com/MHS-20/EtcFS/pkg/metrics"
@@ -31,10 +32,13 @@ import (
 // reads keys and deletes the orphans it is allowed to reclaim, and nothing
 // else.  Declaring only that keeps the scrubber testable against a stub and
 // makes the blast radius of a scrub bug obvious from its dependencies.
+//
+// The delete goes through Txn rather than a plain Delete so it can be made
+// conditional on the record not having changed since the scan read it.
 type MetadataStore interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.KeyValue, error)
-	Delete(ctx context.Context, key string) error
+	Txn(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, error)
 }
 
 // Result records a single scrub finding.
@@ -45,6 +49,7 @@ type Result struct {
 	DiskOff uint64
 	Length  uint64 // length of the disk range, when the finding refers to one
 	Key     string // etcd key the finding refers to, when it is a single key
+	ModRev  int64  // revision Key was at when the finding was made, when it refers to one
 	AutoFix bool   // true if the scrubber can safely remediate
 }
 
@@ -177,9 +182,25 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 		// Delete first: the blocks must stop being reachable through metadata
 		// before they can be handed to another allocation, or a reader
 		// resolving the extent could land on data already overwritten.
-		if err := s.store.Delete(ctx, r.Key); err != nil {
+		//
+		// Conditional on the record still being at the revision the scan read
+		// it at, because the pass runs against a snapshot taken some time ago
+		// and takes no inode lock.  An unconditional delete succeeds even on a
+		// key that is already gone, so a truncate that reclaimed this extent in
+		// between — freeing its blocks, which the allocator may since have
+		// handed to another file — would be followed by a second free of the
+		// same range from here, and two files would own the same blocks.  A
+		// finding that loses the comparison is simply re-found next pass.
+		ok, err := s.store.Txn(ctx,
+			[]clientv3.Cmp{clientv3.Compare(clientv3.ModRevision(r.Key), "=", r.ModRev)},
+			[]clientv3.Op{clientv3.OpDelete(r.Key)}, nil)
+		if err != nil {
 			s.log.Error("scrub auto-fix: extent not deleted, blocks not reclaimed",
 				"key", r.Key, "error", err)
+			continue
+		}
+		if !ok {
+			s.log.Info("scrub auto-fix: extent changed since the scan, left alone", "key", r.Key)
 			continue
 		}
 		if r.Length > 0 {
@@ -386,6 +407,7 @@ func CheckOrphanExtents(snap *Snapshot) []Result {
 			DiskOff: ext.DiskOff,
 			Length:  ext.Length,
 			Key:     ext.Key,
+			ModRev:  ext.ModRevision,
 			AutoFix: true,
 		})
 	}
@@ -431,6 +453,7 @@ func CheckDeadExtents(snap *Snapshot) []Result {
 				DiskOff: ext.DiskOff,
 				Length:  ext.Length,
 				Key:     ext.Key,
+				ModRev:  ext.ModRevision,
 				AutoFix: true,
 			})
 		}

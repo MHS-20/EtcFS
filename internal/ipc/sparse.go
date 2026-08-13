@@ -96,6 +96,23 @@ func (s *Service) handleFallocate(ctx context.Context, payload []byte) ([]byte, 
 		return int32Resp(-22), nil
 	}
 
+	// Allocation with KEEP_SIZE changes nothing here — blocks are claimed at
+	// write time — so it is answered before anything is locked.
+	if mode == fallocKeepSize {
+		return okResp(), nil
+	}
+
+	// Both served modes mutate the file — a punch rewrites extents, plain
+	// allocation republishes the size — so both take the exclusive lock the
+	// write path takes, and for the same reason: a concurrent write must not
+	// commit an extent into a range this operation has already read past.
+	lk, lerr := s.lockInode(ctx, ino, metadata.LockExclusive)
+	if lerr != nil {
+		s.log.Warn("fallocate: cannot lock inode", "ino", ino, "error", lerr)
+		return int32Resp(-11), nil // EAGAIN
+	}
+	defer lk.Release()
+
 	switch {
 	case mode&fallocPunchHole != 0:
 		// The kernel requires KEEP_SIZE alongside PUNCH_HOLE, and a punch that
@@ -109,10 +126,7 @@ func (s *Service) handleFallocate(ctx context.Context, payload []byte) ([]byte, 
 		}
 		return okResp(), nil
 
-	case mode&^fallocKeepSize == 0:
-		if mode&fallocKeepSize != 0 {
-			return okResp(), nil
-		}
+	case mode == 0:
 		if err := s.growTo(ctx, ino, offset+length); err != nil {
 			s.log.Error("fallocate: grow failed", "ino", ino, "error", err)
 			return int32Resp(errnoFor(err, -5)), nil
