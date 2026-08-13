@@ -23,6 +23,12 @@ const (
 	LockExclusive LockMode = "exclusive"
 )
 
+// fallbackSessionTTL backs a want key written before any lock has been taken.
+// In practice a want key only follows a failed acquisition, which has already
+// created the session, and lockSession ignores the TTL of every call after the
+// first — so this is the value of last resort, not the operative one.
+const fallbackSessionTTL = 2 * time.Second
+
 // ErrConflict is returned when a lock cannot be acquired due to a conflict.
 var ErrConflict = fmt.Errorf("lock conflict")
 
@@ -185,6 +191,42 @@ func (s *Store) CloseLockSession() error {
 	err := s.session.Close()
 	s.session = nil
 	return err
+}
+
+// AnnounceLockWant records that this node is waiting for an inode's lock, so
+// that a peer holding a cached one drops it instead of keeping it until its
+// session ends.  The key is written under the same session lease as the locks
+// themselves, so a waiter that dies stops asking.
+//
+// Written unguarded: it mutates no filesystem state, and a fenced node that
+// cannot ask for a lock would spin against a holder that has no reason to
+// yield.  The acquisition the want key leads to is guarded as it always was.
+func (s *Store) AnnounceLockWant(ctx context.Context, ino uint64) error {
+	sess, err := s.lockSession(fallbackSessionTTL)
+	if err != nil {
+		return fmt.Errorf("announce lock want ino %d: session: %w", ino, err)
+	}
+	if _, err := s.putRaw(ctx, LockWantKey(ino, s.nodeID), []byte(s.nodeID),
+		clientv3.WithLease(sess.Lease())); err != nil {
+		return fmt.Errorf("announce lock want ino %d: %w", ino, err)
+	}
+	return nil
+}
+
+// ClearLockWant withdraws this node's request for an inode's lock.
+func (s *Store) ClearLockWant(ctx context.Context, ino uint64) error {
+	if _, err := s.client.Delete(ctx, LockWantKey(ino, s.nodeID)); err != nil {
+		return fmt.Errorf("clear lock want ino %d: %w", ino, err)
+	}
+	return nil
+}
+
+// WatchLockWants delivers every peer's request for a lock, cluster-wide.  One
+// watch covers every inode: a node holding no cached lock for the inode named
+// by an event simply ignores it, which is cheaper than maintaining a watch per
+// inode it happens to hold.
+func (s *Store) WatchLockWants(ctx context.Context) clientv3.WatchChan {
+	return s.Watch(ctx, PrefixLockWant, clientv3.WithPrefix())
 }
 
 // GetLockInfo returns the current lock state for an inode, or nil if it is

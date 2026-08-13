@@ -6,6 +6,7 @@
 //	inode:<ino>                   → serialised InodeRecord
 //	dirent:<parent_ino>/<name>    → <ino> (uint64, big-endian)
 //	lock:<ino>/<mode>/<lease_id>  → holder's node ID, one key per holder
+//	lock_want:<ino>/<node_id>     → a peer asking a cached lock holder to yield
 //	arena:<node_id>/<arena_id>    → <arena_id> (uint64, big-endian)
 //	free_arena:<arena_id>         → arena returned to the global pool
 //	extent:<ino>/<chunk>          → <log_off>,<disk_off>,<length>,<generation>,<sequence>
@@ -36,6 +37,7 @@ const (
 	PrefixXattr      = "xattr:"
 	PrefixQuota      = "quota:"
 	PrefixLock       = "lock:"
+	PrefixLockWant   = "lock_want:"
 	PrefixArena      = "arena:"
 	PrefixExtent     = "extent:"
 	PrefixFreeArena  = "free_arena:"
@@ -289,6 +291,40 @@ func ParseLockKey(key string, ino uint64) (mode LockMode, ok bool) {
 		return LockMode(modeStr), true
 	}
 	return "", false
+}
+
+// Lock-want keys.
+//
+//	lock_want:<ino>/<node>
+//
+// A node that keeps an inode's lock key in etcd after the operation that took
+// it — see the lock cache in internal/ipc — is not reachable by a lease expiry
+// any more, so a blocked peer needs a way to ask for it back. It writes a want
+// key, the holder watches the prefix and drops the cached lock.
+//
+// Deliberately outside PrefixLock: an acquisition compares the whole of
+// LockPrefix(ino) against "no keys exist", so a want key stored under it would
+// block the very acquisition it exists to unblock.
+func LockWantKey(ino uint64, node string) string {
+	return fmt.Sprintf("%s%d/%s", PrefixLockWant, ino, node)
+}
+
+// ParseLockWantKey returns the inode a want key names, and the node that wants
+// it.
+func ParseLockWantKey(key string) (ino uint64, node string, ok bool) {
+	rest, found := strings.CutPrefix(key, PrefixLockWant)
+	if !found {
+		return 0, "", false
+	}
+	inoStr, node, found := strings.Cut(rest, "/")
+	if !found {
+		return 0, "", false
+	}
+	ino, err := strconv.ParseUint(inoStr, 10, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	return ino, node, true
 }
 
 // ArenaOwnerKey names the record proving nodeID owns arenaID.

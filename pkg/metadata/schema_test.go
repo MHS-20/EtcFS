@@ -25,6 +25,23 @@ func TestLockKey(t *testing.T) {
 	assert.Equal(t, "lock:99/exclusive/3", LockKey(99, LockExclusive, "3"))
 }
 
+// A want key must not fall under the lock prefix: an acquisition compares that
+// whole range against "empty", so a want key stored there would block the
+// acquisition it exists to unblock.
+func TestLockWantKeyIsOutsideTheLockPrefix(t *testing.T) {
+	key := LockWantKey(99, "node-1")
+	assert.Equal(t, "lock_want:99/node-1", key)
+	assert.NotContains(t, key, LockPrefix(99))
+
+	ino, node, ok := ParseLockWantKey(key)
+	assert.True(t, ok)
+	assert.Equal(t, uint64(99), ino)
+	assert.Equal(t, "node-1", node)
+
+	_, _, ok = ParseLockWantKey(LockKey(99, LockExclusive, "3"))
+	assert.False(t, ok)
+}
+
 func TestArenaOwnerKey(t *testing.T) {
 	assert.Equal(t, "arena:node-1/7", ArenaOwnerKey("node-1", 7))
 }
