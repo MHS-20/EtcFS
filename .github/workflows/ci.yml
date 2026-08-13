@@ -234,9 +234,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
-
       # GOTOOLCHAIN=auto, not the job-wide `local` setup-go pins: nfpm's go.mod
       # requires a newer Go than go.mod's 1.24 (itself pinned for
       # golangci-lint compat, see go.mod). `local` refuses to fetch it and
@@ -246,17 +243,32 @@ jobs:
         run: GOTOOLCHAIN=auto go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2
 
       # Both Go binaries are CGO_ENABLED=0: static, no glibc version to match
-      # against whatever distro the .deb/.rpm lands on. etcfuse links
-      # libfuse3 dynamically — deb/rpm depend on it (see packaging/nfpm/).
-      - name: Build binaries
+      # against whatever distro the .deb/.rpm lands on.
+      - name: Build Go binaries
         run: |
           mkdir -p dist
           LDFLAGS="-s -w -X github.com/MHS-20/EtcFS/internal/config.Version=${VERSION}"
           CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o dist/etcfuse-meta ./cmd/etcfuse-meta
           CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o dist/etcfsctl ./cmd/etcfsctl
-          cc -I. -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g \
-            cmd/etcfuse/main.c pkg/fuse/fuse.c pkg/fuse/ops.c pkg/block/block.c \
-            -o dist/etcfuse -lfuse3 -lpthread
+
+      # etcfuse links libfuse3 dynamically, so unlike the Go binaries it
+      # does need to match the glibc of wherever it runs. Built here on
+      # ubuntu-latest (glibc ~2.39+) it linked GLIBC_2.38 symbols that
+      # don't exist on Amazon Linux 2023 (glibc 2.34, the AMI family every
+      # deployment doc and Terraform module in this repo targets) — the
+      # released binary failed to even start there with "version
+      # `GLIBC_2.38' not found". Found running the ASG deployment path
+      # against a real AL2023 instance, not by inspection. Built inside the
+      # same amazonlinux:2023 image deploy/docker/Dockerfile.etcfuse already
+      # builds the daemon in, instead of the ubuntu-latest job's own cc.
+      - name: Build etcfuse (AL2023 container, for glibc compat)
+        run: |
+          docker run --rm -v "$PWD:/build" -w /build amazonlinux:2023 bash -c '
+            dnf install -y -q gcc fuse3-devel &&
+            cc -I. -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -O2 -g \
+              cmd/etcfuse/main.c pkg/fuse/fuse.c pkg/fuse/ops.c pkg/block/block.c \
+              -o dist/etcfuse -lfuse3 -lpthread
+          '
 
       - name: Package tarballs
         run: |
