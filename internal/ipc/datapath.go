@@ -493,13 +493,22 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	}
 
 	// A shared lock keeps a concurrent writer off the range while it is read,
-	// and is what makes the metadata below cacheable at all.  Best effort: a
-	// read that cannot take the lock still returns data, from a fresh etcd
-	// snapshot, since a snapshot no lock protects cannot be cached or reused.
-	lk, lerr := s.lockInode(ctx, ino, metadata.LockShared)
-	if lerr == nil {
-		defer lk.Release()
+	// and is what makes the metadata below cacheable at all.
+	//
+	// A read that cannot take it fails rather than proceeding unlocked.  What
+	// the lock excludes is not merely a racing update: a writer that buries an
+	// extent now frees its blocks in the same transaction that publishes the
+	// write, so an unlocked reader can resolve an extent, have its blocks
+	// returned to the arena and handed to another file, and then read back
+	// bytes belonging to that other file.  Serving that quietly is worse than
+	// EAGAIN, and lock acquisition already asks the holder to yield and retries
+	// before giving up.
+	lk, err := s.lockInode(ctx, ino, metadata.LockShared)
+	if err != nil {
+		s.log.Warn("read: cannot lock inode", "ino", ino, "error", err)
+		return int32Resp(-11), nil // EAGAIN
 	}
+	defer lk.Release()
 
 	// Only useful against a cache this read could otherwise be served from: an
 	// O_DIRECT read consults none, so the ioctl would cost a device round trip
@@ -511,18 +520,7 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	// The record and the extents come together, from one revision: the record
 	// clamps the request to the file's size, the extents resolve it.  Under a
 	// lock this node already held they cost nothing at all.
-	var meta *inodeMeta
-	var merr error
-	if lerr == nil {
-		meta, merr = lk.meta(ctx)
-	} else {
-		meta = &inodeMeta{}
-		merr = retryEtcd(ctx, func(ictx context.Context) error {
-			var gerr error
-			meta.rec, meta.extents, gerr = s.store.GetInodeAndExtents(ictx, ino)
-			return gerr
-		})
-	}
+	meta, merr := lk.meta(ctx)
 	if merr != nil {
 		s.log.Warn("read: cannot read metadata", "ino", ino, "error", merr)
 		return int32Resp(-5), nil
