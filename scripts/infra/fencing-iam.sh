@@ -50,6 +50,12 @@ read -r -d '' POLICY <<'EOF'
       "Resource": ["arn:aws:ec2:*:*:volume/*", "arn:aws:ec2:*:*:instance/*"]
     },
     {
+      "Sid": "AsgClusterFormationElection",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:GetItem"],
+      "Resource": "arn:aws:dynamodb:*:*:table/*-etcfs-seed"
+    },
+    {
       "Sid": "VolumeAndPeerVisibility",
       "Effect": "Allow",
       "Action": [
