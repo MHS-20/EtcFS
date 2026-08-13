@@ -12,14 +12,13 @@ The two daemons talk over a hand-rolled length-prefixed binary protocol on a Uni
 
 **7 of 7 assertions pass**, most recently on the docker cluster (2026-08-10) alongside arena reclamation (6/6) and a 240 s fuzz run; and earlier on real AWS infra (`chaos-report-20260730-180644`, commit `660a14a`): S1, S2, S3 (both assertions), S5, S6, S7. Full scenario descriptions, the two product bugs that were fixed to get here (an inode-numbering collision with the FUSE root directory, and a `readdirplus` parser desync), the harness bugs found along the way, and known gaps not covered by this suite are all in `docs/reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md` — read that before touching `scripts/test/chaos-test.sh` or the write path. Single-cluster sequential and randomized-fuzz results are in `docs/reports/chaos-reports/2026-07-31-single-cluster-and-fuzz.md`.
 
-Every mutation is generation-guarded: the guard is installed on the store itself (`Store.SetGuard`), so namespace transactions carry it as well as extent commits. `docs/TODO.md` is the live list of what is settled and what is left; `docs/design-decisions.md` records the choices behind the non-obvious ones.
+Every mutation is generation-guarded: the guard is installed on the store itself (`Store.SetGuard`), so namespace transactions carry it as well as extent commits. `docs/design-decisions.md` records the choices behind the non-obvious ones.
 
 ## Document map
 
 | Document | Purpose |
 |----------|---------|
 | `docs/architecture/*.md` | Per-subsystem design docs — fencing, write ordering, schema, coherence, scrubber |
-| `docs/TODO.md` | Tracking list: one line per item, closed ones kept |
 | `docs/design-decisions.md` | Why the non-obvious choices were made |
 | `docs/background/etcd_raft_research.md` | etcd/Raft internals research — transaction model, leases, watches, scaling limits (~1M files per cluster), watch amplification, pagination |
 | `docs/background/cluster-fs-survey.md` | Cluster/distributed filesystem survey — GFS2, OCFS2, CephFS, GlusterFS, Lustre, EBS Multi-Attach failure modes, design lessons |

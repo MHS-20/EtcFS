@@ -14,8 +14,8 @@ import (
 // They are enforced here rather than only in the FUSE layer because etcd is
 // the thing being protected: an attribute is a value in the metadata store,
 // replicated through Raft to every member, and an unbounded one is a way to
-// push the cluster into the quota that docs/TODO.md item 41 already had to
-// defend.  The kernel applies the same two numbers, so nothing legitimate is
+// push the cluster into the same etcd storage ceiling the subtree quota
+// mechanism already had to defend.  The kernel applies the same two numbers, so nothing legitimate is
 // refused by them.
 const (
 	MaxXattrNameLen  = 255
