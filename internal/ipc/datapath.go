@@ -199,18 +199,16 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	// both counters move.
 	//
 	// Everything this write does to metadata goes into this one transaction:
-	// the new extents, the size change, the rewrite of every extent the write
-	// buries, and the release of the inode lock.  Each of those used to be its
-	// own round trip after the commit, and each was a Raft commit on the
-	// critical path of every write.  Folding them also makes the write atomic
-	// in a way it was not: a buried extent stops being referenced at the same
-	// revision the extent burying it appears, and the lock is dropped exactly
-	// when the work it protected becomes visible.
+	// the new extents, the size change, and the rewrite of every extent the
+	// write buries.  Each of those used to be its own round trip after the
+	// commit, and each was a Raft commit on the critical path of every write.
+	// Folding them also makes the write atomic in a way it was not: a buried
+	// extent stops being referenced at the same revision the extent burying it
+	// appears.
 	end := offset
 	var plans []*reclaimPlan
 	var deferredReclaim []metadata.Extent
 	var nextChunk uint64
-	var foldedRelease bool
 	proposal := func() ([]clientv3.Cmp, []clientv3.Op) {
 		cmps := make([]clientv3.Cmp, 0, len(runs))
 		ops := make([]clientv3.Op, 0, len(runs)+2)
@@ -272,14 +270,6 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 			}
 		}
 
-		// Only when this transaction finishes the write: a reclaim left over
-		// for afterwards still needs the inode held, or another node could
-		// rewrite those extents between the commit and the reclaim and turn a
-		// leak into a lost update.
-		foldedRelease = len(deferredReclaim) == 0
-		if foldedRelease {
-			ops = append(ops, lk.ReleaseOp())
-		}
 		nextChunk = next
 		return cmps, ops
 	}
@@ -321,9 +311,6 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return int32Resp(-5), nil
 	}
 	rec.Size = max(rec.Size, end)
-	if foldedRelease {
-		lk.Folded()
-	}
 
 	// Only after the commit — before it, a transaction the generation guard
 	// rejects would have freed blocks the file still refers to.

@@ -116,21 +116,14 @@ func (s *Service) retryKV(ctx context.Context, fn func(context.Context) error) {
 
 // heldLock is an acquired inode lock.
 //
-// Release drops it in a round trip of its own.  A caller that is already
-// committing a transaction can instead put ReleaseOp into it and call Folded
-// once that transaction commits, which releases the lock at the same revision
-// as the work it was protecting and saves the round trip entirely.  Release
-// stays safe to defer either way: after Folded it does nothing.
+// The lock it holds is node-local: the etcd key behind it is cached by the
+// lock cache and outlives this hold, so Release is a mutex unlock and costs no
+// round trip at all.  See lockcache.go for why the key stays.
 type heldLock struct {
 	s        *Service
-	ino      uint64
+	e        *lockEntry
 	mode     metadata.LockMode
-	holder   string
 	released bool
-	// releaseQueuedAt is when ReleaseOp put this lock's deletion into a
-	// caller's transaction: a lower bound on when a folded release took
-	// effect, since the commit that carries it cannot precede it.
-	releaseQueuedAt time.Time
 }
 
 // lockModeByte encodes a LockMode as the single byte the lock history payload
@@ -156,84 +149,150 @@ func lockModeByte(mode metadata.LockMode) byte {
 // strictly later than it happened, and left no room at all for clock offset
 // between hosts, so ordinary skew between two nodes read as two holders of
 // one lock.
+//
+// The interval recorded is the operation's, not the cached etcd key's, which
+// is longer at both ends.  A subset of the true hold interval is the safe
+// direction to be wrong in for a mutual-exclusion checker: it can only ever
+// report overlaps that really happened.
 func (l *heldLock) recordLockEvent(kind byte, call, ret time.Time) {
 	if l.s == nil || l.s.history == nil {
 		return
 	}
 	var b buf
 	b.b = append(b.b, kind, lockModeByte(l.mode))
-	b.w64(l.ino)
+	b.w64(l.e.ino)
 	l.s.history.Record("lock_hold", historyOpLockHold, call, ret, b.b, nil)
 }
 
-// ReleaseOp is the deletion that drops this lock, for folding into a caller's
-// own transaction.
-func (l *heldLock) ReleaseOp() clientv3.Op {
-	l.releaseQueuedAt = time.Now()
-	return clientv3.OpDelete(metadata.LockKey(l.ino, l.mode, l.holder))
-}
-
-// Folded records that a transaction carrying ReleaseOp committed, so the
-// deferred Release becomes a no-op.  Only call it once the transaction is
-// known to have committed — a rejected one released nothing.
-func (l *heldLock) Folded() {
-	l.released = true
-	l.recordLockEvent(lockEventRelease, l.releaseQueuedAt, time.Now())
-}
-
-// Release drops the lock, unless a committed transaction already carried it.
+// Release drops the node-local hold.  Idempotent, so a deferred Release is
+// safe next to an explicit one.
 func (l *heldLock) Release() {
 	if l.released {
 		return
 	}
-	// Fresh context rather than the request's: releasing has to work even
-	// when the request deadline has already expired, otherwise the lock
-	// lingers and blocks the next writer for no reason.  Retried, because a
-	// lock key now outlives a failed release for as long as the node does:
-	// the session lease that would have expired it is the one this node
-	// keeps renewing.
-	rctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
-	defer cancel()
-	call := time.Now()
-	err := retryEtcd(rctx, func(dctx context.Context) error {
-		return l.s.store.ReleaseLock(dctx, l.ino, l.mode, l.holder)
-	})
-	if err != nil {
-		l.s.log.Error("inode lock not released, it will block writers until this node exits",
-			"ino", l.ino, "mode", l.mode, "error", err)
-		return
-	}
 	l.released = true
+	call := time.Now()
+	if l.mode == metadata.LockExclusive {
+		l.e.rw.Unlock()
+	} else {
+		l.e.rw.RUnlock()
+	}
 	l.recordLockEvent(lockEventRelease, call, time.Now())
 }
 
-// lockInode takes a lock on an inode.  The lock is written under the store's
-// session lease, which is renewed for the life of the process, so nothing
-// per-lock is left running past the release.
+// lockInode takes a lock on an inode: the node-local exclusion first, then the
+// etcd key that excludes the other nodes — which is usually already there,
+// cached from an earlier operation on the same inode.
 //
-// Each acquisition attempt runs against its own bounded context.  This is the
-// first etcd call on both the read and the write path, so an unbounded one
-// stalls I/O here, before any generation guard is consulted; the caller's ctx
-// still caps the total, so a request that has already run out of time does not
-// start another attempt.
+// The local wait is bounded rather than blocking. Two threads on one node
+// contending for the same inode used to collide in etcd and get EAGAIN after
+// the retry budget; keeping that shape means a pathologically slow holder
+// still cannot pin a FUSE request open indefinitely.
 func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockMode) (*heldLock, error) {
-	var holder string
+	e := s.lockEntryFor(ino)
 
 	call := time.Now()
-	err := retry(ctx, etcdAttempts, func() error {
-		actx, cancel := context.WithTimeout(ctx, etcdOpTimeout)
-		defer cancel()
-		var aerr error
-		holder, aerr = s.store.AcquireLock(actx, ino, mode, inodeLockTTL)
-		return aerr
-	})
-	if err != nil {
+	if err := lockLocal(ctx, e, mode); err != nil {
 		return nil, err
 	}
 
-	held := &heldLock{s: s, ino: ino, mode: mode, holder: holder}
+	if err := s.ensureLockKey(ctx, e, mode); err != nil {
+		unlockLocal(e, mode)
+		return nil, err
+	}
+
+	held := &heldLock{s: s, e: e, mode: mode}
 	held.recordLockEvent(lockEventAcquire, call, time.Now())
 	return held, nil
+}
+
+// lockLocal takes the entry's node-local lock, giving up rather than waiting
+// forever.  sync.RWMutex has no timed acquire, so the budget is spent as
+// TryLock attempts on the same backoff every other contended operation uses.
+func lockLocal(ctx context.Context, e *lockEntry, mode metadata.LockMode) error {
+	return retry(ctx, lockAttempts, func() error {
+		if mode == metadata.LockExclusive {
+			if e.rw.TryLock() {
+				return nil
+			}
+		} else if e.rw.TryRLock() {
+			return nil
+		}
+		return metadata.ErrConflict
+	})
+}
+
+func unlockLocal(e *lockEntry, mode metadata.LockMode) {
+	if mode == metadata.LockExclusive {
+		e.rw.Unlock()
+	} else {
+		e.rw.RUnlock()
+	}
+}
+
+// ensureLockKey makes sure etcd carries a lock key for this inode that covers
+// the requested mode, acquiring one only when the cache cannot answer.
+func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata.LockMode) error {
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+
+	if e.holder != "" && covers(e.mode, mode) {
+		return nil
+	}
+	// A cached shared key blocks this node's own exclusive acquisition — the
+	// comparison behind it rejects any holder, including us — so it goes first.
+	// The upgrade is not downgraded afterwards, so a read-modify-write sequence
+	// pays this once rather than on every alternation.
+	if e.holder != "" {
+		s.releaseKeyLocked(e)
+	}
+
+	holder, err := s.acquireLockKey(ctx, e.ino, mode)
+	if err != nil {
+		return err
+	}
+	e.holder, e.mode = holder, mode
+	return nil
+}
+
+// acquireLockKey takes the etcd lock key, asking the current holder to yield if
+// one is in the way.  The want key is written once per acquisition, not once
+// per attempt: a peer needs to be told once, and each repeat is a Raft commit
+// against a node already working on the recall.
+func (s *Service) acquireLockKey(ctx context.Context, ino uint64, mode metadata.LockMode) (string, error) {
+	var holder string
+	announced := false
+
+	err := retry(ctx, lockAttempts, func() error {
+		actx, cancel := context.WithTimeout(ctx, etcdOpTimeout)
+		defer cancel()
+
+		var aerr error
+		holder, aerr = s.store.AcquireLock(actx, ino, mode, inodeLockTTL)
+		if errors.Is(aerr, metadata.ErrConflict) && !announced {
+			announced = true
+			if werr := s.store.AnnounceLockWant(actx, ino); werr != nil {
+				s.log.Warn("cannot announce a lock request; the holder will not be asked to yield",
+					"ino", ino, "error", werr)
+			}
+		}
+		return aerr
+	})
+
+	if announced {
+		// Off the critical path: the lock is already ours or already lost, and
+		// leaving the want key behind would have every peer yield this inode
+		// for nothing from here on.
+		go func() {
+			cctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
+			defer cancel()
+			if cerr := s.store.ClearLockWant(cctx, ino); cerr != nil {
+				s.log.Warn("lock request not withdrawn; peers will keep yielding this inode",
+					"ino", ino, "error", cerr)
+			}
+		}()
+	}
+	return holder, err
 }
 
 // commitGuarded applies ops in one transaction carrying the caller's

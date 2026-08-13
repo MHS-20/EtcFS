@@ -277,6 +277,7 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 
 	log.Info("binary IPC server starting")
 	svc.StartNotificationServer(ctx)
+	svc.StartLockRevocation(ctx)
 	go func() {
 		if err := ipc.StartNotifyServer(svc, cfg.NotifyAddr); err != nil {
 			// Not fatal: the mount works without it, but every node's caches
@@ -287,7 +288,7 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	}()
 	serveErr := ipc.StartSocketServer(ctx, svc, cfg.ListenAddr, log)
 
-	leaveCluster(cfg, store, membership, log)
+	leaveCluster(cfg, svc, store, membership, log)
 
 	log.Info("etcfuse-meta stopped")
 	if serveErr != nil {
@@ -368,7 +369,7 @@ func stopOnSignalOrFence(ctx context.Context, cancel context.CancelFunc,
 // so no further write can be issued from here — which is what a fenced node
 // needs an external Fencer to establish.  Skipping this is what made arena
 // space leak on every departure, graceful or not.
-func leaveCluster(cfg *config.Config, store *metadata.Store,
+func leaveCluster(cfg *config.Config, svc *ipc.Service, store *metadata.Store,
 	membership *metadata.Membership, log *config.Logger) {
 	// A context of its own: the daemon's is already cancelled by now.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -383,8 +384,12 @@ func leaveCluster(cfg *config.Config, store *metadata.Store,
 		log.Info("released arenas on shutdown", "node", cfg.NodeID, "arenas", released)
 	}
 
-	// Ends the lease backing this node's file locks.  They are released
-	// individually as each operation finishes, so this only clears a key a
+	// Cached inode locks first: their keys outlive the operations that took
+	// them, so nothing else has dropped them, and a peer blocked on one should
+	// not have to wait for the lease revocation below to notice.
+	svc.ReleaseCachedLocks()
+
+	// Ends the lease backing this node's file locks.  This clears whatever a
 	// failed release left behind — which would otherwise stand until the lease
 	// expires, and the lease is renewed for as long as the process lives.
 	if err := store.CloseLockSession(); err != nil {

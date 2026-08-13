@@ -53,6 +53,11 @@ type Service struct {
 	// the last release deletes the record.
 	orphaned map[uint64]bool
 
+	// locks caches this node's inode locks past the operations that took
+	// them, so a repeat acquisition costs no etcd round trip. See lockcache.go.
+	lockMu sync.Mutex
+	locks  map[uint64]*lockEntry
+
 	// Fencing generation this node started with.  Every data-path commit is
 	// guarded against it, so once the fencing controller bumps gen:<node_id>
 	// this node's commits stop being accepted by etcd.
@@ -72,6 +77,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		log:        log,
 		openCount:  make(map[uint64]int),
 		orphaned:   make(map[uint64]bool),
+		locks:      make(map[uint64]*lockEntry),
 	}
 }
 
