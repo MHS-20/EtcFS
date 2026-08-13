@@ -95,6 +95,23 @@ func connect(cfg *config.Config) (*clientv3.Client, error) {
 	})
 }
 
+// connectLocal dials only the etcd member colocated with this node, for the
+// reads the store serves through it.
+//
+// Endpoint auto-sync is deliberately off: it would discover the whole cluster
+// and hand the balancer the other members back, which is exactly the pinning
+// this client exists to keep.
+func connectLocal(cfg *config.Config) (*clientv3.Client, error) {
+	return clientv3.New(clientv3.Config{
+		Endpoints:            []string{cfg.EtcdLocalEndpoint},
+		DialTimeout:          3 * time.Second,
+		DialKeepAliveTime:    1 * time.Second,
+		DialKeepAliveTimeout: 1 * time.Second,
+		PermitWithoutStream:  true,
+		TLS:                  cfg.EtcdTLSConfig(),
+	})
+}
+
 func runFsck(ctx context.Context, cfg *config.Config) error {
 	cli, err := connect(cfg)
 	if err != nil {
@@ -173,6 +190,16 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 
 	// Metadata store: wraps etcd client with schema-aware helpers
 	store := metadata.NewStore(etcdCli, cfg.NodeID)
+
+	if cfg.EtcdLocalEndpoint != "" {
+		localCli, lerr := connectLocal(cfg)
+		if lerr != nil {
+			return fmt.Errorf("connect to local etcd member %s: %w", cfg.EtcdLocalEndpoint, lerr)
+		}
+		defer func() { _ = localCli.Close() }()
+		store.SetLocalClient(localCli)
+		log.Info("etcd reads pinned to local member", "endpoint", cfg.EtcdLocalEndpoint)
+	}
 
 	// Self-fencing watchdog
 	watchdog := fencing.NewWatchdog(membership, cfg.LeaseTTL)

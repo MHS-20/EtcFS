@@ -18,15 +18,24 @@ var Version = "0.1.0"
 type Config struct {
 	ListenAddr    string
 	EtcdEndpoints []string
-	EtcdCertFile  string
-	EtcdKeyFile   string
-	EtcdCAFile    string
-	NodeID        string
-	ClusterName   string
-	LeaseTTL      time.Duration
-	LogLevel      int
-	ShowVersion   bool
-	BlockDevice   string
+
+	// EtcdLocalEndpoint is the endpoint of the etcd member colocated with this
+	// node, if there is one.  Reads are issued through it instead of through
+	// the round-robin client, so a serializable read on the data path is
+	// answered locally rather than over the network; a read the local member
+	// cannot answer falls back to the cluster-wide client.  Unset leaves every
+	// read on the round-robin client.
+	EtcdLocalEndpoint string
+
+	EtcdCertFile string
+	EtcdKeyFile  string
+	EtcdCAFile   string
+	NodeID       string
+	ClusterName  string
+	LeaseTTL     time.Duration
+	LogLevel     int
+	ShowVersion  bool
+	BlockDevice  string
 
 	// VolumeID identifies the shared data volume by its cloud volume ID.  When
 	// set it takes precedence over BlockDevice, whose literal path does not
@@ -126,6 +135,8 @@ func Parse() *Config {
 		"Unix domain socket path for C daemon IPC")
 	flag.StringVar(&etcdEndpoints, "etcd-endpoints", "http://localhost:2379",
 		"Comma-separated etcd client endpoints")
+	flag.StringVar(&cfg.EtcdLocalEndpoint, "etcd-local-endpoint", "",
+		"Endpoint of the etcd member colocated with this node; reads are served through it, with the round-robin client as fallback")
 	flag.StringVar(&cfg.EtcdCertFile, "etcd-cert", "",
 		"Path to etcd client certificate")
 	flag.StringVar(&cfg.EtcdKeyFile, "etcd-key", "",

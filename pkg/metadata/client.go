@@ -33,6 +33,11 @@ type Store struct {
 	client *clientv3.Client
 	nodeID string
 
+	// localClient, when set, is a client dialed only at the etcd member
+	// colocated with this node, and every read is attempted through it first.
+	// See SetLocalClient.
+	localClient *clientv3.Client
+
 	// session is the lease every lock this node holds is written under, granted
 	// once and kept alive for the store's lifetime instead of per acquisition.
 	// lockSeq makes holder tokens unique within it.  See AcquireLock.
@@ -68,6 +73,53 @@ func NewStore(client *clientv3.Client, nodeID string) *Store {
 // registration), and each is unguarded for a reason documented at the call.
 func (s *Store) SetGuard(g GuardFunc) {
 	s.guard = g
+}
+
+// SetLocalClient installs a client dialed only at the etcd member colocated
+// with this node, through which reads are then issued.
+//
+// The round-robin client spreads requests over every endpoint, so a
+// serializable read — which exists to avoid a leader round trip — can still
+// leave the machine.  Pinning reads to the local member is what makes it
+// actually local.  Linearizable reads are unaffected in meaning: the local
+// member still confirms its read index with the leader.
+//
+// Writes keep using the cluster-wide client, and a read the local member
+// cannot answer is retried there, so losing the colocated member costs
+// latency rather than availability.
+func (s *Store) SetLocalClient(c *clientv3.Client) {
+	s.localClient = c
+}
+
+// read issues a range request, preferring the colocated member when one is
+// configured.
+func (s *Store) read(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+	start := time.Now()
+	defer func() { metrics.EtcdReadDuration.Observe(time.Since(start).Seconds()) }()
+
+	if s.localClient != nil {
+		if resp, err := s.localClient.Get(ctx, key, opts...); err == nil {
+			return resp, nil
+		}
+	}
+	return s.client.Get(ctx, key, opts...)
+}
+
+// readTxn issues read-only operations as one unconditional transaction.
+//
+// A transaction needs no comparisons to be useful here: etcd applies its
+// operations against a single revision, so the batch costs one round trip and
+// is a consistent snapshot rather than a sequence of independent reads.
+func (s *Store) readTxn(ctx context.Context, ops ...clientv3.Op) (*clientv3.TxnResponse, error) {
+	start := time.Now()
+	defer func() { metrics.EtcdReadDuration.Observe(time.Since(start).Seconds()) }()
+
+	if s.localClient != nil {
+		if resp, err := s.localClient.Txn(ctx).Then(ops...).Commit(); err == nil {
+			return resp, nil
+		}
+	}
+	return s.client.Txn(ctx).Then(ops...).Commit()
 }
 
 // Client returns the underlying etcd client (for direct use by watch
@@ -154,7 +206,7 @@ func (s *Store) guardFailed(ctx context.Context) (bool, error) {
 
 // Get reads a single key's value.  Returns nil if the key doesn't exist.
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
-	resp, err := s.client.Get(ctx, key)
+	resp, err := s.read(ctx, key)
 	if err != nil {
 		return nil, fmt.Errorf("get %s: %w", key, err)
 	}
@@ -165,10 +217,6 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 }
 
 // GetMany reads several keys in one round trip, returning only those present.
-//
-// A read needs no comparisons, so this is an unconditional transaction: etcd
-// applies its operations against a single revision, which also makes the batch
-// a consistent snapshot rather than a sequence of independent reads.
 //
 // Batched because the alternative is a request per key.  A readdir of a
 // thousand-entry directory made a thousand sequential gets, on every listing.
@@ -184,7 +232,7 @@ func (s *Store) GetMany(ctx context.Context, keys []string) (map[string][]byte, 
 		for _, k := range keys[start:end] {
 			ops = append(ops, clientv3.OpGet(k))
 		}
-		resp, err := s.client.Txn(ctx).Then(ops...).Commit()
+		resp, err := s.readTxn(ctx, ops...)
 		if err != nil {
 			return nil, fmt.Errorf("get %d keys: %w", end-start, err)
 		}
@@ -206,7 +254,7 @@ func (s *Store) GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.KeyValu
 // asking for a serializable read stays a decision of the few call sites that
 // have established they do not need a leader round trip.
 func (s *Store) getPrefix(ctx context.Context, prefix string, opts ...clientv3.OpOption) ([]*mvccpb.KeyValue, error) {
-	resp, err := s.client.Get(ctx, prefix, append([]clientv3.OpOption{clientv3.WithPrefix()}, opts...)...)
+	resp, err := s.read(ctx, prefix, append([]clientv3.OpOption{clientv3.WithPrefix()}, opts...)...)
 	if err != nil {
 		return nil, fmt.Errorf("get prefix %s: %w", prefix, err)
 	}
@@ -216,7 +264,7 @@ func (s *Store) getPrefix(ctx context.Context, prefix string, opts ...clientv3.O
 // GetRevision reads a key at a specific etcd revision (point-in-time snapshot).
 // Useful for consistent paginated directory listings.
 func (s *Store) GetRevision(ctx context.Context, key string, opts ...clientv3.OpOption) ([]*mvccpb.KeyValue, int64, error) {
-	resp, err := s.client.Get(ctx, key, opts...)
+	resp, err := s.read(ctx, key, opts...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("get rev %s: %w", key, err)
 	}
