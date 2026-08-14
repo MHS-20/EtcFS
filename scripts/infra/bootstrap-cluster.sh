@@ -111,6 +111,11 @@ for ip in "${PUB_IPS[@]}"; do
         sudo chmod +x /usr/local/bin/etcd /usr/local/bin/etcdctl
     " || true
     wait_ssh "$ip" 3
+    # Stop whatever is already running before overwriting its binary: a
+    # re-bootstrap onto a live cluster otherwise fails the copy with "Text file
+    # busy" and leaves that node serving the previous build, which is invisible
+    # afterwards and silently poisons anything measured against it.
+    ssh_retry "$ip" "sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; true" || true
     scp $SSH_OPTS -q "$PROJECT_ROOT/bin/etcfuse-meta" "ec2-user@$ip:/tmp/" 2>/dev/null || true
     ssh_retry "$ip" "sudo cp /tmp/etcfuse-meta /usr/local/bin/etcfuse-meta && sudo chmod +x /usr/local/bin/etcfuse-meta" || true
     scp $SSH_OPTS -q /tmp/etcfs-bootstrap-src.tar.gz "ec2-user@$ip:/tmp/" 2>/dev/null || true
@@ -134,10 +139,21 @@ for i in "${!PRIV_IPS[@]}"; do
     [[ -n "$INITIAL_CLUSTER" ]] && INITIAL_CLUSTER+=","
     INITIAL_CLUSTER+="e${i}=http://${PRIV_IPS[$i]}:2380"
 done
+# Stop and wipe every member before starting any of them.  Interleaving the two
+# leaves a wiped node trying to join peers that still hold the previous
+# incarnation's member IDs, which etcd refuses with "member has already been
+# bootstrapped" — so a re-bootstrap onto a live cluster brings up no etcd at all.
+for ip in "${PUB_IPS[@]}"; do
+    ssh $SSH_OPTS "ec2-user@$ip" "
+        sudo killall -9 etcd 2>/dev/null
+        sudo rm -rf /var/lib/etcd && sudo mkdir -p /var/lib/etcd
+    " 2>/dev/null
+done
+sleep 2
+
 for i in "${!PUB_IPS[@]}"; do
     ip="${PUB_IPS[$i]}"; priv="${PRIV_IPS[$i]}"; ename="e${i}"
     ssh $SSH_OPTS "ec2-user@$ip" "
-        sudo rm -rf /var/lib/etcd && sudo mkdir -p /var/lib/etcd
         sudo nohup /usr/local/bin/etcd --name $ename --data-dir /var/lib/etcd \
             --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://$priv:2379 \
             --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://$priv:2380 \

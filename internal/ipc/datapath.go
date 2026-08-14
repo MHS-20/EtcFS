@@ -365,7 +365,10 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		var bufData []bufferedRun
 		var bufRuns []arena.Run
 		bytes := uint64(dataLen)
-		if s.dataCache {
+		// The extent is deferred either way; only the bytes are in question, and
+		// they are worth holding back only when the flush can merge them with
+		// their neighbours.  See streakContinues.
+		if s.dataCache && lk.e.streakContinues(runs) {
 			payload := make([]byte, padded)
 			copy(payload, data)
 			pos := uint64(0)
@@ -373,13 +376,17 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 				bufData = append(bufData, bufferedRun{diskOff: r.DiskOff, buf: payload[pos : pos+r.Length]})
 				pos += r.Length
 			}
-			bufRuns, bytes = runs, uint64(padded)
+			bytes = uint64(padded)
 		} else if werr := writeThrough(); werr != nil {
 			freeRuns()
 			s.log.Warn("write: block device write failed", "error", werr)
 			return int32Resp(errnoForWrite(werr)), nil
 		}
 
+		// Tracked whether or not the bytes were buffered: the extent naming these
+		// blocks is unpublished either way, so a discarded buffer has to give
+		// them back.
+		bufRuns = runs
 		berr := s.bufferWrite(ctx, lk.e, m, cmps, ops, plans, bytes, bufData, bufRuns)
 		if errors.Is(berr, errBufferPublished) {
 			// The buffer was full and has been published, which moved every key

@@ -8,6 +8,7 @@ import (
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
@@ -96,6 +97,11 @@ type lockEntry struct {
 	meta    *inodeMeta
 	metaFor string
 
+	// dataStreakEnd is the device offset the buffered write data currently runs
+	// up to, so the next write can tell whether it continues that range.  See
+	// streakContinues.  Guarded by keyMu.
+	dataStreakEnd uint64
+
 	// pending is the metadata this node's writes have produced and not yet
 	// published.  It lives beside meta, under the same mutex and the same
 	// validity rule, because it is the other half of one statement about the
@@ -141,6 +147,36 @@ func (s *Service) pendingSize(ino uint64) (uint64, bool) {
 		return 0, false
 	}
 	return e.meta.rec.Size, true
+}
+
+// streakContinues reports whether runs continue the contiguous device range the
+// buffer has been accumulating, and records where they end either way.
+//
+// Buffering a write's *data* only pays when the flush can merge it with its
+// neighbours into a larger device I/O.  A provisioned volume rate-limits I/O
+// operations rather than capping how many may be outstanding, so a batch of
+// scattered 4 K writes costs the device exactly what the same writes cost issued
+// one at a time — deferring them converts steady latency into a burst and buys
+// nothing back.  Merging is what actually reduces the count, and merging needs
+// adjacency, which is what sequential allocation gives and a random overwrite
+// workload — reallocating from the scattered holes its own reclaims leave —
+// never does.
+//
+// So the cheapest possible test decides it: does this write's first run start
+// where the last one ended.  A write that fails it is written through, exactly
+// as it was before data buffering existed; its extent is still deferred, which
+// is where the Raft commit was saved and that saving is unconditional.
+func (e *lockEntry) streakContinues(runs []arena.Run) bool {
+	if len(runs) == 0 {
+		return false
+	}
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+
+	continues := runs[0].DiskOff == e.dataStreakEnd
+	last := runs[len(runs)-1]
+	e.dataStreakEnd = last.DiskOff + last.Length
+	return continues
 }
 
 // bufferedReadAt serves a device range from this node's own unpublished write
