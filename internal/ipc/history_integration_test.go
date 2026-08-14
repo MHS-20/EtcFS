@@ -263,6 +263,18 @@ func TestIntegration_RecordedDataPathHistoryIsConsistent(t *testing.T) {
 	}
 	wg.Wait()
 
+	// A write buffers its extents rather than committing them, so the guarded
+	// commit the generation history is checked against belongs to the flush.
+	// Publishing here rather than after every write keeps the rounds above
+	// exercising the buffered path, which is what the extent history checks.
+	for _, svc := range services {
+		for round := 0; round < inos; round++ {
+			var b buf
+			b.w64(uint64(900 + round))
+			_, _ = svc.observedDispatch(ipcOpFsync, b.b)
+		}
+	}
+
 	entries, err := history.Load(historyPath)
 	if err != nil {
 		t.Fatalf("load history: %v", err)

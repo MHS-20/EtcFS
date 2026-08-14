@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -138,10 +139,18 @@ func (p *pending) reset() []*reclaimPlan {
 // Zero is today's behaviour: one commit per write.
 func (s *Service) deferWrites() bool { return s.flushInterval > 0 }
 
+// errBufferPublished reports that the buffer had to be published to make room
+// for the write being folded in, and that the write was therefore not folded.
+//
+// The caller must re-plan before trying again.  A flush moves every key it
+// wrote to a new revision, so a proposal built before it — including the
+// snapshot the caller derived for the cache — compares against revisions etcd
+// has already left behind, and could never commit.
+var errBufferPublished = errors.New("the buffer was published to make room")
+
 // bufferWrite folds a committed-to-device write into the entry's buffer and
 // updates the cached metadata to match, so this node's own reads and its next
-// write see the write immediately.  Flushes first when the buffer would
-// otherwise outgrow what one transaction can carry.
+// write see the write immediately.
 //
 // The caller holds the entry's exclusive local lock, so no other operation on
 // this inode is in flight.
@@ -149,29 +158,33 @@ func (s *Service) bufferWrite(ctx context.Context, e *lockEntry, m *inodeMeta,
 	cmps []clientv3.Cmp, ops []clientv3.Op, plans []*reclaimPlan, bytes uint64) error {
 
 	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+
 	if e.pending == nil {
 		e.pending = &pending{}
 	}
 	// etcd caps a transaction's size, so a buffer that cannot absorb this write
-	// is published before the write joins it rather than after.
-	if len(e.pending.order)+len(ops) > maxWriteTxnOps ||
-		e.pending.bytes+bytes > s.flushMaxBytes {
+	// is published before the write joins it.  The write does not join it here:
+	// its plan predates the flush, and the caller has to build a new one.  The
+	// retry cannot land here again, because the buffer it found full is empty
+	// now and one write's proposal is capped at what a transaction can carry.
+	if !e.pending.empty() &&
+		(len(e.pending.order)+len(ops) > maxWriteTxnOps || e.pending.bytes+bytes > s.flushMaxBytes) {
 		if err := s.flushLocked(ctx, e, "buffer_full"); err != nil {
-			e.keyMu.Unlock()
 			return err
 		}
+		return errBufferPublished
 	}
+
 	e.pending.add(cmps, ops, plans, bytes)
-	pendingOps, pendingBytes := len(e.pending.order), e.pending.bytes
 	// The snapshot is republished under the same mutex the buffer is, so the
 	// two can never disagree about what this node has written.
 	if e.holder != "" {
 		e.meta, e.metaFor = m, e.holder
 	}
-	e.keyMu.Unlock()
 
-	metrics.PendingExtents.Set(float64(pendingOps))
-	metrics.PendingBytes.Set(float64(pendingBytes))
+	metrics.PendingExtents.Set(float64(len(e.pending.order)))
+	metrics.PendingBytes.Set(float64(e.pending.bytes))
 	return nil
 }
 

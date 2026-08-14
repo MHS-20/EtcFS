@@ -159,6 +159,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return int32Resp(-2), nil
 	}
 	rec := meta.rec
+	existing := meta.extents
 
 	runs, err := s.allocateBlocks(ctx, uint64(dataLen))
 	if err != nil {
@@ -213,7 +214,6 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	// buried extent.  That retry re-reads linearizably, which is the only way
 	// to be sure the second attempt is not working from the same stale view.
 	var chunk, seq uint64
-	existing := meta.extents
 	countFrom := func() {
 		chunk, seq = 0, 0
 		for _, e := range existing {
@@ -251,6 +251,11 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	var plans []*reclaimPlan
 	var deferredReclaim []metadata.Extent
 	var nextChunk uint64
+	// A write that costs the file its set-user-ID bits must not have that
+	// change deferred with the rest of the transaction.  Deferring the bytes
+	// trades durability; deferring this trades privilege, and any peer reading
+	// the inode in the meantime is told the file is still setuid.
+	var modeChanged bool
 	proposal := func() ([]clientv3.Cmp, []clientv3.Op) {
 		cmps := make([]clientv3.Cmp, 0, len(runs))
 		ops := make([]clientv3.Op, 0, len(runs)+2)
@@ -282,7 +287,9 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		// The inode is rewritten when the write grows the file, and also when it
 		// costs the file its set-user-ID bits — both ride the transaction that
 		// publishes the write rather than a round trip of their own.
-		if mode := metadata.ClearSetIDOnWrite(rec.Mode, uid); end > rec.Size || mode != rec.Mode {
+		mode := metadata.ClearSetIDOnWrite(rec.Mode, uid)
+		modeChanged = mode != rec.Mode
+		if end > rec.Size || modeChanged {
 			updated := *rec
 			updated.Size = max(rec.Size, end)
 			updated.Mode = mode
@@ -324,21 +331,42 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	// committing takes the Raft commit off the write path entirely; see
 	// delegate.go for what the flush has to assert to make that safe.
 	//
-	// Three things send a write down the committing path anyway: deferral being
-	// switched off, the caller having asked for a synchronous write, and a
-	// transaction this node cannot replay into its own cache — the buffer is
-	// that replay, so a proposal it cannot account for has nothing to be folded
-	// into.
-	if !sync && len(deferredReclaim) == 0 {
-		if m := afterCommit(ino, existing, rec, ops, 0); m != nil {
-			if berr := s.bufferWrite(ctx, lk.e, m, cmps, ops, plans, uint64(dataLen)); berr != nil {
+	// Four things send a write down the committing path anyway: deferral being
+	// switched off, the caller having asked for a synchronous write, a change
+	// to the file's mode, and a transaction this node cannot replay into its
+	// own cache — the buffer is that replay, so a proposal it cannot account
+	// for has nothing to be folded into.
+	for !sync && !modeChanged && len(deferredReclaim) == 0 {
+		m := afterCommit(ino, existing, rec, ops, 0)
+		if m == nil {
+			break
+		}
+		berr := s.bufferWrite(ctx, lk.e, m, cmps, ops, plans, uint64(dataLen))
+		if errors.Is(berr, errBufferPublished) {
+			// The buffer was full and has been published, which moved every key
+			// it held to a new revision.  This proposal was planned against the
+			// revisions those keys carried while they were buffered, so it is
+			// rebuilt from the snapshot the flush left behind — a cache hit, not
+			// a round trip, since the flush maintained it.  The buffer is empty
+			// now, so this cannot repeat.
+			fresh, merr := lk.meta(ctx)
+			if merr != nil || fresh.rec == nil {
 				freeRuns()
-				s.log.Warn("write: cannot buffer the extent", "ino", ino, "error", berr)
+				s.log.Warn("write: cannot re-read metadata after a flush", "ino", ino, "error", merr)
 				return int32Resp(-5), nil
 			}
-			lk.metaPublished = true
-			return writtenResp(uint32(dataLen)), nil
+			rec, existing = fresh.rec, fresh.extents
+			countFrom()
+			cmps, ops = proposal()
+			continue
 		}
+		if berr != nil {
+			freeRuns()
+			s.log.Warn("write: cannot buffer the extent", "ino", ino, "error", berr)
+			return int32Resp(-5), nil
+		}
+		lk.metaPublished = true
+		return writtenResp(uint32(dataLen)), nil
 	}
 
 	// This write is committing after all, and the proposal above may have been

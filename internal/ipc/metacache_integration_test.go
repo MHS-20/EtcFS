@@ -30,9 +30,19 @@ func cachedMetaFor(svc *Service, ino uint64) *inodeMeta {
 }
 
 // assertCacheMatchesEtcd fails if the cached view differs from a fresh read.
+//
+// A write's extents are buffered rather than committed, so the two agree only
+// once the buffer is published — the comparison is against what the write
+// eventually stored, not against what etcd held mid-flight.  The fsync is
+// therefore part of the assertion rather than setup for it: it is the point the
+// replay's answer becomes checkable.
 func assertCacheMatchesEtcd(t *testing.T, svc *Service, store *metadata.Store, ino uint64, stage string) {
 	t.Helper()
 	ctx := context.Background()
+
+	if e := fsyncInode(t, svc, ino); e != 0 {
+		t.Fatalf("%s: fsync returned errno %d", stage, e)
+	}
 
 	m := cachedMetaFor(svc, ino)
 	if m == nil {
