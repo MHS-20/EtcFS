@@ -364,9 +364,12 @@ func (s *Service) releaseKeyLocked(e *lockEntry) error {
 	// exits and every peer stalls on it.
 	ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
 	defer cancel()
-	if err := retryEtcd(ctx, func(rctx context.Context) error {
+	call := time.Now()
+	err := retryEtcd(ctx, func(rctx context.Context) error {
 		return s.store.ReleaseLock(rctx, e.ino, mode, holder)
-	}); err != nil {
+	})
+	s.recordKeyEvent(e.ino, mode, lockEventRelease, call, time.Now())
+	if err != nil {
 		s.log.Error("cached inode lock not released, it will block peers until this node exits",
 			"ino", e.ino, "mode", mode, "error", err)
 	}
@@ -385,6 +388,13 @@ func (s *Service) keyLostLocked(e *lockEntry, why string) {
 		s.log.Error("kernel pages not invalidated for an inode whose lock key is gone; "+
 			"a reader on this node may see stale data until the file is reopened",
 			"ino", e.ino, "error", err)
+	}
+	if e.holder != "" {
+		// etcd dropped the key at some unobserved instant between this node
+		// taking it and noticing it was gone, so that whole span is what the
+		// history is told.  Claiming the release happened now would place it
+		// after a peer's acquisition that legitimately came first.
+		s.recordKeyEvent(e.ino, e.mode, lockEventRelease, e.acquiredAt, time.Now())
 	}
 	e.holder, e.lease, e.meta, e.metaFor = "", 0, nil, ""
 	if !e.pending.empty() {

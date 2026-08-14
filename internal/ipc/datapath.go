@@ -178,7 +178,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	}
 	freeRuns := func() {
 		for _, r := range runs {
-			s.alloc.Free(r.DiskOff, r.Length)
+			s.freeBlocks(r.DiskOff, r.Length)
 		}
 	}
 
@@ -626,13 +626,27 @@ func (s *Service) writeRun(buf []byte, diskOff uint64) error {
 func (s *Service) allocateBlocks(ctx context.Context, size uint64) ([]arena.Run, error) {
 	if s.alloc.ArenaCount() > 0 {
 		if runs, err := s.alloc.Allocate(size); err == nil {
-			return runs, nil
+			return s.recordReserved(runs), nil
 		}
 	}
 	if _, err := s.alloc.AcquireArena(ctx); err != nil {
 		return nil, err
 	}
-	return s.alloc.Allocate(size)
+	runs, err := s.alloc.Allocate(size)
+	if err != nil {
+		return nil, err
+	}
+	return s.recordReserved(runs), nil
+}
+
+// recordReserved notes a reservation in the history, so that a block handed out
+// twice — or handed out while an extent still names it — is visible to the
+// block-lifetime model rather than only to fsck.
+func (s *Service) recordReserved(runs []arena.Run) []arena.Run {
+	for _, r := range runs {
+		s.recordBlockEvent(blockEventReserve, r.DiskOff, r.Length)
+	}
+	return runs
 }
 
 // writeGeneration returns the fencing generation to stamp on an extent: this
@@ -969,6 +983,6 @@ func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
 // freeReclaimed returns a committed plan's blocks to the arena.
 func (s *Service) freeReclaimed(p *reclaimPlan) {
 	if p.freeLen > 0 {
-		s.alloc.Free(p.freeOff, p.freeLen)
+		s.freeBlocks(p.freeOff, p.freeLen)
 	}
 }

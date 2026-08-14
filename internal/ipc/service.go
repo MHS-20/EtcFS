@@ -196,7 +196,7 @@ func (s *Service) Allocator() *arena.Allocator {
 }
 
 func (s *Service) FreeBlock(diskOff, length uint64) {
-	s.alloc.Free(diskOff, length)
+	s.freeBlocks(diskOff, length)
 }
 
 // Store returns the underlying metadata store.

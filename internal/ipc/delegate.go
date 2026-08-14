@@ -566,7 +566,7 @@ func (s *Service) discardPending(e *lockEntry, why string) {
 	// The extents naming these runs will never be published, so nothing on the
 	// device or in etcd refers to them and they are free to hand out again.
 	for _, r := range runs {
-		s.alloc.Free(r.DiskOff, r.Length)
+		s.freeBlocks(r.DiskOff, r.Length)
 	}
 	// The cached snapshot describes writes that no longer exist anywhere.
 	e.meta, e.metaFor = nil, ""

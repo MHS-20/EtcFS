@@ -356,12 +356,14 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 		}
 	}
 
+	call := time.Now()
 	holder, err := s.acquireLockKey(ctx, e.ino, mode)
 	if err != nil {
 		return err
 	}
 	lease, _ := metadata.LockHolderLease(holder)
 	e.holder, e.lease, e.mode, e.acquiredAt = holder, lease, mode, time.Now()
+	s.recordKeyEvent(e.ino, mode, lockEventAcquire, call, e.acquiredAt)
 	return nil
 }
 

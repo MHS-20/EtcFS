@@ -170,11 +170,14 @@ func (s *Service) invalidatePages(ino uint64) error {
 	buf := make([]byte, 12)
 	binary.BigEndian.PutUint32(buf[0:4], notifyInvalInode)
 	binary.BigEndian.PutUint64(buf[4:12], ino)
+	call := time.Now()
 	err := s.notifyServer.send(buf, true)
 	switch {
 	case err == nil:
+		s.recordPageInval(ino, pageInvalDone, call, time.Now())
 		return nil
 	case errors.Is(err, errNoNotifyClient):
+		s.recordPageInval(ino, pageInvalNoClient, call, time.Now())
 		// Nothing can be cached again until a client reconnects and an open is
 		// answered, and that open sets the flag afresh.
 		s.pagesCached.Store(false)
@@ -182,6 +185,7 @@ func (s *Service) invalidatePages(ino uint64) error {
 			"ino", ino, "error", err)
 		return nil
 	default:
+		s.recordPageInval(ino, pageInvalFailed, call, time.Now())
 		return fmt.Errorf("invalidate kernel pages for ino %d: %w", ino, err)
 	}
 }
