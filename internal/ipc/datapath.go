@@ -8,7 +8,6 @@ import (
 	"time"
 	"unsafe"
 
-	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/pkg/arena"
@@ -460,43 +459,76 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 func afterCommit(ino uint64, existing []metadata.Extent, rec *metadata.InodeRecord,
 	ops []clientv3.Op, rev int64) *inodeMeta {
 
-	type entry struct {
-		value  string
-		modRev int64
-	}
-	kvs := make(map[string]entry, len(existing)+len(ops))
-	for _, e := range existing {
-		kvs[e.Key] = entry{e.Encode(), e.ModRevision}
-	}
-
 	inodeKey := metadata.InodeKey(ino)
 	extentPrefix := metadata.ExtentPrefix(ino)
+
+	// The transaction is a handful of operations; the list it applies to runs to
+	// thousands on a file under random overwrite.  So the *transaction* is
+	// indexed and the list walked once, rather than the other way round.  An
+	// earlier version re-encoded every existing extent into a map and decoded
+	// the whole thing back, which is work proportional to the file on every
+	// single write — invisible while each write also paid a Raft commit, and the
+	// dominant cost once that commit went away.
 	updated := rec
+	touched := make(map[string]clientv3.Op, len(ops))
 	for _, op := range ops {
 		key := string(op.KeyBytes())
 		switch {
-		case op.IsDelete() && strings.HasPrefix(key, extentPrefix):
-			delete(kvs, key)
-		case !op.IsPut():
-			return nil
-		case key == inodeKey:
+		case key == inodeKey && op.IsPut():
 			if updated = metadata.DecodeInode(op.ValueBytes()); updated == nil {
 				return nil
 			}
-		case strings.HasPrefix(key, extentPrefix):
-			kvs[key] = entry{string(op.ValueBytes()), rev}
+		case !strings.HasPrefix(key, extentPrefix):
+			return nil
+		case op.IsPut(), op.IsDelete():
+			touched[key] = op
 		default:
 			return nil
 		}
 	}
 
-	decoded := make([]*mvccpb.KeyValue, 0, len(kvs))
-	for key, e := range kvs {
-		decoded = append(decoded, &mvccpb.KeyValue{
-			Key: []byte(key), Value: []byte(e.value), ModRevision: e.modRev,
-		})
+	out := make([]metadata.Extent, 0, len(existing)+len(touched))
+	for _, e := range existing {
+		op, found := touched[e.Key]
+		if !found {
+			out = append(out, e)
+			continue
+		}
+		// Removed from the index as it is consumed, so what remains afterwards is
+		// exactly the keys the list did not already carry.
+		delete(touched, e.Key)
+		if op.IsDelete() {
+			continue
+		}
+		next, ok := metadata.DecodeExtent(e.Key, op.ValueBytes())
+		if !ok {
+			return nil
+		}
+		next.ModRevision = rev
+		out = append(out, next)
 	}
-	return &inodeMeta{rec: updated, extents: metadata.DecodeExtents(decoded)}
+
+	// Whatever is left is a key the list did not have: a new chunk.  A delete of
+	// one changes nothing, which a transaction rebuilt after a rejection can
+	// legitimately contain.
+	for key, op := range touched {
+		if op.IsDelete() {
+			continue
+		}
+		next, ok := metadata.DecodeExtent(key, op.ValueBytes())
+		if !ok {
+			return nil
+		}
+		next.ModRevision = rev
+		out = append(out, next)
+	}
+
+	// A put can move an extent's logical offset — the tail half of a split keeps
+	// its parent's key — and an append lands at the end, so order is restored
+	// rather than assumed.  The input is already sorted and only a few entries
+	// move, which is the case the sort is fastest on.
+	metadata.SortExtents(out)
+	return &inodeMeta{rec: updated, extents: out}
 }
 
 // writeRun puts one run on the device.

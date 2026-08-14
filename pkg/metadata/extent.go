@@ -1,9 +1,10 @@
 package metadata
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -172,16 +173,29 @@ func DecodeExtents(kvs []*mvccpb.KeyValue) []Extent {
 			extents = append(extents, e)
 		}
 	}
-	sort.Slice(extents, func(i, j int) bool {
-		if extents[i].LogOff != extents[j].LogOff {
-			return extents[i].LogOff < extents[j].LogOff
-		}
-		if extents[i].Seq != extents[j].Seq {
-			return extents[i].Seq > extents[j].Seq
-		}
-		return extents[i].Chunk > extents[j].Chunk
-	})
+	SortExtents(extents)
 	return extents
+}
+
+// SortExtents puts an extent list in resolution order: by logical offset, and
+// where two cover the same one, newest first.  Walking it forward and taking
+// the first extent that reaches a cursor therefore resolves an overwrite to the
+// later write.
+//
+// Exported so that a list maintained incrementally — from a transaction's own
+// operations rather than from a fresh read — is ordered by the same rule as one
+// that came out of DecodeExtents. Two orderings that could drift apart would be
+// two different answers to what a byte of the file contains.
+func SortExtents(extents []Extent) {
+	slices.SortFunc(extents, func(a, b Extent) int {
+		if a.LogOff != b.LogOff {
+			return cmp.Compare(a.LogOff, b.LogOff)
+		}
+		if a.Seq != b.Seq {
+			return cmp.Compare(b.Seq, a.Seq)
+		}
+		return cmp.Compare(b.Chunk, a.Chunk)
+	})
 }
 
 // Supersedes reports whether e covers every logical byte of other and was
