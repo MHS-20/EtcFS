@@ -564,3 +564,81 @@ func TestIntegration_UnlinkKeepsAnOpenFileAlive(t *testing.T) {
 		t.Errorf("orphan marker survived the last release: %v", orphans)
 	}
 }
+
+// ---- buffered write data ----
+
+// With the payload buffered, a write puts nothing on the device until the flush
+// does — so the read path has to answer out of the buffer, the flush has to put
+// the bytes down before it publishes the extents naming them, and the file has
+// to read back identically from the device once it has.
+//
+// The mixed offsets matter: they produce runs the flush can coalesce, which is
+// the case where a bug would put the right bytes at the wrong offset.
+func TestIntegration_BufferedWriteDataIsReadableBeforeAndAfterTheFlush(t *testing.T) {
+	svc, store := newTestService(t)
+	svc.SetDataCache(true)
+	ctx := context.Background()
+	const ino = 7010
+	seedFile(t, store, ino, metadata.ModeFile|0644)
+
+	const blocks, blockLen = 6, 4096
+	want := make([]byte, blocks*blockLen)
+	for i := 0; i < blocks; i++ {
+		chunk := bytes.Repeat([]byte{byte(0x10 + i)}, blockLen)
+		copy(want[i*blockLen:], chunk)
+		if _, err := svc.handleWrite(ctx, writePayload(ino, uint64(i*blockLen), chunk, 0)); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	if !svc.hasPending(ino) {
+		t.Fatal("nothing is buffered after six deferred writes")
+	}
+
+	read := func(what string) []byte {
+		t.Helper()
+		var rq buf
+		rq.w64(ino)
+		rq.w64(0)
+		rq.w32(uint32(len(want)))
+		resp, err := svc.handleRead(ctx, rq.b)
+		if err != nil {
+			t.Fatalf("read %s the flush: %v", what, err)
+		}
+		return readPayload(t, resp)
+	}
+
+	// Before the flush the bytes exist only in RAM: this is the read that fails
+	// if the buffer is not consulted.
+	if got := read("before"); !bytes.Equal(got, want) {
+		t.Fatalf("read before the flush did not return what was written")
+	}
+
+	if code := fsyncInode(t, svc, ino); code != 0 {
+		t.Fatalf("fsync returned errno %d", -code)
+	}
+	if svc.hasPending(ino) {
+		t.Fatal("the buffer survived a successful fsync")
+	}
+
+	// And now only on the device: the buffer is empty, so anything wrong with
+	// the coalescing shows up here as bytes at the wrong offset.
+	if got := read("after"); !bytes.Equal(got, want) {
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("first mismatch after the flush at byte %d: got %#x, want %#x",
+					i, got[i], want[i])
+			}
+		}
+	}
+
+	// The extents are published only once the bytes are down, so they are in
+	// etcd exactly now and not before.
+	extents, err := store.GetExtents(ctx, ino)
+	if err != nil {
+		t.Fatalf("read extents: %v", err)
+	}
+	if len(extents) != blocks {
+		t.Fatalf("published extents = %d, want %d", len(extents), blocks)
+	}
+}
