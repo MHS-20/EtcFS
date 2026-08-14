@@ -14,6 +14,7 @@ import (
 // separate copy rather than a shared import, on purpose: see decode.go.
 const (
 	lockHoldOpcode   = 1000
+	lockKeyOpcode    = 1002
 	lockEventAcquire = 0
 	lockEventRelease = 1
 )
@@ -72,12 +73,31 @@ func (k lockOpKind) String() string {
 	return "?"
 }
 
-// DecodeLocks turns a recorded history into its lock acquire/release events,
-// in call order. Entries other than historyOpLockHold are skipped.
+// DecodeLocks turns a recorded history into its per-operation lock
+// acquire/release events, in call order.
 func DecodeLocks(entries []history.Entry) ([]LockOp, error) {
+	return decodeLockStream(entries, lockHoldOpcode)
+}
+
+// DecodeLockKeys turns a recorded history into the acquire/release events of
+// the *cached* etcd lock key, which is what actually excludes peers.
+//
+// The per-operation events DecodeLocks returns span a subset of this interval:
+// the key is taken before the operation that needed it and kept afterwards,
+// against the next operation on the same inode. A subset is the safe direction
+// to be wrong in for a mutual-exclusion checker — it can only report overlaps
+// that really happened — but it is also blind to the whole failure the cached
+// lock introduced, which is a key held past the point the cluster believes it
+// was given up. That is why both streams are recorded and both are checked; the
+// same model runs over each.
+func DecodeLockKeys(entries []history.Entry) ([]LockOp, error) {
+	return decodeLockStream(entries, lockKeyOpcode)
+}
+
+func decodeLockStream(entries []history.Entry, opcode uint16) ([]LockOp, error) {
 	ops := make([]LockOp, 0, len(entries))
 	for _, e := range entries {
-		if e.Opcode != lockHoldOpcode {
+		if e.Opcode != opcode {
 			continue
 		}
 		req, _, err := e.Payloads()

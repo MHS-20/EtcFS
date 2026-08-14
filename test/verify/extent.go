@@ -18,6 +18,24 @@ import (
 // entries the namespace model reads, no separate recording needed, since both
 // operations already cross the socket and are already logged.
 //
+// Deferred writes changed what a write means here. A write is acknowledged from
+// this node's RAM: its bytes are on no device and in no etcd record until a
+// flush publishes them, and a node that dies before that flush takes them with
+// it. What the model checks is therefore not "every acknowledged write is
+// durable" but the guarantee the filesystem actually offers:
+//
+//   - a read never contradicts a write that was fsynced, from any node;
+//   - a read never contradicts a write from its own node, flushed or not,
+//     because that node serves its own buffer;
+//   - a write that was never fsynced may vanish, but only for a node the caller
+//     names as crashed, and only for readers other than the node that wrote it.
+//
+// That last relaxation is the only one, and it is deliberately not automatic: a
+// checker that let any unflushed write vanish would accept a history where the
+// data simply disappeared under a healthy cluster, which is the failure this
+// model exists to catch. The chaos suite knows which daemons it killed and says
+// so; a run that killed nothing checks the strict property.
+//
 // Scope, stated plainly: this model only constrains a byte position once some
 // operation in the history has shown a value for it, exactly the way the
 // namespace model's dirState.known tracks names it has not yet seen evidence
@@ -35,6 +53,8 @@ const (
 	extentReadOpcode    = 22
 	extentSetattrOpcode = 12
 	extentFallocOpcode  = 35
+	extentFsyncOpcode   = 24
+	extentFlushOpcode   = 26
 	fattrSize           = 1 << 3 // FUSE_SET_ATTR_SIZE, from internal/ipc/handlers.go
 )
 
@@ -52,6 +72,10 @@ const (
 	// a hole punched by fallocate, whose exact result is not worth modelling
 	// precisely when forgetting the range is already sound.
 	ExtentInvalidate
+	// ExtentFsync is the durability barrier: every write this node has
+	// acknowledged for the inode is published by the time it returns, and so
+	// cannot be lost by a later crash.
+	ExtentFsync
 )
 
 // ExtentOp is one decoded data-path operation.
@@ -101,6 +125,12 @@ func DecodeExtents(entries []history.Entry) ([]ExtentOp, error) {
 			}
 		case extentFallocOpcode:
 			op, err := decodeFallocate(e)
+			if err != nil {
+				return nil, err
+			}
+			ops = append(ops, op)
+		case extentFsyncOpcode, extentFlushOpcode:
+			op, err := decodeFsync(e)
 			if err != nil {
 				return nil, err
 			}
@@ -189,6 +219,31 @@ func decodeFallocate(e history.Entry) (ExtentOp, error) {
 	}, nil
 }
 
+// decodeFsync reads an FSYNC or FLUSH: [u64:ino]. Both flush this inode's
+// buffer before replying, so both are the same barrier. A failed one is not:
+// its errno is carried through, and the model ignores it, which is what makes
+// an fsync that returned EIO stop being a durability promise.
+func decodeFsync(e history.Entry) (ExtentOp, error) {
+	req, resp, err := e.Payloads()
+	if err != nil {
+		return ExtentOp{}, err
+	}
+	if len(req) < 8 {
+		return ExtentOp{}, fmt.Errorf("fsync at %d: request too short", e.CallNs)
+	}
+	errno := int32(0)
+	if len(resp) >= 4 {
+		errno = int32(binary.BigEndian.Uint32(resp))
+	}
+	if errno < 0 {
+		errno = -errno
+	}
+	return ExtentOp{
+		Node: e.Node, Ino: binary.BigEndian.Uint64(req), Kind: ExtentFsync,
+		Errno: errno, Call: e.CallNs, Ret: e.ReturnNs,
+	}, nil
+}
+
 func decodeRead(e history.Entry) (ExtentOp, error) {
 	req, resp, err := e.Payloads()
 	if err != nil {
@@ -231,15 +286,28 @@ func extentOperations(ops []ExtentOp) []porcupine.Operation {
 	return out
 }
 
+// cell is what the history has established about one byte position: its value,
+// which node's unpublished buffer it is still only in, and whether anything has
+// made it durable — an fsync, or an observation by a reader.
+//
+// owner is empty and durable true for a value a read established: a byte
+// somebody has already seen cannot go back to being lost.
+type cell struct {
+	b       byte
+	owner   string
+	durable bool
+}
+
 // byteState is the bytes this history has established, per absolute offset —
 // deliberately sparse rather than a flat buffer, since only positions the
 // history has touched carry any constraint at all.
-type byteState map[uint64]byte
+type byteState map[uint64]cell
 
-func (s byteState) step(op ExtentOp) (bool, byteState) {
+func (s byteState) step(op ExtentOp, crashed map[string]bool) (bool, byteState) {
 	if op.Errno != 0 {
 		// An operation the store rejected changed nothing; there is nothing
-		// here to check or to learn from.
+		// here to check or to learn from.  A failed fsync in particular
+		// promises nothing: its writes stay losable.
 		return true, s
 	}
 	next := maps.Clone(s)
@@ -248,6 +316,16 @@ func (s byteState) step(op ExtentOp) (bool, byteState) {
 	}
 
 	switch op.Kind {
+	case ExtentFsync:
+		// Everything this node had buffered for the inode is published by the
+		// time the call returns, so none of it can be lost from here on.
+		for pos, c := range next {
+			if c.owner == op.Node && !c.durable {
+				c.durable = true
+				next[pos] = c
+			}
+		}
+		return true, next
 	case ExtentTruncate:
 		// Everything at or past the new size stops existing. Reads there
 		// return zeroes, which is not what was written, and holding on to
@@ -267,54 +345,78 @@ func (s byteState) step(op ExtentOp) (bool, byteState) {
 
 	for i, b := range op.Data {
 		pos := op.Off + uint64(i)
-		if op.Kind == ExtentRead {
+		if op.Kind == ExtentWrite {
+			next[pos] = cell{b: b, owner: op.Node}
+			continue
+		}
+
+		known, seen := next[pos]
+		switch {
+		case !seen, known.b == b:
+			// Nothing established here yet, or the read agrees with what was.
+			// Either way the reader has now seen this value, and no crash can
+			// take a byte back from a node that has already returned it.
+			next[pos] = cell{b: b, durable: true}
+		case !known.durable && known.owner != op.Node && crashed[known.owner]:
+			// The only excused disagreement: a write that was acknowledged out
+			// of a buffer, never fsynced, and lost with the node that held it.
+			next[pos] = cell{b: b, durable: true}
+		default:
 			// A read disagreeing with an established byte is the violation
 			// this model exists to catch.
-			if known, seen := next[pos]; seen && known != b {
-				return false, s
-			}
+			return false, s
 		}
-		next[pos] = b
 	}
 	return true, next
 }
 
-// ExtentModel is the per-inode byte-position register described above.
-var ExtentModel = porcupine.Model{
-	Partition: func(h []porcupine.Operation) [][]porcupine.Operation {
-		byIno := map[uint64][]porcupine.Operation{}
-		for _, o := range h {
-			ino := o.Input.(ExtentOp).Ino
-			byIno[ino] = append(byIno[ino], o)
-		}
-		out := make([][]porcupine.Operation, 0, len(byIno))
-		for _, ops := range byIno {
-			out = append(out, ops)
-		}
-		return out
-	},
-	Init: func() interface{} { return byteState{} },
-	Step: func(state, input, output interface{}) (bool, interface{}) {
-		ok, next := state.(byteState).step(input.(ExtentOp))
-		return ok, next
-	},
-	Equal: func(a, b interface{}) bool {
-		return maps.Equal(a.(byteState), b.(byteState))
-	},
-	DescribeOperation: func(input, output interface{}) string {
-		op := input.(ExtentOp)
-		names := map[ExtentKind]string{
-			ExtentWrite: "write", ExtentRead: "read",
-			ExtentTruncate: "truncate", ExtentInvalidate: "invalidate",
-		}
-		return fmt.Sprintf("%s(ino=%d off=%d len=%d)", names[op.Kind], op.Ino, op.Off, len(op.Data))
-	},
+// ExtentModel is the per-inode byte-position register described above, for a
+// run in which the named nodes died without a clean shutdown. Pass none for the
+// strict model, under which no acknowledged write may ever vanish.
+func ExtentModel(crashed ...string) porcupine.Model {
+	lost := make(map[string]bool, len(crashed))
+	for _, n := range crashed {
+		lost[n] = true
+	}
+	return porcupine.Model{
+		Partition: func(h []porcupine.Operation) [][]porcupine.Operation {
+			byIno := map[uint64][]porcupine.Operation{}
+			for _, o := range h {
+				ino := o.Input.(ExtentOp).Ino
+				byIno[ino] = append(byIno[ino], o)
+			}
+			out := make([][]porcupine.Operation, 0, len(byIno))
+			for _, ops := range byIno {
+				out = append(out, ops)
+			}
+			return out
+		},
+		Init: func() interface{} { return byteState{} },
+		Step: func(state, input, output interface{}) (bool, interface{}) {
+			ok, next := state.(byteState).step(input.(ExtentOp), lost)
+			return ok, next
+		},
+		Equal: func(a, b interface{}) bool {
+			return maps.Equal(a.(byteState), b.(byteState))
+		},
+		DescribeOperation: func(input, output interface{}) string {
+			op := input.(ExtentOp)
+			names := map[ExtentKind]string{
+				ExtentWrite: "write", ExtentRead: "read", ExtentTruncate: "truncate",
+				ExtentInvalidate: "invalidate", ExtentFsync: "fsync",
+			}
+			return fmt.Sprintf("%s(ino=%d off=%d len=%d)", names[op.Kind], op.Ino, op.Off, len(op.Data))
+		},
+	}
 }
 
-// CheckExtents checks a decoded WRITE/READ history against the byte-register
+// CheckExtents checks a decoded data-path history against the byte-register
 // model. WRITE and READ are both linearizable as observed over the socket —
 // see docs/verification/porcupine.md for why the write path's internal
 // serializable pre-read does not need its own classifier here.
-func CheckExtents(ops []ExtentOp, timeout time.Duration) porcupine.CheckResult {
-	return porcupine.CheckOperationsTimeout(ExtentModel, extentOperations(ops), timeout)
+//
+// crashed names the nodes that were killed rather than shut down, whose
+// unflushed writes are allowed to have been lost with them.
+func CheckExtents(ops []ExtentOp, crashed []string, timeout time.Duration) porcupine.CheckResult {
+	return porcupine.CheckOperationsTimeout(ExtentModel(crashed...), extentOperations(ops), timeout)
 }

@@ -14,9 +14,9 @@ func rop(node string, ino, off uint64, data []byte, call, ret int64) ExtentOp {
 	return ExtentOp{Node: node, Ino: ino, Kind: ExtentRead, Off: off, Data: data, Call: call, Ret: ret}
 }
 
-func extentOK(t *testing.T, ops []ExtentOp) bool {
+func extentOK(t *testing.T, ops []ExtentOp, crashed ...string) bool {
 	t.Helper()
-	res := CheckExtents(ops, timeout)
+	res := CheckExtents(ops, crashed, timeout)
 	if res == porcupine.Unknown {
 		t.Fatal("checker timed out")
 	}
@@ -133,5 +133,74 @@ func TestExtentSeparateInodesDoNotConstrainEachOther(t *testing.T) {
 	}
 	if !extentOK(t, ops) {
 		t.Fatal("two independent inodes were checked against each other")
+	}
+}
+
+func fsop(node string, ino uint64, call, ret int64) ExtentOp {
+	return ExtentOp{Node: node, Ino: ino, Kind: ExtentFsync, Call: call, Ret: ret}
+}
+
+// A write acknowledged out of a buffer and never fsynced may be lost with the
+// node that held it -- but only for a node the run actually killed.
+func TestExtentUnflushedWriteIsLostOnlyWithACrashedNode(t *testing.T) {
+	ops := []ExtentOp{
+		wop("n1", 1, 0, []byte("hello"), 10, 20),
+		rop("n2", 1, 0, []byte{0, 0, 0, 0, 0}, 30, 40),
+	}
+	if extentOK(t, ops) {
+		t.Fatal("a write vanished under a cluster where nothing crashed")
+	}
+	if !extentOK(t, ops, "n1") {
+		t.Fatal("an unflushed write was required to survive the death of the node holding it")
+	}
+}
+
+// fsync is the barrier: past it the write is published, and losing it is a
+// violation no matter what happened to the node that made it.
+func TestExtentFsyncedWriteSurvivesACrash(t *testing.T) {
+	ops := []ExtentOp{
+		wop("n1", 1, 0, []byte("hello"), 10, 20),
+		fsop("n1", 1, 21, 25),
+		rop("n2", 1, 0, []byte{0, 0, 0, 0, 0}, 30, 40),
+	}
+	if extentOK(t, ops, "n1") {
+		t.Fatal("data that fsync acknowledged was allowed to disappear")
+	}
+}
+
+// An fsync that failed acknowledged nothing, so its writes stay losable.
+func TestExtentFailedFsyncIsNotABarrier(t *testing.T) {
+	ops := []ExtentOp{
+		wop("n1", 1, 0, []byte("hello"), 10, 20),
+		{Node: "n1", Ino: 1, Kind: ExtentFsync, Errno: 5, Call: 21, Ret: 25},
+		rop("n2", 1, 0, []byte{0, 0, 0, 0, 0}, 30, 40),
+	}
+	if !extentOK(t, ops, "n1") {
+		t.Fatal("an fsync that returned EIO was treated as a durability promise")
+	}
+}
+
+// A node reads back its own buffered write even before any flush, and the loss
+// relaxation must never excuse the node that wrote the bytes from seeing them.
+func TestExtentNodeSeesItsOwnBufferedWrite(t *testing.T) {
+	ops := []ExtentOp{
+		wop("n1", 1, 0, []byte("hello"), 10, 20),
+		rop("n1", 1, 0, []byte("world"), 30, 40),
+	}
+	if extentOK(t, ops, "n1") {
+		t.Fatal("a node failed to read back its own buffered write and it was accepted")
+	}
+}
+
+// Once a peer has returned the bytes to an application, no later crash can take
+// them back: they were observed, whatever their durability was.
+func TestExtentObservedBytesCannotVanish(t *testing.T) {
+	ops := []ExtentOp{
+		wop("n1", 1, 0, []byte("hello"), 10, 20),
+		rop("n2", 1, 0, []byte("hello"), 30, 40),
+		rop("n3", 1, 0, []byte{0, 0, 0, 0, 0}, 50, 60),
+	}
+	if extentOK(t, ops, "n1") {
+		t.Fatal("bytes an earlier read had already returned were allowed to disappear")
 	}
 }

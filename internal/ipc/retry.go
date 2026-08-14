@@ -209,7 +209,9 @@ func lockModeByte(mode metadata.LockMode) byte {
 // The interval recorded is the operation's, not the cached etcd key's, which
 // is longer at both ends.  A subset of the true hold interval is the safe
 // direction to be wrong in for a mutual-exclusion checker: it can only ever
-// report overlaps that really happened.
+// report overlaps that really happened.  It is also blind to a key kept past
+// the operation that took it, which is what caching the lock introduced, so
+// the key's own hold is recorded separately — see recordKeyEvent.
 func (l *heldLock) recordLockEvent(kind byte, call, ret time.Time) {
 	if l.s == nil || l.s.history == nil {
 		return

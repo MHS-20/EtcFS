@@ -17,16 +17,18 @@ import (
 )
 
 func main() {
-	var files, models string
+	var files, models, crashed string
 	var timeout time.Duration
 	flag.StringVar(&files, "files", "", "comma-separated history files, one per node")
-	flag.StringVar(&models, "models", "namespace,extent,lock,generation",
-		"comma-separated models to check: namespace, extent, lock, generation")
+	flag.StringVar(&models, "models", allModels,
+		"comma-separated models to check: "+allModels)
+	flag.StringVar(&crashed, "crashed", "",
+		"comma-separated nodes that were killed rather than shut down, whose unflushed writes may be lost")
 	flag.DurationVar(&timeout, "timeout", 5*time.Minute, "per-model checker timeout")
 	flag.Parse()
 
 	if files == "" {
-		fmt.Fprintln(os.Stderr, "usage: verify-history --files=history-n1.jsonl,history-n2.jsonl [--models=namespace,extent,lock,generation]")
+		fmt.Fprintln(os.Stderr, "usage: verify-history --files=history-n1.jsonl,history-n2.jsonl [--models="+allModels+"] [--crashed=n1]")
 		os.Exit(2)
 	}
 
@@ -43,7 +45,7 @@ func main() {
 
 	failed := false
 	for _, model := range strings.Split(models, ",") {
-		ok, err := checkModel(strings.TrimSpace(model), entries, timeout)
+		ok, err := checkModel(strings.TrimSpace(model), entries, split(crashed), timeout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", model, err)
 			failed = true
@@ -58,7 +60,21 @@ func main() {
 	}
 }
 
-func checkModel(model string, entries []history.Entry, timeout time.Duration) (bool, error) {
+// allModels is every model this command knows, and the default set.
+const allModels = "namespace,extent,lock,lockkey,block,pagecache,generation"
+
+// split turns a comma-separated flag into its non-empty parts.
+func split(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func checkModel(model string, entries []history.Entry, crashed []string, timeout time.Duration) (bool, error) {
 	switch model {
 	case "namespace":
 		ops, err := verify.DecodeNamespace(entries)
@@ -73,7 +89,7 @@ func checkModel(model string, entries []history.Entry, timeout time.Duration) (b
 			return false, err
 		}
 		fmt.Printf("extent: checking %d operations\n", len(ops))
-		return report("extent", verify.CheckExtents(ops, timeout))
+		return report("extent", verify.CheckExtents(ops, crashed, timeout))
 	case "lock":
 		ops, err := verify.DecodeLocks(entries)
 		if err != nil {
@@ -81,6 +97,40 @@ func checkModel(model string, entries []history.Entry, timeout time.Duration) (b
 		}
 		fmt.Printf("lock: checking %d events\n", len(ops))
 		return report("lock", verify.CheckLocks(ops, verify.DefaultLockLeaseTTL, timeout))
+	case "lockkey":
+		ops, err := verify.DecodeLockKeys(entries)
+		if err != nil {
+			return false, err
+		}
+		fmt.Printf("lockkey: checking %d events\n", len(ops))
+		return report("lockkey", verify.CheckLocks(ops, verify.DefaultLockLeaseTTL, timeout))
+	case "block":
+		ops, err := verify.DecodeBlocks(entries)
+		if err != nil {
+			return false, err
+		}
+		fmt.Printf("block: checking %d events\n", len(ops))
+		return report("block", verify.CheckBlocks(ops, timeout))
+	case "pagecache":
+		keys, err := verify.DecodeLockKeys(entries)
+		if err != nil {
+			return false, err
+		}
+		invals, err := verify.DecodePageInvals(entries)
+		if err != nil {
+			return false, err
+		}
+		fmt.Printf("pagecache: checking %d releases against %d invalidations\n", len(keys), len(invals))
+		violations := verify.CheckPageCache(keys, invals)
+		for _, v := range violations {
+			fmt.Printf("pagecache: %s\n", v)
+		}
+		if len(violations) > 0 {
+			fmt.Println("pagecache: VIOLATION")
+			return false, nil
+		}
+		fmt.Println("pagecache: OK")
+		return true, nil
 	case "generation":
 		ops, err := verify.DecodeGuardedCommits(entries)
 		if err != nil {
