@@ -332,14 +332,11 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 		if lease, ok := s.store.LockSessionLease(); !ok || lease != e.lease {
 			s.log.Warn("lock session lost, dropping this node's cached lock",
 				"ino", e.ino, "key_lease", e.lease, "session_lease", lease)
-			e.holder, e.lease, e.meta, e.metaFor = "", 0, nil, ""
 			// Anything buffered under that key can never be published: the
 			// flush's own comparison on it would reject the transaction, and a
 			// peer may already own the inode.  Nothing in etcd references the
 			// blocks, so they go back to the arena.
-			if !e.pending.empty() {
-				s.discardPending(e, "the lock session backing them was lost")
-			}
+			s.keyLostLocked(e, "the lock session backing them was lost")
 		}
 	}
 
@@ -351,7 +348,12 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 	// The upgrade is not downgraded afterwards, so a read-modify-write sequence
 	// pays this once rather than on every alternation.
 	if e.holder != "" {
-		s.releaseKeyLocked(e)
+		// The kernel's pages go with the key here as well: the delete and the
+		// re-acquisition are not one transaction, and a peer that slips into the
+		// gap and writes would otherwise stay invisible behind them.
+		if err := s.releaseKeyLocked(e); err != nil {
+			return err
+		}
 	}
 
 	holder, err := s.acquireLockKey(ctx, e.ino, mode)

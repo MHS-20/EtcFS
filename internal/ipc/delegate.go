@@ -326,8 +326,7 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 			// The lease went, etcd deleted the key, and a peer may already own
 			// the inode.  Nothing buffered was ever published, so nothing can
 			// reference the blocks.
-			e.holder, e.lease, e.meta, e.metaFor = "", 0, nil, ""
-			s.discardPending(e, "the lock key backing them was lost")
+			s.keyLostLocked(e, "the lock key backing them was lost")
 			return metadata.ErrConflict
 		}
 		// The lock key is still ours and a comparison still failed, so an inode

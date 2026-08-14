@@ -620,6 +620,7 @@ static void ec_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
     }
     struct rbuf rb = rb_new(resp, rlen);
     int32_t e = rb_i32(&rb);
+    uint32_t keep_cache = rb_u32(&rb);
     free(resp);
     if (!rb.ok) {
         fuse_reply_err(req, EIO);
@@ -631,8 +632,13 @@ static void ec_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
     }
 
     fi->fh = next_file_handle(ctx);
-    fi->direct_io = 1;
-    fi->keep_cache = 0;
+    /* The backend decides, because only it knows whether it can take the pages
+     * back: it invalidates them before it yields the inode's lock, and it says
+     * no when there is nothing connected to carry that invalidation.  Writes
+     * stay write-through either way — FUSE_WRITEBACK_CACHE is not negotiated —
+     * so the kernel caches what it reads and nothing it has yet to send. */
+    fi->direct_io = keep_cache ? 0 : 1;
+    fi->keep_cache = keep_cache ? 1 : 0;
     fuse_reply_open(req, fi);
 }
 

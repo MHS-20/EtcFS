@@ -8,6 +8,7 @@ package ipc
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -53,6 +54,17 @@ type Service struct {
 	// write a lost write rather than a read of garbage.
 	dataCache bool
 
+	// pageCache lets the kernel keep an inode's data pages across reads while
+	// this node holds its lock, so a re-read costs nothing at all.  What makes
+	// it sound is that the pages are invalidated before the lock is yielded;
+	// what makes it possible to switch off is that it buys nothing for a
+	// workload whose reads are O_DIRECT and does not defend itself.
+	pageCache bool
+	// pagesCached records that at least one open was told the kernel may cache
+	// this filesystem's data, so a later release knows it cannot skip the
+	// invalidation just because no client happens to be connected now.
+	pagesCached atomic.Bool
+
 	// readOnly rejects every mutating opcode with EROFS before it reaches a
 	// handler. Checked in dispatch rather than per-handler so a new mutating
 	// operation is safe by default: it must be added to mutatingOps to be
@@ -97,6 +109,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		openCount:     make(map[uint64]int),
 		orphaned:      make(map[uint64]bool),
 		locks:         make(map[uint64]*lockEntry),
+		notifyServer:  &notifyServer{},
 		flushInterval: defaultFlushInterval,
 		flushMaxBytes: defaultFlushMaxBytes,
 	}
@@ -108,6 +121,18 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 // carries a Raft commit.
 func (s *Service) SetFlushInterval(d time.Duration) {
 	s.flushInterval = d
+}
+
+// SetPageCache lets the kernel cache data pages for inodes this node holds a
+// lock on.  Off leaves every read going through to the daemon, which is what
+// the filesystem did before there was anything able to invalidate a page.
+func (s *Service) SetPageCache(on bool) {
+	s.pageCache = on
+}
+
+// pagesCacheable reports whether an invalidation could have anything to do.
+func (s *Service) pagesCacheable() bool {
+	return s.pageCache && s.pagesCached.Load()
 }
 
 // SetDataCache buffers a deferred write's payload in RAM as well as its extents.

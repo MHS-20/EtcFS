@@ -307,6 +307,7 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	svc.StartLockRevocation(ctx)
 	svc.SetFlushInterval(cfg.MetadataFlushInterval)
 	svc.SetDataCache(cfg.WriteDataCache && cfg.MetadataFlushInterval > 0)
+	svc.SetPageCache(cfg.PageCache)
 	svc.StartFlusher(ctx)
 	if cfg.MetadataFlushInterval > 0 {
 		log.Info("deferring extent publication; a crash loses writes not yet flushed or fsynced",

@@ -377,7 +377,28 @@ func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error
 		}
 	}
 	s.retain(ino)
-	return okResp(), nil
+	return openResp(s.cacheableOpen(flags)), nil
+}
+
+// cacheableOpen reports whether the kernel may keep this open's data pages
+// rather than going through to the daemon for every read.
+//
+// It is safe only because something can take the pages back: the invalidation
+// that runs before an inode's lock key is yielded.  So it needs a client
+// connected to carry that invalidation — without one the pages would outlive
+// the lock with nothing able to drop them.
+//
+// A synchronous open keeps the direct-IO path it has always had.  The
+// guarantee that O_SYNC and O_DSYNC disable deferral rests on the flags
+// arriving with every write, which was measured on that path; a buffered open
+// reaches the kernel's write path through different code, and narrowing the
+// open is cheaper than widening what has been checked.
+func (s *Service) cacheableOpen(flags uint32) bool {
+	if !s.pageCache || flags&oDSync != 0 || !s.notifyServer.connected() {
+		return false
+	}
+	s.pagesCached.Store(true)
+	return true
 }
 
 // RELEASE payload: [u64:ino]

@@ -57,6 +57,22 @@ static void *notify_thread(void *arg)
                 name[n] = '\0';
                 fuse_lowlevel_notify_inval_entry(ctx->notify_se, parent, name, strlen(name));
             }
+        } else if (typ == 2) {
+            /* Drop the kernel's data pages for one inode, then acknowledge.
+             * The backend is holding that inode's lock open until this reply
+             * arrives: a peer that took the inode while pages were still
+             * cached here would have its writes hidden behind them, and a page
+             * cache has no timeout to fall back on.
+             *
+             * This runs on the notify thread and must keep doing so.  A
+             * request thread calling it can deadlock against the kernel's own
+             * writeback of the inode being invalidated. */
+            int rc = fuse_lowlevel_notify_inval_inode(ctx->notify_se, parent, 0, 0);
+            /* ENOENT means the kernel has no such inode cached, which is the
+             * outcome the caller wanted. */
+            uint8_t ack = (rc == 0 || rc == -ENOENT) ? 0 : 1;
+            if (write(fd, &ack, 1) != 1)
+                break;
         }
     }
     close(fd);

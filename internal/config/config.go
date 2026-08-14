@@ -92,6 +92,14 @@ type Config struct {
 	// zero, since nothing is deferred then.
 	WriteDataCache bool
 
+	// PageCache lets the kernel hold data pages for an inode this node has a
+	// lock on, so a re-read of recently read data costs nothing at all.  The
+	// lock is what makes it sound — no peer can write an inode this node holds —
+	// and the daemon drops the pages before it yields the lock.  It has no
+	// effect on a reader using O_DIRECT, which bypasses the page cache by
+	// definition.
+	PageCache bool
+
 	// NotifyAddr is the socket the C daemon connects to for cache-invalidation
 	// notifications.  Configurable for the same reason ListenAddr is: two
 	// daemons on one host need two paths.
@@ -191,6 +199,8 @@ func Parse() *Config {
 		"Flush the device cache, sync the range and read it back after every write; needed only on a device with a volatile write cache that does not publish an acknowledged O_DIRECT write to its other attachers (always on without O_DIRECT)")
 	flag.StringVar(&flushInterval, "metadata-flush-interval", "100ms",
 		"How long a write's extent may stay buffered in memory before it is published to etcd; 0 commits every write before acknowledging it (durable, one Raft commit per write)")
+	flag.BoolVar(&cfg.PageCache, "page-cache", true,
+		"Let the kernel cache data pages for files this node holds a lock on; they are invalidated before the lock is yielded")
 	flag.BoolVar(&cfg.WriteDataCache, "write-data-cache", true,
 		"Buffer a deferred write's data in memory as well as its extents, and put it on the device at flush time; off writes the data through on every write")
 	flag.StringVar(&cfg.EC2InstanceID, "ec2-instance-id", "",

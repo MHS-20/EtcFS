@@ -177,7 +177,8 @@ for i in "${!PUB_IPS[@]}"; do
         sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
         sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock \
             --etcd-endpoints=$ENDPOINTS --node-id=$node_id --cluster-name=$TAG \
-            --lease-ttl=${ETCFS_LEASE_TTL:-10s} $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
+            --lease-ttl=${ETCFS_LEASE_TTL:-10s} $dev_flag --log-level=1 $fence_flags \
+            --metrics-addr=:9090 ${ETCFS_META_EXTRA_ARGS:-} > /tmp/meta.log 2>&1 &
         sleep 4
         sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock \
             --node-id=$node_id --log-level=1 /mnt/etcfuse > /tmp/fuse.log 2>&1 &

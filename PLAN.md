@@ -89,79 +89,61 @@ lost on a crash (POSIX-legal, `write()` never promised durability).
 
 ### 7.1 Buffer
 
-- [ ] `lockEntry` gains pending state next to `meta`: new extents, size/mode
+- [x] `lockEntry` gains pending state next to `meta`: new extents, size/mode
       delta, and the `reclaimPlan`s whose blocks must not be freed yet.
       Guarded by `keyMu` like the rest; only valid while `metaFor == holder`.
-- [ ] `handleWriteBlock` stops committing: device write, then fold the
+      Coalesced by key, and a key's comparison is taken the first time the
+      buffer touches it — a later write's revision for that key exists only in
+      this node's memory.
+- [x] `handleWriteBlock` stops committing: device write, then fold the
       proposal into the buffer, then reply. `meta` is updated in the same step
-      so this node's own reads and the next write see it (`afterCommit`'s
-      replay, applied to the buffer rather than to a committed txn).
-- [ ] Blocks stay reserved: `freeReclaimed` and `deferredReclaim` move behind
-      the flush. Arena bitmap is node-local, so nothing else can hand them out.
-- [ ] Cap the buffer (ops and bytes) and flush when it fills, so one
-      transaction never exceeds `maxWriteTxnOps` and a hot inode cannot grow
-      an unbounded pending list.
+      (`afterCommit`'s replay applied to the buffer), under the same mutex.
+- [x] Blocks stay reserved: `freeReclaimed` moved behind the flush.
+      `deferredReclaim` is non-empty only when one write buries more extents
+      than a transaction can carry; that write commits synchronously instead.
+- [x] Cap the buffer (`maxWriteTxnOps`, 16 MiB) and flush when it fills.
 
 ### 7.2 Flush
 
-One guarded transaction, built from the buffer exactly as the write path
-builds one today.
-
-- [ ] Comparisons: `CreateRevision == 0` per new chunk, `ModRevision` per
-      rewrite, the fencing guard, **plus our own lock key still exists**, by
-      exact holder token — `CreateRevision(LockKey(ino, mode, ourHolder)) != 0`,
-      not a prefix check, which a peer's key would satisfy. That last one is
-      new and is what stops a flush landing after a lost lease or a recall.
-- [ ] Triggers: `fsync`/`flush` IPC, recall (before yielding the key),
-      eviction, observed session loss, self-fence, shutdown, buffer cap, and a
-      timer (default 100 ms, `--metadata-flush-interval`, 0 = flush per write
-      = today's behaviour).
-- [ ] Recall must flush *before* `dropCachedLock`, or a peer reads a file
-      missing the writes this node acked.
-- [ ] Failed flush keeps the buffer. Never discard on error — that is
-      fsyncgate. Mark the entry errored and fail every later `fsync` on it
-      with `EIO` until one commits.
-- [ ] Lease lost / lock key gone: the flush is rejected by the new
-      comparison. Discard the buffer, free the blocks back to the arena, log
-      loudly. The data was never published, so nothing can reference it.
+- [x] Comparisons: the buffered ones, plus `CreateRevision(LockKey(ino, mode,
+      ourHolder)) != 0` — exact holder token, not a prefix.
+- [x] Triggers: fsync/flush IPC, recall, eviction, observed session loss,
+      self-fence, shutdown, buffer cap, sync write, any operation that plans
+      from etcd rather than the snapshot, and a timer
+      (`--metadata-flush-interval`, default 100ms, 0 = commit per write).
+- [x] Recall flushes before `dropCachedLock`, and refuses to yield the key if
+      the flush fails.
+- [x] Failed flush keeps the buffer and fails every later `fsync` with `EIO`
+      until one commits.
+- [x] Lease lost / lock key gone / fenced: buffer discarded, blocks freed,
+      logged loudly.
 
 ### 7.3 Durability surface
 
-- [ ] Wire `fsync`/`fsyncdir`/`flush`: `ec_fsync` and `ec_flush` in
-      `pkg/fuse/ops.c` reply 0 without IPC today, and `ipcOpFsync`/`ipcOpFlush`
-      map to `ok` in `socket.go`. Both sides must actually flush and block.
-      `fsyncdir` stays a no-op — namespace ops are never deferred.
-- [ ] `O_SYNC`/`O_DSYNC` disable deferral **per write**, read from the write
-      request's own flags — not latched per inode at open. Verified against the
-      kernel: with `FOPEN_DIRECT_IO` a write goes through
-      `fuse_direct_write_iter`, which never calls `generic_write_sync`, so a
-      synchronous open produces no `FUSE_FSYNC` at all and waiting for one
-      would wait forever. But `fuse_send_write` sets
-      `inarg->flags = fuse_write_flags(iocb)`, and libfuse passes it through as
-      `fi->flags`, so the daemon sees `O_SYNC`/`O_DSYNC` on every write. The C
-      side must forward that byte over IPC; `handleWrite` decides from it.
-- [ ] Measure whether the async direct-IO path (`fuse_direct_IO` →
-      `fuse_async_req_send`, i.e. AIO and io_uring) carries the same flags.
-      Until it is known, claim the guarantee for synchronous writes only, and
-      say so in the docs.
-- [ ] Flush on `release`/`flush` (close), and before any namespace operation
-      naming the inode, so write→close→rename cannot publish a name for data
-      that is not there (the ext4 delayed-allocation trap).
-- [ ] Buffered-IO mode (`--allow-buffered-io`): `fsync` must also flush the
-      device, not only the metadata.
+- [x] `ec_fsync` and `ec_flush` send IPC and block; `fsyncdir` stays a no-op.
+- [x] `O_SYNC`/`O_DSYNC` disable deferral per write, from the write request's
+      own flags, forwarded by the C side.
+- [x] Measured the async direct-IO path (`fuse_direct_IO` →
+      `fuse_async_req_send`, i.e. AIO and io_uring): it carries the same flags.
+      io_uring with `O_DIRECT|O_DSYNC` reached the daemon as flags=53250, both
+      bits set. Guarantee holds on every submission path; docs widened.
+- [x] Flush on `flush` (close) and before any namespace operation naming the
+      inode.
+- [x] Buffered-IO mode: `fsync` flushes the device too.
 - [ ] One run of `nvme id-ctrl` on a real io2 attachment, recording ONCS bit 0
-      and FUSES bit 0, to close the question of device-side atomics for good.
-      Not needed for anything planned — coordination stays in etcd — but it is
-      one command and it settles a recurring question.
+      and FUSES bit 0. Needs hardware; not needed for anything planned.
 
 ### 7.4 Local coherence
 
-- [ ] `handleGetattr` and `handleLookup` must serve this inode's size from the
-      cache when this node holds the lock, or `write(); stat()` on one node
-      reports a stale size. Peers still read etcd and lag by up to the flush
-      interval — that is the delegation's cost, bound it and document it.
-- [ ] Metrics: pending extents and bytes, flush latency, flush failures,
+- [x] `handleGetattr`, `handleLookup` and readdirplus serve this inode's size
+      from the buffer while this node holds the lock.
+- [x] Metrics: pending extents and bytes, flush latency, flush failures,
       flushes by trigger.
+- [x] Re-benchmark: 996 randwrite (from 331), 1004 randread, p99 72ms -> 15ms.
+      Required one more fix: the cached extent list was rebuilt per write,
+      which became the bottleneck once the commit was gone. seqwrite 128k fell
+      52 -> 36 MiB/s, from arena fragmentation left by a 3x faster random
+      phase, not from the write path; coalescing at flush is what closes it.
 
 ## 8. Caching past the device ceiling
 

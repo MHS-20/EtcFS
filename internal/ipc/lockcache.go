@@ -290,16 +290,26 @@ func (s *Service) dropCachedLock(e *lockEntry, trigger string) error {
 			return err
 		}
 	}
-	s.releaseKeyLocked(e)
-	return nil
+	return s.releaseKeyLocked(e)
 }
 
 // releaseKeyLocked deletes an entry's etcd key with keyMu already held.
 //
-// The metadata cached under that key goes with it, and this is the single
-// place that obligation is discharged: recall, eviction, an upgrade from
-// shared to exclusive and shutdown all release the key through here.
-func (s *Service) releaseKeyLocked(e *lockEntry) {
+// Every cached copy of the inode goes with that key, and this is the single
+// place the obligation is discharged: recall, eviction, an upgrade from shared
+// to exclusive, a lost session and shutdown all release the key through here.
+// There are three such copies — the metadata snapshot, anything still buffered,
+// and the kernel's data pages — and the last of those is the only one this
+// process cannot simply drop, so it is done first and its failure aborts the
+// release.  Yielding the key with pages still cached would hide the next
+// holder's writes behind them for good, since a page cache has no timeout.
+func (s *Service) releaseKeyLocked(e *lockEntry) error {
+	if err := s.invalidatePages(e.ino); err != nil {
+		s.log.Error("kernel pages not invalidated, so this node's lock is not yielded",
+			"ino", e.ino, "error", err)
+		return err
+	}
+
 	holder, mode := e.holder, e.mode
 	e.holder, e.lease = "", 0
 	e.meta, e.metaFor = nil, ""
@@ -310,7 +320,7 @@ func (s *Service) releaseKeyLocked(e *lockEntry) {
 		s.discardPending(e, "the lock key was released with writes still buffered")
 	}
 	if holder == "" {
-		return
+		return nil
 	}
 
 	// A context of its own: a release has to happen even when the request that
@@ -323,6 +333,26 @@ func (s *Service) releaseKeyLocked(e *lockEntry) {
 	}); err != nil {
 		s.log.Error("cached inode lock not released, it will block peers until this node exits",
 			"ino", e.ino, "mode", mode, "error", err)
+	}
+	return nil
+}
+
+// keyLostLocked drops everything cached under a key etcd has already deleted:
+// the session went, or a flush found the key gone.  Nothing can be refused here
+// — the key is not ours to hold on to any more, and a peer may already own the
+// inode — so the kernel pages are dropped on a best-effort basis and a failure
+// is reported rather than acted on.  This is the one window the page cache
+// cannot fully close, and it is the same window the metadata snapshot has: the
+// gap between a lease expiring in etcd and this node observing it.
+func (s *Service) keyLostLocked(e *lockEntry, why string) {
+	if err := s.invalidatePages(e.ino); err != nil {
+		s.log.Error("kernel pages not invalidated for an inode whose lock key is gone; "+
+			"a reader on this node may see stale data until the file is reopened",
+			"ino", e.ino, "error", err)
+	}
+	e.holder, e.lease, e.meta, e.metaFor = "", 0, nil, ""
+	if !e.pending.empty() {
+		s.discardPending(e, why)
 	}
 }
 
@@ -408,7 +438,12 @@ func (s *Service) ReleaseCachedLocks() {
 			// arena than left allocated for the next incarnation to reconstruct.
 			e.keyMu.Lock()
 			s.discardPending(e, "this node is shutting down and the writes could not be published")
-			s.releaseKeyLocked(e)
+			// Last chance, so a failure here is reported and not obeyed: the
+			// process is going away and its kernel pages with it.
+			if rerr := s.releaseKeyLocked(e); rerr != nil {
+				s.log.Error("cached inode lock not released on shutdown",
+					"ino", e.ino, "error", rerr)
+			}
 			e.keyMu.Unlock()
 		}
 		e.rw.Unlock()

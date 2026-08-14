@@ -424,6 +424,22 @@ func okResp() []byte {
 	return int32Resp(0)
 }
 
+// openResp answers an OPEN: [i32:error][u32:keep_cache]
+//
+// The flag decides whether the kernel may hold this file's data pages across
+// reads.  The daemon decides it rather than the C side, because only the daemon
+// knows whether it can take them back again.
+func openResp(keepCache bool) []byte {
+	var b buf
+	b.w32(0)
+	if keepCache {
+		b.w32(1)
+	} else {
+		b.w32(0)
+	}
+	return b.b
+}
+
 // writtenResp answers a WRITE: [i32:error][u32:written]
 func writtenResp(written uint32) []byte {
 	var b buf
