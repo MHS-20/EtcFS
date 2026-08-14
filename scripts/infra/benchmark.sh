@@ -232,7 +232,16 @@ fi
 # the timed jobs start) would take ~27 minutes at 256M. 8M is still far
 # more than a runtime-bounded QD1 job touches, so it doesn't change what's
 # measured — it only avoids paying setup cost nothing needs.
-run_fio "etcfs" "$FUSE_MOUNTPOINT/fio.dat" "8M"
+# Not mounted means fio would write to a plain directory on the instance's root
+# volume and this row would report that volume's numbers as EtcFS's — a root
+# gp3 outruns the io2 data volume, so the failure reads as a great result rather
+# than a broken one.  The usual cause is a node fenced since the last bootstrap,
+# which detaches the shared volume from it.
+if $SSH_CMD "ec2-user@$N0" "mountpoint -q $FUSE_MOUNTPOINT" 2>/dev/null; then
+    run_fio "etcfs" "$FUSE_MOUNTPOINT/fio.dat" "8M"
+else
+    log "SKIPPING etcfs row: $FUSE_MOUNTPOINT is not mounted on $N0 — measuring it would report the root volume"
+fi
 
 $SSH_CMD "ec2-user@$N0" "sudo rm -f /mnt/bench-ext4/fio.dat /mnt/bench-efs/fio.dat $FUSE_MOUNTPOINT/fio.dat 2>/dev/null || true"
 

@@ -41,6 +41,17 @@ log ""
 
 $SSH_CMD "ec2-user@$N0" "sudo dnf install -y fio >/dev/null 2>&1 || sudo yum install -y fio >/dev/null 2>&1"
 
+# Refuse to run against a mountpoint that is not mounted.  fio's directory= is
+# an ordinary path, so an EtcFS mount that failed to come up leaves it writing
+# to a plain directory on the instance's root volume — and reporting that
+# volume's numbers as EtcFS's.  A root gp3's 3000-IOPS baseline is well above
+# the io2 data volume's provisioning, so the failure reads as a spectacular
+# result rather than as a broken run.  The most common cause is a node that was
+# fenced (and so had the shared volume detached) since it was last bootstrapped.
+if ! $SSH_CMD "ec2-user@$N0" "mountpoint -q $FUSE_MOUNTPOINT" 2>/dev/null; then
+    die "$FUSE_MOUNTPOINT is not mounted on $N0 — benchmarking it would measure the root volume, not EtcFS. Re-run bootstrap-cluster.sh and check the daemon logs."
+fi
+
 # Matches run_fio's etcfs branch in benchmark.sh: psync (not libaio — FUSE
 # doesn't reliably support AIO), one file per thread via directory= +
 # filename_format= so numjobs actually exercises concurrent FUSE workers on

@@ -165,48 +165,78 @@ shape rather than an intermediate one.
 
 ### 8.1 Read: kernel page cache for held inodes
 
-- [ ] Allow the kernel to cache data pages for an inode this node holds a lock
+- [x] Allow the kernel to cache data pages for an inode this node holds a lock
       on — `keep_cache`, dropping `direct_io` for that open. Today both are off
       unconditionally (`pkg/fuse/ops.c`), decided per open, so the daemon has
       to decide at OPEN and invalidate later if the lock goes.
-- [ ] Invalidate on recall, before the key is yielded, via
-      `fuse_lowlevel_notify_inval_inode` — the daemon already runs a notify
-      socket and already uses `INVAL_INODE` for attributes, so this is the
-      existing path pointed at data.
-- [ ] Invalidation must not run on a request thread. `notify_inval_inode` can
+- [x] Invalidate before the key is yielded, via
+      `fuse_lowlevel_notify_inval_inode`, on every path through
+      `releaseKeyLocked` — recall, eviction, the shared-to-exclusive upgrade and
+      shutdown. The premise was wrong: the notify socket carried only
+      `INVAL_ENTRY`, so `INVAL_INODE` and its acknowledgement are new.
+- [x] Invalidation must not run on a request thread. `notify_inval_inode` can
       block against the kernel's own writeback and deadlock the daemon if
       called from one; the recall path needs its own thread and the peer must
       not proceed until invalidation has completed.
-- [ ] Scope it to reads first: keep writes write-through to the daemon rather
+- [x] Scope it to reads first: keep writes write-through to the daemon rather
       than enabling the kernel's writeback cache. Writeback changes the shape
       of every write request and is a separate project.
-- [ ] Expected: re-reads cost nothing, cold reads unchanged at ~1015. Will not
-      show in the current benchmark — fio's `direct=1` bypasses the client page
-      cache, and the 8 MB files would sit entirely in RAM anyway. Needs a
-      benchmark that measures what it changes, or it is unmeasured.
+- [x] Expected: re-reads cost nothing, cold reads unchanged at ~1015. Confirmed
+      on the docker cluster by counting READ upcalls in the history log: the
+      first `cat` produces one, two more produce none, and a peer's write puts
+      one back. Still invisible to the fio benchmark, whose `direct=1` bypasses
+      the client page cache — that benchmark is still owed.
+- [x] `open` decides; `create` still returns direct_io, so a file is page-cached
+      from its first reopen rather than from the create. No correctness effect.
+- [x] A notify client that has gone away is treated as nothing-to-invalidate:
+      the client is the FUSE session, so its pages died with it, and refusing to
+      yield would lock every cached inode against the cluster until the process
+      exited. Found by killing the C daemon under a primed page cache.
 
 ### 8.2 Write: buffer data in RAM, not only metadata
 
-- [ ] Buffer the bytes alongside the pending extents in the `lockEntry` and
+- [x] Buffer the bytes alongside the pending extents in the `lockEntry` and
       reply before the device write, so a write costs no device I/O either.
       Blocks are still reserved from the arena at write time, so offsets are
       known and the flush has somewhere to put them.
-- [ ] **Flush order is data then metadata, always.** Device writes first, then
+- [x] **Flush order is data then metadata, always.** Device writes first, then
       the etcd transaction. Publishing an extent whose bytes are not yet on the
       volume is the one inversion that turns a lost write into a read of
       garbage, and it is the invariant the current write path is built around.
-- [ ] Reads on this node must consult the buffer before the device, or a node
+- [x] Reads on this node must consult the buffer before the device, or a node
       cannot read back what it just wrote.
-- [ ] Bound the buffer in bytes, with backpressure: past the cap a write waits
+- [x] Bound the buffer in bytes, with backpressure: past the cap a write waits
       for a flush rather than growing memory without limit.
-- [ ] Coalesce adjacent buffered writes into larger device I/Os at flush. This
-      is the one part that raises the *sustained* rate rather than the peak —
-      4 K random writes become fewer, larger, more sequential ones.
-- [ ] Crash exposure is unchanged in kind and larger in size: the bytes are now
+- [x] Coalesce adjacent buffered writes into larger device I/Os at flush, and
+      issue the resulting I/Os concurrently rather than one at a time.
+- [x] The premise above was half wrong, and measuring said so. Coalescing only
+      fires where the allocator handed out adjacent blocks: 4 K random writes
+      reallocate from the scattered holes their own reclaims leave, so the
+      measured merge rate was 1.20 runs per I/O with 96.6% merging nothing. And
+      a provisioned volume meters operations per second rather than capping how
+      many are outstanding, so batching scattered writes spends the same budget
+      and only turns steady latency into a burst — randwrite p99 went 15 -> 65ms.
+      The payload is now buffered only when it continues a contiguous run, or
+      when the write is large enough (>=64 KiB) to be latency-bound instead of
+      rate-limited. Everything else writes through, deferring only its extent.
+- [x] Crash exposure is unchanged in kind and larger in size: the bytes are now
       lost with the mapping instead of being stranded on the volume. Observably
       identical — an unpublished extent was unreachable either way — but say so
       in the docs rather than leaving it implied.
-- [ ] `fsync` flushes both, in that order, and keeps §7's error semantics.
+- [x] `fsync` flushes both, in that order, and keeps §7's error semantics.
+
+### 8.3 Measured
+
+30 s per job, 3-node t3.medium, 1000-IOPS io2, single fio client, verified on
+every run that all three nodes carried the build under test and had the shared
+volume open with O_DIRECT.
+
+| Build | randwrite | p99 | randread | seqwrite |
+|---|---|---|---|---|
+| publication deferred (7.4) | 996 | 15ms | 1004 | 36 MiB/s |
+| + data buffered unconditionally | 850 | 65ms | 969 | 12 MiB/s |
+| + flush I/Os issued concurrently | 893 | 64ms | 1014 | 44 MiB/s |
+| + buffered only where it pays | 985 | 15ms | 1014 | 40 MiB/s |
 
 ## 9. Verification — make the guarantees checkable, not argued
 

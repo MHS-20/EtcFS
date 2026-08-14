@@ -93,6 +93,35 @@ COUNT=${#PUB_IPS[@]}
 
 log "Bootstrapping $COUNT-node cluster '$TAG' (state=$STATE_FILE)"
 
+# ---- Re-attach the shared volume to any node that has lost it.
+#
+# This script re-deploys onto an existing cluster, and the usual reason a
+# cluster needs re-deploying is that something on it died — which is exactly
+# when the survivors will have fenced it.  External fencing detaches the shared
+# volume from the node it fences and deliberately never puts it back: a fence
+# that undid itself would not be a fence, and the supported recovery is to
+# replace the instance, not to resurrect it.
+#
+# Re-attaching here is safe because this script is the operator saying the
+# cluster is being rebuilt from scratch — every daemon is killed and every etcd
+# member wiped below, so there is no fenced node still running to protect the
+# volume from.  Without it the daemon fails with "no such file or directory" on
+# the device, which names the symptom and not the cause. ----
+if [[ -n "$VOL_ID" ]] && command -v aws >/dev/null 2>&1; then
+    for i in "${!PUB_IPS[@]}"; do
+        inst="${INST_IDS[$i]:-}"
+        [[ -n "$inst" && "$inst" != "null" ]] || continue
+        if aws ec2 describe-volumes --volume-ids "$VOL_ID" \
+            --query "Volumes[0].Attachments[?InstanceId=='$inst'] | length(@)" \
+            --output text 2>/dev/null | grep -qx 0; then
+            log "  $inst has no attachment to $VOL_ID (fenced?), re-attaching"
+            aws ec2 attach-volume --volume-id "$VOL_ID" --instance-id "$inst" \
+                --device /dev/sdf >/dev/null 2>&1 || log "  attach failed for $inst"
+        fi
+    done
+    sleep 10
+fi
+
 # ---- Build once locally, ship to every node ----
 cd "$PROJECT_ROOT" || exit 1
 go build -o "$PROJECT_ROOT/bin/etcfuse-meta" "$PROJECT_ROOT/cmd/etcfuse-meta/" 2>&1 | tail -1
