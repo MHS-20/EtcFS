@@ -22,16 +22,20 @@ import (
 // invalidates before it deletes the key and refuses to release if that fails.
 // What is checked here is that the recorded events agree: every yielded key was
 // preceded by an invalidation of its inode, on the same node, that had already
-// returned. The one exception the daemon makes for itself is a FUSE session that
-// has gone away, which takes its page cache with it — that outcome is recorded
-// too, and counts as discharged.
+// returned. Two outcomes discharge the obligation without any page being
+// dropped, and both are recorded rather than left implicit: a FUSE session that
+// has gone away, which took its page cache with it, and an inode nothing could
+// have cached in the first place (caching off, or no open ever told the kernel
+// it could cache). A history that simply omitted those would be
+// indistinguishable from one where the invalidation was owed and skipped.
 
 const pageInvalOpcode = 1003
 
 const (
-	pageInvalDone     = 0
-	pageInvalNoClient = 1
-	pageInvalFailed   = 2
+	pageInvalDone      = 0
+	pageInvalNoClient  = 1
+	pageInvalFailed    = 2
+	pageInvalNotCached = 3
 )
 
 // PageInvalOp is one kernel page-cache invalidation.
@@ -119,7 +123,7 @@ func CheckPageCache(keys []LockOp, invals []PageInvalOp) []PageCacheViolation {
 
 	var out []PageCacheViolation
 	for k, releases := range releasesFor {
-		sort.Slice(releases, func(i, j int) bool { return releases[i].Call < releases[j].Call })
+		sort.Slice(releases, func(i, j int) bool { return releases[i].actualCall() < releases[j].actualCall() })
 		// Each release needs an invalidation of its own, after the previous
 		// release and finished before this one began: pages cached under the
 		// hold that is ending are not covered by the invalidation that ended the
@@ -135,7 +139,7 @@ func CheckPageCache(keys []LockOp, invals []PageInvalOp) []PageCacheViolation {
 			}
 			matched := PageInvalOp{}
 			found := false
-			for next < len(list) && list[next].Ret <= rel.Call {
+			for next < len(list) && list[next].Ret <= rel.actualCall() {
 				if list[next].Ret >= floor {
 					matched, found = list[next], true
 				}

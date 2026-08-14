@@ -57,6 +57,12 @@ type LockOp struct {
 	// two hosts look like two holders of one lock.
 	Call int64
 	Ret  int64
+	// ActualCall is when the event really started, which differs from Call only
+	// for a release of a key that had already expired: Call is widened back to
+	// the acquisition so a peer's legitimate acquire can be ordered inside it,
+	// and that widening would misplace anything asking what the node did just
+	// before letting go. Falls back to Call for histories recorded without it.
+	ActualCall int64
 }
 
 func (k lockOpKind) String() string {
@@ -127,9 +133,16 @@ func decodeLockStream(entries []history.Entry, opcode uint16) ([]LockOp, error) 
 		default:
 			return nil, fmt.Errorf("lock event at %d: unknown event/mode %d/%d", e.CallNs, event, mode)
 		}
+		actual := e.CallNs
+		if len(req) >= 18 {
+			ar := newReader(req[10:])
+			if v := ar.u64(); ar.ok {
+				actual = int64(v)
+			}
+		}
 		ops = append(ops, LockOp{
 			Node: e.Node, Ino: ino, Kind: kind,
-			Call: e.CallNs, Ret: e.ReturnNs,
+			Call: e.CallNs, Ret: e.ReturnNs, ActualCall: actual,
 		})
 	}
 	return ops, nil
@@ -224,28 +237,47 @@ const DefaultLockLeaseTTL = 5 * time.Second
 // violation. The chaos suite SIGKILLs daemons, so this is the common case,
 // not an exotic one.
 //
-// The synthetic release spans [last event from that node, + leaseTTL], which
-// is the honest bound: the lease cannot have expired before the node's last
-// observed activity, and cannot survive a TTL past it. That interval also
+// The synthetic release spans [last event from that incarnation, + leaseTTL],
+// which is the honest bound: the lease cannot have expired before the node's
+// last observed activity, and cannot survive a TTL past it. That interval also
 // keeps a genuinely leaked lock a violation -- a node that stayed alive and
 // simply failed to release goes on emitting events, so its synthetic release
 // lands after them, well after any conflicting acquire.
-func withLeaseExpiryReleases(ops []LockOp, leaseTTL time.Duration) []LockOp {
-	lastSeen := map[string]int64{}
-	for _, op := range ops {
-		if op.Ret > lastSeen[op.Node] {
-			lastSeen[op.Node] = op.Ret
-		}
-	}
+//
+// "Incarnation", not "node", is what the bound is taken over, and the
+// distinction is the whole point of the starts argument. The chaos suite kills
+// a daemon and restarts it under the same node id, appending to the same
+// history: treating that as one continuous identity puts the synthetic release
+// for a lock held at the kill at the end of the *run* rather than the end of
+// the incarnation that held it, and every legitimate acquisition by whoever
+// took the inode next then reads as a second holder. Locks die with the
+// session that wrote them, so each incarnation is closed out on its own.
+//
+// A history with no start markers -- one recorded before the daemon emitted
+// them -- has exactly one incarnation per node, which is the behaviour this
+// had before.
+func withLeaseExpiryReleases(ops []LockOp, starts []StartOp, leaseTTL time.Duration) []LockOp {
+	in := newIncarnations(starts)
 
+	type incarnation struct {
+		node string
+		gen  int
+	}
 	type holding struct {
 		node string
+		gen  int
 		ino  uint64
 		excl bool
 	}
+
+	lastSeen := map[incarnation]int64{}
 	held := map[holding]int{}
 	for _, op := range ops {
-		key := holding{node: op.Node, ino: op.Ino,
+		gen := in.at(op.Node, op.Call)
+		if ik := (incarnation{op.Node, gen}); op.Ret > lastSeen[ik] {
+			lastSeen[ik] = op.Ret
+		}
+		key := holding{node: op.Node, gen: gen, ino: op.Ino,
 			excl: op.Kind == lockAcquireExclusive || op.Kind == lockReleaseExclusive}
 		switch op.Kind {
 		case lockAcquireExclusive, lockAcquireShared:
@@ -262,10 +294,11 @@ func withLeaseExpiryReleases(ops []LockOp, leaseTTL time.Duration) []LockOp {
 			if key.excl {
 				kind = lockReleaseExclusive
 			}
+			last := lastSeen[incarnation{key.node, key.gen}]
 			out = append(out, LockOp{
 				Node: key.node, Ino: key.ino, Kind: kind,
-				Call: lastSeen[key.node],
-				Ret:  lastSeen[key.node] + int64(leaseTTL),
+				Call: last,
+				Ret:  last + int64(leaseTTL),
 			})
 		}
 	}
@@ -275,8 +308,22 @@ func withLeaseExpiryReleases(ops []LockOp, leaseTTL time.Duration) []LockOp {
 // CheckLocks checks a decoded lock history for mutual-exclusion violations.
 //
 // leaseTTL is the session TTL the locks were written under; pass
-// DefaultLockLeaseTTL unless the cluster was configured otherwise.
-func CheckLocks(ops []LockOp, leaseTTL, timeout time.Duration) porcupine.CheckResult {
+// DefaultLockLeaseTTL unless the cluster was configured otherwise. starts marks
+// where each daemon incarnation began, so that locks a killed one held are
+// closed out when its session died rather than at the end of the run; pass the
+// result of DecodeStarts, or nil for a history with no restarts in it.
+func CheckLocks(ops []LockOp, starts []StartOp, leaseTTL, timeout time.Duration) porcupine.CheckResult {
 	return porcupine.CheckOperationsTimeout(
-		LockModel, lockOperations(withLeaseExpiryReleases(ops, leaseTTL)), timeout)
+		LockModel, lockOperations(withLeaseExpiryReleases(ops, starts, leaseTTL)), timeout)
+}
+
+// actualCall is when the event really began: the widened Call for a release of
+// an already-expired key says when the hold *may* have ended, which is the
+// right thing for mutual exclusion and the wrong thing for ordering a release
+// against the invalidation that had to precede it.
+func (o LockOp) actualCall() int64 {
+	if o.ActualCall != 0 {
+		return o.ActualCall
+	}
+	return o.Call
 }

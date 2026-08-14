@@ -3,6 +3,7 @@ package verify
 import (
 	"fmt"
 	"maps"
+	"sort"
 	"time"
 
 	"github.com/anishathalye/porcupine"
@@ -46,10 +47,14 @@ const (
 	blockSize = 4096
 )
 
-// BlockOp is one reservation or release of a device range.
+// BlockOp is one reservation or release of a device range, or the death of the
+// incarnation that was holding one.
 type BlockOp struct {
 	Node    string
 	Reserve bool
+	// Crash marks the boundary where the incarnation holding this range died,
+	// rather than an operation it performed. See withCrashBoundaries.
+	Crash   bool
 	DiskOff uint64
 	Length  uint64
 	Call    int64
@@ -108,6 +113,22 @@ func (s blockState) step(op BlockOp) (bool, blockState) {
 	for off := op.DiskOff; off < op.DiskOff+op.Length; off += blockSize {
 		holder, known := next[off]
 		switch {
+		case op.Crash:
+			// The incarnation holding this block died. Whether the block is
+			// still spoken for is no longer something the history knows: the
+			// allocator that comes back rebuilds its bitmap from the extent
+			// records, so a block whose extent was published is still held and
+			// one whose write never made it out is free again — and nothing
+			// recorded here says which. Forgetting it says exactly that, and
+			// leaves both a later reservation and a later release ordinary
+			// while still catching a second release of the same block.
+			//
+			// Only this node's own hold is forgotten. Dropping a block a peer
+			// holds would let one node's crash excuse another's double
+			// allocation.
+			if known && holder == op.Node {
+				delete(next, off)
+			}
 		case op.Reserve && known && holder != blockFree:
 			// Two live owners for one block: the corruption every layer above
 			// this assumes cannot happen.
@@ -155,7 +176,10 @@ var BlockModel = porcupine.Model{
 	DescribeOperation: func(input, output interface{}) string {
 		op := input.(BlockOp)
 		kind := "free"
-		if op.Reserve {
+		switch {
+		case op.Crash:
+			kind = "crash"
+		case op.Reserve:
 			kind = "reserve"
 		}
 		return fmt.Sprintf("%s(off=%d len=%d)", kind, op.DiskOff, op.Length)
@@ -167,9 +191,85 @@ var BlockModel = porcupine.Model{
 // and no violation can hide in the gap between them.
 const blockGroupSize = 1 << 30
 
+// withCrashBoundaries marks every block an incarnation still held when it died.
+//
+// A daemon killed mid-run takes its allocator's bitmap with it, and what comes
+// back is rebuilt from the extent records — so a block it was holding may be
+// held still (its extent got published) or free again (the write never made it
+// out), and the history does not say which. Read as one continuous node, the
+// rebuilt allocator handing the same block out again is a block reserved twice
+// with no release between, which is the violation this model exists to catch.
+// Attributing the reservation to the incarnation that made it tells the two
+// apart.
+//
+// The boundary marks the hold as unknown rather than released, which is the
+// difference between what the history knows and what would be convenient. An
+// outright release would say the block went back to the pool, and the scrubber
+// reclaiming that same block after the restart — a real, recorded free of an
+// extent that outlived the crash — would then read as a double free.
+//
+// The marker spans [last event of that incarnation, start of the next], which
+// is the honest bound: the crash happened somewhere in there. A node that
+// stayed up and really did reserve a block twice has no boundary between the
+// two, so it is still a violation.
+func withCrashBoundaries(ops []BlockOp, starts []StartOp) []BlockOp {
+	in := newIncarnations(starts)
+
+	type holder struct {
+		node string
+		gen  int
+	}
+	// Reservations outstanding per incarnation, in the order they were made.
+	held := map[holder]map[uint64]uint64{}
+	lastSeen := map[holder]int64{}
+	for _, op := range ops {
+		h := holder{op.Node, in.at(op.Node, op.Call)}
+		if op.Ret > lastSeen[h] {
+			lastSeen[h] = op.Ret
+		}
+		if held[h] == nil {
+			held[h] = map[uint64]uint64{}
+		}
+		for off := op.DiskOff; off < op.DiskOff+op.Length; off += blockSize {
+			if op.Reserve {
+				held[h][off] = blockSize
+			} else {
+				delete(held[h], off)
+			}
+		}
+	}
+
+	out := ops
+	for h, blocks := range held {
+		end := in.endOf(h.node, h.gen)
+		if end == 0 || len(blocks) == 0 {
+			// The incarnation still running at the end of the history has not
+			// crashed, and its reservations are still legitimately its own.
+			continue
+		}
+		offs := make([]uint64, 0, len(blocks))
+		for off := range blocks {
+			offs = append(offs, off)
+		}
+		sort.Slice(offs, func(i, j int) bool { return offs[i] < offs[j] })
+		for _, off := range offs {
+			out = append(out, BlockOp{
+				Node: h.node, Crash: true, DiskOff: off, Length: blockSize,
+				Call: lastSeen[h], Ret: end,
+			})
+		}
+	}
+	return out
+}
+
 // CheckBlocks checks a decoded block history for double allocation and double
 // free.
-func CheckBlocks(ops []BlockOp, timeout time.Duration) porcupine.CheckResult {
+//
+// starts marks where each daemon incarnation began, so that blocks a killed one
+// had reserved are released when it died rather than held for the rest of the
+// run; pass the result of DecodeStarts, or nil for a history with no restarts.
+func CheckBlocks(ops []BlockOp, starts []StartOp, timeout time.Duration) porcupine.CheckResult {
+	ops = withCrashBoundaries(ops, starts)
 	clients := map[string]int{}
 	h := make([]porcupine.Operation, 0, len(ops))
 	for _, op := range ops {

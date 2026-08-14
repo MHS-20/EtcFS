@@ -14,7 +14,7 @@ func lop(node string, ino uint64, kind lockOpKind, at int64) LockOp {
 
 func lockOK(t *testing.T, ops []LockOp) bool {
 	t.Helper()
-	res := CheckLocks(ops, DefaultLockLeaseTTL, timeout)
+	res := CheckLocks(ops, nil, DefaultLockLeaseTTL, timeout)
 	if res == porcupine.Unknown {
 		t.Fatal("checker timed out")
 	}
@@ -84,6 +84,46 @@ func TestLockReleaseWithoutAcquireIsRejected(t *testing.T) {
 	ops := []LockOp{lop("n1", 1, lockReleaseExclusive, 10)}
 	if lockOK(t, ops) {
 		t.Fatal("a release with nothing held was accepted")
+	}
+}
+
+// A node killed mid-hold and restarted under the same id, with a peer taking
+// the inode in between: the lock died with the session, so this is legitimate.
+//
+// Without the start markers the synthetic lease-expiry release lands after
+// n1's *last* event — the ones its new incarnation went on to record — and
+// n2's perfectly valid acquisition reads as a second holder. This is the shape
+// every chaos run produces, since the suite SIGKILLs daemons and restarts them
+// under the same node id, appending to the same history.
+func TestLockRestartedNodeDoesNotHoldItsPreviousIncarnationsLock(t *testing.T) {
+	ops := []LockOp{
+		lop("n1", 1, lockAcquireExclusive, 10), // held when n1 was killed: never released
+		lop("n2", 1, lockAcquireExclusive, 100),
+		lop("n2", 1, lockReleaseExclusive, 110),
+		lop("n1", 2, lockAcquireExclusive, 200), // n1 back up, unrelated inode
+		lop("n1", 2, lockReleaseExclusive, 210),
+	}
+	starts := []StartOp{{Node: "n1", At: 1}, {Node: "n2", At: 1}, {Node: "n1", At: 150}}
+	if res := CheckLocks(ops, starts, DefaultLockLeaseTTL, timeout); res != porcupine.Ok {
+		t.Fatalf("a lock left behind by a killed incarnation was reported as still held (%v)", res)
+	}
+}
+
+// The same history without the restart marker: n1 stayed up throughout and
+// simply never released, which is a genuine leak and must still be rejected.
+// Bounding the synthetic release by incarnation must not cost the check its
+// teeth.
+func TestLockLiveNodeHoldingPastAPeersAcquireIsRejected(t *testing.T) {
+	ops := []LockOp{
+		lop("n1", 1, lockAcquireExclusive, 10),
+		lop("n2", 1, lockAcquireExclusive, 100),
+		lop("n2", 1, lockReleaseExclusive, 110),
+		lop("n1", 2, lockAcquireExclusive, 200),
+		lop("n1", 2, lockReleaseExclusive, 210),
+	}
+	starts := []StartOp{{Node: "n1", At: 1}, {Node: "n2", At: 1}}
+	if res := CheckLocks(ops, starts, DefaultLockLeaseTTL, timeout); res == porcupine.Ok {
+		t.Fatal("a lock held across a peer's acquisition by a live node was accepted")
 	}
 }
 

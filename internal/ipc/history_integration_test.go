@@ -288,7 +288,9 @@ func TestIntegration_RecordedDataPathHistoryIsConsistent(t *testing.T) {
 		t.Fatalf("decode extents: %v", err)
 	}
 	t.Logf("checking %d extent operations", len(extents))
-	if res := verify.CheckExtents(extents, 60*time.Second); res != porcupine.Ok {
+	// No crashed nodes: this test kills nothing, so a write that went missing
+	// is a defect rather than a buffer a SIGKILL legitimately took with it.
+	if res := verify.CheckExtents(extents, nil, 60*time.Second); res != porcupine.Ok {
 		t.Fatalf("recorded extent history is not consistent (%v)", res)
 	}
 
@@ -300,7 +302,7 @@ func TestIntegration_RecordedDataPathHistoryIsConsistent(t *testing.T) {
 	if len(locks) == 0 {
 		t.Fatal("no lock events were recorded")
 	}
-	if res := verify.CheckLocks(locks, verify.DefaultLockLeaseTTL, 60*time.Second); res != porcupine.Ok {
+	if res := verify.CheckLocks(locks, verify.DecodeStarts(entries), verify.DefaultLockLeaseTTL, 60*time.Second); res != porcupine.Ok {
 		t.Fatalf("recorded lock history admits a mutual-exclusion violation (%v)", res)
 	}
 

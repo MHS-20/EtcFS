@@ -96,21 +96,21 @@ func checkModel(model string, entries []history.Entry, crashed []string, timeout
 			return false, err
 		}
 		fmt.Printf("lock: checking %d events\n", len(ops))
-		return report("lock", verify.CheckLocks(ops, verify.DefaultLockLeaseTTL, timeout))
+		return report("lock", verify.CheckLocks(ops, verify.DecodeStarts(entries), verify.DefaultLockLeaseTTL, timeout))
 	case "lockkey":
 		ops, err := verify.DecodeLockKeys(entries)
 		if err != nil {
 			return false, err
 		}
 		fmt.Printf("lockkey: checking %d events\n", len(ops))
-		return report("lockkey", verify.CheckLocks(ops, verify.DefaultLockLeaseTTL, timeout))
+		return report("lockkey", verify.CheckLocks(ops, verify.DecodeStarts(entries), verify.DefaultLockLeaseTTL, timeout))
 	case "block":
 		ops, err := verify.DecodeBlocks(entries)
 		if err != nil {
 			return false, err
 		}
 		fmt.Printf("block: checking %d events\n", len(ops))
-		return report("block", verify.CheckBlocks(ops, timeout))
+		return report("block", verify.CheckBlocks(ops, verify.DecodeStarts(entries), timeout))
 	case "pagecache":
 		keys, err := verify.DecodeLockKeys(entries)
 		if err != nil {
