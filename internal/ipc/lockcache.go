@@ -143,6 +143,17 @@ func (s *Service) pendingSize(ino uint64) (uint64, bool) {
 	return e.meta.rec.Size, true
 }
 
+// bufferedReadAt serves a device range from this node's own unpublished write
+// data, reporting false when the range is not wholly buffered.
+func (s *Service) bufferedReadAt(e *lockEntry, dst []byte, diskOff uint64) bool {
+	if !s.dataCache {
+		return false
+	}
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+	return e.pending.readAt(dst, diskOff)
+}
+
 // inodeMeta is an inode's metadata as of one revision: the record and the
 // extent list, which every data-path operation needs together.  Immutable once
 // published into a lockEntry.

@@ -35,6 +35,17 @@ const (
 // safe direction to fail in — the alternative, a referenced extent written by
 // a node that has lost its lease, is corruption.
 
+// errUnalignedBuffer reports that no buffer the device would accept could be
+// obtained, which is a memory failure rather than an I/O one.
+var errUnalignedBuffer = errors.New("no sector-aligned buffer available")
+
+func errnoForWrite(err error) int32 {
+	if errors.Is(err, errUnalignedBuffer) {
+		return -12 // ENOMEM
+	}
+	return -5 // EIO
+}
+
 // ioBuffer returns a buffer of at least n bytes usable for device I/O, along
 // with the function that releases it.
 //
@@ -175,31 +186,37 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	// out to whole blocks can be sliced per run and still satisfy O_DIRECT.
 	// The padding past dataLen is written but never referenced by an extent.
 	padded := (dataLen + arena.BlockSize - 1) / arena.BlockSize * arena.BlockSize
-	writeData := data
-	if padded != dataLen || !s.directSafe(data) {
-		aligned, free := s.ioBuffer(padded)
-		defer free()
-		if !s.directSafe(aligned) {
-			freeRuns()
-			return int32Resp(-12), nil // ENOMEM
+
+	// writeThrough puts the payload on the device now, which is what every write
+	// that is not going to be buffered has to do before its extents are
+	// published.  Idempotent, and a no-op once it has run.
+	written := false
+	writeThrough := func() error {
+		if written {
+			return nil
 		}
-		copy(aligned, data)
-		writeData = aligned[:padded]
+		writeData := data
+		if padded != dataLen || !s.directSafe(data) {
+			aligned, free := s.ioBuffer(padded)
+			defer free()
+			if !s.directSafe(aligned) {
+				return errUnalignedBuffer
+			}
+			copy(aligned, data)
+			writeData = aligned[:padded]
+		}
+		pos := uint64(0)
+		for _, r := range runs {
+			if werr := s.writeRun(writeData[pos:pos+r.Length], r.DiskOff); werr != nil {
+				return werr
+			}
+			pos += r.Length
+		}
+		written = true
+		return nil
 	}
 
 	gen := s.writeGeneration(ctx)
-
-	// The device write is independent of how the extents are numbered, so it
-	// happens once even if the proposal below has to be rebuilt.
-	pos := uint64(0)
-	for _, r := range runs {
-		if werr := s.writeRun(writeData[pos:pos+r.Length], r.DiskOff); werr != nil {
-			freeRuns()
-			s.log.Warn("write: block device write failed", "error", werr)
-			return int32Resp(-5), nil
-		}
-		pos += r.Length
-	}
 
 	// The extent list answers the rest of what this write needs: which chunk
 	// numbers are free, what sequence it takes, and which existing extents it
@@ -340,7 +357,30 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		if m == nil {
 			break
 		}
-		berr := s.bufferWrite(ctx, lk.e, m, cmps, ops, plans, uint64(dataLen))
+		// With the payload buffered too, the write costs no device I/O either:
+		// the blocks were reserved above, so the extents already name their
+		// final offsets and only the bytes are outstanding.  The flush puts them
+		// on the device before it publishes anything.  Without it the bytes go
+		// down now and only the metadata is deferred.
+		var bufData []bufferedRun
+		var bufRuns []arena.Run
+		bytes := uint64(dataLen)
+		if s.dataCache {
+			payload := make([]byte, padded)
+			copy(payload, data)
+			pos := uint64(0)
+			for _, r := range runs {
+				bufData = append(bufData, bufferedRun{diskOff: r.DiskOff, buf: payload[pos : pos+r.Length]})
+				pos += r.Length
+			}
+			bufRuns, bytes = runs, uint64(padded)
+		} else if werr := writeThrough(); werr != nil {
+			freeRuns()
+			s.log.Warn("write: block device write failed", "error", werr)
+			return int32Resp(errnoForWrite(werr)), nil
+		}
+
+		berr := s.bufferWrite(ctx, lk.e, m, cmps, ops, plans, bytes, bufData, bufRuns)
 		if errors.Is(berr, errBufferPublished) {
 			// The buffer was full and has been published, which moved every key
 			// it held to a new revision.  This proposal was planned against the
@@ -383,6 +423,14 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 			return int32Resp(-5), nil
 		}
 		cmps, ops = proposal()
+	}
+
+	// This write is not being buffered, so its bytes go down before its extents
+	// are published — the same ordering the flush follows, for the same reason.
+	if werr := writeThrough(); werr != nil {
+		freeRuns()
+		s.log.Warn("write: block device write failed", "error", werr)
+		return int32Resp(errnoForWrite(werr)), nil
 	}
 
 	committed, fenced, rev, cerr := s.commitGuarded(ctx, cmps, ops)
@@ -690,6 +738,14 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 
 		within := pos - ext.LogOff
 		n := min(ext.Length-within, reqEnd-pos)
+		// A node has to be able to read back what it just wrote, and a buffered
+		// write's bytes are not on the device yet.  The extent already names
+		// their final device range, so the buffer is consulted by that range and
+		// the device answers everything it does not cover.
+		if s.bufferedReadAt(lk.e, data[pos-offset:pos-offset+n], ext.DiskOff+within) {
+			pos += n
+			continue
+		}
 		if _, err := s.readInto(data[pos-offset:pos-offset+n], int64(ext.DiskOff+within)); err != nil {
 			s.log.Warn("read: block device read failed", "ino", ino, "error", err)
 			return int32Resp(-5), nil

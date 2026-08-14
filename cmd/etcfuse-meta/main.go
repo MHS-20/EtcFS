@@ -306,10 +306,11 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	svc.StartNotificationServer(ctx)
 	svc.StartLockRevocation(ctx)
 	svc.SetFlushInterval(cfg.MetadataFlushInterval)
+	svc.SetDataCache(cfg.WriteDataCache && cfg.MetadataFlushInterval > 0)
 	svc.StartFlusher(ctx)
 	if cfg.MetadataFlushInterval > 0 {
 		log.Info("deferring extent publication; a crash loses writes not yet flushed or fsynced",
-			"flush_interval", cfg.MetadataFlushInterval)
+			"flush_interval", cfg.MetadataFlushInterval, "write_data_cache", cfg.WriteDataCache)
 	}
 	go func() {
 		if err := ipc.StartNotifyServer(svc, cfg.NotifyAddr); err != nil {

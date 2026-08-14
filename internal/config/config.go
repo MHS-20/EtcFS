@@ -83,6 +83,15 @@ type Config struct {
 	// acknowledging it, which loses nothing and pays a Raft commit per write.
 	MetadataFlushInterval time.Duration
 
+	// WriteDataCache buffers a deferred write's payload in RAM beside its
+	// extents, so the write costs no device I/O at all and the flush puts the
+	// bytes down — coalesced into larger, more sequential I/Os — before it
+	// publishes the extents naming them.  It raises the crash exposure that
+	// deferring the commit already creates in size, not in kind: an unflushed
+	// write was unreachable either way.  Ignored when the flush interval is
+	// zero, since nothing is deferred then.
+	WriteDataCache bool
+
 	// NotifyAddr is the socket the C daemon connects to for cache-invalidation
 	// notifications.  Configurable for the same reason ListenAddr is: two
 	// daemons on one host need two paths.
@@ -182,6 +191,8 @@ func Parse() *Config {
 		"Flush the device cache, sync the range and read it back after every write; needed only on a device with a volatile write cache that does not publish an acknowledged O_DIRECT write to its other attachers (always on without O_DIRECT)")
 	flag.StringVar(&flushInterval, "metadata-flush-interval", "100ms",
 		"How long a write's extent may stay buffered in memory before it is published to etcd; 0 commits every write before acknowledging it (durable, one Raft commit per write)")
+	flag.BoolVar(&cfg.WriteDataCache, "write-data-cache", true,
+		"Buffer a deferred write's data in memory as well as its extents, and put it on the device at flush time; off writes the data through on every write")
 	flag.StringVar(&cfg.EC2InstanceID, "ec2-instance-id", "",
 		"This node's EC2 instance ID, recorded in its membership key so peers can detach the volume when it expires")
 	flag.StringVar(&cfg.HistoryLog, "history-log", "",

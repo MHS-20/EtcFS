@@ -41,8 +41,17 @@ type Service struct {
 	flushInterval time.Duration
 	// flushMaxBytes caps the write payload one buffer may stand for, so a hot
 	// inode cannot turn an unbounded amount of acknowledged data into data that
-	// a crash would lose.
+	// a crash would lose.  With dataCache on it is also the bound on how much
+	// RAM one inode's buffered payload may occupy, and the backpressure: a write
+	// past the cap waits for the flush that makes room for it.
 	flushMaxBytes uint64
+
+	// dataCache buffers a deferred write's payload in RAM alongside its extents
+	// instead of putting it on the device as the write is served, so a write
+	// costs no device I/O either.  The flush writes the bytes before it
+	// publishes the extents naming them, which is the ordering that keeps a lost
+	// write a lost write rather than a read of garbage.
+	dataCache bool
 
 	// readOnly rejects every mutating opcode with EROFS before it reaches a
 	// handler. Checked in dispatch rather than per-handler so a new mutating
@@ -99,6 +108,13 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 // carries a Raft commit.
 func (s *Service) SetFlushInterval(d time.Duration) {
 	s.flushInterval = d
+}
+
+// SetDataCache buffers a deferred write's payload in RAM as well as its extents.
+// Off restores a device write per write, which is the configuration that loses
+// nothing beyond what deferring the commit already loses.
+func (s *Service) SetDataCache(on bool) {
+	s.dataCache = on
 }
 
 // SetBlockDevice attaches a block device for data I/O.

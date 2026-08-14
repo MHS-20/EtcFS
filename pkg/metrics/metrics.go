@@ -106,6 +106,16 @@ var (
 		Help: "Flushes of deferred metadata that did not publish, by reason.",
 	}, []string{"reason"})
 
+	// CoalescedRuns observes how many buffered write runs a flush merged into
+	// one device I/O.  It is the measure of what data buffering buys beyond the
+	// peak: a median above one means scattered small writes are reaching the
+	// volume as fewer, larger ones.
+	CoalescedRuns = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "etcfuse_flush_coalesced_runs",
+		Help:    "Buffered write runs merged into a single device write at flush.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 10),
+	})
+
 	// FlushDuration observes how long publishing a buffer takes.  It is the
 	// latency an fsync pays, and the one a recalled peer waits out.
 	FlushDuration = promauto.NewHistogram(prometheus.HistogramOpts{

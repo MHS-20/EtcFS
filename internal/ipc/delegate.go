@@ -3,11 +3,13 @@ package ipc
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
@@ -74,6 +76,18 @@ type pending struct {
 	// the allocator hand out blocks an extent still published in etcd refers to.
 	plans []*reclaimPlan
 
+	// data is the payload of those writes, when it is buffered rather than put
+	// on the device as the write is served.  Each entry is one run: the device
+	// range was reserved at write time, so the extents above already name their
+	// final offsets and only the bytes are outstanding.
+	data []bufferedRun
+
+	// runs are the blocks those buffered writes reserved.  A buffer that can
+	// never be published leaves its extents unwritten, so its blocks are given
+	// back with it — without this they would stay marked allocated in this
+	// node's bitmap until the process restarted and rebuilt it from etcd.
+	runs []arena.Run
+
 	bytes uint64    // buffered write payload, for the size cap
 	since time.Time // when the oldest unflushed write landed
 
@@ -85,6 +99,34 @@ type pending struct {
 }
 
 func (p *pending) empty() bool { return p == nil || len(p.order) == 0 }
+
+// bufferedRun is one device range whose bytes are still in RAM.
+type bufferedRun struct {
+	diskOff uint64
+	buf     []byte
+}
+
+func (r bufferedRun) end() uint64 { return r.diskOff + uint64(len(r.buf)) }
+
+// readAt serves a device range from the buffer, reporting false when the range
+// is not wholly buffered.
+//
+// ponytail: a linear scan of the runs, which is bounded by the buffer cap and
+// sits behind a read that would otherwise be a device round trip.  A sorted
+// index is the upgrade if a profile ever shows it.
+func (p *pending) readAt(dst []byte, diskOff uint64) bool {
+	if p == nil {
+		return false
+	}
+	end := diskOff + uint64(len(dst))
+	for _, r := range p.data {
+		if r.diskOff <= diskOff && end <= r.end() {
+			copy(dst, r.buf[diskOff-r.diskOff:])
+			return true
+		}
+	}
+	return false
+}
 
 // add folds one write's proposal into the buffer.
 func (p *pending) add(cmps []clientv3.Cmp, ops []clientv3.Op, plans []*reclaimPlan, bytes uint64) {
@@ -128,12 +170,15 @@ func (p *pending) txn() ([]clientv3.Cmp, []clientv3.Op) {
 	return cmps, ops
 }
 
-// reset empties the buffer, returning the plans whose blocks are now free to
-// hand out again.
-func (p *pending) reset() []*reclaimPlan {
-	plans := p.plans
-	p.cmps, p.ops, p.order, p.plans, p.bytes, p.err = nil, nil, nil, nil, 0, nil
-	return plans
+// reset empties the buffer, returning the plans whose blocks a commit frees and
+// the runs a discard frees.  Which of the two the caller gives back is the
+// difference between a flush that published and one that never can: a published
+// extent owns its run, and only what it buried becomes free.
+func (p *pending) reset() ([]*reclaimPlan, []arena.Run) {
+	plans, runs := p.plans, p.runs
+	p.cmps, p.ops, p.order, p.plans = nil, nil, nil, nil
+	p.data, p.runs, p.bytes, p.err = nil, nil, 0, nil
+	return plans, runs
 }
 
 // deferWrites reports whether extent publication may be deferred at all.
@@ -155,8 +200,12 @@ var errBufferPublished = errors.New("the buffer was published to make room")
 //
 // The caller holds the entry's exclusive local lock, so no other operation on
 // this inode is in flight.
+// data and runs are non-empty only when the payload is buffered too: the bytes
+// this write would otherwise have put on the device, and the blocks reserved to
+// hold them.  Both are empty when the write has already been written through.
 func (s *Service) bufferWrite(ctx context.Context, e *lockEntry, m *inodeMeta,
-	cmps []clientv3.Cmp, ops []clientv3.Op, plans []*reclaimPlan, bytes uint64) error {
+	cmps []clientv3.Cmp, ops []clientv3.Op, plans []*reclaimPlan, bytes uint64,
+	data []bufferedRun, runs []arena.Run) error {
 
 	e.keyMu.Lock()
 	defer e.keyMu.Unlock()
@@ -178,6 +227,8 @@ func (s *Service) bufferWrite(ctx context.Context, e *lockEntry, m *inodeMeta,
 	}
 
 	e.pending.add(cmps, ops, plans, bytes)
+	e.pending.data = append(e.pending.data, data...)
+	e.pending.runs = append(e.pending.runs, runs...)
 	// The snapshot is republished under the same mutex the buffer is, so the
 	// two can never disagree about what this node has written.
 	if e.holder != "" {
@@ -216,6 +267,19 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 	if e.holder == "" {
 		s.discardPending(e, "the lock key backing them is gone")
 		return nil
+	}
+
+	// Data before metadata, always.  Publishing an extent whose bytes are not
+	// yet on the volume is the one inversion that turns a lost write into a read
+	// of garbage: a crash between the two leaves blocks nothing references, which
+	// is unreachable and reclaimed, while the reverse leaves a file pointing at
+	// whatever those blocks held before.
+	if err := s.flushData(e.pending); err != nil {
+		metrics.FlushFailures.WithLabelValues("device").Inc()
+		e.pending.err = err
+		s.log.Error("buffered write data not put on the device; it is kept and will be retried",
+			"ino", e.ino, "error", err)
+		return err
 	}
 
 	cmps, ops := e.pending.txn()
@@ -285,6 +349,48 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 	return nil
 }
 
+// flushData puts the buffered payload on the device, coalescing runs that turn
+// out to be adjacent into one I/O.
+//
+// Coalescing is the part of data buffering that raises the sustained rate
+// rather than only the peak: a random 4 K workload allocates from one arena, so
+// the runs behind a batch of writes are frequently contiguous even though the
+// logical offsets are scattered, and merging them turns many small device
+// writes into few large ones.
+//
+// The runs stay in the buffer, since the extents naming them are still
+// unpublished; only the payload is dropped, because from here the device is
+// where those bytes live and a retried flush must not write them twice.
+func (s *Service) flushData(p *pending) error {
+	if len(p.data) == 0 {
+		return nil
+	}
+	sort.Slice(p.data, func(i, j int) bool { return p.data[i].diskOff < p.data[j].diskOff })
+
+	for i := 0; i < len(p.data); {
+		j, length := i+1, uint64(len(p.data[i].buf))
+		for j < len(p.data) && p.data[j].diskOff == p.data[i].diskOff+length {
+			length += uint64(len(p.data[j].buf))
+			j++
+		}
+		buf, free := s.ioBuffer(int(length))
+		pos := 0
+		for _, r := range p.data[i:j] {
+			pos += copy(buf[pos:], r.buf)
+		}
+		err := s.writeRun(buf[:length], p.data[i].diskOff)
+		free()
+		if err != nil {
+			return err
+		}
+		metrics.CoalescedRuns.Observe(float64(j - i))
+		i = j
+	}
+
+	p.data = nil
+	return nil
+}
+
 // flushCommitted finishes a flush that reached etcd.
 //
 // The blocks its reclaims freed go back to the arena — only now, because before
@@ -292,7 +398,8 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 // refers to — and the cached extents take the revisions their keys now carry,
 // which is what a later comparison on those extents has to match.
 func (s *Service) flushCommitted(e *lockEntry, revs map[string]int64) {
-	for _, p := range e.pending.reset() {
+	plans, _ := e.pending.reset()
+	for _, p := range plans {
 		s.freeReclaimed(p)
 	}
 	metrics.PendingExtents.Set(0)
@@ -364,8 +471,14 @@ func (s *Service) flushAlreadyLanded(ctx context.Context, e *lockEntry) (map[str
 // blocks to the arena.
 func (s *Service) discardPending(e *lockEntry, why string) {
 	ops := len(e.pending.order)
-	for _, p := range e.pending.reset() {
+	plans, runs := e.pending.reset()
+	for _, p := range plans {
 		s.freeReclaimed(p)
+	}
+	// The extents naming these runs will never be published, so nothing on the
+	// device or in etcd refers to them and they are free to hand out again.
+	for _, r := range runs {
+		s.alloc.Free(r.DiskOff, r.Length)
 	}
 	// The cached snapshot describes writes that no longer exist anywhere.
 	e.meta, e.metaFor = nil, ""

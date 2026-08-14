@@ -60,7 +60,29 @@ func TestPendingKeepsTheFirstComparisonPerKey(t *testing.T) {
 	if p.empty() {
 		t.Error("buffer reports empty with two writes in it")
 	}
-	if plans := p.reset(); plans != nil || !p.empty() {
+	if plans, runs := p.reset(); plans != nil || runs != nil || !p.empty() {
 		t.Error("reset left the buffer non-empty")
+	}
+}
+
+// A buffered write's bytes are not on the device yet, so a read of the range it
+// covers has to come out of the buffer or the node cannot read back what it just
+// wrote.  A range the buffer does not wholly cover must fall through to the
+// device rather than be answered in part.
+func TestPendingReadAtServesOnlyWhollyBufferedRanges(t *testing.T) {
+	p := pending{data: []bufferedRun{
+		{diskOff: 8192, buf: []byte("abcd")},
+		{diskOff: 4096, buf: []byte("wxyz")},
+	}}
+
+	got := make([]byte, 2)
+	if !p.readAt(got, 8193) || string(got) != "bc" {
+		t.Errorf("read inside a buffered run = %q, %v; want \"bc\", true", got, true)
+	}
+	if p.readAt(make([]byte, 8), 8192) {
+		t.Error("a range running past the end of a run was served from the buffer")
+	}
+	if p.readAt(make([]byte, 4), 0) {
+		t.Error("an unbuffered range was served from the buffer")
 	}
 }
