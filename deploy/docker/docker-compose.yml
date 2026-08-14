@@ -143,7 +143,7 @@ services:
       - --cluster-name=docker-chaos
       - --lease-ttl=10s
       - --block-device=/block-device/etcfuse.img
-      - --log-level=1
+      - --log-level=2
       - --history-log=/var/log/etcfuse/history-n1.jsonl
     volumes:
       - meta1_sock:/var/run
@@ -169,7 +169,7 @@ services:
       - --cluster-name=docker-chaos
       - --lease-ttl=10s
       - --block-device=/block-device/etcfuse.img
-      - --log-level=1
+      - --log-level=2
       - --history-log=/var/log/etcfuse/history-n2.jsonl
     volumes:
       - meta2_sock:/var/run
@@ -195,7 +195,7 @@ services:
       - --cluster-name=docker-chaos
       - --lease-ttl=10s
       - --block-device=/block-device/etcfuse.img
-      - --log-level=1
+      - --log-level=2
       - --history-log=/var/log/etcfuse/history-n3.jsonl
     volumes:
       - meta3_sock:/var/run

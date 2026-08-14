@@ -29,8 +29,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 VOLUME="${1:-docker_history_data}"
-OUT="$(mktemp -d)"
-trap 'rm -rf "$OUT"' EXIT
+# KEEP_HISTORY_DIR preserves the copied histories instead of discarding them
+# with the temp directory. A violation reported against a history that no
+# longer exists cannot be investigated, and the volume it came from is removed
+# by the chaos suite's teardown moments later.
+if [[ -n "${KEEP_HISTORY_DIR:-}" ]]; then
+    OUT="$KEEP_HISTORY_DIR"
+    mkdir -p "$OUT"
+else
+    OUT="$(mktemp -d)"
+    trap 'rm -rf "$OUT"' EXIT
+fi
 
 if ! docker volume inspect "$VOLUME" >/dev/null 2>&1; then
     echo "[verify-history] volume $VOLUME does not exist — was a docker chaos scenario run?" >&2
