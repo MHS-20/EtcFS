@@ -52,10 +52,16 @@ const (
 	defaultFlushMaxBytes = 16 << 20
 
 	// flushIOConcurrency is how many of a flush's device writes may be in
-	// flight at once.  A provisioned volume's IOPS are bought as parallelism —
-	// one outstanding I/O reaches its latency, not its rate — so a flush that
-	// issued its writes one at a time would spend the whole batch serialized
-	// behind the device while holding an inode's lock.
+	// flight at once.  A flush that issued them one at a time would spend the
+	// whole batch at the device's latency, serialized, with an inode's lock
+	// held — which is what a queue depth of one costs and what the device's
+	// own queue exists to avoid.
+	//
+	// It buys time, not rate.  A provisioned volume meters operations per
+	// second and charges the same for a batch however it is queued, so this
+	// helps a batch of large writes, where latency is the binding constraint,
+	// and does nothing for scattered small ones — see minBufferedWriteBytes,
+	// which is where that distinction is actually made.
 	//
 	// ponytail: a constant rather than a knob, sized to keep a batch of the
 	// size the transaction op cap allows (~46 writes) inside a couple of device
@@ -381,16 +387,23 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 // flushData puts the buffered payload on the device: adjacent runs coalesced
 // into one I/O, and the resulting I/Os issued concurrently.
 //
-// Both halves matter, and the second one is what makes this affordable at all.
-// Coalescing only helps where the allocator handed out adjacent blocks, which
-// is the sequential case; a random overwrite workload frees a scattered block
-// per write and reallocates from those holes, so its runs are almost never
-// adjacent and the merge is a no-op. What is left is one small device write per
-// buffered write, and issuing those serially spends the whole flush at the
-// device's *latency* when the thing that was provisioned is its *parallelism* —
-// the same mistake a per-operation etcd commit made on the write path. A buffer
-// of ~46 writes serialized is ~46ms with this node's inode lock held; issued
-// against the device's queue it is a couple of round trips.
+// The two do different jobs, against different limits, and conflating them is
+// what made the first version of this slower than no buffering at all.
+//
+// Coalescing reduces the number of operations the device is charged for, which
+// is the only thing that helps against a provisioned volume: it meters I/O
+// operations per second, so a batch of scattered writes costs exactly what the
+// same writes cost issued one at a time. Merging needs adjacency, and only a
+// caller that has one gets this far — streakContinues turns the rest away
+// precisely because batching them would buy nothing.
+//
+// Issuing concurrently reduces the time the batch takes, which helps against
+// the device's latency at queue depth one. That is the large-write case, where
+// a single write is already a whole operation or more and the rate is not the
+// binding constraint. It buys no rate: a metered device charges the same 46
+// operations whether they are outstanding together or in sequence — measured,
+// and it is why parallel issue alone moved sequential throughput from 12 to
+// 44 MiB/s while leaving random-write p99 at 64ms.
 //
 // Every write targets a block reserved by this node and named by no published
 // extent, so they are disjoint and may be issued in any order. What may not
