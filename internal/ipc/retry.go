@@ -3,6 +3,7 @@ package ipc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -107,14 +108,6 @@ func retryEtcd(ctx context.Context, fn func(context.Context) error) error {
 	})
 }
 
-// retryKV is retryEtcd for callers that treat a total failure as "no data"
-// rather than an error, and only want it logged.
-func (s *Service) retryKV(ctx context.Context, fn func(context.Context) error) {
-	if err := retryEtcd(ctx, fn); err != nil {
-		s.log.Warn("etcd KV operation failed after retries", "error", err)
-	}
-}
-
 // heldLock is an acquired inode lock.
 //
 // The lock it holds is node-local: the etcd key behind it is cached by the
@@ -144,6 +137,18 @@ func (l *heldLock) meta(ctx context.Context) (*inodeMeta, error) {
 	}
 	metrics.MetaCache.WithLabelValues("miss").Inc()
 
+	// The snapshot and the buffer are two halves of one statement about the
+	// inode, and every path that invalidates one invalidates the other.  Losing
+	// the snapshot while writes are still buffered would send this read to etcd,
+	// which is behind by exactly those writes — so it fails instead of quietly
+	// answering from a view that is missing data this node has acknowledged.
+	l.e.keyMu.Lock()
+	orphaned := !l.e.pending.empty()
+	l.e.keyMu.Unlock()
+	if orphaned {
+		return nil, fmt.Errorf("ino %d: metadata snapshot lost with writes still buffered", l.e.ino)
+	}
+
 	var m inodeMeta
 	if err := retryEtcd(ctx, func(ictx context.Context) error {
 		var gerr error
@@ -165,6 +170,16 @@ func (l *heldLock) meta(ctx context.Context) (*inodeMeta, error) {
 func (l *heldLock) publishMeta(m *inodeMeta) {
 	l.e.setMeta(m)
 	l.metaPublished = true
+}
+
+// flush publishes this inode's deferred writes.
+//
+// Every path that reads or rewrites an inode's extents in etcd rather than
+// through the cached snapshot has to call it first: the buffer is the
+// difference between the two, and a plan built from etcd alone would rewrite a
+// file as if the writes this node has already acknowledged had not happened.
+func (l *heldLock) flush(ctx context.Context) error {
+	return l.s.flushEntry(ctx, l.e, "operation")
 }
 
 // lockModeByte encodes a LockMode as the single byte the lock history payload
@@ -318,6 +333,13 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 			s.log.Warn("lock session lost, dropping this node's cached lock",
 				"ino", e.ino, "key_lease", e.lease, "session_lease", lease)
 			e.holder, e.lease, e.meta, e.metaFor = "", 0, nil, ""
+			// Anything buffered under that key can never be published: the
+			// flush's own comparison on it would reject the transaction, and a
+			// peer may already own the inode.  Nothing in etcd references the
+			// blocks, so they go back to the arena.
+			if !e.pending.empty() {
+				s.discardPending(e, "the lock session backing them was lost")
+			}
 		}
 	}
 

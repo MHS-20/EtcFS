@@ -842,8 +842,7 @@ static void ec_rename(fuse_req_t req, fuse_ino_t old_parent, const char *old_nam
 static void ec_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_t off,
                      struct fuse_file_info *fi)
 {
-    (void) fi;
-    uint8_t *payload = malloc(24 + size);
+    uint8_t *payload = malloc(28 + size);
     uint32_t pos = 0;
     pos += wb_u64(payload + pos, ino);
     pos += wb_u64(payload + pos, (uint64_t) off);
@@ -853,6 +852,13 @@ static void ec_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t siz
     /* The backend owns the mode, so it is the only place that can drop the
      * set-user-ID bits this write costs the file. */
     pos += wb_u32(payload + pos, fuse_req_ctx(req)->uid);
+    /* The open flags as the kernel attached them to *this write*, which is
+     * where O_SYNC and O_DSYNC arrive on a direct-IO mount: the kernel sets
+     * them from fuse_write_flags() on every write request, and never sends a
+     * FUSE_FSYNC for a synchronous open, because fuse_direct_write_iter does
+     * not call generic_write_sync().  The backend decides per write whether it
+     * may defer publishing the extent. */
+    pos += wb_u32(payload + pos, (uint32_t) (fi ? fi->flags : 0));
 
     uint8_t *resp;
     uint32_t rlen;
@@ -1086,19 +1092,47 @@ static void ec_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
     (void) fi;
     fuse_reply_err(req, 0);
 }
+/* Ask the backend to publish everything it is holding for this inode, and wait
+ * for it.  Both fsync and flush go through here: a write is acknowledged before
+ * its extent reaches etcd, so neither can be answered locally any more, and a
+ * failure has to reach the caller rather than be swallowed. */
+static void ec_sync_inode(fuse_req_t req, fuse_ino_t ino)
+{
+    uint8_t payload[8];
+    uint32_t off = wb_u64(payload, ino);
+
+    uint8_t *resp;
+    uint32_t rlen;
+    if (ipc_sync(FD(ctx), IPC_OP_FSYNC, payload, off, &resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+    int32_t e = 0;
+    if (rlen >= 4)
+        e = (int32_t) ((uint32_t) resp[0] << 24 | (uint32_t) resp[1] << 16 |
+                       (uint32_t) resp[2] << 8 | (uint32_t) resp[3]);
+    free(resp);
+    fuse_reply_err(req, e != 0 ? -e : 0);
+}
+
+/* close() sends this, so it is where a program that never calls fsync still
+ * gets its writes published before the descriptor goes away. */
 static void ec_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    (void) ino;
     (void) fi;
-    fuse_reply_err(req, 0);
+    ec_sync_inode(req, ino);
 }
+/* datasync is ignored: this filesystem has no attribute state that outlives a
+ * write independently of the extent publishing it, so both halves of the
+ * distinction flush the same thing. */
 static void ec_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
-    (void) ino;
     (void) datasync;
     (void) fi;
-    fuse_reply_err(req, 0);
+    ec_sync_inode(req, ino);
 }
+/* Namespace operations are never deferred — they commit before they are
+ * acknowledged — so there is nothing for a directory fsync to wait on. */
 static void ec_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
     (void) ino;

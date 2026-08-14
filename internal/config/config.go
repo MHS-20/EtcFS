@@ -74,6 +74,15 @@ type Config struct {
 	// volatile write cache needs them; buffered mode turns them on regardless.
 	WriteBarriers bool
 
+	// MetadataFlushInterval bounds how long a write acknowledged to the kernel
+	// may sit with its extent buffered in RAM instead of published to etcd.
+	// While this node holds an inode's exclusive lock no peer can read it, so
+	// deferring the commit costs nothing cross-node except a peer's stat
+	// freshness — and a crash loses whatever has not been flushed, which is
+	// what fsync and O_SYNC exist to bound.  Zero commits every write before
+	// acknowledging it, which loses nothing and pays a Raft commit per write.
+	MetadataFlushInterval time.Duration
+
 	// NotifyAddr is the socket the C daemon connects to for cache-invalidation
 	// notifications.  Configurable for the same reason ListenAddr is: two
 	// daemons on one host need two paths.
@@ -128,6 +137,7 @@ func Parse() *Config {
 
 	var etcdEndpoints string
 	var leaseTTL string
+	var flushInterval string
 
 	flag.StringVar(&cfg.NotifyAddr, "notify-socket", DefaultNotifySocket,
 		"Unix socket the C daemon connects to for cache-invalidation notifications")
@@ -170,6 +180,8 @@ func Parse() *Config {
 		"Permit opening the data device without O_DIRECT; unsafe on a device attached to more than one node")
 	flag.BoolVar(&cfg.WriteBarriers, "write-barriers", false,
 		"Flush the device cache, sync the range and read it back after every write; needed only on a device with a volatile write cache that does not publish an acknowledged O_DIRECT write to its other attachers (always on without O_DIRECT)")
+	flag.StringVar(&flushInterval, "metadata-flush-interval", "100ms",
+		"How long a write's extent may stay buffered in memory before it is published to etcd; 0 commits every write before acknowledging it (durable, one Raft commit per write)")
 	flag.StringVar(&cfg.EC2InstanceID, "ec2-instance-id", "",
 		"This node's EC2 instance ID, recorded in its membership key so peers can detach the volume when it expires")
 	flag.StringVar(&cfg.HistoryLog, "history-log", "",
@@ -190,6 +202,23 @@ func Parse() *Config {
 		fmt.Fprintln(os.Stderr, "-nvme-reservations requires -volume-id or -block-device")
 		os.Exit(1)
 	}
+
+	fi, err := time.ParseDuration(flushInterval)
+	if err != nil || fi < 0 {
+		fmt.Fprintf(os.Stderr, "invalid metadata-flush-interval %q\n", flushInterval)
+		os.Exit(1)
+	}
+	// A buffer is published before its inode's lock is given up, and a request
+	// that has to wait for that flush is bounded by the request deadline.  An
+	// interval at or above it would let a peer's recall time out against a
+	// holder that was still within its own flush interval.
+	if fi >= RequestTimeout {
+		fmt.Fprintf(os.Stderr,
+			"metadata-flush-interval %s is at or above the %s request timeout: "+
+				"a peer's recall would time out waiting for the flush\n", fi, RequestTimeout)
+		os.Exit(1)
+	}
+	cfg.MetadataFlushInterval = fi
 
 	d, err := time.ParseDuration(leaseTTL)
 	if err != nil {

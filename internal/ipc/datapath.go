@@ -65,17 +65,25 @@ func (s *Service) directSafe(buf []byte) bool {
 	return uintptr(len(buf))%ss == 0 && uintptr(unsafe.Pointer(&buf[0]))%ss == 0
 }
 
-// WRITE payload: [u64:ino][u64:offset][u32:data_len][data][u32:uid]
+// WRITE payload: [u64:ino][u64:offset][u32:data_len][data][u32:uid][u32:flags]
 // Response: [i32:error][u32:written]
 //
 // The caller's uid rides along because a write by an unprivileged user has to
 // drop the file's set-user-ID and set-group-ID bits, and the mode lives in
 // EtcFS's own inode record rather than anywhere the kernel can clear it.
+//
+// flags are the open flags the kernel attached to this write, not to the open.
+// They are what says whether the write may be deferred: with FOPEN_DIRECT_IO a
+// synchronous open produces no FUSE_FSYNC at all, because the kernel writes
+// through fuse_direct_write_iter and never reaches generic_write_sync — so
+// waiting for one would wait forever.  The flags arrive on every write instead
+// (fuse_send_write sets inarg->flags from fuse_write_flags, and libfuse
+// surfaces it as fi->flags), which is why the decision is made per write.
 func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, error) {
 	r := newReader(payload)
 	ino, offset := r.u64(), r.u64()
 	data := r.blob()
-	uid := r.u32()
+	uid, flags := r.u32(), r.u32()
 	if !r.ok {
 		return int32Resp(-22), nil
 	}
@@ -84,7 +92,7 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 	// The record is read under the inode lock on the block-device path, so that
 	// a lock this node already holds can answer it without a round trip.
 	if s.dev != nil {
-		return s.handleWriteBlock(ctx, ino, offset, data, uid)
+		return s.handleWriteBlock(ctx, ino, offset, data, uid, flags)
 	}
 
 	rec, err := s.store.GetInode(ctx, ino)
@@ -105,7 +113,7 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 }
 
 func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint64,
-	data []byte, uid uint32) ([]byte, error) {
+	data []byte, uid uint32, flags uint32) ([]byte, error) {
 
 	dataLen := len(data)
 	if dataLen == 0 {
@@ -125,6 +133,18 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		return int32Resp(-11), nil // EAGAIN after retries
 	}
 	defer lk.Release()
+
+	// A synchronous write publishes everything this inode has outstanding, and
+	// does it before reading the metadata below: the snapshot describes
+	// buffered extents under revisions that exist nowhere but in this node's
+	// memory, and a proposal built from those could not compare against etcd.
+	sync := !s.deferWrites() || flags&oDSync != 0
+	if sync && s.hasPending(ino) {
+		if ferr := s.flushEntry(ctx, lk.e, "sync_write"); ferr != nil {
+			s.log.Warn("write: cannot publish this inode's deferred writes", "ino", ino, "error", ferr)
+			return int32Resp(-5), nil
+		}
+	}
 
 	// One lookup answers everything this write needs to know about the inode:
 	// the record it may have to rewrite, and the extents that decide the chunk
@@ -297,6 +317,47 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	}
 
 	cmps, ops := proposal()
+
+	// While this node holds the inode's exclusive lock no peer can take even a
+	// shared one, so the extent does not have to be in etcd for the write to be
+	// correct — only before the lock is given up.  Buffering it there instead of
+	// committing takes the Raft commit off the write path entirely; see
+	// delegate.go for what the flush has to assert to make that safe.
+	//
+	// Three things send a write down the committing path anyway: deferral being
+	// switched off, the caller having asked for a synchronous write, and a
+	// transaction this node cannot replay into its own cache — the buffer is
+	// that replay, so a proposal it cannot account for has nothing to be folded
+	// into.
+	if !sync && len(deferredReclaim) == 0 {
+		if m := afterCommit(ino, existing, rec, ops, 0); m != nil {
+			if berr := s.bufferWrite(ctx, lk.e, m, cmps, ops, plans, uint64(dataLen)); berr != nil {
+				freeRuns()
+				s.log.Warn("write: cannot buffer the extent", "ino", ino, "error", berr)
+				return int32Resp(-5), nil
+			}
+			lk.metaPublished = true
+			return writtenResp(uint32(dataLen)), nil
+		}
+	}
+
+	// This write is committing after all, and the proposal above may have been
+	// built over buffered extents.  Publish them and plan again from what etcd
+	// now holds.
+	if s.hasPending(ino) {
+		if ferr := s.flushEntry(ctx, lk.e, "sync_write"); ferr != nil {
+			freeRuns()
+			s.log.Warn("write: cannot publish this inode's deferred writes", "ino", ino, "error", ferr)
+			return int32Resp(-5), nil
+		}
+		if xerr := readExtents(); xerr != nil {
+			freeRuns()
+			s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
+			return int32Resp(-5), nil
+		}
+		cmps, ops = proposal()
+	}
+
 	committed, fenced, rev, cerr := s.commitGuarded(ctx, cmps, ops)
 	if cerr == nil && !committed && !fenced {
 		// The list this proposal was built from missed a chunk that exists, so

@@ -70,7 +70,26 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(-5), nil
 	}
 
-	return entryResp(ino, rec), nil
+	return entryResp(ino, s.withPendingSize(rec)), nil
+}
+
+// withPendingSize replaces a record's size with the size this node's own
+// unpublished writes have left the file at.
+//
+// etcd is behind by up to the flush interval for an inode this node is writing,
+// so without this a write followed by a stat on the same node reports the size
+// from before the write.  A peer's stat still reads etcd and still lags: that
+// lag is what deferring publication costs, and it is bounded by the flush
+// interval.  Copying rather than mutating keeps the cached record immutable,
+// which every other reader of it relies on.
+func (s *Service) withPendingSize(rec *metadata.InodeRecord) *metadata.InodeRecord {
+	size, found := s.pendingSize(rec.Ino)
+	if !found || size == rec.Size {
+		return rec
+	}
+	updated := *rec
+	updated.Size = size
+	return &updated
 }
 
 // GETATTR payload: [u64:ino]
@@ -87,7 +106,7 @@ func (s *Service) handleGetattr(ctx context.Context, payload []byte) ([]byte, er
 		return int32Resp(-2), nil // ENOENT
 	}
 
-	return attrResp(rec), nil
+	return attrResp(s.withPendingSize(rec)), nil
 }
 
 // READDIR payload: [u64:ino][u64:offset][u32:size]
@@ -161,7 +180,7 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 		if rec == nil {
 			rec = &metadata.InodeRecord{Ino: e.Ino}
 		}
-		b.wAttr(rec)
+		b.wAttr(s.withPendingSize(rec))
 		b.w32(1) // entry_timeout (seconds)
 		b.w32(1) // attr_timeout (seconds)
 	}
@@ -348,6 +367,10 @@ func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error
 		}
 		defer lk.Release()
 
+		if ferr := lk.flush(ctx); ferr != nil {
+			s.log.Warn("open: cannot publish deferred writes before truncating", "ino", ino, "error", ferr)
+			return int32Resp(-5), nil
+		}
 		if err := s.truncateToZero(ctx, ino); err != nil {
 			s.log.Warn("open: truncate failed", "ino", ino, "error", err)
 			return int32Resp(errnoFor(err, -5)), nil
@@ -486,6 +509,15 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(-2), nil
 	}
 
+	// write(); close(); rename() is how a program publishes a file atomically,
+	// and it only works if the data is there by the time the name is.  Renaming
+	// while this node still had the writes buffered would name a file whose
+	// content is a flush interval behind — the ext4 delayed-allocation trap.
+	if ferr := s.flushInode(ctx, ino); ferr != nil {
+		s.log.Warn("rename: cannot publish deferred writes", "ino", ino, "error", ferr)
+		return int32Resp(-5), nil
+	}
+
 	err = s.store.AtomicRename(ctx, oldParent, oldName, newParent, newName, ino, flags)
 	if err != nil {
 		return int32Resp(errnoFor(err, -17)), nil // EEXIST or other, unless fenced
@@ -541,6 +573,16 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 			return int32Resp(-11), nil // EAGAIN
 		}
 		defer lk.Release()
+
+		// The record and extents below are read from etcd, so what this node
+		// has buffered has to be there first — otherwise a shrink plans against
+		// a file missing its most recent writes, and the size published here
+		// overwrites theirs.
+		if ferr := lk.flush(ctx); ferr != nil {
+			s.log.Warn("setattr: cannot publish deferred writes before a size change",
+				"ino", ino, "error", ferr)
+			return int32Resp(-5), nil
+		}
 	}
 
 	rec, rev, err := s.store.GetInodeRev(ctx, ino)
@@ -642,6 +684,13 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 	ino, newParent, name := r.u64(), r.u64(), r.str()
 	if !r.ok {
 		return int32Resp(-22), nil
+	}
+
+	// A second name for the inode, for the same reason a rename gets one: the
+	// name must not become reachable before the data it points at.
+	if ferr := s.flushInode(ctx, ino); ferr != nil {
+		s.log.Warn("link: cannot publish deferred writes", "ino", ino, "error", ferr)
+		return int32Resp(-5), nil
 	}
 
 	rec, err := s.store.AtomicLink(ctx, ino, newParent, name)

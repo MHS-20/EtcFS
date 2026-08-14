@@ -73,9 +73,8 @@ type op struct {
 	handle func(*Service, context.Context, []byte) ([]byte, error)
 }
 
-// ok answers an operation that has no distributed state to keep: open, close
-// and flush take no locks, and every write is committed before it is
-// acknowledged, so there is nothing left to do at these points.
+// ok answers an operation that has no distributed state to keep: opening and
+// closing a directory take no locks and defer nothing.
 func ok(*Service, context.Context, []byte) ([]byte, error) { return okResp(), nil }
 
 // unsupported answers an opcode the backend deliberately does not serve.
@@ -111,8 +110,11 @@ var ops = map[uint16]op{
 	ipcOpOpendir:     {"opendir", ok},
 	ipcOpRelease:     {"release", (*Service).handleRelease},
 	ipcOpReleasedir:  {"releasedir", ok},
-	ipcOpFlush:       {"flush", ok},
-	ipcOpFsync:       {"fsync", ok},
+	// Both publish this inode's deferred writes and block until they are in
+	// etcd.  flush arrives on every close(), fsync on the call of that name;
+	// neither can be answered locally once a write may be sitting in RAM.
+	ipcOpFlush: {"flush", (*Service).handleFsync},
+	ipcOpFsync: {"fsync", (*Service).handleFsync},
 	// Block allocation happens inside the WRITE handler, not as a separate
 	// request; these opcodes are unused.
 	ipcOpAlloc:  {"alloc", unsupported},
@@ -122,6 +124,9 @@ var ops = map[uint16]op{
 // mutatingOps are the opcodes a read-only mount rejects with EROFS instead of
 // dispatching. Everything else (lookups, reads, release/flush, statfs) is safe
 // to serve: it changes no metadata and touches the device only to read it.
+// fsync and flush do commit metadata, but only metadata a write left buffered,
+// and a read-only mount rejects every write — so they have nothing to publish
+// and refusing them would only break close().
 // Open is here because the daemon sends it only for O_TRUNC, which empties the
 // file.
 var mutatingOps = map[uint16]bool{
@@ -479,7 +484,7 @@ func (s *Service) dispatch(code uint16, payload []byte) ([]byte, error) {
 	// handlers make: a context without a deadline blocks for as long as the
 	// etcd client will keep retrying, which under a partition is indefinitely,
 	// and every handler inherits this one.  Calls that manage their own budget
-	// (commitGuarded, retryKV) build their contexts from Background and are
+	// (commitGuarded, a flush) build their contexts from Background and are
 	// deliberately not truncated by this deadline — a commit already in flight
 	// should finish or fail on its own terms rather than be cut mid-transaction.
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)

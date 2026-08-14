@@ -72,6 +72,48 @@ var (
 		Help: "Data-path metadata lookups, by whether the lock-held cache answered them.",
 	}, []string{"result"})
 
+	// PendingExtents holds how many metadata keys are buffered but not yet
+	// published.  Together with PendingBytes it is the size of what a crash
+	// would lose right now, which is the number an operator weighing the flush
+	// interval actually wants.
+	PendingExtents = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "etcfuse_pending_extents",
+		Help: "Metadata keys written by acknowledged writes and not yet published to etcd.",
+	})
+
+	// PendingBytes holds how much acknowledged write payload those keys stand
+	// for.
+	PendingBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "etcfuse_pending_bytes",
+		Help: "Acknowledged write payload whose extents are not yet published to etcd.",
+	})
+
+	// Flushes counts publications of a buffer, by what triggered them
+	// (interval, buffer_full, sync_write, operation, recall, eviction,
+	// shutdown).  A run dominated by "recall" means the flush interval is
+	// losing to cross-node contention rather than to the timer.
+	Flushes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_metadata_flush_total",
+		Help: "Publications of deferred metadata, by trigger.",
+	}, []string{"trigger"})
+
+	// FlushFailures counts flushes that did not publish, by why (error,
+	// rejected, fenced).  Anything but zero is worth an alert: "error" means
+	// acknowledged writes are sitting unpublished, and the other two mean they
+	// were discarded.
+	FlushFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_metadata_flush_failures_total",
+		Help: "Flushes of deferred metadata that did not publish, by reason.",
+	}, []string{"reason"})
+
+	// FlushDuration observes how long publishing a buffer takes.  It is the
+	// latency an fsync pays, and the one a recalled peer waits out.
+	FlushDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "etcfuse_metadata_flush_duration_seconds",
+		Help:    "Latency of publishing deferred metadata to etcd.",
+		Buckets: prometheus.ExponentialBuckets(0.0005, 3, 10),
+	})
+
 	// BlockIO counts block-device operations, by direction (read, write).
 	BlockIO = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "etcfuse_block_io_total",

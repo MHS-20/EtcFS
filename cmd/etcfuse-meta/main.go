@@ -305,6 +305,12 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	log.Info("binary IPC server starting")
 	svc.StartNotificationServer(ctx)
 	svc.StartLockRevocation(ctx)
+	svc.SetFlushInterval(cfg.MetadataFlushInterval)
+	svc.StartFlusher(ctx)
+	if cfg.MetadataFlushInterval > 0 {
+		log.Info("deferring extent publication; a crash loses writes not yet flushed or fsynced",
+			"flush_interval", cfg.MetadataFlushInterval)
+	}
 	go func() {
 		if err := ipc.StartNotifyServer(svc, cfg.NotifyAddr); err != nil {
 			// Not fatal: the mount works without it, but every node's caches

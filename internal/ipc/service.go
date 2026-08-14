@@ -8,6 +8,7 @@ package ipc
 import (
 	"context"
 	"sync"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
@@ -33,6 +34,15 @@ type Service struct {
 	// writeBarriers adds a device flush, a range sync and a readback to every
 	// write, and a device flush to every read.  See writeRun.
 	writeBarriers bool
+
+	// flushInterval is how long an inode's extents may stay buffered in RAM
+	// before they are published to etcd.  Zero disables deferral entirely, so
+	// every write commits before it is acknowledged.  See delegate.go.
+	flushInterval time.Duration
+	// flushMaxBytes caps the write payload one buffer may stand for, so a hot
+	// inode cannot turn an unbounded amount of acknowledged data into data that
+	// a crash would lose.
+	flushMaxBytes uint64
 
 	// readOnly rejects every mutating opcode with EROFS before it reaches a
 	// handler. Checked in dispatch rather than per-handler so a new mutating
@@ -70,15 +80,25 @@ type Service struct {
 func NewService(store *metadata.Store, membership *metadata.Membership,
 	watchdog *fencing.Watchdog, log *config.Logger) *Service {
 	return &Service{
-		store:      store,
-		membership: membership,
-		watchdog:   watchdog,
-		alloc:      arena.NewAllocator(membership.NodeID(), store),
-		log:        log,
-		openCount:  make(map[uint64]int),
-		orphaned:   make(map[uint64]bool),
-		locks:      make(map[uint64]*lockEntry),
+		store:         store,
+		membership:    membership,
+		watchdog:      watchdog,
+		alloc:         arena.NewAllocator(membership.NodeID(), store),
+		log:           log,
+		openCount:     make(map[uint64]int),
+		orphaned:      make(map[uint64]bool),
+		locks:         make(map[uint64]*lockEntry),
+		flushInterval: defaultFlushInterval,
+		flushMaxBytes: defaultFlushMaxBytes,
 	}
+}
+
+// SetFlushInterval bounds how long an acknowledged write may stay unpublished.
+// Zero commits every write before acknowledging it, which is the behaviour
+// before write delegation: nothing is ever lost by a crash, and every write
+// carries a Raft commit.
+func (s *Service) SetFlushInterval(d time.Duration) {
+	s.flushInterval = d
 }
 
 // SetBlockDevice attaches a block device for data I/O.

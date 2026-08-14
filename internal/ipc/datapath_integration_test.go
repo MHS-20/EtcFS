@@ -110,6 +110,7 @@ func writePayload(ino, offset uint64, data []byte, uid uint32) []byte {
 	b.w32(uint32(len(data)))
 	b.b = append(b.b, data...)
 	b.w32(uid)
+	b.w32(0) // open flags: neither O_SYNC nor O_DSYNC
 	return b.b
 }
 

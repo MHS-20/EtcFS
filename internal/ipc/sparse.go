@@ -40,6 +40,14 @@ func (s *Service) handleLseek(ctx context.Context, payload []byte) ([]byte, erro
 		return int32Resp(-22), nil // EINVAL: the kernel handles SET/CUR/END
 	}
 
+	// Both answers come from the extent map in etcd, which is behind by
+	// whatever this node has buffered — a SEEK_DATA over a range only this node
+	// has written would otherwise report a hole.
+	if ferr := s.flushInode(ctx, ino); ferr != nil {
+		s.log.Warn("lseek: cannot publish deferred writes", "ino", ino, "error", ferr)
+		return int32Resp(-5), nil
+	}
+
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
 		return int32Resp(-2), nil // ENOENT
@@ -112,6 +120,13 @@ func (s *Service) handleFallocate(ctx context.Context, payload []byte) ([]byte, 
 		return int32Resp(-11), nil // EAGAIN
 	}
 	defer lk.Release()
+
+	// Both modes plan against what etcd holds, so this node's own buffered
+	// writes have to be published before the plan is built.
+	if ferr := lk.flush(ctx); ferr != nil {
+		s.log.Warn("fallocate: cannot publish deferred writes", "ino", ino, "error", ferr)
+		return int32Resp(-5), nil
+	}
 
 	switch {
 	case mode&fallocPunchHole != 0:

@@ -96,7 +96,51 @@ type lockEntry struct {
 	meta    *inodeMeta
 	metaFor string
 
+	// pending is the metadata this node's writes have produced and not yet
+	// published.  It lives beside meta, under the same mutex and the same
+	// validity rule, because it is the other half of one statement about the
+	// inode: meta says what this node believes the file is, and pending says
+	// which part of that belief etcd has not been told yet.  See delegate.go.
+	pending *pending
+
 	lastUsed time.Time // guarded by Service.lockMu
+}
+
+// hasPending reports whether an inode has writes this node has acknowledged
+// and not yet published.  Takes no lock on the entry itself, so it is safe on
+// a path that must not block behind an operation in flight.
+func (s *Service) hasPending(ino uint64) bool {
+	s.lockMu.Lock()
+	e := s.locks[ino]
+	s.lockMu.Unlock()
+	if e == nil {
+		return false
+	}
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+	return !e.pending.empty()
+}
+
+// pendingSize returns an inode's size as this node's own unpublished writes
+// have left it.
+//
+// Only consulted when writes are actually deferred: without it a write
+// followed by a stat on the same node reports the size etcd still carries,
+// which is the size before the write.  A peer's stat still reads etcd and lags
+// by up to the flush interval, which is the delegation's cost.
+func (s *Service) pendingSize(ino uint64) (uint64, bool) {
+	s.lockMu.Lock()
+	e := s.locks[ino]
+	s.lockMu.Unlock()
+	if e == nil {
+		return 0, false
+	}
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+	if e.pending.empty() || e.holder == "" || e.metaFor != e.holder || e.meta == nil || e.meta.rec == nil {
+		return 0, false
+	}
+	return e.meta.rec.Size, true
 }
 
 // inodeMeta is an inode's metadata as of one revision: the record and the
@@ -198,18 +242,45 @@ func (s *Service) evictLocksLocked() {
 		if victim == nil {
 			return
 		}
+		if err := s.dropCachedLock(victim, "eviction"); err != nil {
+			// Its writes are not published, so its lock cannot be given up.
+			// Leaving it in the cache keeps the buffer reachable by the flush
+			// interval; the cache runs over its bound until then, which the
+			// bound already tolerates.
+			victim.rw.Unlock()
+			return
+		}
 		delete(s.locks, oldest)
-		s.dropCachedLock(victim)
 		victim.rw.Unlock()
 	}
 }
 
-// dropCachedLock deletes an entry's etcd key.  The caller must hold the
-// entry's write lock, so no operation is running under the lock being dropped.
-func (s *Service) dropCachedLock(e *lockEntry) {
+// dropCachedLock publishes anything this node has buffered for the inode and
+// then deletes its etcd key.  The caller must hold the entry's write lock, so
+// no operation is running under the lock being dropped.
+//
+// The flush comes first and its failure aborts the drop.  Yielding the key with
+// writes still buffered would let a peer read a file missing the writes this
+// node has already acknowledged, and the flush can never succeed afterwards —
+// its own comparison on the lock key would reject it.  Refusing to yield makes
+// the peer wait, which is the safe direction to fail in.
+func (s *Service) dropCachedLock(e *lockEntry, trigger string) error {
 	e.keyMu.Lock()
 	defer e.keyMu.Unlock()
+
+	if !e.pending.empty() {
+		// A context of its own, for the same reason the release below has one:
+		// this runs off whatever request last touched the inode, and may run
+		// with none at all.
+		ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
+		err := s.flushLocked(ctx, e, trigger)
+		cancel()
+		if err != nil && !e.pending.empty() {
+			return err
+		}
+	}
 	s.releaseKeyLocked(e)
+	return nil
 }
 
 // releaseKeyLocked deletes an entry's etcd key with keyMu already held.
@@ -221,6 +292,12 @@ func (s *Service) releaseKeyLocked(e *lockEntry) {
 	holder, mode := e.holder, e.mode
 	e.holder, e.lease = "", 0
 	e.meta, e.metaFor = nil, ""
+	// Every caller is expected to have published or discarded its buffer before
+	// reaching here.  Reaching it with one still standing is a bug, and the only
+	// thing left to do about it is give the blocks back rather than leak them.
+	if !e.pending.empty() {
+		s.discardPending(e, "the lock key was released with writes still buffered")
+	}
 	if holder == "" {
 		return
 	}
@@ -290,7 +367,11 @@ func (s *Service) recallLock(ino uint64) {
 
 	e.rw.Lock()
 	defer e.rw.Unlock()
-	s.dropCachedLock(e)
+	if err := s.dropCachedLock(e, "recall"); err != nil {
+		s.log.Error("cached inode lock not yielded: this node's writes to it are not published",
+			"ino", ino, "error", err)
+		return
+	}
 	s.log.Debug("yielded a cached inode lock to a peer", "ino", ino)
 }
 
@@ -310,7 +391,15 @@ func (s *Service) ReleaseCachedLocks() {
 
 	for _, e := range entries {
 		e.rw.Lock()
-		s.dropCachedLock(e)
+		if err := s.dropCachedLock(e, "shutdown"); err != nil {
+			// Last chance: the process is exiting, so a buffer kept here dies
+			// with it either way, and the blocks are better returned to the
+			// arena than left allocated for the next incarnation to reconstruct.
+			e.keyMu.Lock()
+			s.discardPending(e, "this node is shutting down and the writes could not be published")
+			s.releaseKeyLocked(e)
+			e.keyMu.Unlock()
+		}
 		e.rw.Unlock()
 	}
 }
