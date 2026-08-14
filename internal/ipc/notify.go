@@ -75,20 +75,22 @@ func (n *notifyServer) send(msg []byte, ack bool) error {
 		_, rerr := n.conn.Read(b[:])
 		return rerr
 	}()
-	if err == nil && ack {
-		if b[0] != 0 {
-			// The stream is still in step — the client answered — so the
-			// connection stays up and only this call failed.
-			return errors.New("the client reported the invalidation failed")
-		}
+	if err == nil && ack && b[0] != 0 {
+		// The stream is still in step — the client answered — so the connection
+		// stays up and only this call failed.
+		return errors.New("the client reported the invalidation failed")
 	}
 	if err != nil {
 		// The stream carries a reply per acknowledged message, so a connection
 		// that has failed part way through one can no longer be read in step.
+		// It is reported as a lost client rather than as an I/O error, because
+		// what the caller has to know is that there is nobody there — not which
+		// syscall said so.
 		_ = n.conn.Close()
 		n.conn = nil
+		return fmt.Errorf("%w: %v", errNoNotifyClient, err)
 	}
-	return err
+	return nil
 }
 
 // set installs a new connection, closing whatever it replaces.
@@ -153,6 +155,14 @@ func (s *Service) sendInvalEntry(parent, name string) {
 //
 // A no-op when nothing could have been cached — page caching switched off, or
 // no open ever told the kernel it could cache this filesystem's data.
+//
+// A client that has gone away is also a no-op, and deliberately so: the client
+// is the FUSE session, so its pages died with it and there is nothing left to
+// invalidate.  Refusing to yield in that case would leave every inode this node
+// had cached locked against the whole cluster until the process exited, which is
+// an outage in exchange for invalidating a cache that no longer exists.  A
+// client that is still there and reports the invalidation failed is the real
+// failure, and that one does stop the release.
 func (s *Service) invalidatePages(ino uint64) error {
 	if !s.pagesCacheable() {
 		return nil
@@ -160,10 +170,20 @@ func (s *Service) invalidatePages(ino uint64) error {
 	buf := make([]byte, 12)
 	binary.BigEndian.PutUint32(buf[0:4], notifyInvalInode)
 	binary.BigEndian.PutUint64(buf[4:12], ino)
-	if err := s.notifyServer.send(buf, true); err != nil {
+	err := s.notifyServer.send(buf, true)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errNoNotifyClient):
+		// Nothing can be cached again until a client reconnects and an open is
+		// answered, and that open sets the flag afresh.
+		s.pagesCached.Store(false)
+		s.log.Warn("no client to invalidate kernel pages; its FUSE session and their pages are gone with it",
+			"ino", ino, "error", err)
+		return nil
+	default:
 		return fmt.Errorf("invalidate kernel pages for ino %d: %w", ino, err)
 	}
-	return nil
 }
 
 func (s *Service) acceptNotifyConn(conn net.Conn) {
