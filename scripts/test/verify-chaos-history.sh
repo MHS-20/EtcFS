@@ -4,6 +4,15 @@
 #
 # Usage:
 #   scripts/test/verify-chaos-history.sh
+#   CRASHED=n1,n2 scripts/test/verify-chaos-history.sh
+#
+# CRASHED names the nodes the scenario SIGKILLed rather than shut down. Writes
+# are acknowledged out of the daemon's own memory and published by a later
+# flush, so a killed node legitimately loses whatever it had not yet flushed —
+# and the extent model refuses to excuse that loss for any node not named here,
+# because a write vanishing under a healthy cluster is exactly the failure it
+# exists to catch. Naming a node that did not die only weakens the check; not
+# naming one that did makes it report a violation that is not one.
 #
 # Every node in deploy/docker/docker-compose.yml is started with
 # --history-log writing into the shared history_data volume; this script
@@ -48,4 +57,4 @@ cd "$PROJECT_ROOT"
 go build -o "$OUT/verify-history" ./cmd/verify-history
 
 echo "[verify-history] checking: $joined"
-"$OUT/verify-history" --files="$joined"
+"$OUT/verify-history" --files="$joined" ${CRASHED:+--crashed="$CRASHED"}
