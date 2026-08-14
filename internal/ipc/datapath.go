@@ -365,10 +365,13 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		var bufData []bufferedRun
 		var bufRuns []arena.Run
 		bytes := uint64(dataLen)
-		// The extent is deferred either way; only the bytes are in question, and
-		// they are worth holding back only when the flush can merge them with
-		// their neighbours.  See streakContinues.
-		if s.dataCache && lk.e.streakContinues(runs) {
+		// The extent is deferred either way; only the bytes are in question.
+		// Holding them back pays when the flush can merge them into fewer device
+		// operations, and separately when the write is large enough that the
+		// workload is bound by device latency rather than by the operation rate.
+		// Neither holds for a small scattered write, and for that one the buffer
+		// is a burst with nothing bought back.
+		if s.dataCache && (lk.e.streakContinues(runs) || dataLen >= minBufferedWriteBytes) {
 			payload := make([]byte, padded)
 			copy(payload, data)
 			pos := uint64(0)

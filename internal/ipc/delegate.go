@@ -63,6 +63,23 @@ const (
 	// different queue depth.
 	flushIOConcurrency = 32
 
+	// minBufferedWriteBytes is the write size above which the payload is worth
+	// buffering even when it continues nothing.
+	//
+	// The two regimes a shared volume presents want opposite things.  Small
+	// scattered writes are rate-limited — a provisioned volume meters I/O
+	// operations per second — so batching them changes nothing about the cost and
+	// only turns steady latency into a burst; only merging adjacent ones into
+	// fewer operations helps, which is what streakContinues detects.  A large
+	// write is already a whole operation or more, so its workload is bound by the
+	// device's latency at queue depth one instead, and there batching is pure
+	// gain: the flush issues the batch against the device's queue rather than one
+	// write at a time.
+	//
+	// 64 KiB sits above the point a write stops being cheap to meter and starts
+	// being worth pipelining.
+	minBufferedWriteBytes = 64 << 10
+
 	// oDSync is O_DSYNC as the kernel passes it in a write request's flags.
 	// O_SYNC carries this bit too, so one test covers both.
 	oDSync = 0o10000
