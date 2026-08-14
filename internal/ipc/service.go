@@ -89,6 +89,12 @@ type Service struct {
 	lockMu sync.Mutex
 	locks  map[uint64]*lockEntry
 
+	// recalling names the inodes with a recall already in flight, so that a
+	// burst of want events for one inode starts one yield rather than a race
+	// between several for the same key. See StartLockRevocation.
+	recallMu  sync.Mutex
+	recalling map[uint64]bool
+
 	// Fencing generation this node started with.  Every data-path commit is
 	// guarded against it, so once the fencing controller bumps gen:<node_id>
 	// this node's commits stop being accepted by etcd.
@@ -109,6 +115,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		openCount:     make(map[uint64]int),
 		orphaned:      make(map[uint64]bool),
 		locks:         make(map[uint64]*lockEntry),
+		recalling:     make(map[uint64]bool),
 		notifyServer:  &notifyServer{},
 		flushInterval: defaultFlushInterval,
 		flushMaxBytes: defaultFlushMaxBytes,
@@ -189,8 +196,9 @@ func (s *Service) ReconstructArenas(ctx context.Context) error {
 	return s.alloc.Reconstruct(ctx)
 }
 
-// Allocator returns this node's block allocator, so background passes (the
-// scrubber's orphan reclamation) can return disk ranges to it.
+// Allocator returns this node's block allocator, for background passes that
+// need to ask it about the device or sweep it.  Anything that *returns* space
+// wants Reclaimer instead, so the release lands in the history.
 func (s *Service) Allocator() *arena.Allocator {
 	return s.alloc
 }
@@ -198,6 +206,28 @@ func (s *Service) Allocator() *arena.Allocator {
 func (s *Service) FreeBlock(diskOff, length uint64) {
 	s.freeBlocks(diskOff, length)
 }
+
+// Reclaimer returns the allocator wrapped so that a background pass returning
+// disk ranges is recorded in the operation history like every other release.
+//
+// Handing out the bare allocator instead is what made the scrubber's
+// reclamations invisible: freeBlocks is the single point every release is
+// supposed to pass through, and a range the scrubber freed silently, then
+// handed out again, read as one block reserved twice with nothing between —
+// a corruption report for a history that was merely incomplete.
+func (s *Service) Reclaimer() interface {
+	Free(diskOff, size uint64)
+	Owns(diskOff uint64) bool
+} {
+	return recordedReclaimer{s}
+}
+
+// recordedReclaimer satisfies scrub.Reclaimer structurally, so the scrubber
+// needs no knowledge of this package and this package needs no import of it.
+type recordedReclaimer struct{ s *Service }
+
+func (r recordedReclaimer) Free(diskOff, size uint64) { r.s.freeBlocks(diskOff, size) }
+func (r recordedReclaimer) Owns(diskOff uint64) bool  { return r.s.alloc.Owns(diskOff) }
 
 // Store returns the underlying metadata store.
 func (s *Service) Store() *metadata.Store {

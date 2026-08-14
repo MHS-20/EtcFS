@@ -152,8 +152,9 @@ func TestIntegration_LockAcquireRelease(t *testing.T) {
 	assert.True(t, locked)
 
 	// Release
-	err = store.ReleaseLock(ctx, ino, LockExclusive, holder)
+	released, err := store.ReleaseLock(ctx, ino, LockExclusive, holder)
 	require.NoError(t, err)
+	require.True(t, released, "the lock key should still have been there to release")
 
 	// Verify the holder's key is gone
 	locked, err = store.IsLocked(ctx, ino)
@@ -227,7 +228,7 @@ func TestIntegration_LockSurvivesAcquisitionContextCancel(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, locked, "lock must outlive the context used to acquire it")
 
-	require.NoError(t, store.ReleaseLock(context.Background(), ino, LockExclusive, holder))
+	mustReleaseLock(t, store, context.Background(), ino, LockExclusive, holder)
 }
 
 // ---- C1.7: Fencing generation CAS ----
@@ -1035,14 +1036,14 @@ func TestIntegration_SharedLocksAreHeldConcurrently(t *testing.T) {
 
 	// One reader leaving must not drop the lock for the other. Revoking the
 	// single shared key is exactly what the old scheme did.
-	require.NoError(t, first.ReleaseLock(ctx, ino, LockShared, holderA))
+	mustReleaseLock(t, first, ctx, ino, LockShared, holderA)
 
 	rec, err = second.GetLockInfo(ctx, ino)
 	require.NoError(t, err)
 	require.NotNil(t, rec, "the surviving reader still holds the lock")
 	assert.Equal(t, []string{"reader-2"}, rec.Holders)
 
-	require.NoError(t, second.ReleaseLock(ctx, ino, LockShared, holderB))
+	mustReleaseLock(t, second, ctx, ino, LockShared, holderB)
 	locked, err := second.IsLocked(ctx, ino)
 	require.NoError(t, err)
 	assert.False(t, locked, "the lock is gone once the last holder leaves")
@@ -1060,10 +1061,10 @@ func TestIntegration_SharedAndExclusiveLocksExcludeEachOther(t *testing.T) {
 	_, err = writer.AcquireLock(ctx, sharedFirst, LockExclusive, 2*time.Second)
 	assert.ErrorIs(t, err, ErrConflict, "a writer must wait for readers")
 
-	require.NoError(t, reader.ReleaseLock(ctx, sharedFirst, LockShared, readHolder))
+	mustReleaseLock(t, reader, ctx, sharedFirst, LockShared, readHolder)
 	writeHolder, err := writer.AcquireLock(ctx, sharedFirst, LockExclusive, 10*time.Second)
 	require.NoError(t, err, "the writer proceeds once the reader is gone")
-	require.NoError(t, writer.ReleaseLock(ctx, sharedFirst, LockExclusive, writeHolder))
+	mustReleaseLock(t, writer, ctx, sharedFirst, LockExclusive, writeHolder)
 
 	// And a writer blocks both readers and other writers.
 	const exclusiveFirst = 9211
@@ -1080,7 +1081,7 @@ func TestIntegration_SharedAndExclusiveLocksExcludeEachOther(t *testing.T) {
 	require.NotNil(t, rec)
 	assert.Equal(t, string(LockExclusive), rec.Mode)
 
-	require.NoError(t, writer.ReleaseLock(ctx, exclusiveFirst, LockExclusive, writeHolder))
+	mustReleaseLock(t, writer, ctx, exclusiveFirst, LockExclusive, writeHolder)
 }
 
 // A failed acquisition must not leave its lease behind holding a key.
@@ -1101,7 +1102,7 @@ func TestIntegration_RefusedLockLeavesNothingBehind(t *testing.T) {
 	require.NotNil(t, rec)
 	assert.Equal(t, []string{"writer"}, rec.Holders, "the refused acquirer left no key")
 
-	require.NoError(t, writer.ReleaseLock(ctx, ino, LockExclusive, holder))
+	mustReleaseLock(t, writer, ctx, ino, LockExclusive, holder)
 }
 
 // ---- lost-update protection on nlink ----
@@ -1501,4 +1502,14 @@ func TestIntegration_ConcurrentMkdirKeepsTheParentCount(t *testing.T) {
 	rec, err := store.GetInode(ctx, parent)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(2+concurrent), rec.Nlink, "an increment was lost to contention")
+}
+
+// mustReleaseLock releases a lock the test just took, asserting both that the
+// call succeeded and that the key was still there to release — the second is
+// what tells a genuine release apart from a lease that had already dropped it.
+func mustReleaseLock(t *testing.T, s *Store, ctx context.Context, ino uint64, mode LockMode, holder string) {
+	t.Helper()
+	released, err := s.ReleaseLock(ctx, ino, mode, holder)
+	require.NoError(t, err)
+	require.True(t, released, "the lock key was already gone")
 }

@@ -23,6 +23,12 @@ import (
 	"time"
 )
 
+// OpStart marks the beginning of one daemon incarnation. It is not an
+// operation the filesystem served; it is the boundary that tells a reader of
+// the file where a restart happened. Numbered above the operation opcodes so
+// it cannot collide with one.
+const OpStart = 1005
+
 // Entry is one served operation.
 type Entry struct {
 	Node   string `json:"node"`
@@ -55,7 +61,17 @@ func NewRecorder(path, node string) (*Recorder, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open history log %s: %w", path, err)
 	}
-	return &Recorder{node: node, f: f, enc: json.NewEncoder(f)}, nil
+	r := &Recorder{node: node, f: f, enc: json.NewEncoder(f)}
+	// A restarted daemon appends to the same file under the same node name, so
+	// without this marker one file reads as a single unbroken incarnation. That
+	// matters to any checker reasoning about what a lease expiry dropped: the
+	// keys of a killed daemon die one TTL after *that* incarnation stopped
+	// renewing, not one TTL after the last thing the node name ever did. It is
+	// recorded here rather than by a caller so that it cannot be forgotten:
+	// exactly one lands at the head of every incarnation's entries.
+	now := time.Now()
+	r.Record("start", OpStart, now, now, nil, nil)
+	return r, nil
 }
 
 // Record appends one operation. Errors are dropped: a history that cannot be

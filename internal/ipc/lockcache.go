@@ -44,11 +44,26 @@ const (
 	// inode fan-out of a real workload ever makes the sweep hot.
 	lockCacheMax = 4096
 
-	// lockAttempts is the acquisition budget for a lock that a peer holds.  It
-	// is larger than the general etcd retry budget because the wait is now for
-	// another node to notice a want key and yield, not merely for an operation
-	// to finish.
-	lockAttempts = 6
+	// entryRetries bounds how many times an acquisition restarts because the
+	// cache entry was evicted from under it.  This is a race with the evictor
+	// and not a wait for anyone, so a handful of attempts is plenty: each one
+	// re-reads the map and takes a different mutex.
+	entryRetries = 6
+
+	// contendedAttempts is the budget for waiting out a contended inode,
+	// whether the holder is a thread on this node or a peer that has to be
+	// recalled first.  Both are the same wait in the end — this node cannot
+	// have the inode until whoever holds it lets go — so both get the same
+	// budget.
+	//
+	// It was six attempts, which is 450ms, and a contended chaos run showed why
+	// that is the wrong number: a plain cross-node `cat > file` failed with EIO
+	// while requestTimeout still had 95% of its budget left.  Contention is
+	// supposed to make a write wait, not fail.  The real bound is the request
+	// deadline — retry aborts on it — and this only has to be large enough to
+	// reach it: the delays are 10ms + 40ms per attempt, so 22 of them sum past
+	// requestTimeout.
+	contendedAttempts = 22
 
 	// minHoldTime is how long a freshly acquired lock is kept before a peer's
 	// recall is honoured.  Without it, sustained contention on one inode costs a
@@ -365,10 +380,26 @@ func (s *Service) releaseKeyLocked(e *lockEntry) error {
 	ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
 	defer cancel()
 	call := time.Now()
+	var wasHeld bool
 	err := retryEtcd(ctx, func(rctx context.Context) error {
-		return s.store.ReleaseLock(rctx, e.ino, mode, holder)
+		var rerr error
+		wasHeld, rerr = s.store.ReleaseLock(rctx, e.ino, mode, holder)
+		return rerr
 	})
-	s.recordKeyEvent(e.ino, mode, lockEventRelease, call, time.Now())
+	// A key that was already gone was dropped by the lease at an instant this
+	// node never saw, so the honest statement is that the hold ended somewhere
+	// between acquiring it and noticing — the same span keyLostLocked records,
+	// and for the same reason.  Timing the release from now instead would
+	// claim the inode right through the window a peer legitimately owned it,
+	// which is a mutual-exclusion violation in the history and not in the
+	// filesystem.  A lost response on a retry lands here too, and widening the
+	// interval is the safe direction to be wrong in: it weakens this node's
+	// claim rather than inventing one.
+	widened := call
+	if !wasHeld {
+		widened = e.acquiredAt
+	}
+	s.recordKeyEvent(e.ino, mode, lockEventRelease, widened, time.Now(), call)
 	if err != nil {
 		s.log.Error("cached inode lock not released, it will block peers until this node exits",
 			"ino", e.ino, "mode", mode, "error", err)
@@ -394,7 +425,7 @@ func (s *Service) keyLostLocked(e *lockEntry, why string) {
 		// taking it and noticing it was gone, so that whole span is what the
 		// history is told.  Claiming the release happened now would place it
 		// after a peer's acquisition that legitimately came first.
-		s.recordKeyEvent(e.ino, e.mode, lockEventRelease, e.acquiredAt, time.Now())
+		s.recordKeyEvent(e.ino, e.mode, lockEventRelease, e.acquiredAt, time.Now(), time.Now())
 	}
 	e.holder, e.lease, e.meta, e.metaFor = "", 0, nil, ""
 	if !e.pending.empty() {
@@ -405,9 +436,17 @@ func (s *Service) keyLostLocked(e *lockEntry, why string) {
 // StartLockRevocation serves peers' requests for locks this node has cached.
 //
 // One watch for the whole cluster: an event names an inode, and a node with no
-// cached lock on it ignores the event.  Recalls are handled one at a time,
-// which is bounded by how long an operation can hold an inode (requestTimeout)
-// and keeps the loop free of a goroutine per event.
+// cached lock on it ignores the event.
+//
+// Recalls run one *per inode*, not one at a time.  Serialising the whole loop
+// was simpler and is what a recall storm showed to be wrong: each recall waits
+// out minHoldTime and then a flush, so a queue of them made unrelated inodes
+// wait on each other, and peers blocked on inodes nobody was slow about
+// exhausted their acquisition budget and took an EIO.  Concurrency is bounded
+// by the number of distinct contended inodes rather than by the event rate —
+// an inode already being recalled ignores further events, since the one in
+// flight is what the peer is waiting for and starting a second would race it
+// for the same key.
 func (s *Service) StartLockRevocation(ctx context.Context) {
 	ch := s.store.WatchLockWants(ctx)
 	go func() {
@@ -420,10 +459,34 @@ func (s *Service) StartLockRevocation(ctx context.Context) {
 				if !ok || node == s.store.NodeID() {
 					continue
 				}
-				s.recallLock(ino)
+				if !s.beginRecall(ino) {
+					continue
+				}
+				go func(ino uint64) {
+					defer s.endRecall(ino)
+					s.recallLock(ino)
+				}(ino)
 			}
 		}
 	}()
+}
+
+// beginRecall claims the right to recall an inode, reporting false if one is
+// already in flight.
+func (s *Service) beginRecall(ino uint64) bool {
+	s.recallMu.Lock()
+	defer s.recallMu.Unlock()
+	if s.recalling[ino] {
+		return false
+	}
+	s.recalling[ino] = true
+	return true
+}
+
+func (s *Service) endRecall(ino uint64) {
+	s.recallMu.Lock()
+	defer s.recallMu.Unlock()
+	delete(s.recalling, ino)
 }
 
 // recallLock yields a cached lock to a peer that has asked for it — the

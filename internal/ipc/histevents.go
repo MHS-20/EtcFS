@@ -31,9 +31,10 @@ const (
 
 // Page-invalidation outcomes, as the response byte of a page_inval event.
 const (
-	pageInvalDone     = 0 // the kernel dropped the inode's pages
-	pageInvalNoClient = 1 // no FUSE session is connected, so no pages exist
-	pageInvalFailed   = 2 // the client is there and reported a failure
+	pageInvalDone      = 0 // the kernel dropped the inode's pages
+	pageInvalNoClient  = 1 // no FUSE session is connected, so no pages exist
+	pageInvalFailed    = 2 // the client is there and reported a failure
+	pageInvalNotCached = 3 // caching is off, or no open ever let the kernel cache
 )
 
 // recordKeyEvent appends one endpoint of the *cached* hold of an inode's etcd
@@ -43,13 +44,19 @@ const (
 // a checker fed only those can report mutual exclusion but never notice a key
 // held past the operation that took it.  Recording both streams is what makes
 // the cached hold checkable as the thing that actually excludes peers.
-func (s *Service) recordKeyEvent(ino uint64, mode metadata.LockMode, event byte, call, ret time.Time) {
+// call may be widened back to the acquisition when the key turns out to have
+// expired under the node, so that a peer's legitimate acquisition can be
+// ordered inside it. That widening is right for mutual exclusion and wrong for
+// anything asking what this node did just before letting go, so the instant the
+// release actually started is carried alongside it as actualCall.
+func (s *Service) recordKeyEvent(ino uint64, mode metadata.LockMode, event byte, call, ret time.Time, actualCall time.Time) {
 	if s.history == nil {
 		return
 	}
 	var b buf
 	b.b = append(b.b, event, lockModeByte(mode))
 	b.w64(ino)
+	b.w64(uint64(actualCall.UnixNano()))
 	s.history.Record("lock_key", historyOpLockKey, call, ret, b.b, nil)
 }
 

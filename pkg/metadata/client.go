@@ -323,15 +323,36 @@ func (s *Store) guardedWrite(ctx context.Context, op clientv3.Op, verb, key stri
 
 // Delete removes a key.  Guarded when a guard is installed — see Put.
 func (s *Store) Delete(ctx context.Context, key string) error {
+	_, err := s.DeleteCounting(ctx, key)
+	return err
+}
+
+// DeleteCounting removes a key and reports how many were actually there.
+//
+// The count is what distinguishes "this key was mine and I dropped it" from
+// "it was already gone", which an unconditional delete cannot tell apart — and
+// the two say very different things about when the caller stopped holding
+// whatever the key stood for.
+func (s *Store) DeleteCounting(ctx context.Context, key string) (int64, error) {
 	if s.guard != nil {
-		_, err := s.guardedWrite(ctx, clientv3.OpDelete(key), "delete", key)
-		return err
+		cmp, _, ok := s.guard()
+		if !ok {
+			return 0, fmt.Errorf("delete %s: %w", key, ErrGuardUnavailable)
+		}
+		resp, err := s.client.Txn(ctx).If(cmp).Then(clientv3.OpDelete(key)).Commit()
+		if err != nil {
+			return 0, fmt.Errorf("delete %s: %w", key, err)
+		}
+		if !resp.Succeeded {
+			return 0, fmt.Errorf("delete %s: %w", key, ErrFenced)
+		}
+		return resp.Responses[0].GetResponseDeleteRange().Deleted, nil
 	}
-	_, err := s.client.Delete(ctx, key)
+	resp, err := s.client.Delete(ctx, key)
 	if err != nil {
-		return fmt.Errorf("delete %s: %w", key, err)
+		return 0, fmt.Errorf("delete %s: %w", key, err)
 	}
-	return nil
+	return resp.Deleted, nil
 }
 
 // DeletePrefix removes all keys with the given prefix.  Guarded when a guard

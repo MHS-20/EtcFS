@@ -165,6 +165,13 @@ func (s *Service) sendInvalEntry(parent, name string) {
 // failure, and that one does stop the release.
 func (s *Service) invalidatePages(ino uint64) error {
 	if !s.pagesCacheable() {
+		// Recorded rather than passed over in silence: the obligation is
+		// discharged here too, and a history that simply omits the event is
+		// indistinguishable from one where the invalidation was skipped while
+		// pages *were* cached.  The checker cannot tell "nothing to do" from
+		// "not done" unless the daemon says which it was.
+		now := time.Now()
+		s.recordPageInval(ino, pageInvalNotCached, now, now)
 		return nil
 	}
 	buf := make([]byte, 12)

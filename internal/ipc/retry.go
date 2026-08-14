@@ -259,7 +259,7 @@ func (l *heldLock) Release() {
 func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockMode) (*heldLock, error) {
 	call := time.Now()
 
-	for attempt := 0; attempt < lockAttempts; attempt++ {
+	for attempt := 0; attempt < entryRetries; attempt++ {
 		e := s.lockEntryFor(ino)
 		if err := lockLocal(ctx, e, mode); err != nil {
 			return nil, err
@@ -287,8 +287,14 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 // lockLocal takes the entry's node-local lock, giving up rather than waiting
 // forever.  sync.RWMutex has no timed acquire, so the budget is spent as
 // TryLock attempts on the same backoff every other contended operation uses.
+//
+// The budget is the same one a peer's key gets: this node's own hold on an
+// inode lasts as long as the recall it is waiting out, so sizing the local
+// wait for local contention alone handed callers an EAGAIN on a plain write
+// while the request deadline still had seconds left.  The deadline remains the
+// bound — retry gives up on it.
 func lockLocal(ctx context.Context, e *lockEntry, mode metadata.LockMode) error {
-	return retry(ctx, lockAttempts, func() error {
+	return retry(ctx, contendedAttempts, func() error {
 		if mode == metadata.LockExclusive {
 			if e.rw.TryLock() {
 				return nil
@@ -365,7 +371,7 @@ func (s *Service) ensureLockKey(ctx context.Context, e *lockEntry, mode metadata
 	}
 	lease, _ := metadata.LockHolderLease(holder)
 	e.holder, e.lease, e.mode, e.acquiredAt = holder, lease, mode, time.Now()
-	s.recordKeyEvent(e.ino, mode, lockEventAcquire, call, e.acquiredAt)
+	s.recordKeyEvent(e.ino, mode, lockEventAcquire, call, e.acquiredAt, call)
 	return nil
 }
 
@@ -378,7 +384,7 @@ func (s *Service) acquireLockKey(ctx context.Context, ino uint64, mode metadata.
 	announced := false
 	var attempted []string
 
-	err := retry(ctx, lockAttempts, func() error {
+	err := retry(ctx, contendedAttempts, func() error {
 		actx, cancel := context.WithTimeout(ctx, etcdOpTimeout)
 		defer cancel()
 
@@ -402,7 +408,15 @@ func (s *Service) acquireLockKey(ctx context.Context, ino uint64, mode metadata.
 		if aerr != nil {
 			holder = ""
 		}
-		if errors.Is(aerr, metadata.ErrConflict) && !announced {
+		// Announced on every conflicting attempt, not just the first.  A recall
+		// fires off the *event* a want key writes, so a want announced against
+		// one holder is never seen by the next: with three nodes on one inode,
+		// A yields to B, B acquires without ever learning C is still waiting,
+		// and C — whose key is sitting in etcd unheeded — spins until its
+		// budget runs out and the write takes an EIO.  Re-announcing turns that
+		// lost wakeup into one extra commit per attempt, and only while
+		// actually blocked.
+		if errors.Is(aerr, metadata.ErrConflict) {
 			announced = true
 			if werr := s.store.AnnounceLockWant(actx, ino); werr != nil {
 				s.log.Warn("cannot announce a lock request; the holder will not be asked to yield",

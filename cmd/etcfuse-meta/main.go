@@ -284,7 +284,7 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	// Without this the scrubber deletes an unlinked file's dangling extent
 	// records but never returns their blocks, so disk space leaks on every
 	// deletion.
-	scrubber.SetReclaimer(svc.Allocator())
+	scrubber.SetReclaimer(svc.Reclaimer())
 	// The range check compares against the real device rather than a hardcoded
 	// ceiling; without a device attached it is skipped.
 	scrubber.SetDeviceSize(svc.Allocator().DeviceSize())

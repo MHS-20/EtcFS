@@ -228,16 +228,25 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 	return holder, nil
 }
 
-// ReleaseLock drops one holder's lock.
+// ReleaseLock drops one holder's lock, reporting whether the key was still
+// there to drop.
 //
 // Deleting that holder's key and only that key leaves a shared lock standing
 // with its remaining holders — and, now that the lease is shared by every lock
 // the node holds, a delete is the only release that does not drop all of them.
-func (s *Store) ReleaseLock(ctx context.Context, ino uint64, mode LockMode, holder string) error {
-	if err := s.Delete(ctx, LockKey(ino, mode, holder)); err != nil {
-		return fmt.Errorf("release lock ino %d: %w", ino, err)
+//
+// A false return means the lease had already expired the key: the caller
+// stopped holding the lock at some instant it never observed, rather than at
+// the moment it got round to releasing.  Callers that record when locks change
+// hands have to tell the two apart, or a node whose session died reads as
+// having held the inode right up until it noticed — across the whole window in
+// which a peer legitimately owned it.
+func (s *Store) ReleaseLock(ctx context.Context, ino uint64, mode LockMode, holder string) (bool, error) {
+	n, err := s.DeleteCounting(ctx, LockKey(ino, mode, holder))
+	if err != nil {
+		return false, fmt.Errorf("release lock ino %d: %w", ino, err)
 	}
-	return nil
+	return n > 0, nil
 }
 
 // CloseLockSession ends the node's lock session, revoking the lease and with it
