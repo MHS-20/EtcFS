@@ -36,31 +36,41 @@ if [[ ! -f "$JAR" ]]; then
     }
 fi
 
-# config:expected — "pass" means TLC must find no error, "fail" means it must
-# produce a counterexample, and the named invariant is the one it must break.
+# module:config:expected — "pass" means TLC must find no error, "fail" means it
+# must produce a counterexample, and the named invariant is the one it must
+# break.
 CHECKS=(
-    "Fencing:pass:"
-    "FencingNoFencer:pass:"
-    "FencingUnreliableFencer:pass:"
-    "FencingGuardIsBackstop:pass:"
-    "FencingNoIncarnationCheck:fail:NoHealthyNodeSevered"
-    "FencingNoGuard:fail:StaleWriteRejected"
-    "FencingArenaBug:fail:ReleasedArenaHasNoLiveWriter"
+    "Fencing:Fencing:pass:"
+    "Fencing:FencingNoFencer:pass:"
+    "Fencing:FencingUnreliableFencer:pass:"
+    "Fencing:FencingGuardIsBackstop:pass:"
+    "Fencing:FencingNoIncarnationCheck:fail:NoHealthyNodeSevered"
+    "Fencing:FencingNoGuard:fail:StaleWriteRejected"
+    "Fencing:FencingArenaBug:fail:ReleasedArenaHasNoLiveWriter"
+    "CachedLock:CachedLock:pass:"
+    "CachedLock:CachedLockNoLeaseIdentity:fail:NoTwoHolders"
+    "CachedLock:CachedLockNoFlushKeyCheck:fail:NoPublishWithoutLock"
+    "CachedLock:CachedLockNoRecallFlush:fail:NoLostAckedWrite"
+    "CachedLock:CachedLockNoInvalidate:fail:NoStalePages"
+    "CachedLock:CachedLockStaleSnapshot:fail:ViewMatchesTruth"
+    "CachedLock:CachedLockKeepsCacheOnKeyLoss:fail:NoStalePages"
 )
-[[ "${DEEP:-0}" == "1" ]] && CHECKS+=("Fencing3Nodes:pass:")
+[[ "${DEEP:-0}" == "1" ]] && CHECKS+=("Fencing:Fencing3Nodes:pass:")
 
 cd "$SPECS" || exit 1
 fails=0
 
 for check in "${CHECKS[@]}"; do
-    cfg="${check%%:*}"
+    module="${check%%:*}"
     rest="${check#*:}"
+    cfg="${rest%%:*}"
+    rest="${rest#*:}"
     expected="${rest%%:*}"
     wanted="${rest#*:}"
 
-    printf '%-26s ' "$cfg"
+    printf '%-32s ' "$cfg"
     out=$(nice -n 10 java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC \
-            -workers "$WORKERS" -config "$cfg.cfg" Fencing.tla 2>&1)
+            -workers "$WORKERS" -config "$cfg.cfg" "$module.tla" 2>&1)
 
     states=$(echo "$out" | grep -oE '[0-9]+ distinct states found' | tail -1 | grep -oE '^[0-9]+')
     broke=$(echo "$out" | grep -oE 'Invariant [A-Za-z]+ is violated' | head -1 | awk '{print $2}')
