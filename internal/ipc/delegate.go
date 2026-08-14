@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -49,6 +50,18 @@ const (
 	// may stand for.  The interval bounds the crash window in time; this bounds
 	// it in bytes, for a writer fast enough to make the interval irrelevant.
 	defaultFlushMaxBytes = 16 << 20
+
+	// flushIOConcurrency is how many of a flush's device writes may be in
+	// flight at once.  A provisioned volume's IOPS are bought as parallelism —
+	// one outstanding I/O reaches its latency, not its rate — so a flush that
+	// issued its writes one at a time would spend the whole batch serialized
+	// behind the device while holding an inode's lock.
+	//
+	// ponytail: a constant rather than a knob, sized to keep a batch of the
+	// size the transaction op cap allows (~46 writes) inside a couple of device
+	// round trips.  Make it configurable when a device shows up that wants a
+	// different queue depth.
+	flushIOConcurrency = 32
 
 	// oDSync is O_DSYNC as the kernel passes it in a write request's flags.
 	// O_SYNC carries this bit too, so one test covers both.
@@ -348,14 +361,24 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 	return nil
 }
 
-// flushData puts the buffered payload on the device, coalescing runs that turn
-// out to be adjacent into one I/O.
+// flushData puts the buffered payload on the device: adjacent runs coalesced
+// into one I/O, and the resulting I/Os issued concurrently.
 //
-// Coalescing is the part of data buffering that raises the sustained rate
-// rather than only the peak: a random 4 K workload allocates from one arena, so
-// the runs behind a batch of writes are frequently contiguous even though the
-// logical offsets are scattered, and merging them turns many small device
-// writes into few large ones.
+// Both halves matter, and the second one is what makes this affordable at all.
+// Coalescing only helps where the allocator handed out adjacent blocks, which
+// is the sequential case; a random overwrite workload frees a scattered block
+// per write and reallocates from those holes, so its runs are almost never
+// adjacent and the merge is a no-op. What is left is one small device write per
+// buffered write, and issuing those serially spends the whole flush at the
+// device's *latency* when the thing that was provisioned is its *parallelism* —
+// the same mistake a per-operation etcd commit made on the write path. A buffer
+// of ~46 writes serialized is ~46ms with this node's inode lock held; issued
+// against the device's queue it is a couple of round trips.
+//
+// Every write targets a block reserved by this node and named by no published
+// extent, so they are disjoint and may be issued in any order. What may not
+// move is the boundary after them: all of it is on the device before the
+// transaction naming any of it is committed.
 //
 // The runs stay in the buffer, since the extents naming them are still
 // unpublished; only the payload is dropped, because from here the device is
@@ -366,24 +389,60 @@ func (s *Service) flushData(p *pending) error {
 	}
 	sort.Slice(p.data, func(i, j int) bool { return p.data[i].diskOff < p.data[j].diskOff })
 
+	// Coalesce first, serially: it is memcpy against a device round trip, and
+	// the groups have to exist before they can be handed out.
+	type group struct {
+		diskOff uint64
+		buf     []byte
+		free    func()
+		runs    int
+	}
+	var groups []group
+	defer func() {
+		for _, g := range groups {
+			g.free()
+		}
+	}()
 	for i := 0; i < len(p.data); {
 		j, length := i+1, uint64(len(p.data[i].buf))
 		for j < len(p.data) && p.data[j].diskOff == p.data[i].diskOff+length {
 			length += uint64(len(p.data[j].buf))
 			j++
 		}
+		// Copied even for a single run: the payload is an ordinary Go slice, and
+		// O_DIRECT needs a sector-aligned address the allocator cannot promise.
 		buf, free := s.ioBuffer(int(length))
 		pos := 0
 		for _, r := range p.data[i:j] {
 			pos += copy(buf[pos:], r.buf)
 		}
-		err := s.writeRun(buf[:length], p.data[i].diskOff)
-		free()
-		if err != nil {
-			return err
-		}
-		metrics.CoalescedRuns.Observe(float64(j - i))
+		groups = append(groups, group{diskOff: p.data[i].diskOff, buf: buf[:length], free: free, runs: j - i})
 		i = j
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	sem := make(chan struct{}, flushIOConcurrency)
+	for _, g := range groups {
+		metrics.CoalescedRuns.Observe(float64(g.runs))
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(g group) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := s.writeRun(g.buf, g.diskOff); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+		}(g)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
 	}
 
 	p.data = nil
