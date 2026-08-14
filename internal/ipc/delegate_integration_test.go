@@ -137,6 +137,85 @@ func TestIntegration_CachedRevisionsSurviveAFlush(t *testing.T) {
 	}
 }
 
+// A flush whose reply is lost commits in etcd and comes back as a rejection,
+// because commitGuarded's retry re-proposes comparisons the first attempt has
+// already invalidated — `CreateRevision == 0` on keys it just created.
+//
+// Replaying the same buffer against a flush that already landed reproduces that
+// exactly, with no fault injection: the transaction is identical and etcd
+// rejects it for the same reason. Treating the rejection at face value would
+// wedge the inode on EIO for good and hold its blocks forever.
+func TestIntegration_FlushWhoseReplyWasLostIsAdoptedNotRejected(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino = 9304
+	seedFile(t, store, ino, 0o100644)
+
+	block := make([]byte, 4096)
+	for i := uint64(0); i < 4; i++ {
+		writeAt(t, svc, ino, i*4096, block)
+	}
+
+	svc.lockMu.Lock()
+	e := svc.locks[ino]
+	svc.lockMu.Unlock()
+	if e == nil {
+		t.Fatal("no lock entry for an inode this node just wrote")
+	}
+
+	// The buffer as it stood before the flush consumed it, which is what a
+	// retry after a lost reply would carry.
+	e.keyMu.Lock()
+	replay := *e.pending
+	e.keyMu.Unlock()
+
+	if err := svc.flushEntry(ctx, e, "test"); err != nil {
+		t.Fatalf("first flush: %v", err)
+	}
+
+	_, before, err := store.GetInodeAndExtents(ctx, ino)
+	if err != nil {
+		t.Fatalf("read extents: %v", err)
+	}
+
+	e.keyMu.Lock()
+	e.pending = &replay
+	e.keyMu.Unlock()
+
+	if err := svc.flushEntry(ctx, e, "test"); err != nil {
+		t.Fatalf("a flush that had already landed was reported as failed: %v", err)
+	}
+
+	e.keyMu.Lock()
+	stillPending := !e.pending.empty()
+	e.keyMu.Unlock()
+	if stillPending {
+		t.Error("the buffer was kept after its transaction was found already published")
+	}
+
+	// Adoption must not have written anything a second time.
+	_, after, err := store.GetInodeAndExtents(ctx, ino)
+	if err != nil {
+		t.Fatalf("re-read extents: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("extent count changed from %d to %d across an adopted flush",
+			len(before), len(after))
+	}
+	for i := range after {
+		if after[i] != before[i] {
+			t.Errorf("extent %d changed across an adopted flush: %+v -> %+v",
+				i, before[i], after[i])
+		}
+	}
+
+	// And the inode must still be writable, which is what the wedge cost.
+	writeAt(t, svc, ino, 0, block)
+	if e := fsyncInode(t, svc, ino); e != 0 {
+		t.Fatalf("fsync after an adopted flush returned errno %d", e)
+	}
+}
+
 // A write that costs the file its set-user-ID bits must not leave them readable
 // to anyone while the extent that dropped them waits in the buffer.  Deferring
 // the bytes is a durability trade; deferring the mode change is a privilege one,

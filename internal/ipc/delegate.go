@@ -3,6 +3,7 @@ package ipc
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -246,6 +247,16 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 		return err
 
 	case !committed:
+		// A rejection is also what a committed transaction whose reply was lost
+		// looks like, so that is ruled out before anything is discarded or
+		// given up on.
+		if revs, landed := s.flushAlreadyLanded(ctx, e); landed {
+			s.log.Warn("adopted a flush whose reply was lost; its writes are published",
+				"ino", e.ino)
+			s.flushCommitted(e, revs)
+			return nil
+		}
+
 		metrics.FlushFailures.WithLabelValues("rejected").Inc()
 		if held, herr := s.store.LockHeldBy(ctx, e.ino, e.mode, e.holder); herr == nil && !held {
 			// The lease went, etcd deleted the key, and a peer may already own
@@ -264,20 +275,89 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 		return metadata.ErrConflict
 	}
 
-	// Only now: before the commit, a rejected transaction would have freed
-	// blocks the file still refers to.
+	revs := make(map[string]int64, len(ops))
+	for _, op := range ops {
+		if op.IsPut() {
+			revs[string(op.KeyBytes())] = rev
+		}
+	}
+	s.flushCommitted(e, revs)
+	return nil
+}
+
+// flushCommitted finishes a flush that reached etcd.
+//
+// The blocks its reclaims freed go back to the arena — only now, because before
+// the commit a rejected transaction would have freed blocks the file still
+// refers to — and the cached extents take the revisions their keys now carry,
+// which is what a later comparison on those extents has to match.
+func (s *Service) flushCommitted(e *lockEntry, revs map[string]int64) {
 	for _, p := range e.pending.reset() {
 		s.freeReclaimed(p)
 	}
 	metrics.PendingExtents.Set(0)
 	metrics.PendingBytes.Set(0)
 
-	// Every key the transaction wrote now carries this revision, which is what
-	// a later comparison on those extents has to match.
-	if e.meta != nil {
-		e.meta = &inodeMeta{rec: e.meta.rec, extents: stampRevision(e.meta.extents, ops, rev)}
+	if e.meta == nil {
+		return
 	}
-	return nil
+	extents := make([]metadata.Extent, len(e.meta.extents))
+	copy(extents, e.meta.extents)
+	for i := range extents {
+		if rev, found := revs[extents[i].Key]; found {
+			extents[i].ModRevision = rev
+		}
+	}
+	e.meta = &inodeMeta{rec: e.meta.rec, extents: extents}
+}
+
+// flushAlreadyLanded reports whether the transaction a flush just had rejected
+// is in fact already in etcd, and the revisions its keys carry if so.
+//
+// commitGuarded retries a transient failure, and the retry re-proposes the same
+// comparisons — including `CreateRevision == 0` on keys the first attempt has by
+// then created. So a committed transaction whose reply was lost comes back as a
+// rejection. Taking that at face value would strand a buffer that was in fact
+// published: its fsync would return EIO for good, its reclaimed blocks would
+// stay reserved, and every later write to the inode would be doomed to the same
+// rejection.
+//
+// Only this node can have written those keys — it holds the inode's exclusive
+// lock, and the values carry its own extents — so a key present with exactly
+// the value this flush proposed is proof the flush landed. This is the same
+// problem, and the same answer, as an acquisition whose reply was lost.
+func (s *Service) flushAlreadyLanded(ctx context.Context, e *lockEntry) (map[string]int64, bool) {
+	_, published, err := s.store.GetInodeAndExtents(ctx, e.ino)
+	if err != nil {
+		return nil, false
+	}
+
+	revs := make(map[string]int64, len(published))
+	values := make(map[string]string, len(published))
+	for _, ext := range published {
+		revs[ext.Key] = ext.ModRevision
+		values[ext.Key] = ext.Encode()
+	}
+
+	// The inode record rides the same transaction but is not an extent, and a
+	// buffer carrying nothing but that record proves nothing either way.
+	prefix := metadata.ExtentPrefix(e.ino)
+	checked := 0
+	for _, key := range e.pending.order {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		op := e.pending.ops[key]
+		value, found := values[key]
+		switch {
+		case op.IsDelete() && found:
+			return nil, false
+		case op.IsPut() && (!found || value != string(op.ValueBytes())):
+			return nil, false
+		}
+		checked++
+	}
+	return revs, checked > 0
 }
 
 // discardPending drops a buffer that can never be published and returns its
@@ -293,26 +373,6 @@ func (s *Service) discardPending(e *lockEntry, why string) {
 	metrics.PendingBytes.Set(0)
 	s.log.Error("deferred writes discarded and their blocks released", "ino", e.ino,
 		"operations", ops, "reason", why)
-}
-
-// stampRevision records, on the cached extents, the revision the keys a flush
-// just wrote now carry.  Without it the next reclaim of one of those extents
-// would compare against a revision that only ever existed inside the buffer.
-func stampRevision(cached []metadata.Extent, ops []clientv3.Op, rev int64) []metadata.Extent {
-	written := make(map[string]bool, len(ops))
-	for _, op := range ops {
-		if op.IsPut() {
-			written[string(op.KeyBytes())] = true
-		}
-	}
-	out := make([]metadata.Extent, len(cached))
-	copy(out, cached)
-	for i := range out {
-		if written[out[i].Key] {
-			out[i].ModRevision = rev
-		}
-	}
-	return out
 }
 
 // flushInode publishes an inode's buffer from a caller that holds no lock on
