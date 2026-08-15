@@ -296,7 +296,7 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	go svc.Allocator().ReapEmptyArenas(ctx, time.Minute)
 
 	if cfg.MetricsAddr != "" {
-		go func() { _ = metrics.StartServer(cfg.MetricsAddr) }()
+		go func() { _ = metrics.StartServer(cfg.MetricsAddr, readiness(svc, membership)) }()
 		log.Info("metrics server listening", "addr", cfg.MetricsAddr)
 	}
 
@@ -334,6 +334,26 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	case <-selfFenced:
 		return errSelfFenced
 	default:
+		return nil
+	}
+}
+
+// readiness reports whether this node can serve I/O, for /readyz.
+//
+// Three conditions, each of which makes the daemon useless to route work to
+// while leaving the process perfectly alive: the IPC socket is not being
+// served yet, the membership lease has lapsed (so peers may already be fencing
+// this node), or self-fencing has triggered (so every write will be rejected).
+func readiness(svc *ipc.Service, membership *metadata.Membership) func() error {
+	return func() error {
+		switch {
+		case !svc.Serving():
+			return errors.New("the IPC socket is not serving yet")
+		case !membership.IsAlive():
+			return errors.New("the membership lease is not live")
+		case svc.IsFenced():
+			return errors.New("this node has fenced itself")
+		}
 		return nil
 	}
 }

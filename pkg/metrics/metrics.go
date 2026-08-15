@@ -1,5 +1,6 @@
 // Package metrics defines the Prometheus metrics EtcFS exposes on
-// --metrics-addr, and the /metrics server that serves them.
+// --metrics-addr, and the server that serves them alongside the health and
+// readiness endpoints.
 //
 // The metrics are package-level variables registered with the default
 // Prometheus registry rather than values threaded through every constructor:
@@ -10,7 +11,9 @@
 package metrics
 
 import (
+	"io"
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -161,9 +164,46 @@ var (
 	}, []string{"outcome"})
 )
 
-// StartServer serves /metrics on addr. It blocks until the server stops.
-func StartServer(addr string) error {
+// StartServer serves /metrics, /healthz and /readyz on addr.  It blocks until
+// the server stops.
+//
+// ready reports whether this node can serve I/O right now; a nil ready makes
+// /readyz answer for liveness alone.  The distinction is the one an
+// orchestrator acts on: /healthz says the process is alive and should not be
+// restarted, /readyz says work sent here will be served rather than answered
+// with EIO.  A node whose lease has lapsed or that has fenced itself is
+// healthy — it is running, and killing it fixes nothing — but not ready.
+func StartServer(addr string, ready func() error) error {
+	// Timeouts, because this listener is reachable by anything that can route
+	// to the node: without them a client that opens a connection and never
+	// finishes its request holds a goroutine and an fd for as long as it likes.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           Handler(ready),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	return srv.ListenAndServe()
+}
+
+// Handler builds the served routes.  Separate from StartServer so the
+// endpoints can be exercised without binding a port.
+func Handler(ready func() error) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	return http.ListenAndServe(addr, mux)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok\n")
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if ready != nil {
+			if err := ready(); err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+		}
+		_, _ = io.WriteString(w, "ready\n")
+	})
+	return mux
 }

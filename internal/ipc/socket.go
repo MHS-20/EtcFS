@@ -156,6 +156,8 @@ func opName(code uint16) string {
 // RunSocket starts a raw binary IPC server on the given listener.
 // Each connection is handled in its own goroutine.
 func (s *Service) RunSocket(listener net.Listener) error {
+	s.serving.Store(true)
+	defer s.serving.Store(false)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
