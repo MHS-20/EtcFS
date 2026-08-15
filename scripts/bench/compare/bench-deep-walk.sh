@@ -20,10 +20,10 @@ compare_begin
 compare_mount
 
 log "Populating a $FILES-file tree to walk..."
-compare_build_tree "${BENCH_NODES[0]}" "$FILES" >/dev/null
-compare_untar_tree "${BENCH_NODES[0]}" "$MOUNT_PATH/walk" "$FILES" >/dev/null
+compare_build_tree "$N0" "$FILES" >/dev/null
+compare_untar_tree "$N0" "$MOUNT_PATH/walk" "$FILES" >/dev/null
 
-read -r cold warm du_s < <(compare_walk_tree "${BENCH_NODES[0]}" "$MOUNT_PATH/walk")
+read -r cold warm du_s < <(compare_walk_tree "$N0" "$MOUNT_PATH/walk")
 compare_headline deep-walk find_cold_s "$cold" s
 compare_headline deep-walk find_warm_s "$warm" s
 compare_headline deep-walk du_s "$du_s" s

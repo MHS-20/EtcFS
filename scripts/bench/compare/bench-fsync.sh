@@ -1,8 +1,8 @@
 #!/bin/bash
-# bench-fsync.sh — O_DSYNC 4 KiB random writes. Write deferral is off, so every
-# write costs a device write plus (on etcfs) a Raft commit, against GFS2 whose
-# journal absorbs the same pattern locally. Headline is sustained synchronous
-# write IOPS with its 99th-percentile latency.
+# bench-fsync.sh — 4 KiB writes with O_DSYNC. Write deferral is off by
+# definition, so every write costs a device write plus, on etcfs, a Raft
+# commit; GFS2 absorbs the same pattern into a local journal. The number is
+# sustained sync-write IOPS and the p99 of a single synchronous write.
 #
 # Usage:
 #   COMPARE_BACKEND=etcfs ./bench-fsync.sh
@@ -14,27 +14,26 @@ source "$SCRIPT_DIR/compare-lib.sh"
 RUNTIME="${ETCFS_BENCH_RUNTIME:-60}"
 
 compare_begin
-compare_mount
+compare_mount 0
 
-# sync=1 opens with O_DSYNC, which is the pattern under test; psync because
-# there is nothing for an async engine to overlap once every write is
-# synchronous, and libaio + FUSE is a known hang (see bench-juicefs.sh).
+# sync=dsync opens with O_DSYNC; iodepth 1 and psync keep one write in flight,
+# which is the latency this scenario is about — a deeper queue would report a
+# throughput number that hides it.
 json=$(compare_run_job "fsync-$COMPARE_BACKEND" "$N0" "$RUNTIME" "
 [global]
 ioengine=psync
-direct=1
-sync=1
-bs=4k
-filename=$MOUNT_PATH/fsync.dat
+direct=0
+sync=dsync
+filename=$MOUNT_PATH/dsync.dat
 size=1G
 runtime=$RUNTIME
 time_based=1
-group_reporting=1
-[dsync-randwrite]
+[randwrite-4k-dsync]
 rw=randwrite
-numjobs=1
+bs=4k
 iodepth=1
 ")
-compare_headline fsync-small-writes sync_write_iops "$(compare_fio_iops "$json" write)" iops
-compare_headline fsync-small-writes write_p99_us \
+
+compare_headline fsync sync_write_iops "$(compare_fio_iops "$json" write)" ops/s
+compare_headline fsync sync_write_p99_us \
     "$(jq -r '(.jobs[0].write.clat_ns.percentile."99.000000" // 0) / 1000 | round' "$json")" us
