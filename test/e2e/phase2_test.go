@@ -54,7 +54,7 @@ func TestPhase2EndToEnd(t *testing.T) {
 	log := config.NewLogger(1)
 	membership := metadata.NewMembership(cli, "e2e-node", "e2e-cluster", 30*time.Second)
 	watchdog := fencing.NewWatchdog(membership, 30*time.Second)
-	svc := ipc.NewService(store, membership, watchdog, log)
+	svc := ipc.NewService(store, membership, watchdog, log, ipc.Options{})
 
 	errc := make(chan error, 1)
 	listener, err := net.Listen("unix", sockPath)

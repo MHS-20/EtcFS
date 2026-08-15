@@ -60,13 +60,13 @@ func newTestService(t *testing.T) (*Service, *metadata.Store) {
 	store := metadata.NewStore(cli, "node-test")
 	membership := metadata.NewMembership(cli, "node-test", "etcfuse", 10*time.Second)
 	svc := NewService(store, membership, fencing.NewWatchdog(membership, 10*time.Second),
-		config.NewLogger(0))
+		config.NewLogger(0), Options{FlushInterval: DefaultFlushInterval})
 
 	if err := svc.InitGeneration(context.Background()); err != nil {
 		t.Fatalf("init generation: %v", err)
 	}
 	svc.InstallStoreGuard()
-	svc.SetBlockDevice(dev, false)
+	svc.setBlockDevice(dev, false)
 
 	return svc, store
 }
@@ -576,7 +576,7 @@ func TestIntegration_UnlinkKeepsAnOpenFileAlive(t *testing.T) {
 // the case where a bug would put the right bytes at the wrong offset.
 func TestIntegration_BufferedWriteDataIsReadableBeforeAndAfterTheFlush(t *testing.T) {
 	svc, store := newTestService(t)
-	svc.SetDataCache(true)
+	svc.dataCache = true
 	ctx := context.Background()
 	const ino = 7010
 	seedFile(t, store, ino, metadata.ModeFile|0644)
@@ -736,9 +736,9 @@ func TestIntegration_OnlyFsyncedWritesSurviveACrash(t *testing.T) {
 // buffered for a crash to take.
 func TestIntegration_SynchronousConfigurationPublishesBeforeAcknowledging(t *testing.T) {
 	svc, store := newTestService(t)
-	svc.SetFlushInterval(0)
-	svc.SetDataCache(false)
-	svc.SetPageCache(false)
+	svc.flushInterval = 0
+	svc.dataCache = false
+	svc.pageCache = false
 	ctx := context.Background()
 	const ino = 7120
 	seedFile(t, store, ino, metadata.ModeFile|0644)

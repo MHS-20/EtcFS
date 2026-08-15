@@ -204,8 +204,49 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	// Self-fencing watchdog
 	watchdog := fencing.NewWatchdog(membership, cfg.LeaseTTL)
 
+	var historyRecorder *history.Recorder
+	if cfg.HistoryLog != "" {
+		rec, herr := history.NewRecorder(cfg.HistoryLog, cfg.NodeID)
+		if herr != nil {
+			return fmt.Errorf("open history log: %w", herr)
+		}
+		defer func() { _ = rec.Close() }()
+		historyRecorder = rec
+		log.Info("recording an operation history", "path", cfg.HistoryLog)
+	}
+
 	// IPC service: handles FUSE op requests from the C daemon
-	svc := ipc.NewService(store, membership, watchdog, log)
+	// The block device is opened before the service, because a Service is
+	// configured once, at construction, rather than by a sequence of setters
+	// whose ordering nothing enforces.
+	var dev *blockio.Device
+	if cfg.BlockDevice != "" {
+		openDevice := blockio.Open
+		if cfg.AllowBufferedIO {
+			openDevice = blockio.OpenBuffered
+		}
+		opened, err := openDevice(cfg.BlockDevice)
+		if err != nil {
+			return fmt.Errorf("open block device %s: %w", cfg.BlockDevice, err)
+		}
+		if !opened.IsDirect() {
+			log.Warn("block device opened WITHOUT O_DIRECT: writes are served from this node's "+
+				"page cache and are not proven visible to other attachers; safe only on an "+
+				"unshared device", "path", cfg.BlockDevice)
+		}
+		defer func() { _ = opened.Close() }()
+		dev = opened
+	}
+
+	svc := ipc.NewService(store, membership, watchdog, log, ipc.Options{
+		FlushInterval: cfg.MetadataFlushInterval,
+		DataCache:     cfg.WriteDataCache && cfg.MetadataFlushInterval > 0,
+		PageCache:     cfg.PageCache,
+		ReadOnly:      cfg.ReadOnly,
+		Device:        dev,
+		WriteBarriers: cfg.WriteBarriers,
+		History:       historyRecorder,
+	})
 
 	// Establish this node's fencing generation before serving any request, then
 	// install it as the store-wide guard so namespace mutations are covered too,
@@ -224,39 +265,12 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	// record nothing names and no descriptor can reach.
 	svc.ReclaimOrphans(ctx)
 
-	if cfg.HistoryLog != "" {
-		rec, herr := history.NewRecorder(cfg.HistoryLog, cfg.NodeID)
-		if herr != nil {
-			return fmt.Errorf("open history log: %w", herr)
-		}
-		defer func() { _ = rec.Close() }()
-		svc.SetHistoryRecorder(rec)
-		log.Info("recording an operation history", "path", cfg.HistoryLog)
-	}
-
 	if cfg.ReadOnly {
-		svc.SetReadOnly(true)
 		log.Info("mounted read-only: every mutating FUSE operation will be rejected with EROFS")
 	}
 
-	if cfg.BlockDevice != "" {
-		openDevice := blockio.Open
-		if cfg.AllowBufferedIO {
-			openDevice = blockio.OpenBuffered
-		}
-		dev, err := openDevice(cfg.BlockDevice)
-		if err != nil {
-			return fmt.Errorf("open block device %s: %w", cfg.BlockDevice, err)
-		}
-		if !dev.IsDirect() {
-			log.Warn("block device opened WITHOUT O_DIRECT: writes are served from this node's "+
-				"page cache and are not proven visible to other attachers; safe only on an "+
-				"unshared device", "path", cfg.BlockDevice)
-		}
-		defer func() { _ = dev.Close() }()
-		svc.SetBlockDevice(dev, cfg.WriteBarriers)
+	if dev != nil {
 		_ = svc.ReconstructArenas(ctx)
-
 		log.Info("block device opened", "path", cfg.BlockDevice,
 			"sector_size", dev.SectorSize(), "total_size", dev.TotalSize(),
 			"direct_io", dev.IsDirect())
@@ -306,9 +320,6 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	svc.StartNotificationServer(ctx)
 	svc.StartLockRevocation(ctx)
 	svc.StartSessionWatch(ctx)
-	svc.SetFlushInterval(cfg.MetadataFlushInterval)
-	svc.SetDataCache(cfg.WriteDataCache && cfg.MetadataFlushInterval > 0)
-	svc.SetPageCache(cfg.PageCache)
 	svc.StartFlusher(ctx)
 	if cfg.MetadataFlushInterval > 0 {
 		log.Info("deferring extent publication; a crash loses writes not yet flushed or fsynced",

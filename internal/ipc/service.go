@@ -114,10 +114,57 @@ type Service struct {
 	startGen uint64
 }
 
-// NewService creates a Service.
+// DefaultFlushInterval is the flush interval a daemon runs with unless it is
+// configured otherwise.  Stated here because it is a property of write
+// delegation rather than of the flag that carries it.
+const DefaultFlushInterval = defaultFlushInterval
+
+// Options is everything about a Service that is decided once, before it serves
+// anything, and never again.
+//
+// These used to be six setters called on a constructed Service. Nothing made
+// them run before the socket started accepting, and each stayed writable for
+// the process's lifetime — so "is the page cache on?" was a question with no
+// answer that held. Passing them here makes the configuration a property of the
+// Service rather than a sequence of calls someone has to get right.
+//
+// Every field means exactly what it says: a zero FlushInterval commits each
+// write before acknowledging it rather than selecting a default.
+type Options struct {
+	// FlushInterval bounds how long an acknowledged write may stay unpublished.
+	// Zero commits every write before acknowledging it, which loses nothing to a
+	// crash and pays a Raft commit per write.
+	FlushInterval time.Duration
+
+	// DataCache buffers a deferred write's payload in RAM alongside its extents.
+	// Off puts the bytes on the device as the write is served.
+	DataCache bool
+
+	// PageCache lets the kernel hold an inode's data pages while this node holds
+	// its lock. Off sends every read through to the daemon.
+	PageCache bool
+
+	// ReadOnly rejects every mutating opcode with EROFS, for mounting a
+	// filesystem for backup or inspection while another node writes.
+	ReadOnly bool
+
+	// Device is the shared block device. Nil is metadata-only mode, where a
+	// write updates the inode's size and nothing else.
+	Device *blockio.Device
+
+	// WriteBarriers adds a flush, a range sync and a readback to every write. It
+	// is forced on for a device opened without O_DIRECT, where the bytes really
+	// do sit in this node's page cache until something pushes them out.
+	WriteBarriers bool
+
+	// History records every served operation for offline consistency checking.
+	History *history.Recorder
+}
+
+// NewService creates a Service that will serve under opts.
 func NewService(store *metadata.Store, membership *metadata.Membership,
-	watchdog *fencing.Watchdog, log *config.Logger) *Service {
-	return &Service{
+	watchdog *fencing.Watchdog, log *config.Logger, opts Options) *Service {
+	s := &Service{
 		store:          store,
 		membership:     membership,
 		watchdog:       watchdog,
@@ -127,25 +174,18 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		locks:          make(map[uint64]*lockEntry),
 		recalling:      make(map[uint64]bool),
 		notifyServer:   &notifyServer{},
-		flushInterval:  defaultFlushInterval,
+		flushInterval:  opts.FlushInterval,
 		flushMaxBytes:  defaultFlushMaxBytes,
 		bufferMaxBytes: defaultBufferMaxBytes,
+		dataCache:      opts.DataCache,
+		pageCache:      opts.PageCache,
+		readOnly:       opts.ReadOnly,
+		history:        opts.History,
 	}
-}
-
-// SetFlushInterval bounds how long an acknowledged write may stay unpublished.
-// Zero commits every write before acknowledging it, which is the behaviour
-// before write delegation: nothing is ever lost by a crash, and every write
-// carries a Raft commit.
-func (s *Service) SetFlushInterval(d time.Duration) {
-	s.flushInterval = d
-}
-
-// SetPageCache lets the kernel cache data pages for inodes this node holds a
-// lock on.  Off leaves every read going through to the daemon, which is what
-// the filesystem did before there was anything able to invalidate a page.
-func (s *Service) SetPageCache(on bool) {
-	s.pageCache = on
+	if opts.Device != nil {
+		s.setBlockDevice(opts.Device, opts.WriteBarriers)
+	}
+	return s
 }
 
 // pagesCacheable reports whether an invalidation could have anything to do.
@@ -153,18 +193,11 @@ func (s *Service) pagesCacheable() bool {
 	return s.pageCache && s.pagesCached.Load()
 }
 
-// SetDataCache buffers a deferred write's payload in RAM as well as its extents.
-// Off restores a device write per write, which is the configuration that loses
-// nothing beyond what deferring the commit already loses.
-func (s *Service) SetDataCache(on bool) {
-	s.dataCache = on
-}
-
-// SetBlockDevice attaches a block device for data I/O.
+// setBlockDevice attaches the block device for data I/O.
 //
 // barriers is forced on for a device opened without O_DIRECT: there the bytes
 // really do sit in this node's page cache until something pushes them out.
-func (s *Service) SetBlockDevice(dev *blockio.Device, barriers bool) {
+func (s *Service) setBlockDevice(dev *blockio.Device, barriers bool) {
 	s.dev = dev
 	s.writeBarriers = barriers || !dev.IsDirect()
 	// The allocator hands out arenas by multiplying an ID by the arena size,
@@ -177,7 +210,7 @@ func (s *Service) SetBlockDevice(dev *blockio.Device, barriers bool) {
 // was working with.
 //
 // A shared volume can be grown while the cluster stays mounted, and the size
-// read at SetBlockDevice would otherwise hold until every daemon restarted.
+// read at construction would otherwise hold until every daemon restarted.
 // Running this only when an allocation has already failed for space keeps the
 // ioctl off the write path: a filesystem that is not full never pays for it.
 func (s *Service) refreshDeviceSize() bool {
@@ -213,18 +246,6 @@ func (s *Service) ReclaimOrphans(ctx context.Context) {
 		}
 		s.log.Info("reclaimed an inode left open by a previous run", "ino", ino)
 	}
-}
-
-// SetHistoryRecorder attaches a recorder that logs every served operation.
-func (s *Service) SetHistoryRecorder(r *history.Recorder) {
-	s.history = r
-}
-
-// SetReadOnly rejects every mutating opcode with EROFS. Intended for mounting
-// a filesystem for backup or inspection while another node writes, and for
-// giving fsck a safe way to run against a live volume.
-func (s *Service) SetReadOnly(ro bool) {
-	s.readOnly = ro
 }
 
 // ReconstructArenas rebuilds the arena free-list from existing extents in etcd.

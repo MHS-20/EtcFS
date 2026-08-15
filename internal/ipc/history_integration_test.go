@@ -49,7 +49,7 @@ func TestIntegration_RecordedNamespaceHistoryIsLinearizable(t *testing.T) {
 		st := metadata.NewStore(cli, node)
 		membership := metadata.NewMembership(cli, node, "verify", 10*time.Second)
 		svc := NewService(st, membership, fencing.NewWatchdog(membership, 10*time.Second),
-			config.NewLogger(0))
+			config.NewLogger(0), Options{FlushInterval: DefaultFlushInterval})
 		if err := svc.InitGeneration(ctx); err != nil {
 			t.Fatalf("init generation for %s: %v", node, err)
 		}
@@ -60,7 +60,7 @@ func TestIntegration_RecordedNamespaceHistoryIsLinearizable(t *testing.T) {
 			t.Fatalf("open recorder for %s: %v", node, err)
 		}
 		t.Cleanup(func() { _ = rec.Close() })
-		svc.SetHistoryRecorder(rec)
+		svc.history = rec
 		services = append(services, svc)
 	}
 
@@ -121,7 +121,8 @@ func TestIntegration_TamperedHistoryIsRejected(t *testing.T) {
 		t.Fatalf("seed root: %v", err)
 	}
 	membership := metadata.NewMembership(cli, "n1", "verify", 10*time.Second)
-	svc := NewService(st, membership, fencing.NewWatchdog(membership, 10*time.Second), config.NewLogger(0))
+	svc := NewService(st, membership, fencing.NewWatchdog(membership, 10*time.Second), config.NewLogger(0),
+		Options{FlushInterval: DefaultFlushInterval})
 	if err := svc.InitGeneration(ctx); err != nil {
 		t.Fatalf("init generation: %v", err)
 	}
@@ -131,7 +132,7 @@ func TestIntegration_TamperedHistoryIsRejected(t *testing.T) {
 		t.Fatalf("open recorder: %v", err)
 	}
 	defer func() { _ = rec.Close() }()
-	svc.SetHistoryRecorder(rec)
+	svc.history = rec
 
 	_, _ = svc.observedDispatch(ipcOpCreate, createPayload(metadata.RootIno, "dup", 0))
 	_, _ = svc.observedDispatch(ipcOpLookup, lookupPayload(metadata.RootIno, "dup"))
@@ -231,19 +232,20 @@ func TestIntegration_RecordedDataPathHistoryIsConsistent(t *testing.T) {
 
 		st := metadata.NewStore(cli, node)
 		membership := metadata.NewMembership(cli, node, "verify", 10*time.Second)
-		svc := NewService(st, membership, fencing.NewWatchdog(membership, 10*time.Second), config.NewLogger(0))
+		svc := NewService(st, membership, fencing.NewWatchdog(membership, 10*time.Second), config.NewLogger(0),
+			Options{FlushInterval: DefaultFlushInterval})
 		if err := svc.InitGeneration(ctx); err != nil {
 			t.Fatalf("init generation for %s: %v", node, err)
 		}
 		svc.InstallStoreGuard()
-		svc.SetBlockDevice(dev, false)
+		svc.setBlockDevice(dev, false)
 
 		rec, err := history.NewRecorder(historyPath, node)
 		if err != nil {
 			t.Fatalf("open recorder for %s: %v", node, err)
 		}
 		t.Cleanup(func() { _ = rec.Close() })
-		svc.SetHistoryRecorder(rec)
+		svc.history = rec
 		services = append(services, svc)
 	}
 
@@ -363,7 +365,8 @@ func TestIntegration_ReaddirDecodesWhatTheHandlerEncoded(t *testing.T) {
 	}
 
 	membership := metadata.NewMembership(cli, "n1", "verify", 10*time.Second)
-	svc := NewService(store, membership, fencing.NewWatchdog(membership, 10*time.Second), config.NewLogger(0))
+	svc := NewService(store, membership, fencing.NewWatchdog(membership, 10*time.Second), config.NewLogger(0),
+		Options{FlushInterval: DefaultFlushInterval})
 	if err := svc.InitGeneration(ctx); err != nil {
 		t.Fatalf("init generation: %v", err)
 	}
@@ -373,7 +376,7 @@ func TestIntegration_ReaddirDecodesWhatTheHandlerEncoded(t *testing.T) {
 		t.Fatalf("recorder: %v", err)
 	}
 	defer func() { _ = rec.Close() }()
-	svc.SetHistoryRecorder(rec)
+	svc.history = rec
 
 	want := map[string]bool{"alpha": true, "beta": true, "gamma": true}
 	for name := range want {

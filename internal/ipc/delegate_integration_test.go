@@ -251,8 +251,8 @@ func TestIntegration_BufferedPayloadIsCappedAcrossInodes(t *testing.T) {
 
 	// Long enough that the interval never fires during the run: the cap has to
 	// be what publishes these buffers, not the timer.
-	svc.SetFlushInterval(time.Minute)
-	svc.SetDataCache(true)
+	svc.flushInterval = time.Minute
+	svc.dataCache = true
 
 	const write = 256 << 10
 	const cap = 4 * write

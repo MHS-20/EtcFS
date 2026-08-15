@@ -24,7 +24,7 @@ func TestStopOnSignalOrFence_SelfFenceCancelsAndReports(t *testing.T) {
 	watchdog := fencing.NewWatchdog(membership, time.Millisecond)
 	go watchdog.Run(ctx)
 
-	svc := ipc.NewService(nil, membership, watchdog, config.NewLogger(0))
+	svc := ipc.NewService(nil, membership, watchdog, config.NewLogger(0), ipc.Options{})
 	fenced := stopOnSignalOrFence(ctx, cancel, svc, watchdog, config.NewLogger(0))
 
 	select {
@@ -47,7 +47,7 @@ func TestStopOnSignalOrFence_OrdinaryShutdownIsNotAFence(t *testing.T) {
 	membership := metadata.NewMembership(nil, "node-a", "test", time.Hour)
 	watchdog := fencing.NewWatchdog(membership, time.Hour)
 
-	svc := ipc.NewService(nil, membership, watchdog, config.NewLogger(0))
+	svc := ipc.NewService(nil, membership, watchdog, config.NewLogger(0), ipc.Options{})
 	fenced := stopOnSignalOrFence(ctx, cancel, svc, watchdog, config.NewLogger(0))
 	cancel()
 

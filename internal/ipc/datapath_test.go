@@ -29,7 +29,7 @@ func TestBufferedDeviceForcesWriteBarriers(t *testing.T) {
 	t.Cleanup(func() { _ = dev.Close() })
 
 	s := &Service{alloc: arena.NewAllocator("node-test", nil)}
-	s.SetBlockDevice(dev, false)
+	s.setBlockDevice(dev, false)
 
 	if dev.IsDirect() {
 		t.Skip("this filesystem supports O_DIRECT, nothing to force barriers for")
