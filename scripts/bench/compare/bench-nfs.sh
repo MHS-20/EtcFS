@@ -5,21 +5,23 @@
 # is the natural deployment for this hardware shape and the baseline the
 # gluster/juicefs runs' NFS-relayed backing store is measured against.
 #
+# ETCFS_BENCH_DIRECT=0 runs the warm-page-cache variant (see bench-etcfs.sh's
+# header for what the two measure). psync in that mode, not libaio: libaio
+# needs O_DIRECT and degrades to synchronous submission without it.
+#
 # Usage:
 #   ./bench-nfs.sh
+#   ETCFS_BENCH_DIRECT=0 ./bench-nfs.sh
 set -euo pipefail
-export COMPARE_BACKEND=nfs
+
+DIRECT="${ETCFS_BENCH_DIRECT:-1}"
+if [[ "$DIRECT" == "1" ]]; then BACKEND=nfs; ENGINE=libaio; else BACKEND=nfs-pagecache; ENGINE=psync; fi
+export COMPARE_BACKEND="$BACKEND"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/compare-lib.sh"
 
 compare_begin
-SERVER_PUB="${COMPARE_PUB_IPS[0]}"
-SERVER_PRIV="${COMPARE_PRIV_IPS[0]}"
-CLIENT_PUB="${COMPARE_PUB_IPS[1]}"
+compare_mount
 
-compare_export_backing "$SERVER_PUB" "$SERVER_PRIV" "$CLIENT_PUB" "${COMPARE_PUB_IPS[2]}"
-compare_install_fio "$CLIENT_PUB"
-
-N0="$CLIENT_PUB"
-run_fio "nfs" "filename=$BACKING_PATH/fio.dat" 1G libaio 4 32 "${ETCFS_BENCH_RUNTIME:-30}"
-compare_finish nfs
+run_fio "$BACKEND" "filename=$MOUNT_PATH/fio.dat" 1G "$ENGINE" 4 32 "${ETCFS_BENCH_RUNTIME:-30}" "$DIRECT"
+compare_finish "$BACKEND"

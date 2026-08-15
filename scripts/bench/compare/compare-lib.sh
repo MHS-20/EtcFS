@@ -19,6 +19,17 @@ COMPARE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPARE_PROJECT_ROOT="$(cd "$COMPARE_SCRIPT_DIR/../../.." && pwd)"
 INFRA_DIR="$COMPARE_PROJECT_ROOT/scripts/infra"
 
+# The backend a variant benchmarks: "etcfs-pagecache" is still etcfs as far as
+# AMI choice, mounting and teardown go — only its results directory differs.
+COMPARE_BACKEND_BASE="${COMPARE_BACKEND%%-*}"
+
+# gfs2-utils/dlm/corosync and glusterfs-server exist on AL2 and not on AL2023
+# (each script's own header explains why); pinned here rather than in five
+# callers so a scenario script only has to name a backend.
+case "$COMPARE_BACKEND_BASE" in
+    gfs2|gluster) export ETCFS_AMI_NAME_FILTER="${ETCFS_AMI_NAME_FILTER:-amzn2-ami-hvm-*-x86_64-gp2}" ;;
+esac
+
 export ETCFS_STATE="$COMPARE_PROJECT_ROOT/infra-state-compare-${COMPARE_BACKEND}.json"
 export ETCFS_CLUSTER="compare-${COMPARE_BACKEND}"
 export ETCFS_COMPUTE_NODES="${ETCFS_COMPUTE_NODES:-3}"
@@ -66,6 +77,9 @@ compare_destroy() {
 # compare_destroy, for a backend that created resources of its own.
 compare_begin() {
     local extra="${1:-}"
+    # gluster always leaves per-node local volumes behind, whichever scenario
+    # drove it — the caller shouldn't have to remember that.
+    [[ -z "$extra" && "$COMPARE_BACKEND_BASE" == "gluster" ]] && extra=compare_destroy_local_volumes
     if [[ -n "$extra" ]]; then
         # Expanded now on purpose: extra is the caller's literal command, and
         # the local holding it is gone by the time the trap fires.
@@ -239,3 +253,201 @@ compare_summary_row() {
     [[ -f "$summary" ]] || echo "[]" > "$summary"
     jq --argjson r "$row" '. + [$r]' "$summary" > "$summary.tmp" && mv "$summary.tmp" "$summary"
 }
+
+# ---- headline numbers ----
+#
+# The scenario suite reports one number per scenario, not an IOPS table, so it
+# needs a sink that isn't fio-shaped. compare_headline appends to this
+# backend's headline.json (an array of {scenario, backend, metric, value,
+# unit}) and prints the number where the run's own log will show it.
+compare_headline() {
+    local scenario="$1" metric="$2" value="$3" unit="${4:-}"
+    local file="$RESULTS_DIR/headline.json"
+    [[ -f "$file" ]] || echo "[]" > "$file"
+    jq --arg s "$scenario" --arg b "$COMPARE_BACKEND" --arg m "$metric" \
+       --arg v "$value" --arg u "$unit" \
+       '. + [{scenario: $s, backend: $b, metric: $m, value: ($v | tonumber), unit: $u}]' \
+       "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+    log "HEADLINE [$COMPARE_BACKEND/$scenario] $metric = $value $unit"
+}
+
+# ---- generic remote timing ----
+#
+# Timed on the node itself, not around the ssh call: an ssh round trip is tens
+# to hundreds of milliseconds, which is the same order as several of the
+# numbers this suite exists to publish (recovery, join latency).
+compare_remote_time() {
+    local ip="$1"; shift
+    $SSH_CMD "ec2-user@$ip" "s=\$(date +%s.%N); { $*; } >/dev/null 2>&1; e=\$(date +%s.%N); awk -v s=\$s -v e=\$e 'BEGIN{printf \"%.3f\", e-s}'"
+}
+
+compare_epoch() { date +%s.%N; }
+
+# compare_div <a> <b> [scale] — awk rather than bash arithmetic: every ratio
+# here (MiB/s, ops/s, percentages) is fractional.
+compare_div() {
+    awk -v a="$1" -v b="$2" -v s="${3:-2}" 'BEGIN{ if (b+0 == 0) { print "0" } else { printf "%.*f", s, a/b } }'
+}
+
+# ---- fio with a caller-supplied job file ----
+#
+# run_fio (bench-lib.sh) hard-codes one randwrite+randread 4k shape, which is
+# right for the IOPS comparison and wrong for every scenario here (sequential
+# handoff, O_DSYNC, single-stream throughput). This keeps run_fio's ssh/copy/
+# timeout handling and lets the caller own the job stanzas. Prints the local
+# JSON path.
+compare_run_job() {
+    local label="$1" ip="$2" runtime="$3" job="$4"
+    log "--- fio: $label on $ip ---"
+    echo "$job" | $SSH_CMD "ec2-user@$ip" "cat > /tmp/${label}.fio"
+    timeout "$((runtime * 4 + 120))" $SSH_CMD "ec2-user@$ip" \
+        "sudo fio /tmp/${label}.fio --output-format=json --output=/tmp/${label}.json" >/dev/null
+    scp $SSH_OPTS "ec2-user@$ip:/tmp/${label}.json" "$RESULTS_DIR/${label}.json" >/dev/null
+    echo "$RESULTS_DIR/${label}.json"
+}
+
+# compare_fio_bw_mibps <json> <read|write> — fio reports bw in KiB/s.
+compare_fio_bw_mibps() {
+    jq -r --arg d "$2" '(.jobs[0][$d].bw // 0) / 1024 | . * 100 | round / 100' "$1"
+}
+
+compare_fio_iops() { jq -r --arg d "$2" '(.jobs[0][$d].iops // 0) | round' "$1"; }
+
+# ---- shared-directory metadata concurrency ----
+#
+# create + stat + unlink of <files_per_node> files by every node at once, all
+# in one directory. The point is the shared directory: GFS2/OCFS2 bounce that
+# directory's DLM lock per operation, so the number that matters is aggregate
+# ops/sec against node count, taken over the slowest node (every node is
+# contending for the whole of its own run, so the run isn't over until the
+# last one finishes).
+compare_metadata_ops() {
+    local label="$1" dir="$2" per_node="$3"
+    shift 3
+    local ips=("$@")
+    log "--- metadata concurrency: $label (${#ips[@]} nodes x $per_node files in $dir) ---"
+    $SSH_CMD "ec2-user@${ips[0]}" "sudo mkdir -p $dir && sudo chmod 777 $dir"
+
+    local remote="
+        p=\$(hostname -s)
+        s=\$(date +%s.%N)
+        for i in \$(seq 1 $per_node); do : > $dir/\$p-\$i; done
+        for i in \$(seq 1 $per_node); do stat $dir/\$p-\$i >/dev/null; done
+        for i in \$(seq 1 $per_node); do rm -f $dir/\$p-\$i; done
+        e=\$(date +%s.%N)
+        awk -v s=\$s -v e=\$e 'BEGIN{printf \"%.3f\", e-s}'
+    "
+    local ip pids=() i=0
+    for ip in "${ips[@]}"; do
+        $SSH_CMD "ec2-user@$ip" "$remote" > "$RESULTS_DIR/${label}-$ip.elapsed" &
+        pids+=($!)
+        i=$((i + 1))
+    done
+    local failed=0
+    for pid in "${pids[@]}"; do wait "$pid" || failed=$((failed + 1)); done
+    [[ "$failed" -eq 0 ]] || die "compare_metadata_ops: $failed/${#ips[@]} node(s) failed during $label"
+
+    local slowest
+    slowest=$(cat "$RESULTS_DIR/${label}"-*.elapsed | sort -g | tail -1)
+    # 3 ops per file: create, stat, unlink.
+    compare_div "$((${#ips[@]} * per_node * 3))" "$slowest"
+}
+
+# ---- small-file tree ----
+#
+# compare_build_tree <ip> <files> — a kernel-source-shaped tree (many small
+# files, two directory levels) staged on the node's *local* disk as a tarball,
+# so the untar below measures the filesystem under test and not the generator.
+# Prints the tarball path. Skips the work if the tarball is already there,
+# which is what lets one provisioned cluster run the storm and the walk.
+COMPARE_TREE_TAR=/tmp/compare-tree.tar
+compare_build_tree() {
+    local ip="$1" files="${2:-80000}" per_dir=100
+    $SSH_CMD "ec2-user@$ip" "
+        set -e
+        [[ -f $COMPARE_TREE_TAR ]] && exit 0
+        rm -rf /tmp/compare-tree && mkdir -p /tmp/compare-tree
+        cd /tmp/compare-tree
+        for d in \$(seq 1 $((files / per_dir))); do
+            mkdir -p d\$d
+            for f in \$(seq 1 $per_dir); do
+                head -c 2048 /dev/zero > d\$d/f\$f.c
+            done
+        done
+        tar cf $COMPARE_TREE_TAR .
+    "
+    echo "$COMPARE_TREE_TAR"
+}
+
+# compare_untar_tree <ip> <dest_dir> — times an untar of that tarball onto the
+# filesystem under test. Prints "<seconds> <files_per_second>".
+compare_untar_tree() {
+    local ip="$1" dest="$2" files="${3:-80000}"
+    $SSH_CMD "ec2-user@$ip" "sudo rm -rf $dest && sudo mkdir -p $dest && sudo chmod 777 $dest"
+    local elapsed
+    elapsed=$(compare_remote_time "$ip" "sudo tar xf $COMPARE_TREE_TAR -C $dest && sync")
+    echo "$elapsed $(compare_div "$files" "$elapsed")"
+}
+
+# compare_walk_tree <ip> <dir> — cold then warm `find` + `du` over a populated
+# tree. Cold drops the client's caches first; the pair is the point, since the
+# gap between them is the metadata-caching story. Prints
+# "<cold_find_s> <warm_find_s> <du_s>".
+compare_walk_tree() {
+    local ip="$1" dir="$2"
+    $SSH_CMD "ec2-user@$ip" "sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null"
+    local cold warm du_s
+    cold=$(compare_remote_time "$ip" "sudo find $dir -type f | wc -l")
+    warm=$(compare_remote_time "$ip" "sudo find $dir -type f | wc -l")
+    du_s=$(compare_remote_time "$ip" "sudo du -s $dir")
+    echo "$cold $warm $du_s"
+}
+
+# ---- I/O probe: continuous writes with a per-attempt outcome log ----
+#
+# The recovery scenarios need to know when a survivor's I/O to a dead node's
+# inodes *resumes*, which no single timed command can answer: the interesting
+# interval starts at the kill and ends at an op that has not been issued yet.
+# So the survivor writes in a loop the whole time, logging one line per
+# attempt, and the number is extracted from that log afterwards against the
+# kill's own timestamp.
+compare_probe_start() {
+    local ip="$1" path="$2"
+    $SSH_CMD "ec2-user@$ip" "sudo rm -f /tmp/probe.log /tmp/probe.stop; sudo touch $path" || true
+    $SSH_CMD -n -f "ec2-user@$ip" "sudo sh -c 'while [ ! -f /tmp/probe.stop ]; do
+        t=\$(date +%s.%N)
+        if dd if=/dev/zero of=$path bs=4k count=1 conv=notrunc oflag=direct >/dev/null 2>&1; then
+            echo \"\$t ok\"
+        else
+            echo \"\$t err\"
+        fi
+    done > /tmp/probe.log' >/dev/null 2>&1"
+}
+
+compare_probe_stop() {
+    $SSH_CMD "ec2-user@$1" "sudo touch /tmp/probe.stop" || true
+}
+
+# compare_probe_recovery <ip> <kill_epoch> — prints
+# "<resume_s> <max_stall_s> <errors_after_kill>": time from the kill to the
+# first write that succeeded after it, the longest gap between consecutive
+# successes after it (the actual stall, if the first post-kill attempt happened
+# to land before the failure did), and how many attempts failed outright.
+compare_probe_recovery() {
+    local ip="$1" t0="$2"
+    $SSH_CMD "ec2-user@$ip" "sudo cat /tmp/probe.log" > "$RESULTS_DIR/probe-$ip.log"
+    awk -v t0="$t0" '
+        $2 == "ok" {
+            if (first == "" && $1 >= t0) first = $1
+            if (prev != "" && prev >= t0 && $1 - prev > gap) gap = $1 - prev
+            prev = $1
+        }
+        $2 == "err" && $1 >= t0 { errs++ }
+        END {
+            if (first == "") { print "-1 -1", errs+0; exit }
+            printf "%.3f %.3f %d\n", first - t0, gap + 0, errs + 0
+        }
+    ' "$RESULTS_DIR/probe-$ip.log"
+}
+
+source "$COMPARE_SCRIPT_DIR/compare-backends.sh"

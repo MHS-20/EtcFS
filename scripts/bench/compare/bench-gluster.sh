@@ -19,67 +19,23 @@
 # yum's priorities plugin hides EPEL's behind it; --disableplugin=priorities
 # on just that one install is what gets the newer one).
 #
+# ETCFS_BENCH_DIRECT=0 runs the warm-page-cache variant (see bench-etcfs.sh's
+# header for what the two measure). psync in that mode, not libaio: libaio
+# needs O_DIRECT and degrades to synchronous submission without it.
+#
 # Usage:
 #   ./bench-gluster.sh
+#   ETCFS_BENCH_DIRECT=0 ./bench-gluster.sh
 set -euo pipefail
-export COMPARE_BACKEND=gluster
-export ETCFS_AMI_NAME_FILTER="amzn2-ami-hvm-*-x86_64-gp2"
+
+DIRECT="${ETCFS_BENCH_DIRECT:-1}"
+if [[ "$DIRECT" == "1" ]]; then BACKEND=gluster; ENGINE=libaio; else BACKEND=gluster-pagecache; ENGINE=psync; fi
+export COMPARE_BACKEND="$BACKEND"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/compare-lib.sh"
 
-compare_begin compare_destroy_local_volumes
-N0="${COMPARE_PUB_IPS[0]}"
-N1="${COMPARE_PUB_IPS[1]}"
-N2="${COMPARE_PUB_IPS[2]}"
-P0="${COMPARE_PRIV_IPS[0]}"; P1="${COMPARE_PRIV_IPS[1]}"; P2="${COMPARE_PRIV_IPS[2]}"
-INST0=$(state_get compute_instance_ids | jq -r '.[0]')
-INST1=$(state_get compute_instance_ids | jq -r '.[1]')
-INST2=$(state_get compute_instance_ids | jq -r '.[2]')
+compare_begin
+compare_mount 0   # one client is all the IOPS comparison drives
 
-# glusterd management (24007) + brick daemons (49152-49251, one per brick —
-# 3 bricks here, wide range is glusterd's own default).
-compare_open_port 24007
-compare_open_port 49152 49251
-
-log "Creating one local 1000-IOPS brick volume per node..."
-mapfile -t BRICK_DEVS < <(compare_create_local_volumes "$ETCFS_VOLUME_IOPS" \
-    "$N0:$P0:$INST0" "$N1:$P1:$INST1" "$N2:$P2:$INST2")
-
-log "Installing glusterd + formatting local brick on each node..."
-IPS=("$N0" "$N1" "$N2")
-for i in 0 1 2; do
-    $SSH_CMD "ec2-user@${IPS[$i]}" "set -e
-        sudo amazon-linux-extras install -y epel
-        printf '%s\n' '[gluster9]' 'name=Gluster 9' \
-            'baseurl=https://vault.centos.org/centos/7/storage/\$basearch/gluster-9/' \
-            'gpgcheck=0' 'enabled=1' | sudo tee /etc/yum.repos.d/gluster9.repo >/dev/null
-        sudo yum install -y --disableplugin=priorities userspace-rcu
-        sudo yum install -y xfsprogs ncurses-compat-libs
-        sudo yum install -y --disablerepo=amzn2-core --disableplugin=priorities glusterfs-server
-        sudo mkfs.xfs -f ${BRICK_DEVS[$i]}
-        sudo mkdir -p /mnt/gluster-brick
-        sudo mount ${BRICK_DEVS[$i]} /mnt/gluster-brick
-        sudo mkdir -p /mnt/gluster-brick/brick
-        sudo systemctl enable --now glusterd
-    "
-done
-
-$SSH_CMD "ec2-user@$N0" "sudo gluster peer probe $P1 && sudo gluster peer probe $P2"
-sleep 5
-$SSH_CMD "ec2-user@$N0" "set -e
-    sudo gluster volume create compare-vol replica 3 \
-        $P0:/mnt/gluster-brick/brick $P1:/mnt/gluster-brick/brick $P2:/mnt/gluster-brick/brick force
-    sudo gluster volume start compare-vol
-"
-sleep 5
-
-$SSH_CMD "ec2-user@$N1" "set -e
-    sudo yum install -y glusterfs-fuse >/dev/null 2>&1
-    sudo mkdir -p /mnt/compare-gluster
-    sudo mount -t glusterfs $P0:/compare-vol /mnt/compare-gluster
-"
-compare_install_fio "$N1"
-
-N0="$N1"
-run_fio "gluster" "filename=/mnt/compare-gluster/fio.dat" 1G libaio 4 32 "${ETCFS_BENCH_RUNTIME:-30}"
-compare_finish gluster
+run_fio "$BACKEND" "filename=$MOUNT_PATH/fio.dat" 1G "$ENGINE" 4 32 "${ETCFS_BENCH_RUNTIME:-30}" "$DIRECT"
+compare_finish "$BACKEND"

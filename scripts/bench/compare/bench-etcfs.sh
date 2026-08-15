@@ -30,12 +30,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/compare-lib.sh"
 
 compare_begin
-N0="${COMPARE_PUB_IPS[0]}"
+compare_mount
 
-bash "$INFRA_DIR/bootstrap-cluster.sh" "$ETCFS_STATE" || die "bootstrap-cluster.sh failed"
-wait_for_fuse_mount "$N0" 60 2 || die "etcfs never mounted on $N0"
-compare_install_fio "$N0"
-
-run_fio "$BACKEND" "directory=$FUSE_MOUNTPOINT
+run_fio "$BACKEND" "directory=$MOUNT_PATH
 filename_format=fio.\$jobname.\$jobnum.\$filenum" 8M psync "${ETCFS_BENCH_JOBS:-4}" 1 "${ETCFS_BENCH_RUNTIME:-30}" "$DIRECT"
 compare_finish "$BACKEND"
