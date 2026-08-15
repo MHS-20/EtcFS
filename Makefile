@@ -3,13 +3,14 @@
 # Targets:
 #   make all         build both binaries (etcfuse, etcfuse-meta)
 #   make test        run unit tests (Go + C)
+#   make test-integration  run the etcd-backed suites (needs a running etcd)
 #   make lint        run linters (Go: golangci-lint, C: clang-format check, bash: shellcheck)
 #   make fmt         auto-format all code
 #   make clean       remove build artifacts
 #   make dev         start docker-compose development environment
 #   make check       lint + test (CI entry point)
 
-.PHONY: all test lint fmt clean dev check test-tla test-conformance test-integration
+.PHONY: all test lint fmt clean dev check test-tla test-conformance test-integration test-e2e
 
 GO_ENTRY   := ./cmd/etcfuse-meta
 GO_OUT     := bin/etcfuse-meta
@@ -73,8 +74,24 @@ bin/test-c: $(C_TEST_SRC) $(C_SRCS) $(C_HDRS)
 	@mkdir -p bin
 	$(CC) $(C_CFLAGS) $(C_TEST_SRC) pkg/fuse/fuse.c pkg/block/block.c -o $@ $(C_LIBS)
 
+# The suites behind the `integration` build tag: the handlers, the lock cache,
+# the flusher and the recall path against a real etcd.  Needs one running —
+# ETCD_ENDPOINTS points at it, default http://localhost:2379:
+#
+#   docker run -d -p 2379:2379 quay.io/coreos/etcd:v3.5.18 \
+#     /usr/local/bin/etcd --data-dir=/etcd-data \
+#     --listen-client-urls=http://0.0.0.0:2379 \
+#     --advertise-client-urls=http://0.0.0.0:2379
+#
+# -race here and not only in test-go: this is the only place those subsystems
+# run against a real etcd and each other, which is where a data race shows up.
 test-integration:
-	bash test/e2e/run.sh
+	go test -race -tags=integration -count=1 -timeout 900s ./...
+
+# The whole stack in one process tree: etcd, the Go backend, and the C daemon
+# on a real mountpoint.  Needs FUSE and an etcd; see the script's header.
+test-e2e:
+	bash test/e2e/run-phase2.sh
 
 # POSIX conformance: upstream pjdfstest against a live mount in Docker.
 # Results in deploy/docker/pjdfstest-results/.
