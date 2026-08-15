@@ -308,12 +308,12 @@ func applyUmask(mode, umask uint32) uint32 {
 }
 
 // CREATE payload:  [u64:parent][u32:name_len][name][u32:mode][u32:flags][u32:umask][u32:uid][u32:gid]
-// Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout]
+// Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout][u32:keep_cache]
 func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, error) {
 	r := newReader(payload)
 	parent, name := r.u64(), r.str()
 	mode := r.u32()
-	r.u32() // flags
+	flags := r.u32()
 	umask, uid, gid := r.u32(), r.u32(), r.u32()
 	if !r.ok {
 		return int32Resp(-22), nil
@@ -336,7 +336,11 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 	// arrives like any other, so it has to be counted like any other.
 	s.retain(rec.Ino)
 
-	return entryResp(rec.Ino, rec), nil
+	// The descriptor a create hands back is answered like any open: a page can
+	// only be filled by a read that reached the daemon under this inode's lock,
+	// and that lock's release invalidates it.  Nothing about a fresh inode
+	// changes either half of that.
+	return createResp(rec.Ino, rec, s.cacheableOpen(flags)), nil
 }
 
 // oTrunc is O_TRUNC as the kernel passes it in fuse_file_info.flags.

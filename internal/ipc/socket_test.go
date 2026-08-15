@@ -105,3 +105,23 @@ func TestDispatchTableCoversEveryOpcode(t *testing.T) {
 		}
 	}
 }
+
+// ec_create in pkg/fuse/ops.c reads the entry block and then one more u32 for
+// keep_cache.  A create response that stops at the entry leaves that read past
+// the end of the buffer, and the C side turns a successful create into EIO.
+func TestCreateRespCarriesKeepCacheAfterTheEntry(t *testing.T) {
+	entry := len(entryResp(1, &metadata.InodeRecord{}))
+	for _, keep := range []bool{false, true} {
+		b := createResp(1, &metadata.InodeRecord{}, keep)
+		if len(b) != entry+4 {
+			t.Fatalf("createResp wrote %d bytes, want entry+4 = %d", len(b), entry+4)
+		}
+		want := uint32(0)
+		if keep {
+			want = 1
+		}
+		if got := binary.BigEndian.Uint32(b[entry:]); got != want {
+			t.Fatalf("keep_cache = %d, want %d", got, want)
+		}
+	}
+}

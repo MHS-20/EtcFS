@@ -691,6 +691,7 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
     ep.entry_timeout = (double) rb_u32(&rb);
     ep.attr_timeout = (double) rb_u32(&rb);
     fill_stat(&ep.attr, &a);
+    uint32_t keep_cache = rb_u32(&rb);
     free(resp);
     if (!rb.ok) {
         fuse_reply_err(req, EIO);
@@ -698,12 +699,10 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
     }
     struct etcfs_context *ctx = fuse_req_userdata(req);
     fi->fh = next_file_handle(ctx);
-    fi->direct_io = 1;
-    fi->keep_cache = 0;
-    if (!rb.ok) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
+    /* Decided by the backend for the same reason an open's is: only it knows
+     * whether it can take the pages back before the inode's lock is yielded. */
+    fi->direct_io = keep_cache ? 0 : 1;
+    fi->keep_cache = keep_cache ? 1 : 0;
     fuse_reply_create(req, &ep, fi);
 }
 

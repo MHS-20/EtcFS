@@ -457,8 +457,21 @@ func dataResp(data []byte) []byte {
 	return b.b
 }
 
-// entryResp answers every op that returns a directory entry — LOOKUP, CREATE,
-// MKDIR, MKNOD, SYMLINK, LINK:
+// createResp answers a CREATE: an entry with the OPEN keep_cache flag appended,
+// because a create hands back an open descriptor and that descriptor needs the
+// same answer an open would have got.
+//
+//	[i32:error][u64:ino][attr][u32:entry_timeout][u32:attr_timeout][u32:keep_cache]
+func createResp(ino uint64, rec *metadata.InodeRecord, keepCache bool) []byte {
+	b := entryResp(ino, rec)
+	if keepCache {
+		return append(b, 0, 0, 0, 1)
+	}
+	return append(b, 0, 0, 0, 0)
+}
+
+// entryResp answers every op that returns a directory entry — LOOKUP, MKDIR,
+// MKNOD, SYMLINK, LINK, and CREATE through createResp:
 //
 //	[i32:error][u64:ino][attr][u32:entry_timeout][u32:attr_timeout]
 //
