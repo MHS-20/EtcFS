@@ -41,9 +41,9 @@ var errUnalignedBuffer = errors.New("no sector-aligned buffer available")
 
 func errnoForWrite(err error) int32 {
 	if errors.Is(err, errUnalignedBuffer) {
-		return -12 // ENOMEM
+		return errNoMem
 	}
-	return -5 // EIO
+	return errIO
 }
 
 // ioBuffer returns a buffer of at least n bytes usable for device I/O, along
@@ -95,7 +95,7 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 	data := r.blob()
 	uid, flags := r.u32(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 	dataLen := uint32(len(data))
 
@@ -107,7 +107,7 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
-		return int32Resp(-2), nil
+		return int32Resp(errNoEnt), nil
 	}
 
 	// No block device — update size and mode only (metadata-only mode)
@@ -135,12 +135,12 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	// avoids writing bytes we already know will never be referenced.
 	if s.IsFenced() {
 		s.log.Error("write: rejected, node has self-fenced", "ino", ino)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 
 	lk, err := s.lockInode(ctx, ino, metadata.LockExclusive)
 	if err != nil {
-		return int32Resp(-11), nil // EAGAIN after retries
+		return int32Resp(errAgain), nil // EAGAIN after retries
 	}
 	defer lk.Release()
 
@@ -152,7 +152,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	if sync && s.hasPending(ino) {
 		if ferr := s.flushEntry(ctx, lk.e, "sync_write"); ferr != nil {
 			s.log.Warn("write: cannot publish this inode's deferred writes", "ino", ino, "error", ferr)
-			return int32Resp(-5), nil
+			return int32Resp(errIO), nil
 		}
 	}
 
@@ -163,10 +163,10 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	meta, err := lk.meta(ctx)
 	if err != nil {
 		s.log.Warn("write: cannot read metadata", "ino", ino, "error", err)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 	if meta.rec == nil {
-		return int32Resp(-2), nil
+		return int32Resp(errNoEnt), nil
 	}
 	rec := meta.rec
 	existing := meta.extents
@@ -174,7 +174,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	runs, err := s.allocateBlocks(ctx, uint64(dataLen))
 	if err != nil {
 		s.log.Warn("write: cannot allocate blocks", "ino", ino, "error", err)
-		return int32Resp(-28), nil
+		return int32Resp(errNoSpace), nil
 	}
 	freeRuns := func() {
 		for _, r := range runs {
@@ -402,7 +402,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 			if merr != nil || fresh.rec == nil {
 				freeRuns()
 				s.log.Warn("write: cannot re-read metadata after a flush", "ino", ino, "error", merr)
-				return int32Resp(-5), nil
+				return int32Resp(errIO), nil
 			}
 			rec, existing = fresh.rec, fresh.extents
 			countFrom()
@@ -412,7 +412,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		if berr != nil {
 			freeRuns()
 			s.log.Warn("write: cannot buffer the extent", "ino", ino, "error", berr)
-			return int32Resp(-5), nil
+			return int32Resp(errIO), nil
 		}
 		lk.metaPublished = true
 		return writtenResp(uint32(dataLen)), nil
@@ -425,12 +425,12 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		if ferr := s.flushEntry(ctx, lk.e, "sync_write"); ferr != nil {
 			freeRuns()
 			s.log.Warn("write: cannot publish this inode's deferred writes", "ino", ino, "error", ferr)
-			return int32Resp(-5), nil
+			return int32Resp(errIO), nil
 		}
 		if xerr := readExtents(); xerr != nil {
 			freeRuns()
 			s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
-			return int32Resp(-5), nil
+			return int32Resp(errIO), nil
 		}
 		cmps, ops = proposal()
 	}
@@ -453,7 +453,7 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		if xerr := readExtents(); xerr != nil {
 			freeRuns()
 			s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
-			return int32Resp(-5), nil
+			return int32Resp(errIO), nil
 		}
 		cmps, ops = proposal()
 		committed, fenced, rev, cerr = s.commitGuarded(ctx, cmps, ops)
@@ -461,18 +461,18 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	if cerr != nil {
 		freeRuns()
 		s.log.Warn("write: metadata commit failed", "ino", ino, "error", cerr)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 	if fenced {
 		freeRuns()
 		s.log.Error("write: rejected, node has been fenced",
 			"ino", ino, "start_generation", s.startGen)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 	if !committed {
 		freeRuns()
 		s.log.Error("write: extent numbering still contended after a fresh read", "ino", ino)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 	// The lock is still held, so what this transaction wrote is still the whole
 	// truth about the inode, and telling the cache saves the next operation on
@@ -682,13 +682,13 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	r := newReader(payload)
 	ino, offset, size := r.u64(), r.u64(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	s.log.Debug("READ", "ino", ino, "offset", offset, "size", size)
 
 	if s.dev == nil {
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 
 	// A shared lock keeps a concurrent writer off the range while it is read,
@@ -705,7 +705,7 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	lk, err := s.lockInode(ctx, ino, metadata.LockShared)
 	if err != nil {
 		s.log.Warn("read: cannot lock inode", "ino", ino, "error", err)
-		return int32Resp(-11), nil // EAGAIN
+		return int32Resp(errAgain), nil
 	}
 	defer lk.Release()
 
@@ -722,11 +722,11 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 	meta, merr := lk.meta(ctx)
 	if merr != nil {
 		s.log.Warn("read: cannot read metadata", "ino", ino, "error", merr)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 	rec, extents := meta.rec, meta.extents
 	if rec == nil {
-		return int32Resp(-2), nil
+		return int32Resp(errNoEnt), nil
 	}
 
 	// A read is answered with the whole requested range, holes included, so a
@@ -778,7 +778,7 @@ func (s *Service) handleRead(ctx context.Context, payload []byte) ([]byte, error
 		}
 		if _, err := s.readInto(data[pos-offset:pos-offset+n], int64(ext.DiskOff+within)); err != nil {
 			s.log.Warn("read: block device read failed", "ino", ino, "error", err)
-			return int32Resp(-5), nil
+			return int32Resp(errIO), nil
 		}
 		pos += n
 	}

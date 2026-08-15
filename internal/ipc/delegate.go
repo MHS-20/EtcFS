@@ -747,12 +747,12 @@ func (s *Service) handleFsync(ctx context.Context, payload []byte) ([]byte, erro
 	r := newReader(payload)
 	ino := r.u64()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	if err := s.flushInode(ctx, ino); err != nil {
 		s.log.Warn("fsync: cannot publish deferred writes", "ino", ino, "error", err)
-		return int32Resp(-5), nil // EIO
+		return int32Resp(errIO), nil
 	}
 
 	// Without O_DIRECT the bytes are in this node's page cache rather than on
@@ -762,7 +762,7 @@ func (s *Service) handleFsync(ctx context.Context, payload []byte) ([]byte, erro
 	if s.dev != nil && !s.dev.IsDirect() {
 		if err := s.dev.FlushDevice(); err != nil {
 			s.log.Warn("fsync: cannot flush the device", "ino", ino, "error", err)
-			return int32Resp(-5), nil
+			return int32Resp(errIO), nil
 		}
 	}
 	return okResp(), nil

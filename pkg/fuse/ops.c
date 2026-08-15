@@ -308,6 +308,55 @@ static void fill_stat(struct stat *st, const struct etcfs_attr *a)
  * started the daemon and is not used to serve requests. */
 #define FD(ctx) etcfs_ipc_fd()
 
+/*
+ * ipc_call — one request/response exchange plus the errno check every handler
+ * opens with.  Returns 1 when the reply is the caller's to read from rb (and
+ * to free through resp), 0 when it has already answered the request.
+ *
+ * The three blocks it replaces — send, "did the socket fail", "did the daemon
+ * return an errno" — were written out at every one of the twenty-odd
+ * operations in this file, which is twenty chances to leak resp on one path or
+ * to reply twice on another.
+ */
+static int ipc_call(fuse_req_t req, uint16_t op, const uint8_t *payload, uint32_t plen,
+                    uint8_t **resp, struct rbuf *rb)
+{
+    uint32_t rlen = 0;
+    *resp = NULL;
+    if (ipc_sync(etcfs_ipc_fd(), op, payload, plen, resp, &rlen) < 0) {
+        fuse_reply_err(req, EIO);
+        return 0;
+    }
+    *rb = rb_new(*resp, rlen);
+    int32_t err = rb_i32(rb);
+    if (err != 0) {
+        free(*resp);
+        *resp = NULL;
+        fuse_reply_err(req, -err);
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * ipc_reply_status — the whole of an operation whose reply is nothing but its
+ * errno: unlink, rmdir, rename, fsync and the rest.  Answers the request in
+ * every case, so the caller has nothing left to do.
+ */
+static void ipc_reply_status(fuse_req_t req, uint16_t op, const uint8_t *payload, uint32_t plen)
+{
+    uint8_t *resp;
+    struct rbuf rb;
+    if (!ipc_call(req, op, payload, plen, &resp, &rb))
+        return;
+    int short_reply = !rb.ok;
+    free(resp);
+    /* A reply too short to hold its own errno word is a broken daemon, not a
+     * success: the errno-only handlers used to read that as zero and tell the
+     * application the operation had worked. */
+    fuse_reply_err(req, short_reply ? EIO : 0);
+}
+
 /* File handles are only ever handed back to the kernel, but they are still
  * allocated from one counter by every worker thread at once. */
 static uint64_t next_file_handle(struct etcfs_context *ctx)
@@ -348,19 +397,9 @@ static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
     off += (uint32_t) nlen;
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_LOOKUP, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_LOOKUP, payload, off, &resp, &rb))
         return;
-    }
-
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
     ep.ino = rb_u64(&rb);
@@ -396,18 +435,9 @@ static void ec_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
     uint8_t payload[8];
     wb_u64(payload, ino);
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_GETATTR, payload, 8, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_GETATTR, payload, 8, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     struct etcfs_attr a;
     rb_attr(&rb, &a);
     uint32_t to = rb_u32(&rb);
@@ -432,18 +462,9 @@ static void ec_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     p += wb_u32(payload + p, (uint32_t) size);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_READDIR, payload, p, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_READDIR, payload, p, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
 
     uint32_t count = rb_u32(&rb);
     size_t bufsz = size > 0 ? size : 4096;
@@ -486,18 +507,9 @@ static void ec_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t of
     p += wb_u32(payload + p, (uint32_t) size);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_READDIRPLUS, payload, p, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_READDIRPLUS, payload, p, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
 
     uint32_t count = rb_u32(&rb);
     size_t bufsz = size > 0 ? size : 4096;
@@ -547,18 +559,9 @@ static void ec_readlink(fuse_req_t req, fuse_ino_t ino)
     uint8_t payload[8];
     wb_u64(payload, ino);
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_READLINK, payload, 8, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_READLINK, payload, 8, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     uint32_t tl = rb_u32(&rb);
     const uint8_t *target = rb_bytes(&rb, tl);
     if (!target) {
@@ -584,18 +587,9 @@ static void ec_statfs(fuse_req_t req, fuse_ino_t ino)
 {
     (void) ino;
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_STATFS, NULL, 0, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_STATFS, NULL, 0, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     struct statvfs sv;
     memset(&sv, 0, sizeof(sv));
     sv.f_blocks = rb_u64(&rb);
@@ -685,18 +679,9 @@ static void ec_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
     off += wb_creds(payload + off, req);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_CREATE, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_CREATE, payload, off, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
     ep.ino = rb_u64(&rb);
@@ -739,18 +724,9 @@ static void ec_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
     off += wb_creds(payload + off, req);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_MKDIR, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_MKDIR, payload, off, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
     ep.ino = rb_u64(&rb);
@@ -781,18 +757,7 @@ static void ec_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
     memcpy(payload + off, name, nlen);
     off += (uint32_t) nlen;
 
-    uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_UNLINK, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
-    int32_t e = 0;
-    if (rlen >= 4)
-        e = (int32_t) ((uint32_t) resp[0] << 24 | (uint32_t) resp[1] << 16 |
-                       (uint32_t) resp[2] << 8 | (uint32_t) resp[3]);
-    free(resp);
-    fuse_reply_err(req, e != 0 ? -e : 0);
+    ipc_reply_status(req, IPC_OP_UNLINK, payload, off);
 }
 
 static void ec_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
@@ -809,18 +774,7 @@ static void ec_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
     memcpy(payload + off, name, nlen);
     off += (uint32_t) nlen;
 
-    uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_RMDIR, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
-    int32_t e = 0;
-    if (rlen >= 4)
-        e = (int32_t) ((uint32_t) resp[0] << 24 | (uint32_t) resp[1] << 16 |
-                       (uint32_t) resp[2] << 8 | (uint32_t) resp[3]);
-    free(resp);
-    fuse_reply_err(req, e != 0 ? -e : 0);
+    ipc_reply_status(req, IPC_OP_RMDIR, payload, off);
 }
 
 static void ec_rename(fuse_req_t req, fuse_ino_t old_parent, const char *old_name,
@@ -844,18 +798,7 @@ static void ec_rename(fuse_req_t req, fuse_ino_t old_parent, const char *old_nam
     off += (uint32_t) nlen;
     off += wb_u32(payload + off, flags);
 
-    uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_RENAME, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
-    int32_t e = 0;
-    if (rlen >= 4)
-        e = (int32_t) ((uint32_t) resp[0] << 24 | (uint32_t) resp[1] << 16 |
-                       (uint32_t) resp[2] << 8 | (uint32_t) resp[3]);
-    free(resp);
-    fuse_reply_err(req, e != 0 ? -e : 0);
+    ipc_reply_status(req, IPC_OP_RENAME, payload, off);
 }
 
 static void ec_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_t off,
@@ -921,18 +864,9 @@ static void ec_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
     off += wb_u32(payload + off, (uint32_t) attr->st_ctim.tv_nsec);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_SETATTR, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_SETATTR, payload, off, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     struct etcfs_attr a;
     rb_attr(&rb, &a);
     uint32_t to = rb_u32(&rb);
@@ -966,18 +900,9 @@ static void ec_symlink(fuse_req_t req, const char *target, fuse_ino_t parent, co
     off += wb_creds(payload + off, req);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_SYMLINK, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_SYMLINK, payload, off, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
     ep.ino = rb_u64(&rb);
@@ -1010,18 +935,9 @@ static void ec_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t new_parent, const
     off += (uint32_t) nlen;
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_LINK, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_LINK, payload, off, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
     ep.ino = rb_u64(&rb);
@@ -1058,18 +974,9 @@ static void ec_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
     off += wb_creds(payload + off, req);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_MKNOD, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_MKNOD, payload, off, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     struct fuse_entry_param ep;
     memset(&ep, 0, sizeof(ep));
     ep.ino = rb_u64(&rb);
@@ -1120,18 +1027,7 @@ static void ec_sync_inode(fuse_req_t req, fuse_ino_t ino)
     uint8_t payload[8];
     uint32_t off = wb_u64(payload, ino);
 
-    uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_FSYNC, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
-    int32_t e = 0;
-    if (rlen >= 4)
-        e = (int32_t) ((uint32_t) resp[0] << 24 | (uint32_t) resp[1] << 16 |
-                       (uint32_t) resp[2] << 8 | (uint32_t) resp[3]);
-    free(resp);
-    fuse_reply_err(req, e != 0 ? -e : 0);
+    ipc_reply_status(req, IPC_OP_FSYNC, payload, off);
 }
 
 /* close() sends this, so it is where a program that never calls fsync still
@@ -1170,18 +1066,9 @@ static void ec_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     p += wb_u32(payload + p, (uint32_t) size);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_READ, payload, p, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_READ, payload, p, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     uint32_t dataLen = rb_u32(&rb);
     const uint8_t *data = rb_bytes(&rb, dataLen);
     if (!data) {
@@ -1207,20 +1094,7 @@ static void ec_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
     off += wb_u64(payload + off, (uint64_t) offset);
     off += wb_u64(payload + off, (uint64_t) length);
 
-    uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_FALLOCATE, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    free(resp);
-    if (!rb.ok) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
-    fuse_reply_err(req, -e);
+    ipc_reply_status(req, IPC_OP_FALLOCATE, payload, off);
 }
 
 /* SEEK_DATA and SEEK_HOLE only. The kernel resolves SEEK_SET, SEEK_CUR and
@@ -1240,18 +1114,9 @@ static void ec_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
     p += wb_u32(payload + p, (uint32_t) whence);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_LSEEK, payload, p, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_LSEEK, payload, p, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     uint64_t found = rb_u64(&rb);
     free(resp);
     if (!rb.ok) {
@@ -1349,18 +1214,9 @@ static void ec_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t
     off += (uint32_t) nlen;
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_GETXATTR, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_GETXATTR, payload, off, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     uint32_t vlen = rb_u32(&rb);
     const uint8_t *value = rb_bytes(&rb, vlen);
     if (!value) {
@@ -1378,18 +1234,9 @@ static void ec_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
     wb_u64(payload, ino);
 
     uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_LISTXATTR, payload, 8, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
+    struct rbuf rb;
+    if (!ipc_call(req, IPC_OP_LISTXATTR, payload, 8, &resp, &rb))
         return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    if (e != 0) {
-        fuse_reply_err(req, -e);
-        free(resp);
-        return;
-    }
     uint32_t nlen = rb_u32(&rb);
     /* An inode with no attributes answers zero bytes, which rb_bytes reports
      * as NULL without it being a decoding failure -- the empty list is a
@@ -1419,20 +1266,7 @@ static void ec_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
     off += (uint32_t) nlen;
     off += wb_creds(payload + off, req);
 
-    uint8_t *resp;
-    uint32_t rlen;
-    if (ipc_sync(FD(ctx), IPC_OP_REMOVEXATTR, payload, off, &resp, &rlen) < 0) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
-    struct rbuf rb = rb_new(resp, rlen);
-    int32_t e = rb_i32(&rb);
-    free(resp);
-    if (!rb.ok) {
-        fuse_reply_err(req, EIO);
-        return;
-    }
-    fuse_reply_err(req, -e);
+    ipc_reply_status(req, IPC_OP_REMOVEXATTR, payload, off);
 }
 
 /* ---- op table ---- */

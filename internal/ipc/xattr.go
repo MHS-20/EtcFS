@@ -38,14 +38,14 @@ func (s *Service) handleSetxattr(ctx context.Context, payload []byte) ([]byte, e
 	ino, name, value := r.u64(), r.str(), r.blob()
 	flags, uid := r.u32(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil // EINVAL
+		return int32Resp(errInval), nil
 	}
 	if privilegedXattrPrefix(name) && uid != 0 {
-		return int32Resp(-1), nil // EPERM
+		return int32Resp(errPerm), nil
 	}
 
 	if err := s.store.SetXattr(ctx, ino, name, value, flags); err != nil {
-		return int32Resp(errnoFor(err, -5)), nil
+		return int32Resp(errnoFor(err, errIO)), nil
 	}
 	return okResp(), nil
 }
@@ -56,12 +56,12 @@ func (s *Service) handleGetxattr(ctx context.Context, payload []byte) ([]byte, e
 	r := newReader(payload)
 	ino, name := r.u64(), r.str()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	value, err := s.store.GetXattr(ctx, ino, name)
 	if err != nil {
-		return int32Resp(errnoFor(err, -5)), nil
+		return int32Resp(errnoFor(err, errIO)), nil
 	}
 
 	var b buf
@@ -81,12 +81,12 @@ func (s *Service) handleListxattr(ctx context.Context, payload []byte) ([]byte, 
 	r := newReader(payload)
 	ino := r.u64()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	names, err := s.store.ListXattrs(ctx, ino)
 	if err != nil {
-		return int32Resp(errnoFor(err, -5)), nil
+		return int32Resp(errnoFor(err, errIO)), nil
 	}
 
 	size := 0
@@ -112,14 +112,14 @@ func (s *Service) handleRemovexattr(ctx context.Context, payload []byte) ([]byte
 	r := newReader(payload)
 	ino, name, uid := r.u64(), r.str(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 	if privilegedXattrPrefix(name) && uid != 0 {
-		return int32Resp(-1), nil // EPERM
+		return int32Resp(errPerm), nil
 	}
 
 	if err := s.store.RemoveXattr(ctx, ino, name); err != nil {
-		return int32Resp(errnoFor(err, -5)), nil
+		return int32Resp(errnoFor(err, errIO)), nil
 	}
 	return okResp(), nil
 }

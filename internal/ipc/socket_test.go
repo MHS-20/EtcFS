@@ -20,6 +20,48 @@ func TestAttrBlockMatchesCDaemonWidth(t *testing.T) {
 	}
 }
 
+// Every fixed-width reply, measured against what the C parser consumes for it.
+//
+// The layouts are hand-encoded twice — buf/reader here, wb_*/rb_* in
+// pkg/fuse/ops.c — so a field added on one side only shifts every field after
+// it on the other, silently. Three replies used to be pinned this way and the
+// rest were unguarded; this covers all of them. The wanted numbers are written
+// as the sum of the C reads, in reply order, so a diff shows which field moved
+// rather than only that a total changed.
+//
+// Variable-length replies (READ, READDIR, READDIRPLUS, READLINK, LISTXATTR,
+// GETXATTR) are not here: their length is carried in the frame, and the reader
+// that consumes them is bounded, so a mismatch is a short read rather than a
+// desync.
+func TestFixedWidthRepliesMatchTheCDaemon(t *testing.T) {
+	rec := &metadata.InodeRecord{}
+	cases := []struct {
+		op    string
+		reply []byte
+		want  int // what ops.c reads back, field by field
+	}{
+		{"errno-only (unlink, rmdir, rename, fsync, flush)", okResp(), 4},
+		{"OPEN", openResp(true), 4 + 4},
+		{"WRITE", writtenResp(0), 4 + 4},
+		{"GETATTR/SETATTR", attrResp(rec), 4 + attrWireSize + 4},
+		{"LOOKUP/MKDIR/MKNOD/SYMLINK/LINK", entryResp(1, rec), 4 + 8 + attrWireSize + 4 + 4},
+		{"CREATE", createResp(1, rec, true), 4 + 8 + attrWireSize + 4 + 4 + 4},
+		{"LSEEK", lseekResp(0), 4 + 8},
+		{"STATFS", statfsResp(0, 0, 0, 0), 4 + 5*8 + 3*4},
+		// The same totals test/c/test_ops.c pins from the reading side. Spelled
+		// out so the two files can be compared by eye without adding them up.
+		{"CREATE, as an absolute width", createResp(1, rec, true), 108},
+		{"LOOKUP, as an absolute width", entryResp(1, rec), 104},
+		{"GETATTR, as an absolute width", attrResp(rec), 92},
+		{"STATFS, as an absolute width", statfsResp(0, 0, 0, 0), 56},
+	}
+	for _, c := range cases {
+		if len(c.reply) != c.want {
+			t.Errorf("%s: the daemon writes %d bytes, ops.c reads %d", c.op, len(c.reply), c.want)
+		}
+	}
+}
+
 // setattrPayloadLen must match what ec_setattr in pkg/fuse/ops.c writes. The
 // two are hand-encoded on opposite sides of the socket, so a field added to one
 // and not the other shifts every field after it.

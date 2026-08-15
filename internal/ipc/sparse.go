@@ -34,10 +34,10 @@ func (s *Service) handleLseek(ctx context.Context, payload []byte) ([]byte, erro
 	r := newReader(payload)
 	ino, offset, whence := r.u64(), r.u64(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 	if whence != seekData && whence != seekHole {
-		return int32Resp(-22), nil // EINVAL: the kernel handles SET/CUR/END
+		return int32Resp(errInval), nil // EINVAL: the kernel handles SET/CUR/END
 	}
 
 	// Both answers come from the extent map in etcd, which is behind by
@@ -45,17 +45,17 @@ func (s *Service) handleLseek(ctx context.Context, payload []byte) ([]byte, erro
 	// has written would otherwise report a hole.
 	if ferr := s.flushInode(ctx, ino); ferr != nil {
 		s.log.Warn("lseek: cannot publish deferred writes", "ino", ino, "error", ferr)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
-		return int32Resp(-2), nil // ENOENT
+		return int32Resp(errNoEnt), nil
 	}
 
 	extents, err := s.store.GetExtents(ctx, ino)
 	if err != nil {
-		return int32Resp(errnoFor(err, -5)), nil
+		return int32Resp(errnoFor(err, errIO)), nil
 	}
 
 	var found uint64
@@ -66,13 +66,10 @@ func (s *Service) handleLseek(ctx context.Context, payload []byte) ([]byte, erro
 		found, ok = metadata.SeekHole(extents, rec.Size, offset)
 	}
 	if !ok {
-		return int32Resp(-6), nil // ENXIO: no such offset in this file
+		return int32Resp(errNXIO), nil // ENXIO: no such offset in this file
 	}
 
-	var b buf
-	b.w32(0)
-	b.w64(found)
-	return b.b, nil
+	return lseekResp(found), nil
 }
 
 // FALLOCATE payload: [u64:ino][u32:mode][u64:offset][u64:length]
@@ -93,15 +90,15 @@ func (s *Service) handleFallocate(ctx context.Context, payload []byte) ([]byte, 
 	r := newReader(payload)
 	ino, mode, offset, length := r.u64(), r.u32(), r.u64(), r.u64()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 	if length == 0 {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 	// Overflow would wrap the end offset back below the start and turn a
 	// punch into a reclaim of the whole file.
 	if offset+length < offset {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	// Allocation with KEEP_SIZE changes nothing here — blocks are claimed at
@@ -117,7 +114,7 @@ func (s *Service) handleFallocate(ctx context.Context, payload []byte) ([]byte, 
 	lk, lerr := s.lockInode(ctx, ino, metadata.LockExclusive)
 	if lerr != nil {
 		s.log.Warn("fallocate: cannot lock inode", "ino", ino, "error", lerr)
-		return int32Resp(-11), nil // EAGAIN
+		return int32Resp(errAgain), nil
 	}
 	defer lk.Release()
 
@@ -125,7 +122,7 @@ func (s *Service) handleFallocate(ctx context.Context, payload []byte) ([]byte, 
 	// writes have to be published before the plan is built.
 	if ferr := lk.flush(ctx); ferr != nil {
 		s.log.Warn("fallocate: cannot publish deferred writes", "ino", ino, "error", ferr)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 
 	switch {
@@ -133,23 +130,23 @@ func (s *Service) handleFallocate(ctx context.Context, payload []byte) ([]byte, 
 		// The kernel requires KEEP_SIZE alongside PUNCH_HOLE, and a punch that
 		// changed the size would be a different operation entirely.
 		if mode&fallocKeepSize == 0 {
-			return int32Resp(-22), nil
+			return int32Resp(errInval), nil
 		}
 		if err := s.punchHole(ctx, ino, offset, offset+length); err != nil {
 			s.log.Error("fallocate: punch hole failed", "ino", ino, "error", err)
-			return int32Resp(errnoFor(err, -5)), nil
+			return int32Resp(errnoFor(err, errIO)), nil
 		}
 		return okResp(), nil
 
 	case mode == 0:
 		if err := s.growTo(ctx, ino, offset+length); err != nil {
 			s.log.Error("fallocate: grow failed", "ino", ino, "error", err)
-			return int32Resp(errnoFor(err, -5)), nil
+			return int32Resp(errnoFor(err, errIO)), nil
 		}
 		return okResp(), nil
 	}
 
-	return int32Resp(-95), nil // EOPNOTSUPP
+	return int32Resp(errNotSupp), nil
 }
 
 // punchHole reclaims every extent range inside [start, end), leaving the file's

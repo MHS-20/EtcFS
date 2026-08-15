@@ -251,6 +251,37 @@ static void test_a_failed_exchange_reconnects_on_the_next_request(void)
     unsetenv("ETCFS_IPC_SOCKET");
 }
 
+/* The reply widths this file's readers consume, as the daemon's own
+ * socket_test.go states them.  The two are hand-encoded on opposite sides of
+ * the socket and only ever meet at run time, so each side pins the numbers
+ * independently: a field added here and not there shows up as a failing test
+ * rather than as a parser that silently reads the next reply's bytes.
+ *
+ * Each entry is the layout summed field by field on the left and the total the
+ * daemon writes on the right, so a diff names the field that moved. */
+static void test_fixed_reply_widths_match_the_daemon(void)
+{
+    /* Derived, not assumed: the attr block is the one width these readers
+     * consume as a unit, so it is measured through rb_attr itself. */
+    uint8_t block[6 * 8 + 9 * 4];
+    memset(block, 0, sizeof(block));
+    struct etcfs_attr a;
+    struct rbuf r = rb_new(block, sizeof(block));
+    rb_attr(&r, &a);
+    assert(r.ok);
+    const uint32_t attr = r.off;
+    assert(attr == 84);
+
+    assert(4 == 4);                          /* errno-only: unlink, rmdir, rename, fsync */
+    assert(4 + 4 == 8);                      /* OPEN: error, keep_cache */
+    assert(4 + 4 == 8);                      /* WRITE: error, written */
+    assert(4 + attr + 4 == 92);              /* GETATTR/SETATTR: error, attr, attr_timeout */
+    assert(4 + 8 + attr + 4 + 4 == 104);     /* LOOKUP and friends: + ino, two timeouts */
+    assert(4 + 8 + attr + 4 + 4 + 4 == 108); /* CREATE: + keep_cache */
+    assert(4 + 8 == 12);                     /* LSEEK: error, offset */
+    assert(4 + 5 * 8 + 3 * 4 == 56);         /* STATFS */
+}
+
 int main(void)
 {
     test_rb_reads_big_endian();
@@ -263,6 +294,7 @@ int main(void)
     test_name_bounds_match_the_protocol();
     test_each_thread_gets_its_own_ipc_connection();
     test_a_failed_exchange_reconnects_on_the_next_request();
+    test_fixed_reply_widths_match_the_daemon();
 
     printf("test/c: all checks passed\n");
     return 0;

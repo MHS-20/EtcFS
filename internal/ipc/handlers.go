@@ -24,25 +24,25 @@ import (
 func errnoFor(err error, fallback int32) int32 {
 	switch {
 	case errors.Is(err, metadata.ErrFenced), errors.Is(err, metadata.ErrGuardUnavailable):
-		return -5 // EIO
+		return errIO
 	case errors.Is(err, metadata.ErrExists):
-		return -17 // EEXIST
+		return errExist
 	case errors.Is(err, metadata.ErrNotFound):
-		return -2 // ENOENT
+		return errNoEnt
 	case errors.Is(err, metadata.ErrNotDir):
-		return -20 // ENOTDIR
+		return errNotDir
 	case errors.Is(err, metadata.ErrIsDir):
-		return -21 // EISDIR
+		return errIsDir
 	case errors.Is(err, metadata.ErrInvalid):
-		return -22 // EINVAL
+		return errInval
 	case errors.Is(err, metadata.ErrNotEmpty):
-		return -39 // ENOTEMPTY
+		return errNotEmpty
 	case errors.Is(err, metadata.ErrPerm):
-		return -1 // EPERM
+		return errPerm
 	case errors.Is(err, metadata.ErrNoData):
-		return -61 // ENODATA
+		return errNoData
 	case errors.Is(err, metadata.ErrTooBig):
-		return -7 // E2BIG
+		return err2Big
 	}
 	return fallback
 }
@@ -53,22 +53,22 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 	r := newReader(payload)
 	parent, name := r.u64(), r.str()
 	if !r.ok {
-		return int32Resp(-22), nil // EINVAL
+		return int32Resp(errInval), nil
 	}
 
 	ino, err := s.store.LookupDirent(ctx, parent, name)
 	if err != nil {
 		s.log.Warn("lookup dirent", "parent", parent, "name", name, "error", err)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 	if ino == 0 {
-		return int32Resp(-2), nil // ENOENT
+		return int32Resp(errNoEnt), nil
 	}
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
 		s.log.Warn("lookup getinode", "ino", ino, "error", err)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 
 	return entryResp(ino, s.withPendingSize(rec)), nil
@@ -99,12 +99,12 @@ func (s *Service) handleGetattr(ctx context.Context, payload []byte) ([]byte, er
 	r := newReader(payload)
 	ino := r.u64()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
-		return int32Resp(-2), nil // ENOENT
+		return int32Resp(errNoEnt), nil
 	}
 
 	return attrResp(s.withPendingSize(rec)), nil
@@ -127,12 +127,12 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 	r := newReader(payload)
 	ino, offset, size := r.u64(), r.u64(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	entries, err := s.store.ListDirents(ctx, ino)
 	if err != nil {
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 
 	// The cookie of an entry is its 1-based position, so the kernel's offset is
@@ -155,7 +155,7 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 	}
 	records, err := s.store.GetMany(ctx, keys)
 	if err != nil {
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 
 	var b buf
@@ -244,12 +244,12 @@ func (s *Service) handleReadlink(ctx context.Context, payload []byte) ([]byte, e
 	r := newReader(payload)
 	ino := r.u64()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	target, err := s.store.Get(ctx, metadata.InodeSymlinkKey(ino))
 	if err != nil || target == nil {
-		return int32Resp(-2), nil // ENOENT
+		return int32Resp(errNoEnt), nil
 	}
 
 	var b buf
@@ -318,17 +318,7 @@ func (s *Service) handleStatfs(ctx context.Context, _ []byte) ([]byte, error) {
 	// ceiling this replaces was not a limit the filesystem enforced anywhere.
 	ffree := bfree
 
-	var b buf
-	b.w32(0)
-	b.w64(blocks)
-	b.w64(bfree)
-	b.w64(bfree)
-	b.w64(files)
-	b.w64(ffree)
-	b.w32(4096)
-	b.w32(255)
-	b.w32(4096)
-	return b.b, nil
+	return statfsResp(blocks, bfree, files, ffree), nil
 }
 
 // ---- write operation handlers ----
@@ -350,7 +340,7 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 	flags := r.u32()
 	umask, uid, gid := r.u32(), r.u32(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	ino, err := s.allocInode(ctx)
@@ -358,12 +348,12 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 		// ENOSPC unless the node has been fenced, which has to surface as EIO:
 		// a fenced create reported as "disk full" is indistinguishable from a
 		// genuinely full device in a log.
-		return int32Resp(errnoFor(err, -28)), nil
+		return int32Resp(errnoFor(err, errNoSpace)), nil
 	}
 
 	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, applyUmask(mode, umask), uid, gid)
 	if err != nil {
-		return int32Resp(errnoFor(err, -17)), nil // EEXIST unless fenced
+		return int32Resp(errnoFor(err, errExist)), nil // EEXIST unless fenced
 	}
 
 	// A create hands back an open descriptor, and the release that closes it
@@ -390,7 +380,7 @@ func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error
 	r := newReader(payload)
 	ino, flags := r.u64(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 	if flags&oTrunc != 0 {
 		// O_TRUNC deletes every extent of the file and publishes the new size,
@@ -401,17 +391,17 @@ func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error
 		lk, lerr := s.lockInode(ctx, ino, metadata.LockExclusive)
 		if lerr != nil {
 			s.log.Warn("open: cannot lock inode for truncate", "ino", ino, "error", lerr)
-			return int32Resp(-11), nil // EAGAIN
+			return int32Resp(errAgain), nil
 		}
 		defer lk.Release()
 
 		if ferr := lk.flush(ctx); ferr != nil {
 			s.log.Warn("open: cannot publish deferred writes before truncating", "ino", ino, "error", ferr)
-			return int32Resp(-5), nil
+			return int32Resp(errIO), nil
 		}
 		if err := s.truncateToZero(ctx, ino); err != nil {
 			s.log.Warn("open: truncate failed", "ino", ino, "error", err)
-			return int32Resp(errnoFor(err, -5)), nil
+			return int32Resp(errnoFor(err, errIO)), nil
 		}
 	}
 	s.retain(ino)
@@ -445,7 +435,7 @@ func (s *Service) handleRelease(ctx context.Context, payload []byte) ([]byte, er
 	r := newReader(payload)
 	ino := r.u64()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 	if s.release(ino) {
 		// The last descriptor on a file whose names are all gone: nothing can
@@ -504,17 +494,17 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 	parent, name := r.u64(), r.str()
 	mode, umask, uid, gid := r.u32(), r.u32(), r.u32(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(errnoFor(err, -28)), nil
+		return int32Resp(errnoFor(err, errNoSpace)), nil
 	}
 
 	rec, err := s.store.AtomicCreateDir(ctx, parent, name, ino, applyUmask(mode, umask), uid, gid)
 	if err != nil {
-		return int32Resp(errnoFor(err, -17)), nil
+		return int32Resp(errnoFor(err, errExist)), nil
 	}
 
 	return entryResp(rec.Ino, rec), nil
@@ -526,12 +516,12 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 	r := newReader(payload)
 	parent, name := r.u64(), r.str()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	err := s.store.AtomicUnlinkKeepingOpen(ctx, parent, name, s.heldOpen)
 	if err != nil {
-		return int32Resp(errnoFor(err, -2)), nil // ENOENT unless fenced
+		return int32Resp(errnoFor(err, errNoEnt)), nil // ENOENT unless fenced
 	}
 	return okResp(), nil
 }
@@ -542,11 +532,11 @@ func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, erro
 	r := newReader(payload)
 	parent, name := r.u64(), r.str()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	if err := s.store.AtomicRmdir(ctx, parent, name); err != nil {
-		return int32Resp(errnoFor(err, -2)), nil
+		return int32Resp(errnoFor(err, errNoEnt)), nil
 	}
 	return okResp(), nil
 }
@@ -559,13 +549,13 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 	newParent, newName := r.u64(), r.str()
 	flags := r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	// Resolve old inode
 	ino, err := s.store.LookupDirent(ctx, oldParent, oldName)
 	if err != nil || ino == 0 {
-		return int32Resp(-2), nil
+		return int32Resp(errNoEnt), nil
 	}
 
 	// write(); close(); rename() is how a program publishes a file atomically,
@@ -574,12 +564,12 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 	// content is a flush interval behind — the ext4 delayed-allocation trap.
 	if ferr := s.flushInode(ctx, ino); ferr != nil {
 		s.log.Warn("rename: cannot publish deferred writes", "ino", ino, "error", ferr)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 
 	err = s.store.AtomicRename(ctx, oldParent, oldName, newParent, newName, ino, flags)
 	if err != nil {
-		return int32Resp(errnoFor(err, -17)), nil // EEXIST or other, unless fenced
+		return int32Resp(errnoFor(err, errExist)), nil // EEXIST or other, unless fenced
 	}
 	return okResp(), nil
 }
@@ -618,7 +608,7 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	atime, mtime, ctime := r.u64(), r.u64(), r.u64()
 	atimeNsec, mtimeNsec, ctimeNsec := r.u32(), r.u32(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	// A size change rewrites extents and republishes the size, so it is held
@@ -629,7 +619,7 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 		lk, lerr := s.lockInode(ctx, ino, metadata.LockExclusive)
 		if lerr != nil {
 			s.log.Warn("setattr: cannot lock inode for size change", "ino", ino, "error", lerr)
-			return int32Resp(-11), nil // EAGAIN
+			return int32Resp(errAgain), nil
 		}
 		defer lk.Release()
 
@@ -640,13 +630,13 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 		if ferr := lk.flush(ctx); ferr != nil {
 			s.log.Warn("setattr: cannot publish deferred writes before a size change",
 				"ino", ino, "error", ferr)
-			return int32Resp(-5), nil
+			return int32Resp(errIO), nil
 		}
 	}
 
 	rec, rev, err := s.store.GetInodeRev(ctx, ino)
 	if err != nil || rec == nil {
-		return int32Resp(-2), nil
+		return int32Resp(errNoEnt), nil
 	}
 
 	// Shrinking releases the extents past the new end, and that runs before the
@@ -704,10 +694,10 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 		[]clientv3.Cmp{metadata.InodeUnchanged(ino, rev)},
 		[]clientv3.Op{clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(rec)))}, nil)
 	if err != nil {
-		return int32Resp(errnoFor(err, -5)), nil
+		return int32Resp(errnoFor(err, errIO)), nil
 	}
 	if !ok {
-		return int32Resp(-11), nil // EAGAIN: the inode moved, let the kernel retry
+		return int32Resp(errAgain), nil // EAGAIN: the inode moved, let the kernel retry
 	}
 
 	return attrResp(rec), nil
@@ -720,17 +710,17 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 	parent, name, target := r.u64(), r.str(), r.str()
 	uid, gid := r.u32(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(errnoFor(err, -28)), nil
+		return int32Resp(errnoFor(err, errNoSpace)), nil
 	}
 
 	rec, err := s.store.AtomicCreateSymlink(ctx, parent, name, ino, target, uid, gid)
 	if err != nil {
-		return int32Resp(errnoFor(err, -17)), nil
+		return int32Resp(errnoFor(err, errExist)), nil
 	}
 
 	return entryResp(ino, rec), nil
@@ -742,19 +732,19 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 	r := newReader(payload)
 	ino, newParent, name := r.u64(), r.u64(), r.str()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	// A second name for the inode, for the same reason a rename gets one: the
 	// name must not become reachable before the data it points at.
 	if ferr := s.flushInode(ctx, ino); ferr != nil {
 		s.log.Warn("link: cannot publish deferred writes", "ino", ino, "error", ferr)
-		return int32Resp(-5), nil
+		return int32Resp(errIO), nil
 	}
 
 	rec, err := s.store.AtomicLink(ctx, ino, newParent, name)
 	if err != nil {
-		return int32Resp(errnoFor(err, -17)), nil
+		return int32Resp(errnoFor(err, errExist)), nil
 	}
 	return entryResp(ino, rec), nil
 }
@@ -767,17 +757,17 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 	mode, rdev, umask := r.u32(), r.u32(), r.u32()
 	uid, gid := r.u32(), r.u32()
 	if !r.ok {
-		return int32Resp(-22), nil
+		return int32Resp(errInval), nil
 	}
 
 	ino, err := s.allocInode(ctx)
 	if err != nil {
-		return int32Resp(errnoFor(err, -28)), nil
+		return int32Resp(errnoFor(err, errNoSpace)), nil
 	}
 
 	rec, err := s.store.AtomicCreateNode(ctx, parent, name, ino, applyUmask(mode, umask), rdev, uid, gid)
 	if err != nil {
-		return int32Resp(errnoFor(err, -17)), nil
+		return int32Resp(errnoFor(err, errExist)), nil
 	}
 
 	return entryResp(ino, rec), nil

@@ -79,7 +79,7 @@ func ok(*Service, context.Context, []byte) ([]byte, error) { return okResp(), ni
 
 // unsupported answers an opcode the backend deliberately does not serve.
 func unsupported(*Service, context.Context, []byte) ([]byte, error) {
-	return int32Resp(-38), nil // ENOSYS
+	return int32Resp(errNoSys), nil
 }
 
 var ops = map[uint16]op{
@@ -233,7 +233,7 @@ func (s *Service) safeDispatch(code uint16, payload []byte) (resp []byte, err er
 		if p := recover(); p != nil {
 			s.log.Error("ipc handler panicked", "op", opName(code), "payload_len", len(payload),
 				"panic", p, "stack", string(debug.Stack()))
-			resp, err = int32Resp(-5), nil // EIO for this request only
+			resp, err = int32Resp(errIO), nil // EIO for this request only
 		}
 	}()
 	return s.dispatch(code, payload)
@@ -472,6 +472,35 @@ func createResp(ino uint64, rec *metadata.InodeRecord, keepCache bool) []byte {
 	return append(b, 0, 0, 0, 0)
 }
 
+// lseekResp answers an LSEEK: [i32:error][u64:offset]
+func lseekResp(offset uint64) []byte {
+	var b buf
+	b.w32(0)
+	b.w64(offset)
+	return b.b
+}
+
+// statfsResp answers a STATFS:
+//
+//	[i32:error][u64:blocks][u64:bfree][u64:bavail][u64:files][u64:ffree]
+//	[u32:bsize][u32:namelen][u32:frsize]
+//
+// bavail repeats bfree: EtcFS reserves nothing for root, so the space an
+// unprivileged writer may use is the space that is free.
+func statfsResp(blocks, bfree, files, ffree uint64) []byte {
+	var b buf
+	b.w32(0)
+	b.w64(blocks)
+	b.w64(bfree)
+	b.w64(bfree)
+	b.w64(files)
+	b.w64(ffree)
+	b.w32(4096) // bsize
+	b.w32(255)  // namelen
+	b.w32(4096) // frsize
+	return b.b
+}
+
 // entryResp answers every op that returns a directory entry — LOOKUP, MKDIR,
 // MKNOD, SYMLINK, LINK, and CREATE through createResp:
 //
@@ -505,10 +534,10 @@ func attrResp(rec *metadata.InodeRecord) []byte {
 func (s *Service) dispatch(code uint16, payload []byte) ([]byte, error) {
 	o, found := ops[code]
 	if !found {
-		return int32Resp(-38), nil // ENOSYS
+		return int32Resp(errNoSys), nil
 	}
 	if s.readOnly && mutatingOps[code] {
-		return int32Resp(-30), nil // EROFS
+		return int32Resp(errROFS), nil
 	}
 
 	// Bounded here rather than at each of the ~35 individual store calls the
