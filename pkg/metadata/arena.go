@@ -87,6 +87,20 @@ func (s *Store) ReleaseArenaID(ctx context.Context, nodeID string, arenaID uint6
 	return won, nil
 }
 
+// CountOwnedArenas reports how many arenas are owned across the whole cluster,
+// counting every node's records rather than this node's.  Arenas sitting in the
+// free pool are not counted: they carry no owner and any node may claim one.
+//
+// Count-only, so etcd answers with a number instead of the keys — the caller
+// (statfs) wants the size of the set and nothing in it.
+func (s *Store) CountOwnedArenas(ctx context.Context) (int64, error) {
+	resp, err := s.read(ctx, PrefixArena, clientv3.WithPrefix(), clientv3.WithCountOnly())
+	if err != nil {
+		return 0, fmt.Errorf("count owned arenas: %w", err)
+	}
+	return resp.Count, nil
+}
+
 // ClaimFreeArena takes one arena out of the global free pool, reporting the
 // arena claimed and whether the pool had one.
 //

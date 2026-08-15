@@ -630,7 +630,13 @@ func (s *Service) allocateBlocks(ctx context.Context, size uint64) ([]arena.Run,
 		}
 	}
 	if _, err := s.alloc.AcquireArena(ctx); err != nil {
-		return nil, err
+		if !errors.Is(err, arena.ErrNoSpace) || !s.refreshDeviceSize() {
+			return nil, err
+		}
+		// The device grew: the arena that did not fit a moment ago may now.
+		if _, err := s.alloc.AcquireArena(ctx); err != nil {
+			return nil, err
+		}
 	}
 	runs, err := s.alloc.Allocate(size)
 	if err != nil {

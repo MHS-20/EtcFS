@@ -3,6 +3,7 @@ package blockio
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -21,8 +22,12 @@ type Device struct {
 	fd         int
 	path       string
 	sectorSize int
-	totalSize  int64
 	direct     bool
+
+	// totalSize is re-read whenever the device may have grown underneath the
+	// running process (see RefreshSize), so it is read by the I/O paths while
+	// another goroutine is writing it.
+	totalSize atomic.Int64
 }
 
 // Open opens the device for data I/O, requiring O_DIRECT.
@@ -87,24 +92,56 @@ func (d *Device) queryGeometry() error {
 		d.sectorSize = int(sec)
 	}
 
-	var bs uint64
-	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, uintptr(d.fd), blkGetSize64,
-		uintptr(unsafe.Pointer(&bs)))
-	if errno == 0 {
-		d.totalSize = int64(bs)
-	} else {
-		var stat unix.Stat_t
-		if err := unix.Fstat(d.fd, &stat); err != nil {
-			return fmt.Errorf("stat: %w", err)
-		}
-		d.totalSize = stat.Size
+	size, err := d.readSize()
+	if err != nil {
+		return err
 	}
+	d.totalSize.Store(size)
 
 	return nil
 }
 
+// readSize asks the kernel how large the device is right now.
+func (d *Device) readSize() (int64, error) {
+	var bs uint64
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(d.fd), blkGetSize64,
+		uintptr(unsafe.Pointer(&bs)))
+	if errno == 0 {
+		return int64(bs), nil
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(d.fd, &stat); err != nil {
+		return 0, fmt.Errorf("stat: %w", err)
+	}
+	return stat.Size, nil
+}
+
+// RefreshSize re-reads the device size and returns it.  A shared volume can be
+// grown while every node that uses it stays mounted — an EBS volume is the
+// case that matters — and the new space is then invisible to a size read once
+// at open: no arena can be handed out from it and statfs under-reports.
+//
+// A size that came back smaller is ignored.  Shrinking a volume under a live
+// filesystem is not a supported operation, and acting on the smaller number
+// would strand arenas that are already in use.
+func (d *Device) RefreshSize() (int64, error) {
+	size, err := d.readSize()
+	if err != nil {
+		return d.TotalSize(), err
+	}
+	for {
+		known := d.totalSize.Load()
+		if size <= known {
+			return known, nil
+		}
+		if d.totalSize.CompareAndSwap(known, size) {
+			return size, nil
+		}
+	}
+}
+
 func (d *Device) SectorSize() int  { return d.sectorSize }
-func (d *Device) TotalSize() int64 { return d.totalSize }
+func (d *Device) TotalSize() int64 { return d.totalSize.Load() }
 func (d *Device) Path() string     { return d.path }
 
 func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {

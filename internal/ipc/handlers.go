@@ -7,6 +7,7 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
@@ -258,15 +259,48 @@ func (s *Service) handleReadlink(ctx context.Context, payload []byte) ([]byte, e
 	return b.b, nil
 }
 
+// freeBytes estimates the space left on the shared device, for statfs.
+//
+// The device is shared but each arena belongs to one node, so the two halves of
+// the answer come from different places.  Space no node has claimed is a
+// cluster-wide fact, read from the ownership records in etcd.  Space still free
+// *inside* an arena is known only to that arena's owner, so only this node's
+// own slack can be added to it.
+//
+// The result therefore under-reports: every other node's unused space inside
+// its own arenas is counted as used.  That is a deliberate choice of which way
+// to be wrong.  Deriving the whole number from this node's arena occupancy —
+// what this used to do — was wrong in both directions at once, reporting a
+// nearly empty device as full whenever this node's own arenas happened to be
+// full, and a nearly full one as empty whenever they happened to be free.
+func (s *Service) freeBytes(ctx context.Context, deviceSize uint64) uint64 {
+	owned, err := s.store.CountOwnedArenas(ctx)
+	if err != nil {
+		s.log.Warn("statfs: cannot count the cluster's arenas", "error", err)
+		return 0
+	}
+
+	claimed := uint64(owned) * arena.ArenaSizeBytes
+	unclaimed := uint64(0)
+	if claimed < deviceSize {
+		unclaimed = deviceSize - claimed
+	}
+
+	mine := uint64(s.alloc.ArenaCount()) * arena.ArenaSizeBytes
+	localFree := uint64(float64(mine) * (1 - s.alloc.LiveRatio()))
+
+	return unclaimed + localFree
+}
+
 // STATFS payload: empty
 // Response: [i32:error][u64:blocks][u64:bfree][u64:bavail][u64:files][u64:ffree][u32:bsize][u32:namelen][u32:frsize]
 func (s *Service) handleStatfs(ctx context.Context, _ []byte) ([]byte, error) {
 	blocks := uint64(1 << 30)
 	bfree := uint64(1 << 29)
 	if s.dev != nil {
-		blocks = uint64(s.dev.TotalSize()) / 512
-		ratio := s.alloc.LiveRatio()
-		bfree = uint64(float64(blocks) * (1 - ratio))
+		size := uint64(s.dev.TotalSize())
+		blocks = size / 512
+		bfree = s.freeBytes(ctx, size) / 512
 	}
 	// The inode allocation counter, not a scan of the inode space: every `df`
 	// used to be a full range read over the whole namespace to use nothing but

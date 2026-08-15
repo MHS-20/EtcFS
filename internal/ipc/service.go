@@ -65,6 +65,12 @@ type Service struct {
 	// invalidation just because no client happens to be connected now.
 	pagesCached atomic.Bool
 
+	// serving records that the IPC socket has been accepted on, which is the
+	// point from which a mount can actually be answered.  Reported by the
+	// readiness endpoint; an orchestrator that routes work here before it is
+	// true gets EIO from a daemon that is merely still starting.
+	serving atomic.Bool
+
 	// readOnly rejects every mutating opcode with EROFS before it reaches a
 	// handler. Checked in dispatch rather than per-handler so a new mutating
 	// operation is safe by default: it must be added to mutatingOps to be
@@ -159,6 +165,31 @@ func (s *Service) SetBlockDevice(dev *blockio.Device, barriers bool) {
 	// The allocator hands out arenas by multiplying an ID by the arena size,
 	// with nothing else to stop it running past the end of the device.
 	s.alloc.SetDeviceSize(uint64(dev.TotalSize()))
+}
+
+// refreshDeviceSize re-reads the device size and tells the allocator about it,
+// reporting whether the device turned out to be larger than what the allocator
+// was working with.
+//
+// A shared volume can be grown while the cluster stays mounted, and the size
+// read at SetBlockDevice would otherwise hold until every daemon restarted.
+// Running this only when an allocation has already failed for space keeps the
+// ioctl off the write path: a filesystem that is not full never pays for it.
+func (s *Service) refreshDeviceSize() bool {
+	if s.dev == nil {
+		return false
+	}
+	size, err := s.dev.RefreshSize()
+	if err != nil {
+		s.log.Warn("cannot re-read the device size", "error", err)
+		return false
+	}
+	if uint64(size) <= s.alloc.DeviceSize() {
+		return false
+	}
+	s.log.Info("the device has grown", "bytes", size)
+	s.alloc.SetDeviceSize(uint64(size))
+	return true
 }
 
 // ReclaimOrphans deletes the inodes a previous incarnation of this node was
@@ -292,3 +323,7 @@ func (s *Service) guardGeneration(ctx context.Context) (uint64, error) {
 	}
 	return s.startGen, nil
 }
+
+// Serving reports whether the IPC socket is accepting connections, which is
+// the point from which this daemon can answer a mount.
+func (s *Service) Serving() bool { return s.serving.Load() }

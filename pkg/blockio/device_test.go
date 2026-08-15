@@ -139,3 +139,32 @@ func TestOpenRefusesToFallBackToBufferedIO(t *testing.T) {
 		t.Error("IsDirect reported true after a buffered fallback")
 	}
 }
+
+func TestRefreshSizePicksUpGrowth(t *testing.T) {
+	f, err := os.CreateTemp("", "blockio-test-*")
+	require.NoError(t, err)
+	name := f.Name()
+	f.Close()
+	defer os.Remove(name)
+
+	require.NoError(t, os.Truncate(name, 4096))
+	dev, err := OpenBuffered(name)
+	require.NoError(t, err)
+	defer dev.Close()
+	require.Equal(t, int64(4096), dev.TotalSize())
+
+	// A volume grown underneath a mounted filesystem: the size read at open is
+	// stale until something re-reads it.
+	require.NoError(t, os.Truncate(name, 8192))
+	size, err := dev.RefreshSize()
+	require.NoError(t, err)
+	assert.Equal(t, int64(8192), size)
+	assert.Equal(t, int64(8192), dev.TotalSize())
+
+	// Shrinking is not a supported operation and must not be acted on: arenas
+	// already handed out from the tail would be stranded.
+	require.NoError(t, os.Truncate(name, 4096))
+	size, err = dev.RefreshSize()
+	require.NoError(t, err)
+	assert.Equal(t, int64(8192), size)
+}
