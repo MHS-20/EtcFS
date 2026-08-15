@@ -6,7 +6,9 @@ package ipc
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -237,5 +239,71 @@ func TestIntegration_SetIDBitsAreClearedWithoutWaitingForAFlush(t *testing.T) {
 	if rec.Mode&(metadata.S_ISUID|metadata.S_ISGID) != 0 {
 		t.Errorf("mode = %o in etcd right after an unprivileged write, want the "+
 			"set-user-ID and set-group-ID bits gone", rec.Mode)
+	}
+}
+
+// The per-inode cap bounds one hot file and says nothing about how many files
+// are hot at once.  Without a process-wide cap, a workload spread across many
+// inodes holds an unbounded amount of acknowledged-but-unpublished payload in
+// RAM — every byte of which a crash would lose.
+func TestIntegration_BufferedPayloadIsCappedAcrossInodes(t *testing.T) {
+	svc, store := newTestService(t)
+
+	// Long enough that the interval never fires during the run: the cap has to
+	// be what publishes these buffers, not the timer.
+	svc.SetFlushInterval(time.Minute)
+	svc.SetDataCache(true)
+
+	const write = 256 << 10
+	const cap = 4 * write
+	svc.bufferMaxBytes = cap
+
+	block := make([]byte, write)
+	for i := range block {
+		block[i] = byte(i)
+	}
+
+	const inodes = 24
+	for i := 0; i < inodes; i++ {
+		ino := uint64(9400 + i)
+		// Not seedFile: it names every inode after the test, and this one needs
+		// a directory entry per inode.
+		if _, err := store.AtomicCreateFile(context.Background(), metadata.RootIno,
+			fmt.Sprintf("%s-%d", t.Name(), i), ino, 0o100644, 1000, 1000); err != nil {
+			t.Fatalf("seed inode %d: %v", ino, err)
+		}
+		writeAt(t, svc, ino, 0, block)
+
+		// One write may cross the cap before the next drain, and an entry with
+		// an operation in flight is skipped — but nothing is in flight here, so
+		// the overshoot is bounded by exactly one write.
+		if held := svc.bufferedBytes.Load(); held > cap+write {
+			t.Fatalf("after %d inodes, %d bytes buffered with a %d byte cap", i+1, held, cap)
+		}
+	}
+
+	// Draining must publish, not discard: every file still has to read back.
+	for i := 0; i < inodes; i++ {
+		ino := uint64(9400 + i)
+		if e := fsyncInode(t, svc, ino); e != 0 {
+			t.Fatalf("fsync ino %d: errno %d", ino, e)
+		}
+		rec, extents, err := store.GetInodeAndExtents(context.Background(), ino)
+		if err != nil {
+			t.Fatalf("read metadata for ino %d: %v", ino, err)
+		}
+		if rec.Size != write {
+			t.Errorf("ino %d: size = %d, want %d", ino, rec.Size, write)
+		}
+		if len(extents) == 0 {
+			t.Errorf("ino %d: no extents published", ino)
+		}
+	}
+
+	if held := svc.bufferedBytes.Load(); held != 0 {
+		t.Errorf("%d bytes still counted as buffered after every inode was fsynced", held)
+	}
+	if ops := svc.bufferedOps.Load(); ops != 0 {
+		t.Errorf("%d operations still counted as buffered after every inode was fsynced", ops)
 	}
 }

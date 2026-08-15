@@ -51,6 +51,15 @@ const (
 	// it in bytes, for a writer fast enough to make the interval irrelevant.
 	defaultFlushMaxBytes = 16 << 20
 
+	// defaultBufferMaxBytes caps the acknowledged-but-unpublished payload held
+	// across every inode at once.  The per-inode cap bounds one hot file; on its
+	// own it bounds nothing at all, because a workload with a thousand hot files
+	// multiplies it by a thousand and holds all of it in RAM.
+	//
+	// 256 MiB is sixteen inodes at the per-inode cap: generous enough that an
+	// ordinary workload never reaches it, small enough to be a bound.
+	defaultBufferMaxBytes = 256 << 20
+
 	// flushIOConcurrency is how many of a flush's device writes may be in
 	// flight at once.  A flush that issued them one at a time would spend the
 	// whole batch at the device's latency, serialized, with an inode's lock
@@ -262,7 +271,19 @@ func (s *Service) bufferWrite(ctx context.Context, e *lockEntry, m *inodeMeta,
 		return errBufferPublished
 	}
 
+	// The per-inode cap above says nothing about how many inodes are buffering
+	// at once, so the process-wide total is drained here before this write joins
+	// it.  Other inodes' buffers are published, never this one's: a flush of
+	// this entry would invalidate the proposal the caller is holding, which is
+	// what errBufferPublished exists to signal, and the caller has already been
+	// told its own buffer had room.
+	if s.bufferedBytes.Load()+int64(bytes) > s.bufferMaxBytes {
+		s.drainBuffers(ctx, e)
+	}
+
+	before := len(e.pending.order)
 	e.pending.add(cmps, ops, plans, bytes)
+	s.bufferAccounted(len(e.pending.order)-before, int64(bytes))
 	e.pending.data = append(e.pending.data, data...)
 	e.pending.runs = append(e.pending.runs, runs...)
 	// The snapshot is republished under the same mutex the buffer is, so the
@@ -271,9 +292,55 @@ func (s *Service) bufferWrite(ctx context.Context, e *lockEntry, m *inodeMeta,
 		e.meta, e.metaFor = m, e.holder
 	}
 
-	metrics.PendingExtents.Set(float64(len(e.pending.order)))
-	metrics.PendingBytes.Set(float64(e.pending.bytes))
 	return nil
+}
+
+// bufferAccounted moves the process-wide buffered totals by one entry's change
+// and republishes them as the pending gauges.
+//
+// Process-wide rather than per-entry because that is the number that matters in
+// both uses: it is what a crash would lose right now, and it is what bounds the
+// RAM these buffers may occupy.  The gauges used to be set from whichever inode
+// was last written, so with more than one inode buffering they described no
+// real quantity at all.
+func (s *Service) bufferAccounted(ops int, bytes int64) {
+	totalOps := s.bufferedOps.Add(int64(ops))
+	totalBytes := s.bufferedBytes.Add(bytes)
+	metrics.PendingExtents.Set(float64(totalOps))
+	metrics.PendingBytes.Set(float64(totalBytes))
+}
+
+// drainBuffers publishes other inodes' buffers until the process-wide total is
+// back under the cap.
+//
+// Entries with an operation in flight are skipped rather than waited for: a
+// flush cannot run alongside an operation whose comparisons it would
+// invalidate, and blocking here would hold one writer behind another's slow
+// request.  If every buffer is in flight the total stays over the cap until
+// they finish, which overshoots by at most one write per inode in flight.
+func (s *Service) drainBuffers(ctx context.Context, skip *lockEntry) {
+	s.lockMu.Lock()
+	entries := make([]*lockEntry, 0, len(s.locks))
+	for _, e := range s.locks {
+		if e != skip {
+			entries = append(entries, e)
+		}
+	}
+	s.lockMu.Unlock()
+
+	for _, e := range entries {
+		if s.bufferedBytes.Load() <= s.bufferMaxBytes {
+			return
+		}
+		if !e.rw.TryLock() {
+			continue
+		}
+		if err := s.flushEntry(ctx, e, "memory_pressure"); err != nil {
+			s.log.Warn("deferred writes not published under memory pressure",
+				"ino", e.ino, "error", err)
+		}
+		e.rw.Unlock()
+	}
 }
 
 // flushEntry publishes an entry's buffer.  The caller must hold the entry's
@@ -483,12 +550,12 @@ func (s *Service) flushData(p *pending) error {
 // refers to — and the cached extents take the revisions their keys now carry,
 // which is what a later comparison on those extents has to match.
 func (s *Service) flushCommitted(e *lockEntry, revs map[string]int64) {
+	ops, bytes := len(e.pending.order), e.pending.bytes
 	plans, _ := e.pending.reset()
 	for _, p := range plans {
 		s.freeReclaimed(p)
 	}
-	metrics.PendingExtents.Set(0)
-	metrics.PendingBytes.Set(0)
+	s.bufferAccounted(-ops, -int64(bytes))
 
 	if e.meta == nil {
 		return
@@ -555,7 +622,7 @@ func (s *Service) flushAlreadyLanded(ctx context.Context, e *lockEntry) (map[str
 // discardPending drops a buffer that can never be published and returns its
 // blocks to the arena.
 func (s *Service) discardPending(e *lockEntry, why string) {
-	ops := len(e.pending.order)
+	ops, bytes := len(e.pending.order), e.pending.bytes
 	plans, runs := e.pending.reset()
 	for _, p := range plans {
 		s.freeReclaimed(p)
@@ -567,8 +634,7 @@ func (s *Service) discardPending(e *lockEntry, why string) {
 	}
 	// The cached snapshot describes writes that no longer exist anywhere.
 	e.meta, e.metaFor = nil, ""
-	metrics.PendingExtents.Set(0)
-	metrics.PendingBytes.Set(0)
+	s.bufferAccounted(-ops, -int64(bytes))
 	s.log.Error("deferred writes discarded and their blocks released", "ino", e.ino,
 		"operations", ops, "reason", why)
 }

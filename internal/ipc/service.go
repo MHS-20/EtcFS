@@ -47,6 +47,15 @@ type Service struct {
 	// past the cap waits for the flush that makes room for it.
 	flushMaxBytes uint64
 
+	// bufferMaxBytes caps the buffered payload across every inode at once, and
+	// bufferedOps/bufferedBytes are the running totals it is compared against.
+	// The per-inode cap bounds one hot file; without this one, a workload with
+	// many hot files holds an unbounded amount of acknowledged-but-unpublished
+	// data in RAM.
+	bufferMaxBytes int64
+	bufferedOps    atomic.Int64
+	bufferedBytes  atomic.Int64
+
 	// dataCache buffers a deferred write's payload in RAM alongside its extents
 	// instead of putting it on the device as the write is served, so a write
 	// costs no device I/O either.  The flush writes the bytes before it
@@ -113,18 +122,19 @@ type Service struct {
 func NewService(store *metadata.Store, membership *metadata.Membership,
 	watchdog *fencing.Watchdog, log *config.Logger) *Service {
 	return &Service{
-		store:         store,
-		membership:    membership,
-		watchdog:      watchdog,
-		alloc:         arena.NewAllocator(membership.NodeID(), store),
-		log:           log,
-		openCount:     make(map[uint64]int),
-		orphaned:      make(map[uint64]bool),
-		locks:         make(map[uint64]*lockEntry),
-		recalling:     make(map[uint64]bool),
-		notifyServer:  &notifyServer{},
-		flushInterval: defaultFlushInterval,
-		flushMaxBytes: defaultFlushMaxBytes,
+		store:          store,
+		membership:     membership,
+		watchdog:       watchdog,
+		alloc:          arena.NewAllocator(membership.NodeID(), store),
+		log:            log,
+		openCount:      make(map[uint64]int),
+		orphaned:       make(map[uint64]bool),
+		locks:          make(map[uint64]*lockEntry),
+		recalling:      make(map[uint64]bool),
+		notifyServer:   &notifyServer{},
+		flushInterval:  defaultFlushInterval,
+		flushMaxBytes:  defaultFlushMaxBytes,
+		bufferMaxBytes: defaultBufferMaxBytes,
 	}
 }
 
