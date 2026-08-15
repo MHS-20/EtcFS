@@ -139,11 +139,14 @@ discover_subnet() {
     fi
 }
 
+# ETCFS_AMI_NAME_FILTER overrides the AMI family every other backend uses
+# (al2023-ami-2023*) — e.g. GFS2's gfs2-utils/kmod-gfs2 packages exist for
+# Amazon Linux 2 (amzn2-ami-hvm-*) but not AL2023, which dropped them.
 discover_ami() {
     aws ec2 describe-images \
         --owners amazon \
         --filters \
-            "Name=name,Values=al2023-ami-2023*" \
+            "Name=name,Values=${ETCFS_AMI_NAME_FILTER:-al2023-ami-2023*}" \
             "Name=architecture,Values=x86_64" \
             "Name=state,Values=available" \
         --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text
