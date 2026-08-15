@@ -41,7 +41,30 @@ const (
 	// rather than the network, and a release that gives up early would yield the
 	// inode with stale pages still cached.
 	notifyAckTimeout = 5 * time.Second
+
+	// notifyBreakerTrips is how many acknowledgements in a row may time out
+	// before the client is treated as unresponsive.  A client that is wedged but
+	// still connected answers nothing while keeping the socket open, so without
+	// this every lock release pays the full ack timeout, one after another,
+	// through a path that is one socket and one thread.
+	notifyBreakerTrips = 3
+
+	// notifyBreakerCooldown is how long acknowledged messages fail immediately
+	// once the breaker has tripped.  Long enough that a wedged client stops
+	// costing anything, short enough that one which recovers is picked up again
+	// without operator action.
+	notifyBreakerCooldown = 30 * time.Second
 )
+
+// errNotifyClientUnresponsive reports that the client has stopped answering
+// acknowledged messages.
+//
+// Deliberately not errNoNotifyClient.  A client that has gone away took its
+// FUSE session and its cached pages with it, so there is nothing left to
+// invalidate and a lock release may proceed.  A client that is merely wedged
+// still has that session, and its pages may still hold what a peer is about to
+// overwrite — so the release has to fail rather than assume the cache is gone.
+var errNotifyClientUnresponsive = errors.New("the cache-invalidation client is not answering")
 
 // errNoNotifyClient reports that no C daemon is connected to be told about an
 // invalidation.
@@ -50,6 +73,16 @@ var errNoNotifyClient = errors.New("no cache-invalidation client is connected")
 type notifyServer struct {
 	mu   sync.Mutex
 	conn net.Conn
+
+	// ackTimeout is notifyAckTimeout, as a field so a test can shorten it.
+	ackTimeout time.Duration
+
+	// ackTimeouts counts acknowledgements that timed out in a row, across
+	// reconnections: a client that wedges, is dropped, reconnects and wedges
+	// again is the case the breaker exists for, and a counter reset by the
+	// reconnection would never reach its limit.  Any successful ack clears it.
+	ackTimeouts int
+	brokenUntil time.Time
 }
 
 // send writes one message and, when ack is set, waits for the C daemon to
@@ -60,6 +93,9 @@ func (n *notifyServer) send(msg []byte, ack bool) error {
 	if n.conn == nil {
 		return errNoNotifyClient
 	}
+	if ack && time.Now().Before(n.brokenUntil) {
+		return errNotifyClientUnresponsive
+	}
 
 	var b [1]byte
 	err := func() error {
@@ -69,7 +105,7 @@ func (n *notifyServer) send(msg []byte, ack bool) error {
 		if !ack {
 			return nil
 		}
-		if derr := n.conn.SetReadDeadline(time.Now().Add(notifyAckTimeout)); derr != nil {
+		if derr := n.conn.SetReadDeadline(time.Now().Add(n.ackTimeoutOrDefault())); derr != nil {
 			return derr
 		}
 		_, rerr := n.conn.Read(b[:])
@@ -88,9 +124,29 @@ func (n *notifyServer) send(msg []byte, ack bool) error {
 		// syscall said so.
 		_ = n.conn.Close()
 		n.conn = nil
+
+		var netErr net.Error
+		if ack && errors.As(err, &netErr) && netErr.Timeout() {
+			n.ackTimeouts++
+			if n.ackTimeouts >= notifyBreakerTrips {
+				n.brokenUntil = time.Now().Add(notifyBreakerCooldown)
+				return fmt.Errorf("%w: %d acknowledgements in a row timed out",
+					errNotifyClientUnresponsive, n.ackTimeouts)
+			}
+		}
 		return fmt.Errorf("%w: %v", errNoNotifyClient, err)
 	}
+	if ack {
+		n.ackTimeouts = 0
+	}
 	return nil
+}
+
+func (n *notifyServer) ackTimeoutOrDefault() time.Duration {
+	if n.ackTimeout > 0 {
+		return n.ackTimeout
+	}
+	return notifyAckTimeout
 }
 
 // set installs a new connection, closing whatever it replaces.
