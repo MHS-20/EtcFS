@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -33,7 +34,12 @@ const (
 // reported to the kernel as an error, so that a leader election or a dropped
 // connection during failover shows up as a brief stall rather than an EIO.
 const (
-	etcdAttempts   = 3
+	// etcdAttempts spans an etcd leader election rather than merely a dropped
+	// connection.  Three attempts covered ~100ms, and an election that outlasts
+	// that surfaced as EIO on every node at once — the failure the retries exist
+	// to hide.  Five spans ~450ms of backoff, and the real ceiling stays the
+	// request deadline, which retry aborts on.
+	etcdAttempts   = 5
 	etcdOpTimeout  = 2 * time.Second
 	inodeLockTTL   = 2 * time.Second
 	retryBaseDelay = 10 * time.Millisecond
@@ -51,8 +57,17 @@ const (
 )
 
 // retryDelay is the pause before the attempt following the given one.
+//
+// Jittered by up to a quarter of the delay in either direction.  Every node
+// retries against the same etcd cluster and a leader election stalls all of
+// them at once, so an exact schedule has the whole cluster come back in
+// lockstep — each wave arriving together, contending, and failing together.
+// The mean is unchanged, which is what keeps the attempt budgets sized against
+// this ramp (see contendedAttempts) still valid.
 func retryDelay(attempt int) time.Duration {
-	return retryBaseDelay + time.Duration(attempt)*retryStep
+	base := retryBaseDelay + time.Duration(attempt)*retryStep
+	spread := int64(base / 2)
+	return base - time.Duration(spread/2) + time.Duration(rand.Int64N(spread+1))
 }
 
 // retry runs fn until it succeeds or the attempt budget is spent, returning
