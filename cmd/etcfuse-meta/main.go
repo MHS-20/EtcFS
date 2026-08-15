@@ -305,6 +305,7 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	log.Info("binary IPC server starting")
 	svc.StartNotificationServer(ctx)
 	svc.StartLockRevocation(ctx)
+	svc.StartSessionWatch(ctx)
 	svc.SetFlushInterval(cfg.MetadataFlushInterval)
 	svc.SetDataCache(cfg.WriteDataCache && cfg.MetadataFlushInterval > 0)
 	svc.SetPageCache(cfg.PageCache)

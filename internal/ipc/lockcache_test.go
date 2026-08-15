@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -148,5 +150,31 @@ func TestEvictedEntryIsNotCurrent(t *testing.T) {
 
 	if s.isCurrent(e) {
 		t.Fatal("an evicted entry still reports as the cache's entry for its inode")
+	}
+}
+
+// A session that ends takes every key written under it with it, so the caches
+// those keys vouched for have to go too — but only those.  An inode
+// re-acquired under a fresh session holds a live key, and dropping it with the
+// dead one would discard writes that are still publishable.
+func TestSessionLossDropsOnlyTheCachesUnderTheDeadLease(t *testing.T) {
+	s := &Service{locks: make(map[uint64]*lockEntry), log: testLogger()}
+
+	const dead, live = clientv3.LeaseID(11), clientv3.LeaseID(12)
+	stale := s.lockEntryFor(7)
+	stale.holder, stale.lease = "11-a", dead
+	stale.meta, stale.metaFor = &inodeMeta{}, "11-a"
+
+	fresh := s.lockEntryFor(8)
+	fresh.holder, fresh.lease = "12-a", live
+	fresh.meta, fresh.metaFor = &inodeMeta{}, "12-a"
+
+	s.dropCachesForLease(dead)
+
+	if stale.holder != "" || stale.meta != nil {
+		t.Fatal("a cache under the dead session's lease survived it")
+	}
+	if fresh.holder == "" || fresh.meta == nil {
+		t.Fatal("a cache under a live session's lease was dropped with the dead one")
 	}
 }

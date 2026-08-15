@@ -111,7 +111,7 @@ jobs:
         working-directory: csi
         env:
           ETCD_ENDPOINTS: http://127.0.0.1:2381
-        run: go test -tags=integration -count=1 -timeout 120s ./...
+        run: go test -race -tags=integration -count=1 -timeout 240s ./...
       - name: Helm lint
         run: helm lint csi/deploy/helm/etcfs-csi --set etcd.endpoints=https://etcd:2379
 
@@ -155,7 +155,11 @@ jobs:
       - name: Run integration tests
         env:
           ETCD_ENDPOINTS: http://127.0.0.1:2379
-        run: go test -tags=integration -count=1 -timeout 600s ./...
+        # -race here and not only in test-go: the integration suite is the
+        # only place the lock cache, the flusher and the recall path run
+        # against a real etcd and each other, which is where a data race would
+        # actually show up.
+        run: go test -race -tags=integration -count=1 -timeout 900s ./...
 
   test-tla:
     name: Test (TLA+ fencing model)

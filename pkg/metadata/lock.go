@@ -142,6 +142,27 @@ func (s *Store) LockSessionLease() (clientv3.LeaseID, bool) {
 	}
 }
 
+// LockSessionWatch returns the current session's lease and a channel closed
+// when that session ends, so a caller holding state behind this node's locks
+// can drop it as soon as the lease is gone rather than at its next operation.
+//
+// The lease is returned with the channel deliberately: by the time the channel
+// closes a later acquisition may already have granted a new session, and only
+// the lease says which session the caller was watching.  State written under a
+// different lease belongs to that new session and must not be dropped with the
+// old one.
+//
+// It never grants a session, for the same reason LockSessionLease does not: a
+// node that has taken no lock has nothing to watch.
+func (s *Store) LockSessionWatch() (clientv3.LeaseID, <-chan struct{}, bool) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if s.session == nil {
+		return 0, nil, false
+	}
+	return s.session.Lease(), s.session.Done(), true
+}
+
 // LockHolderLease returns the lease a holder token was minted under.
 //
 // It lives next to the code that builds the token (see AcquireLock) so the

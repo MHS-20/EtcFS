@@ -525,6 +525,74 @@ func (s *Service) recallLock(ino uint64) {
 	s.log.Debug("yielded a cached inode lock to a peer", "ino", ino)
 }
 
+// sessionPollInterval is how often the session watcher looks for a session to
+// watch when this node has taken no lock yet.  Nothing is at stake while there
+// is no session — there are no keys and no caches under one — so this only has
+// to be short enough that the watch is in place well before the first lock's
+// lease could expire.
+const sessionPollInterval = 500 * time.Millisecond
+
+// StartSessionWatch drops every cache standing behind this node's lock keys as
+// soon as the session those keys were written under ends.
+//
+// Without it the loss is noticed only by the next operation to touch each
+// inode (ensureLockKey), and until then the node serves reads from a metadata
+// snapshot and kernel pages whose lock a peer may already hold, and keeps
+// acknowledging writes into a buffer whose flush is certain to be rejected.
+// The keys are gone the instant the lease expires, so the caches behind them
+// are worthless from that instant too, and every millisecond of late detection
+// is more acknowledged data that will have to be discarded.
+func (s *Service) StartSessionWatch(ctx context.Context) {
+	go func() {
+		for {
+			lease, done, ok := s.store.LockSessionWatch()
+			if !ok {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(sessionPollInterval):
+				}
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				s.dropCachesForLease(lease)
+			}
+		}
+	}()
+}
+
+// dropCachesForLease discards everything cached under one dead session lease.
+//
+// Scoped by lease rather than applied to the whole cache: by the time this
+// runs, an operation may already have granted a fresh session and re-acquired
+// an inode under it, and that entry's key is live.  Entries are left in the
+// map, as a recall leaves them — only what the key vouched for is dropped.
+func (s *Service) dropCachesForLease(lease clientv3.LeaseID) {
+	s.lockMu.Lock()
+	entries := make([]*lockEntry, 0, len(s.locks))
+	for _, e := range s.locks {
+		entries = append(entries, e)
+	}
+	s.lockMu.Unlock()
+
+	dropped := 0
+	for _, e := range entries {
+		e.keyMu.Lock()
+		if e.holder != "" && e.lease == lease {
+			s.keyLostLocked(e, "this node's lock session ended")
+			dropped++
+		}
+		e.keyMu.Unlock()
+	}
+	if dropped > 0 {
+		s.log.Error("lock session ended, so every cache behind this node's locks was dropped",
+			"lease", lease, "inodes", dropped)
+	}
+}
+
 // ReleaseCachedLocks drops every lock this node is holding on to.  Called on
 // shutdown, ahead of ending the lock session: closing the session revokes the
 // lease and would clear the keys anyway, but only after this node has stopped

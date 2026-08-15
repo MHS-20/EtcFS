@@ -642,3 +642,123 @@ func TestIntegration_BufferedWriteDataIsReadableBeforeAndAfterTheFlush(t *testin
 		t.Fatalf("published extents = %d, want %d", len(extents), blocks)
 	}
 }
+
+// ---- durability at each stage of the deferred path ----
+
+// What survives a crash is decided by which stage the writes had reached, and
+// the three stages have to be distinguishable: a write that has only been
+// acknowledged may vanish, a write that has been fsynced may not, and neither
+// may ever be half-published — an extent naming blocks whose bytes are not on
+// the volume is the one failure that reads as corruption rather than as loss.
+//
+// A crash is modelled by abandoning the Service without flushing it, which is
+// exactly what a process death does to a buffer held in its memory, and by
+// reading the result back through a fresh Service that shares nothing with it.
+func TestIntegration_OnlyFsyncedWritesSurviveACrash(t *testing.T) {
+	ctx := context.Background()
+	payload := bytes.Repeat([]byte{0xC7}, 4096)
+
+	cases := []struct {
+		name     string
+		fsync    bool
+		survives bool
+	}{
+		{"acknowledged but never flushed", false, false},
+		{"fsynced before the crash", true, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, store := newTestService(t)
+			ino := uint64(7100 + len(c.name))
+			seedFile(t, store, ino, metadata.ModeFile|0644)
+
+			if _, err := svc.handleWrite(ctx, writePayload(ino, 0, payload, 0)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if !c.fsync && !svc.hasPending(ino) {
+				t.Fatal("the write was published before anything asked for it to be")
+			}
+			if c.fsync {
+				var fq buf
+				fq.w64(ino)
+				if _, err := svc.handleFsync(ctx, fq.b); err != nil {
+					t.Fatalf("fsync: %v", err)
+				}
+			}
+
+			// The crash: the buffer and every block it reserved die with the
+			// process, unpublished, and the lock session goes with them.  A
+			// real death waits out the lease instead of revoking it; the
+			// difference is how long the survivor waits, not what it finds.
+			if err := store.CloseLockSession(); err != nil {
+				t.Fatalf("end the crashed node's lock session: %v", err)
+			}
+
+			extents, err := store.GetExtents(ctx, ino)
+			if err != nil {
+				t.Fatalf("read extents back: %v", err)
+			}
+			if got := len(extents) > 0; got != c.survives {
+				t.Fatalf("extents published = %v, want %v", got, c.survives)
+			}
+
+			survivor, _ := newTestService(t)
+			survivor.dev = svc.dev // the shared volume outlives the node
+			var rq buf
+			rq.w64(ino)
+			rq.w64(0)
+			rq.w32(uint32(len(payload)))
+			resp, err := survivor.handleRead(ctx, rq.b)
+			if err != nil {
+				t.Fatalf("read after the crash: %v", err)
+			}
+			got := readPayload(t, resp)
+			if c.survives {
+				if !bytes.Equal(got, payload) {
+					t.Error("an fsynced write did not read back after the crash")
+				}
+				return
+			}
+			// Lost, never half-published: the read is short or zeroed, and in
+			// particular never the payload sitting on the volume unreferenced.
+			if bytes.Equal(got, payload) {
+				t.Error("a write that was never fsynced came back after the crash")
+			}
+		})
+	}
+}
+
+// The fully synchronous configuration — no deferral, no data buffering, no page
+// caching — is the one that loses nothing, and some deployments will want it.
+// It has to keep working, so it is exercised rather than merely offered: every
+// write is published before it is acknowledged, and nothing is ever left
+// buffered for a crash to take.
+func TestIntegration_SynchronousConfigurationPublishesBeforeAcknowledging(t *testing.T) {
+	svc, store := newTestService(t)
+	svc.SetFlushInterval(0)
+	svc.SetDataCache(false)
+	svc.SetPageCache(false)
+	ctx := context.Background()
+	const ino = 7120
+	seedFile(t, store, ino, metadata.ModeFile|0644)
+
+	payload := bytes.Repeat([]byte{0x5A}, 4096)
+	if _, err := svc.handleWrite(ctx, writePayload(ino, 0, payload, 0)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if svc.hasPending(ino) {
+		t.Fatal("a write was buffered with deferral switched off")
+	}
+	extents, err := store.GetExtents(ctx, ino)
+	if err != nil {
+		t.Fatalf("read extents back: %v", err)
+	}
+	if len(extents) == 0 {
+		t.Fatal("the write was acknowledged without its extent being published")
+	}
+	if svc.cacheableOpen(0) {
+		t.Error("an open was told the kernel may cache pages with page caching switched off")
+	}
+}
