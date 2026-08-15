@@ -306,12 +306,71 @@ compare_run_job() {
     echo "$RESULTS_DIR/${label}.json"
 }
 
+# compare_parallel_fio <label> <runtime> <job_template> <pub_ip>... — one fio
+# per node, all launched together and waited on afterwards, printing the summed
+# write bandwidth in MiB/s. @NODE@ in the template is replaced by the node's
+# index, which is how a caller asks for disjoint per-node files (leave it out
+# and every node lands on the same path, which is the shared working set).
+#
+# run_fio_contention (bench-lib.sh) is the same idea for one shared 4k randrw
+# shape; this one takes the caller's own job, because the scenarios that need
+# it are measuring aggregate sequential bandwidth and load-while-something-else
+# -happens, not contention on a single inode.
+compare_parallel_fio() {
+    local label="$1" runtime="$2" template="$3"
+    shift 3
+    local ips=("$@") i pids=() jsons=()
+    for i in "${!ips[@]}"; do
+        compare_run_job "$label-$i" "${ips[$i]}" "$runtime" "${template//@NODE@/$i}" >/dev/null &
+        pids+=($!)
+        jsons+=("$RESULTS_DIR/$label-$i.json")
+    done
+    local pid
+    for pid in "${pids[@]}"; do wait "$pid" || die "compare_parallel_fio: a node failed during $label"; done
+    jq -s 'map(.jobs[0].write.bw // 0) | add / 1024 | . * 100 | round / 100' "${jsons[@]}"
+}
+
 # compare_fio_bw_mibps <json> <read|write> — fio reports bw in KiB/s.
 compare_fio_bw_mibps() {
     jq -r --arg d "$2" '(.jobs[0][$d].bw // 0) / 1024 | . * 100 | round / 100' "$1"
 }
 
 compare_fio_iops() { jq -r --arg d "$2" '(.jobs[0][$d].iops // 0) | round' "$1"; }
+
+# compare_parallel_fio <label> <runtime> <job> <ips...> — the same job on every
+# named node at once, aggregated. Occurrences of @NODE@ in the job are replaced
+# with the node's own IP, which is what makes a *disjoint* working set
+# expressible (filename=.../w-@NODE@.dat) as well as a shared one (one literal
+# path). Prints total write MiB/s across the nodes.
+#
+# run_fio_contention (bench-lib.sh) covers the shared-file case for the
+# single-cluster suite; this one exists because the scaling curve needs both
+# shapes and needs the aggregate as a number it can go on comparing across
+# node counts.
+compare_parallel_fio() {
+    local label="$1" runtime="$2" job="$3"
+    shift 3
+    local ips=("$@") ip pids=()
+    log "--- parallel fio: $label (${#ips[@]} nodes) ---"
+    for ip in "${ips[@]}"; do
+        echo "${job//@NODE@/$ip}" | $SSH_CMD "ec2-user@$ip" "cat > /tmp/${label}.fio"
+        (
+            timeout "$((runtime * 4 + 120))" $SSH_CMD "ec2-user@$ip" \
+                "sudo fio /tmp/${label}.fio --output-format=json --output=/tmp/${label}.json" >/dev/null || true
+            scp $SSH_OPTS "ec2-user@$ip:/tmp/${label}.json" "$RESULTS_DIR/${label}-$ip.json" >/dev/null
+        ) &
+        pids+=($!)
+    done
+    local failed=0
+    for pid in "${pids[@]}"; do wait "$pid" || failed=$((failed + 1)); done
+    [[ "$failed" -eq 0 ]] || log "WARNING: $failed/${#ips[@]} node(s) hit an error during $label"
+
+    shopt -s nullglob
+    local files=("$RESULTS_DIR/${label}"-*.json)
+    shopt -u nullglob
+    [[ "${#files[@]}" -gt 0 ]] || die "compare_parallel_fio: no results came back for $label"
+    jq -s 'map(.jobs[0].write.bw // 0) | add / 1024 | . * 100 | round / 100' "${files[@]}"
+}
 
 # ---- shared-directory metadata concurrency ----
 #
@@ -362,13 +421,13 @@ compare_metadata_ops() {
 # which is what lets one provisioned cluster run the storm and the walk.
 COMPARE_TREE_TAR=/tmp/compare-tree.tar
 compare_build_tree() {
-    local ip="$1" files="${2:-80000}" per_dir=100
+    local ip="$1" count="${2:-80000}" per_dir=100
     $SSH_CMD "ec2-user@$ip" "
         set -e
         [[ -f $COMPARE_TREE_TAR ]] && exit 0
         rm -rf /tmp/compare-tree && mkdir -p /tmp/compare-tree
         cd /tmp/compare-tree
-        for d in \$(seq 1 $((files / per_dir))); do
+        for d in \$(seq 1 $((count / per_dir))); do
             mkdir -p d\$d
             for f in \$(seq 1 $per_dir); do
                 head -c 2048 /dev/zero > d\$d/f\$f.c
@@ -382,11 +441,11 @@ compare_build_tree() {
 # compare_untar_tree <ip> <dest_dir> — times an untar of that tarball onto the
 # filesystem under test. Prints "<seconds> <files_per_second>".
 compare_untar_tree() {
-    local ip="$1" dest="$2" files="${3:-80000}"
+    local ip="$1" dest="$2" count="${3:-80000}"
     $SSH_CMD "ec2-user@$ip" "sudo rm -rf $dest && sudo mkdir -p $dest && sudo chmod 777 $dest"
     local elapsed
     elapsed=$(compare_remote_time "$ip" "sudo tar xf $COMPARE_TREE_TAR -C $dest && sync")
-    echo "$elapsed $(compare_div "$files" "$elapsed")"
+    echo "$elapsed $(compare_div "$count" "$elapsed")"
 }
 
 # compare_walk_tree <ip> <dir> — cold then warm `find` + `du` over a populated
