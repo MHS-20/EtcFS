@@ -27,7 +27,6 @@ func TestMetrics_DeclaredNamesAreRegistered(t *testing.T) {
 		"etcfuse_fuse_errors_total",
 		"etcfuse_fuse_op_duration_seconds",
 		"etcfuse_etcd_txn_total",
-		"etcfuse_etcd_txn_duration_seconds",
 		"etcfuse_block_io_total",
 		"etcfuse_block_io_bytes_total",
 		"etcfuse_scrub_anomalies_total",

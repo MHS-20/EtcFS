@@ -322,9 +322,7 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 	cmps = append(cmps, clientv3.Compare(
 		clientv3.CreateRevision(metadata.LockKey(e.ino, e.mode, e.holder)), "!=", 0))
 
-	start := time.Now()
 	committed, fenced, rev, err := s.commitGuarded(ctx, cmps, ops)
-	metrics.FlushDuration.Observe(time.Since(start).Seconds())
 	metrics.Flushes.WithLabelValues(trigger).Inc()
 
 	switch {
@@ -455,7 +453,6 @@ func (s *Service) flushData(p *pending) error {
 	var firstErr error
 	sem := make(chan struct{}, flushIOConcurrency)
 	for _, g := range groups {
-		metrics.CoalescedRuns.Observe(float64(g.runs))
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(g group) {

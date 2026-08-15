@@ -197,7 +197,7 @@ func (s *Service) handleConn(conn net.Conn) {
 // observedDispatch records the operation, its latency, and whether it returned
 // an errno.  Wrapped around the whole dispatch rather than added to each
 // handler: every FUSE operation this daemon serves passes through here, so one
-// wrapper instruments all of them and no new handler can forget to.
+// wrapper covers all of them and no new handler can forget to.
 func (s *Service) observedDispatch(code uint16, payload []byte) ([]byte, error) {
 	name := opName(code)
 	start := time.Now()

@@ -30,7 +30,12 @@ var (
 		Help: "FUSE operations that failed, by operation.",
 	}, []string{"op"})
 
-	// FuseOpDuration observes end-to-end handler latency, by operation.
+	// FuseOpDuration observes end-to-end handler latency, by operation. The
+	// stage timings that once sat beside it are gone: they existed to attribute
+	// a request to etcd, the device or the handler while the data path was
+	// being tuned. This one stays because it is the question an operator
+	// actually asks — is the filesystem slow, and at what — and no counter can
+	// answer it.
 	FuseOpDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "etcfuse_fuse_op_duration_seconds",
 		Help:    "FUSE operation handler latency.",
@@ -42,25 +47,6 @@ var (
 		Name: "etcfuse_etcd_txn_total",
 		Help: "etcd transactions attempted, by outcome.",
 	}, []string{"outcome"})
-
-	// EtcdTxnDuration observes etcd transaction round-trip latency. This is
-	// the metric an operator wants percentiles on: it is the dominant term in
-	// every metadata operation's latency.
-	EtcdTxnDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "etcfuse_etcd_txn_duration_seconds",
-		Help:    "etcd transaction round-trip latency.",
-		Buckets: prometheus.ExponentialBuckets(0.0005, 3, 10),
-	})
-
-	// EtcdReadDuration observes etcd read round-trip latency (Get/prefix
-	// reads), separate from EtcdTxnDuration's guarded-commit path: the read and
-	// write paths spend their budgets differently, and telling a read's cost
-	// from a commit's is what makes a slow operation attributable.
-	EtcdReadDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "etcfuse_etcd_read_duration_seconds",
-		Help:    "etcd read round-trip latency.",
-		Buckets: prometheus.ExponentialBuckets(0.0005, 3, 10),
-	})
 
 	// MetaCache counts data-path metadata lookups served from the snapshot
 	// cached under a held inode lock ("hit") against those that had to read
@@ -106,24 +92,6 @@ var (
 		Help: "Flushes of deferred metadata that did not publish, by reason.",
 	}, []string{"reason"})
 
-	// CoalescedRuns observes how many buffered write runs a flush merged into
-	// one device I/O.  It is the measure of what data buffering buys beyond the
-	// peak: a median above one means scattered small writes are reaching the
-	// volume as fewer, larger ones.
-	CoalescedRuns = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "etcfuse_flush_coalesced_runs",
-		Help:    "Buffered write runs merged into a single device write at flush.",
-		Buckets: prometheus.ExponentialBuckets(1, 2, 10),
-	})
-
-	// FlushDuration observes how long publishing a buffer takes.  It is the
-	// latency an fsync pays, and the one a recalled peer waits out.
-	FlushDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "etcfuse_metadata_flush_duration_seconds",
-		Help:    "Latency of publishing deferred metadata to etcd.",
-		Buckets: prometheus.ExponentialBuckets(0.0005, 3, 10),
-	})
-
 	// BlockIO counts block-device operations, by direction (read, write).
 	BlockIO = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "etcfuse_block_io_total",
@@ -134,13 +102,6 @@ var (
 	BlockIOBytes = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "etcfuse_block_io_bytes_total",
 		Help: "Bytes transferred to and from the block device, by direction.",
-	}, []string{"op"})
-
-	// BlockIODuration observes block device operation latency, by direction.
-	BlockIODuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "etcfuse_block_io_duration_seconds",
-		Help:    "Block device operation latency, by direction.",
-		Buckets: prometheus.ExponentialBuckets(0.0001, 3, 10),
 	}, []string{"op"})
 
 	// ScrubAnomalies counts anomalies found by the scrubber, by type

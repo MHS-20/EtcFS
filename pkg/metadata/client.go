@@ -94,9 +94,6 @@ func (s *Store) SetLocalClient(c *clientv3.Client) {
 // read issues a range request, preferring the colocated member when one is
 // configured.
 func (s *Store) read(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
-	start := time.Now()
-	defer func() { metrics.EtcdReadDuration.Observe(time.Since(start).Seconds()) }()
-
 	if s.localClient != nil {
 		if resp, err := s.localClient.Get(ctx, key, opts...); err == nil {
 			return resp, nil
@@ -111,9 +108,6 @@ func (s *Store) read(ctx context.Context, key string, opts ...clientv3.OpOption)
 // operations against a single revision, so the batch costs one round trip and
 // is a consistent snapshot rather than a sequence of independent reads.
 func (s *Store) readTxn(ctx context.Context, ops ...clientv3.Op) (*clientv3.TxnResponse, error) {
-	start := time.Now()
-	defer func() { metrics.EtcdReadDuration.Observe(time.Since(start).Seconds()) }()
-
 	if s.localClient != nil {
 		if resp, err := s.localClient.Txn(ctx).Then(ops...).Commit(); err == nil {
 			return resp, nil
@@ -185,9 +179,7 @@ func (s *Store) TxnRev(ctx context.Context, ifs []clientv3.Cmp, thens, elses []c
 // registration that runs before the generation is known.  Everything else must
 // use Txn.
 func (s *Store) txnRaw(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, int64, error) {
-	start := time.Now()
 	resp, err := s.client.Txn(ctx).If(ifs...).Then(thens...).Else(elses...).Commit()
-	metrics.EtcdTxnDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
 		metrics.EtcdTxns.WithLabelValues("error").Inc()
 		return false, 0, fmt.Errorf("txn: %w", err)

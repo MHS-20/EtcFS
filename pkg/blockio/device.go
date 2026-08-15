@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -115,9 +114,7 @@ func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
 				offset, len(buf), d.sectorSize)
 		}
 	}
-	start := time.Now()
 	n, err := unix.Pread(d.fd, buf, offset)
-	metrics.BlockIODuration.WithLabelValues("read").Observe(time.Since(start).Seconds())
 	metrics.BlockIO.WithLabelValues("read").Inc()
 	metrics.BlockIOBytes.WithLabelValues("read").Add(float64(n))
 	return n, err
@@ -130,9 +127,7 @@ func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
 				offset, len(buf), d.sectorSize)
 		}
 	}
-	start := time.Now()
 	n, err := unix.Pwrite(d.fd, buf, offset)
-	metrics.BlockIODuration.WithLabelValues("write").Observe(time.Since(start).Seconds())
 	metrics.BlockIO.WithLabelValues("write").Inc()
 	metrics.BlockIOBytes.WithLabelValues("write").Add(float64(n))
 	return n, err
