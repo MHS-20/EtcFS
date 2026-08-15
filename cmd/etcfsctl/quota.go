@@ -73,8 +73,14 @@ func setQuota(ctx context.Context, store *metadata.Store, args []string) error {
 		return err
 	}
 	fmt.Printf("quota set on inode %d: bytes=%d inodes=%d\n", ino, rec.Bytes, rec.Inodes)
+	fmt.Println(quotaAdvisoryNote)
 	return nil
 }
+
+// quotaAdvisoryNote is printed wherever a limit is set or reported, because a
+// limit that looks like a limit and rejects nothing is the kind of thing an
+// operator finds out about from a full filesystem.
+const quotaAdvisoryNote = "note: quotas are advisory — usage is reported, and no write is rejected for exceeding a limit"
 
 // reportQuotas computes usage for every quota root.
 //
@@ -136,5 +142,6 @@ func reportQuotas(ctx context.Context, store *metadata.Store, asJSON bool) error
 		}
 		fmt.Println(line)
 	}
+	fmt.Println(quotaAdvisoryNote)
 	return nil
 }
