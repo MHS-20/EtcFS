@@ -108,4 +108,12 @@ int etcfs_run(struct etcfs_context *ctx);
  * connection cannot be established, which the handlers surface as EIO. */
 int etcfs_ipc_fd(void);
 
+/* Closes and forgets the calling thread's IPC socket, so the next etcfs_ipc_fd
+ * establishes a fresh one.  Called whenever an exchange fails: a broken stream
+ * and a desynchronised one are indistinguishable from the client side, and both
+ * make every later frame on that socket meaningless.  Without this a daemon
+ * restart left the mount returning EIO forever on every thread that had already
+ * connected. */
+void etcfs_ipc_drop(void);
+
 #endif /* ETCFS_FUSE_H */

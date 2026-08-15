@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -205,6 +206,51 @@ static void test_each_thread_gets_its_own_ipc_connection(void)
     unsetenv("ETCFS_IPC_SOCKET");
 }
 
+/* A daemon restart used to be terminal: the thread kept its dead fd and every
+ * later request turned into EIO forever.  A failed exchange must instead leave
+ * the thread with no connection, so the next request opens a fresh one. */
+static void test_a_failed_exchange_reconnects_on_the_next_request(void)
+{
+    signal(SIGPIPE, SIG_IGN); /* writing to the closed peer below must return, not kill us */
+
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/etcfs-test-reconnect-%d.sock", (int) getpid());
+    unlink(path);
+
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(listener >= 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    assert(bind(listener, (struct sockaddr *) &addr, sizeof(addr)) == 0);
+    assert(listen(listener, 8) == 0);
+    setenv("ETCFS_IPC_SOCKET", path, 1);
+
+    int fd = etcfs_ipc_fd();
+    assert(fd >= 0);
+    int served = accept(listener, NULL, NULL);
+    assert(served >= 0);
+
+    /* The daemon goes away mid-flight. */
+    close(served);
+    uint8_t *resp = NULL;
+    uint32_t rlen = 0;
+    assert(ipc_sync(fd, IPC_OP_GETATTR, NULL, 0, &resp, &rlen) == -1);
+
+    /* The next request connects again: a second accept only completes because
+     * the thread reconnected rather than reusing the dead fd. */
+    assert(etcfs_ipc_fd() >= 0);
+    int reconnected = accept(listener, NULL, NULL);
+    assert(reconnected >= 0);
+
+    etcfs_ipc_drop();
+    close(reconnected);
+    close(listener);
+    unlink(path);
+    unsetenv("ETCFS_IPC_SOCKET");
+}
+
 int main(void)
 {
     test_rb_reads_big_endian();
@@ -216,6 +262,7 @@ int main(void)
     test_ipc_sync_reports_a_truncated_response();
     test_name_bounds_match_the_protocol();
     test_each_thread_gets_its_own_ipc_connection();
+    test_a_failed_exchange_reconnects_on_the_next_request();
 
     printf("test/c: all checks passed\n");
     return 0;

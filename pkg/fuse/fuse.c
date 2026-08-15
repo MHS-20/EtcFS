@@ -205,6 +205,18 @@ int etcfs_ipc_fd(void)
     return fd;
 }
 
+void etcfs_ipc_drop(void)
+{
+    pthread_once(&ipc_fd_once, ipc_fd_key_create);
+
+    intptr_t stored = (intptr_t) pthread_getspecific(ipc_fd_key);
+    if (stored <= 0)
+        return;
+    pthread_setspecific(ipc_fd_key, NULL);
+    close((int) (stored - 1));
+    etcfs_log(ETCFS_LOG_WARN, "dropped this thread's IPC connection; will reconnect");
+}
+
 /* ---- FUSE init callback ---- */
 
 static void etcfs_init(void *userdata, struct fuse_conn_info *conn)
@@ -226,6 +238,11 @@ int etcfs_run(struct etcfs_context *ctx)
 
     /* get the FUSE op table (populated in ops.c) */
     struct fuse_lowlevel_ops *ops = etcfs_fuse_ops();
+
+    /* A daemon that dies makes the next write to its socket raise SIGPIPE,
+     * whose default action would kill the mount outright.  Ignored so that the
+     * write fails with EPIPE instead and the connection can be re-established. */
+    signal(SIGPIPE, SIG_IGN);
 
     /* connect to Go metadata backend */
     const char *socket_path = getenv("ETCFS_IPC_SOCKET");

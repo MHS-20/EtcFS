@@ -111,14 +111,16 @@ static int ipc_sync(int fd, uint16_t op, const uint8_t *payload, uint32_t plen, 
     hdr[3] = (uint8_t) (plen >> 16);
     hdr[4] = (uint8_t) (plen >> 8);
     hdr[5] = (uint8_t) plen;
+    if (fd < 0)
+        return -1;
     if (send_full(fd, hdr, 6) < 0)
-        return -1;
+        goto broken;
     if (plen > 0 && send_full(fd, payload, plen) < 0)
-        return -1;
+        goto broken;
 
     uint8_t rhdr[4];
     if (recv_full(fd, rhdr, 4) < 0)
-        return -1;
+        goto broken;
     uint32_t rl = ((uint32_t) rhdr[0] << 24) | ((uint32_t) rhdr[1] << 16) |
                   ((uint32_t) rhdr[2] << 8) | (uint32_t) rhdr[3];
     /*
@@ -127,17 +129,29 @@ static int ipc_sync(int fd, uint16_t op, const uint8_t *payload, uint32_t plen, 
      * GiB.  The Go side refuses to send or accept a frame past the same cap.
      */
     if (rl > IPC_MAX_FRAME_LEN)
-        return -1;
+        goto broken;
     uint8_t *rb = malloc(rl > 0 ? rl : 1);
     if (!rb)
         return -1;
     if (rl > 0 && recv_full(fd, rb, rl) < 0) {
         free(rb);
-        return -1;
+        goto broken;
     }
     *resp = rb;
     *rlen = rl;
     return 0;
+
+    /*
+     * Any failure here leaves the socket at an unknown offset -- a short read
+     * mid-frame would otherwise make the next request read this reply's tail --
+     * so the connection is dropped rather than reused.  The caller still sees
+     * one EIO: the request may or may not have reached the daemon, and the ops
+     * are not all idempotent, so retrying it transparently is not safe.  The
+     * next request from this thread reconnects.
+     */
+broken:
+    etcfs_ipc_drop();
+    return -1;
 }
 
 /* ---- binary readers on response buffers ---- */
