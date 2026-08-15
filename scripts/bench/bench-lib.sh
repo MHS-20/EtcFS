@@ -20,12 +20,12 @@
 # etcfs numjobs case) — callers choose which by passing target_spec as either
 # `filename=$path` (shared) or `directory=$dir` (fio names one file per thread).
 run_fio() {
-    local label="$1" target_spec="$2" size="$3" engine="$4" jobs="$5" depth="$6" runtime="$7"
+    local label="$1" target_spec="$2" size="$3" engine="$4" jobs="$5" depth="$6" runtime="$7" direct="${8:-1}"
     log "--- fio: $label ---"
     local job="
 [global]
 ioengine=$engine
-direct=1
+direct=$direct
 $target_spec
 size=$size
 runtime=$runtime

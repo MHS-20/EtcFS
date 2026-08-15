@@ -351,3 +351,27 @@ Porcupine models: namespace, extent, lock, generation), `specs/Fencing.tla`
 - [ ] Every cache gets an off switch, and the fully-synchronous configuration
       (no delegation, no data caching) stays supported and tested — it is the
       one that loses nothing, and some deployments will want it.
+
+## 11. Readdir / negative-dentry caching
+
+Metadata-lookup workloads (repeated `stat`/`open`/`readdir` on paths that
+don't change — build systems, `find`, package managers probing for existing
+files) aren't touched by anything above; §1–10 are all data-path I/O.
+Reuses the existing `dirent:` prefix watch and its invalidation
+(`docs/architecture/consistency/cache-coherence.md`'s ENTRY/negative-dentry
+row) — no new coherence protocol needed, unlike data writeback caching.
+
+- [ ] Negative-dentry caching: `ec_lookup` (`pkg/fuse/ops.c`) replies to a
+      failed lookup with `fuse_reply_err(req, -e)` directly — the kernel gets
+      nothing to cache. To make ENOENT cacheable, reply via
+      `fuse_reply_entry` with `ino=0` and `entry_timeout>0` instead; the
+      `dirent:` watch's existing `inval_entry` on create already evicts a
+      stale negative on the other end.
+- [ ] Daemon-side readdir result caching, keyed like the lock/metadata cache
+      (valid only while something guarantees no concurrent mutation) — kernel
+      already gets `FUSE_CAP_READDIRPLUS` (`pkg/fuse/fuse.c:213`), this is
+      about avoiding a repeat etcd listing on this node's own re-`readdir`,
+      not about what the kernel keeps.
+- [ ] Benchmark to actually measure either: current `scripts/bench/` suite is
+      pure 4k-block I/O and won't move at all from either of these — needs a
+      `stat`/`find`/`ls -R`-shaped scenario, cache-cold vs. cache-warm.
