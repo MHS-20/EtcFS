@@ -61,6 +61,49 @@ compare_destroy() {
     disown
 }
 
+# compare_begin [extra_teardown] — install the teardown trap and provision.
+# Every bench-*.sh opens with this pair; extra_teardown is a command run before
+# compare_destroy, for a backend that created resources of its own.
+compare_begin() {
+    local extra="${1:-}"
+    if [[ -n "$extra" ]]; then
+        # Expanded now on purpose: extra is the caller's literal command, and
+        # the local holding it is gone by the time the trap fires.
+        # shellcheck disable=SC2064
+        trap "$extra; compare_destroy" EXIT
+    else
+        trap compare_destroy EXIT
+    fi
+    compare_provision
+}
+
+# compare_install_fio <pub_ip>... — install fio wherever the run will drive it.
+# dnf or yum: this suite spans AL2023 and AL2, and the backends that need AL2
+# say so in their own headers.
+compare_install_fio() {
+    local ip
+    for ip in "$@"; do
+        $SSH_CMD "ec2-user@$ip" \
+            "sudo dnf install -y fio >/dev/null 2>&1 || sudo yum install -y fio >/dev/null 2>&1"
+    done
+}
+
+# compare_shared_device <pub_ip> — the cluster's Multi-Attach volume as seen by
+# that node, failing loudly rather than letting a later mkfs run against an
+# empty path.
+compare_shared_device() {
+    local dev
+    dev=$(detect_ebs_dev "$1")
+    [[ -n "$dev" ]] || die "$COMPARE_BACKEND: no shared EBS device found on $1"
+    echo "$dev"
+}
+
+# compare_finish <label> — record the run's summary row and say where it went.
+compare_finish() {
+    compare_summary_row "$1" "$RESULTS_DIR/$1.json"
+    log "$1 comparison run complete. Results in $RESULTS_DIR"
+}
+
 # compare_export_backing <server_pub_ip> <server_priv_ip> <client_pub_ips...>
 # — format the shared Multi-Attach volume as ext4 on the server node only
 # (Multi-Attach guarantees safe concurrent *block* access, not a concurrent

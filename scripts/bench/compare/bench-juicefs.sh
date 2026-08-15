@@ -15,8 +15,7 @@ export COMPARE_BACKEND=juicefs
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/compare-lib.sh"
 
-trap compare_destroy EXIT
-compare_provision
+compare_begin
 N0="${COMPARE_PUB_IPS[0]}"
 N1="${COMPARE_PUB_IPS[1]}"
 P0="${COMPARE_PRIV_IPS[0]}"
@@ -24,8 +23,7 @@ P0="${COMPARE_PRIV_IPS[0]}"
 compare_open_port 6379  # redis (metadata)
 compare_open_port 9000  # minio (object storage)
 
-dev=$(detect_ebs_dev "$N0")
-[[ -n "$dev" ]] || die "bench-juicefs: no EBS device found on $N0"
+dev=$(compare_shared_device "$N0")
 
 log "Setting up Redis (metadata) + MinIO (object storage, on the shared volume) on $N0..."
 $SSH_CMD "ec2-user@$N0" "set -e
@@ -76,11 +74,11 @@ $SSH_CMD "ec2-user@$N0" "set -e
 log "Mounting JuiceFS client on $N1..."
 $SSH_CMD "ec2-user@$N1" "set -e
     curl -fsSL https://d.juicefs.com/install | sudo sh -
-    sudo dnf install -y fio >/dev/null 2>&1 || sudo yum install -y fio >/dev/null 2>&1
     sudo mkdir -p /mnt/compare-juicefs
     sudo juicefs mount -d redis://$P0:6379/1 /mnt/compare-juicefs
 "
 sleep 3
+compare_install_fio "$N1"
 
 N0="$N1"
 # psync, not libaio: juicefs is a FUSE mount like etcfs (see bench-etcfs.sh),
@@ -92,6 +90,4 @@ N0="$N1"
 # psync, and this backend doesn't need numjobs to fan out across files the
 # way etcfs's own comparison does.
 run_fio "juicefs" "filename=/mnt/compare-juicefs/fio.dat" 8M psync 4 1 "${ETCFS_BENCH_RUNTIME:-30}"
-compare_summary_row juicefs "$RESULTS_DIR/juicefs.json"
-
-log "juicefs comparison run complete. Results in $RESULTS_DIR"
+compare_finish juicefs

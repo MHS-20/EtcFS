@@ -27,8 +27,7 @@ export ETCFS_AMI_NAME_FILTER="amzn2-ami-hvm-*-x86_64-gp2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/compare-lib.sh"
 
-trap 'compare_destroy_local_volumes; compare_destroy' EXIT
-compare_provision
+compare_begin compare_destroy_local_volumes
 N0="${COMPARE_PUB_IPS[0]}"
 N1="${COMPARE_PUB_IPS[1]}"
 N2="${COMPARE_PUB_IPS[2]}"
@@ -75,13 +74,12 @@ $SSH_CMD "ec2-user@$N0" "set -e
 sleep 5
 
 $SSH_CMD "ec2-user@$N1" "set -e
-    sudo yum install -y glusterfs-fuse fio >/dev/null 2>&1
+    sudo yum install -y glusterfs-fuse >/dev/null 2>&1
     sudo mkdir -p /mnt/compare-gluster
     sudo mount -t glusterfs $P0:/compare-vol /mnt/compare-gluster
 "
+compare_install_fio "$N1"
 
 N0="$N1"
 run_fio "gluster" "filename=/mnt/compare-gluster/fio.dat" 1G libaio 4 32 "${ETCFS_BENCH_RUNTIME:-30}"
-compare_summary_row gluster "$RESULTS_DIR/gluster.json"
-
-log "gluster comparison run complete. Results in $RESULTS_DIR"
+compare_finish gluster

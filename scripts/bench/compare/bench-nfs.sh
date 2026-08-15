@@ -12,17 +12,14 @@ export COMPARE_BACKEND=nfs
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/compare-lib.sh"
 
-trap compare_destroy EXIT
-compare_provision
+compare_begin
 SERVER_PUB="${COMPARE_PUB_IPS[0]}"
 SERVER_PRIV="${COMPARE_PRIV_IPS[0]}"
 CLIENT_PUB="${COMPARE_PUB_IPS[1]}"
 
 compare_export_backing "$SERVER_PUB" "$SERVER_PRIV" "$CLIENT_PUB" "${COMPARE_PUB_IPS[2]}"
-$SSH_CMD "ec2-user@$CLIENT_PUB" "sudo dnf install -y fio >/dev/null 2>&1 || sudo yum install -y fio >/dev/null 2>&1"
+compare_install_fio "$CLIENT_PUB"
 
 N0="$CLIENT_PUB"
 run_fio "nfs" "filename=$BACKING_PATH/fio.dat" 1G libaio 4 32 "${ETCFS_BENCH_RUNTIME:-30}"
-compare_summary_row nfs "$RESULTS_DIR/nfs.json"
-
-log "nfs comparison run complete. Results in $RESULTS_DIR"
+compare_finish nfs

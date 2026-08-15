@@ -23,8 +23,7 @@ export ETCFS_AMI_NAME_FILTER="amzn2-ami-hvm-*-x86_64-gp2"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/compare-lib.sh"
 
-trap compare_destroy EXIT
-compare_provision
+compare_begin
 N0="${COMPARE_PUB_IPS[0]}"; N1="${COMPARE_PUB_IPS[1]}"; N2="${COMPARE_PUB_IPS[2]}"
 P0="${COMPARE_PRIV_IPS[0]}"; P1="${COMPARE_PRIV_IPS[1]}"; P2="${COMPARE_PRIV_IPS[2]}"
 IPS=("$N0" "$N1" "$N2")
@@ -85,8 +84,7 @@ for ip in "${IPS[@]}"; do
 done
 sleep 5
 
-dev=$(detect_ebs_dev "$N0")
-[[ -n "$dev" ]] || die "bench-gfs2: no shared EBS device found on $N0"
+dev=$(compare_shared_device "$N0")
 
 log "Formatting $dev as GFS2 (3 journals, lock_dlm) from $N0..."
 $SSH_CMD "ec2-user@$N0" "sudo mkfs.gfs2 -O -p lock_dlm -t comparegfs2:vol1 -j 3 $dev"
@@ -95,9 +93,7 @@ log "Mounting on all nodes..."
 for ip in "${IPS[@]}"; do
     $SSH_CMD "ec2-user@$ip" "sudo mkdir -p /mnt/compare-gfs2 && sudo mount -t gfs2 -o noatime $dev /mnt/compare-gfs2"
 done
-$SSH_CMD "ec2-user@$N0" "sudo yum install -y fio >/dev/null 2>&1"
+compare_install_fio "$N0"
 
 run_fio "gfs2" "filename=/mnt/compare-gfs2/fio.dat" 1G libaio 4 32 "${ETCFS_BENCH_RUNTIME:-30}"
-compare_summary_row gfs2 "$RESULTS_DIR/gfs2.json"
-
-log "gfs2 comparison run complete. Results in $RESULTS_DIR"
+compare_finish gfs2
