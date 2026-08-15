@@ -158,9 +158,7 @@ func TestIntegration_FlushWhoseReplyWasLostIsAdoptedNotRejected(t *testing.T) {
 		writeAt(t, svc, ino, i*4096, block)
 	}
 
-	svc.lockMu.Lock()
-	e := svc.locks[ino]
-	svc.lockMu.Unlock()
+	e := svc.locks.lookup(ino)
 	if e == nil {
 		t.Fatal("no lock entry for an inode this node just wrote")
 	}

@@ -125,8 +125,7 @@ func (s *Service) handleWrite(ctx context.Context, payload []byte) ([]byte, erro
 func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint64,
 	data []byte, uid uint32, flags uint32) ([]byte, error) {
 
-	dataLen := len(data)
-	if dataLen == 0 {
+	if len(data) == 0 {
 		return writtenResp(0), nil
 	}
 
@@ -168,194 +167,43 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 	if meta.rec == nil {
 		return int32Resp(errNoEnt), nil
 	}
-	rec := meta.rec
-	existing := meta.extents
 
-	runs, err := s.allocateBlocks(ctx, uint64(dataLen))
-	if err != nil {
-		s.log.Warn("write: cannot allocate blocks", "ino", ino, "error", err)
+	w := newWriteOp(s, ino, offset, data, uid, s.writeGeneration(ctx), meta)
+	if aerr := w.allocate(ctx); aerr != nil {
+		s.log.Warn("write: cannot allocate blocks", "ino", ino, "error", aerr)
 		return int32Resp(errNoSpace), nil
 	}
-	freeRuns := func() {
-		for _, r := range runs {
-			s.freeBlocks(r.DiskOff, r.Length)
-		}
+
+	cmps, ops := w.proposal()
+
+	if resp, done := s.bufferWriteOp(ctx, lk, w, cmps, ops, sync); done {
+		return resp, nil
 	}
 
-	// Every run starts and ends on a block boundary, so a single buffer padded
-	// out to whole blocks can be sliced per run and still satisfy O_DIRECT.
-	// The padding past dataLen is written but never referenced by an extent.
-	padded := (dataLen + arena.BlockSize - 1) / arena.BlockSize * arena.BlockSize
+	return s.commitWriteOp(ctx, lk, w)
+}
 
-	// writeThrough puts the payload on the device now, which is what every write
-	// that is not going to be buffered has to do before its extents are
-	// published.  Idempotent, and a no-op once it has run.
-	written := false
-	writeThrough := func() error {
-		if written {
-			return nil
-		}
-		writeData := data
-		if padded != dataLen || !s.directSafe(data) {
-			aligned, free := s.ioBuffer(padded)
-			defer free()
-			if !s.directSafe(aligned) {
-				return errUnalignedBuffer
-			}
-			copy(aligned, data)
-			writeData = aligned[:padded]
-		}
-		pos := uint64(0)
-		for _, r := range runs {
-			if werr := s.writeRun(writeData[pos:pos+r.Length], r.DiskOff); werr != nil {
-				return werr
-			}
-			pos += r.Length
-		}
-		written = true
-		return nil
-	}
+// bufferWriteOp tries to leave this write's extents in the inode's buffer
+// instead of committing them, and reports whether it answered the request.
+//
+// While this node holds the inode's exclusive lock no peer can take even a
+// shared one, so the extent does not have to be in etcd for the write to be
+// correct — only before the lock is given up.  Buffering it there instead of
+// committing takes the Raft commit off the write path entirely; see delegate.go
+// for what the flush has to assert to make that safe.
+//
+// Four things send a write down the committing path anyway: deferral being
+// switched off, the caller having asked for a synchronous write, a change to
+// the file's mode, and a transaction this node cannot replay into its own cache
+// — the buffer is that replay, so a proposal it cannot account for has nothing
+// to be folded into.
+func (s *Service) bufferWriteOp(ctx context.Context, lk *heldLock, w *writeOp,
+	cmps []clientv3.Cmp, ops []clientv3.Op, sync bool) ([]byte, bool) {
 
-	gen := s.writeGeneration(ctx)
-
-	// The extent list answers the rest of what this write needs: which chunk
-	// numbers are free, what sequence it takes, and which existing extents it
-	// is about to bury.  Both counters run one past the highest in use rather
-	// than off the extent count — a truncate deletes records from the middle,
-	// and counting would hand back a number that is still live.
-	//
-	// The list the lock cached is used as-is, and so is a serializable re-read:
-	// both only build a proposal, and the commit below refuses to overwrite a
-	// chunk that already exists, so a stale answer costs a retry rather than a
-	// buried extent.  That retry re-reads linearizably, which is the only way
-	// to be sure the second attempt is not working from the same stale view.
-	var chunk, seq uint64
-	countFrom := func() {
-		chunk, seq = 0, 0
-		for _, e := range existing {
-			if e.Chunk >= chunk {
-				chunk = e.Chunk + 1
-			}
-			if e.Seq >= seq {
-				seq = e.Seq + 1
-			}
-		}
-	}
-	countFrom()
-	readExtents := func(opts ...clientv3.OpOption) error {
-		var xerr error
-		existing, xerr = s.store.GetExtents(ctx, ino, opts...)
-		if xerr != nil {
-			return xerr
-		}
-		countFrom()
-		return nil
-	}
-
-	// One extent per run, in order, so the logical range stays contiguous even
-	// though the device ranges behind it are not.  Rebuilt on a retry, since
-	// both counters move.
-	//
-	// Everything this write does to metadata goes into this one transaction:
-	// the new extents, the size change, and the rewrite of every extent the
-	// write buries.  Each of those used to be its own round trip after the
-	// commit, and each was a Raft commit on the critical path of every write.
-	// Folding them also makes the write atomic in a way it was not: a buried
-	// extent stops being referenced at the same revision the extent burying it
-	// appears.
-	end := offset
-	var plans []*reclaimPlan
-	var deferredReclaim []metadata.Extent
-	var nextChunk uint64
-	// A write that costs the file its set-user-ID bits must not have that
-	// change deferred with the rest of the transaction.  Deferring the bytes
-	// trades durability; deferring this trades privilege, and any peer reading
-	// the inode in the meantime is told the file is still setuid.
-	var modeChanged bool
-	proposal := func() ([]clientv3.Cmp, []clientv3.Op) {
-		cmps := make([]clientv3.Cmp, 0, len(runs))
-		ops := make([]clientv3.Op, 0, len(runs)+2)
-		plans = plans[:0]
-		deferredReclaim = deferredReclaim[:0]
-		end = offset
-		pos := uint64(0)
-		next := chunk
-		for _, r := range runs {
-			// The final run is padded; its extent covers only the real bytes.
-			extLen := min(r.Length, uint64(dataLen)-pos)
-			// Every run of one write shares a sequence: they are one write, and
-			// they cover disjoint logical ranges, so nothing needs to order them
-			// against each other.
-			ext := metadata.Extent{
-				LogOff: offset + pos, DiskOff: r.DiskOff, Length: extLen,
-				Gen: gen, Seq: seq, Node: s.store.NodeID(),
-			}
-			key := metadata.ExtentKey(ino, next)
-			cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(key), "=", 0))
-			ops = append(ops, clientv3.OpPut(key, ext.Encode()))
-			next++
-			end = ext.End()
-			pos += r.Length
-		}
-		// Data is already durable on the device; if the guard rejects the
-		// commit the bytes stay unreferenced and the blocks go back to the
-		// arena.
-		// The inode is rewritten when the write grows the file, and also when it
-		// costs the file its set-user-ID bits — both ride the transaction that
-		// publishes the write rather than a round trip of their own.
-		mode := metadata.ClearSetIDOnWrite(rec.Mode, uid)
-		modeChanged = mode != rec.Mode
-		if end > rec.Size || modeChanged {
-			updated := *rec
-			updated.Size = max(rec.Size, end)
-			updated.Mode = mode
-			ops = append(ops, clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(&updated))))
-		}
-
-		// The write is about to bury these, so they stop being readable through
-		// the extents that held them.  Reclaiming here rather than leaving it
-		// all to the scrubber keeps an overwrite-heavy workload from holding a
-		// scrub interval's worth of buried blocks alive at all times.
-		for _, old := range existing {
-			if old.LogOff >= end || offset >= old.End() {
-				continue
-			}
-			// etcd caps a transaction's size, and one write can bury many
-			// extents.  What does not fit is reclaimed afterwards, in the round
-			// trips of its own this folding exists to avoid — correct either
-			// way, just not free.
-			if len(ops)+maxReclaimOps+1 > maxWriteTxnOps || len(cmps)+1 > maxWriteTxnOps {
-				deferredReclaim = append(deferredReclaim, old)
-				continue
-			}
-			if p := s.planReclaim(old, offset, end, &next); p != nil {
-				cmps = append(cmps, p.cmp)
-				ops = append(ops, p.ops...)
-				plans = append(plans, p)
-			}
-		}
-
-		nextChunk = next
-		return cmps, ops
-	}
-
-	cmps, ops := proposal()
-
-	// While this node holds the inode's exclusive lock no peer can take even a
-	// shared one, so the extent does not have to be in etcd for the write to be
-	// correct — only before the lock is given up.  Buffering it there instead of
-	// committing takes the Raft commit off the write path entirely; see
-	// delegate.go for what the flush has to assert to make that safe.
-	//
-	// Four things send a write down the committing path anyway: deferral being
-	// switched off, the caller having asked for a synchronous write, a change
-	// to the file's mode, and a transaction this node cannot replay into its
-	// own cache — the buffer is that replay, so a proposal it cannot account
-	// for has nothing to be folded into.
-	for !sync && !modeChanged && len(deferredReclaim) == 0 {
-		m := afterCommit(ino, existing, rec, ops, 0)
+	for !sync && !w.modeChanged && len(w.deferredReclaim) == 0 {
+		m := afterCommit(w.ino, w.existing, w.rec, ops, 0)
 		if m == nil {
-			break
+			return nil, false
 		}
 		// With the payload buffered too, the write costs no device I/O either:
 		// the blocks were reserved above, so the extents already name their
@@ -363,34 +211,26 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		// on the device before it publishes anything.  Without it the bytes go
 		// down now and only the metadata is deferred.
 		var bufData []bufferedRun
-		var bufRuns []arena.Run
-		bytes := uint64(dataLen)
+		bytes := uint64(w.dataLen)
 		// The extent is deferred either way; only the bytes are in question.
 		// Holding them back pays when the flush can merge them into fewer device
 		// operations, and separately when the write is large enough that the
 		// workload is bound by device latency rather than by the operation rate.
 		// Neither holds for a small scattered write, and for that one the buffer
 		// is a burst with nothing bought back.
-		if s.dataCache && (lk.e.streakContinues(runs) || dataLen >= minBufferedWriteBytes) {
-			payload := make([]byte, padded)
-			copy(payload, data)
-			pos := uint64(0)
-			for _, r := range runs {
-				bufData = append(bufData, bufferedRun{diskOff: r.DiskOff, buf: payload[pos : pos+r.Length]})
-				pos += r.Length
-			}
-			bytes = uint64(padded)
-		} else if werr := writeThrough(); werr != nil {
-			freeRuns()
+		if s.dataCache && (lk.e.streakContinues(w.runs) || w.dataLen >= minBufferedWriteBytes) {
+			bufData = w.bufferedPayload()
+			bytes = uint64(w.padded)
+		} else if werr := w.writeThrough(); werr != nil {
+			w.freeRuns()
 			s.log.Warn("write: block device write failed", "error", werr)
-			return int32Resp(errnoForWrite(werr)), nil
+			return int32Resp(errnoForWrite(werr)), true
 		}
 
-		// Tracked whether or not the bytes were buffered: the extent naming these
-		// blocks is unpublished either way, so a discarded buffer has to give
-		// them back.
-		bufRuns = runs
-		berr := s.bufferWrite(ctx, lk.e, m, cmps, ops, plans, bytes, bufData, bufRuns)
+		// The runs are tracked whether or not the bytes were buffered: the
+		// extent naming these blocks is unpublished either way, so a discarded
+		// buffer has to give them back.
+		berr := s.bufferWrite(ctx, lk.e, m, cmps, ops, w.plans, bytes, bufData, w.runs)
 		if errors.Is(berr, errBufferPublished) {
 			// The buffer was full and has been published, which moved every key
 			// it held to a new revision.  This proposal was planned against the
@@ -400,45 +240,50 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 			// now, so this cannot repeat.
 			fresh, merr := lk.meta(ctx)
 			if merr != nil || fresh.rec == nil {
-				freeRuns()
-				s.log.Warn("write: cannot re-read metadata after a flush", "ino", ino, "error", merr)
-				return int32Resp(errIO), nil
+				w.freeRuns()
+				s.log.Warn("write: cannot re-read metadata after a flush", "ino", w.ino, "error", merr)
+				return int32Resp(errIO), true
 			}
-			rec, existing = fresh.rec, fresh.extents
-			countFrom()
-			cmps, ops = proposal()
+			cmps, ops = w.replan(fresh)
 			continue
 		}
 		if berr != nil {
-			freeRuns()
-			s.log.Warn("write: cannot buffer the extent", "ino", ino, "error", berr)
-			return int32Resp(errIO), nil
+			w.freeRuns()
+			s.log.Warn("write: cannot buffer the extent", "ino", w.ino, "error", berr)
+			return int32Resp(errIO), true
 		}
 		lk.metaPublished = true
-		return writtenResp(uint32(dataLen)), nil
+		return writtenResp(uint32(w.dataLen)), true
 	}
+	return nil, false
+}
+
+// commitWriteOp puts the payload on the device and publishes this write's
+// metadata in one guarded transaction, then reclaims what it buried.
+func (s *Service) commitWriteOp(ctx context.Context, lk *heldLock, w *writeOp) ([]byte, error) {
+	cmps, ops := w.proposal()
 
 	// This write is committing after all, and the proposal above may have been
 	// built over buffered extents.  Publish them and plan again from what etcd
 	// now holds.
-	if s.hasPending(ino) {
+	if s.hasPending(w.ino) {
 		if ferr := s.flushEntry(ctx, lk.e, "sync_write"); ferr != nil {
-			freeRuns()
-			s.log.Warn("write: cannot publish this inode's deferred writes", "ino", ino, "error", ferr)
+			w.freeRuns()
+			s.log.Warn("write: cannot publish this inode's deferred writes", "ino", w.ino, "error", ferr)
 			return int32Resp(errIO), nil
 		}
-		if xerr := readExtents(); xerr != nil {
-			freeRuns()
-			s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
+		if xerr := w.readExtents(ctx); xerr != nil {
+			w.freeRuns()
+			s.log.Warn("write: cannot read existing extents", "ino", w.ino, "error", xerr)
 			return int32Resp(errIO), nil
 		}
-		cmps, ops = proposal()
+		cmps, ops = w.proposal()
 	}
 
 	// This write is not being buffered, so its bytes go down before its extents
 	// are published — the same ordering the flush follows, for the same reason.
-	if werr := writeThrough(); werr != nil {
-		freeRuns()
+	if werr := w.writeThrough(); werr != nil {
+		w.freeRuns()
 		s.log.Warn("write: block device write failed", "error", werr)
 		return int32Resp(errnoForWrite(werr)), nil
 	}
@@ -449,58 +294,50 @@ func (s *Service) handleWriteBlock(ctx context.Context, ino uint64, offset uint6
 		// either the cached view is behind or the serializable read was served
 		// by a member that had not caught up.  Re-read from the leader and
 		// propose again.
-		s.log.Debug("write: chunk numbering was stale, retrying linearizably", "ino", ino)
-		if xerr := readExtents(); xerr != nil {
-			freeRuns()
-			s.log.Warn("write: cannot read existing extents", "ino", ino, "error", xerr)
+		s.log.Debug("write: chunk numbering was stale, retrying linearizably", "ino", w.ino)
+		if xerr := w.readExtents(ctx); xerr != nil {
+			w.freeRuns()
+			s.log.Warn("write: cannot read existing extents", "ino", w.ino, "error", xerr)
 			return int32Resp(errIO), nil
 		}
-		cmps, ops = proposal()
+		cmps, ops = w.proposal()
 		committed, fenced, rev, cerr = s.commitGuarded(ctx, cmps, ops)
 	}
 	if cerr != nil {
-		freeRuns()
-		s.log.Warn("write: metadata commit failed", "ino", ino, "error", cerr)
+		w.freeRuns()
+		s.log.Warn("write: metadata commit failed", "ino", w.ino, "error", cerr)
 		return int32Resp(errIO), nil
 	}
 	if fenced {
-		freeRuns()
+		w.freeRuns()
 		s.log.Error("write: rejected, node has been fenced",
-			"ino", ino, "start_generation", s.startGen)
+			"ino", w.ino, "start_generation", s.startGen)
 		return int32Resp(errIO), nil
 	}
 	if !committed {
-		freeRuns()
-		s.log.Error("write: extent numbering still contended after a fresh read", "ino", ino)
+		w.freeRuns()
+		s.log.Error("write: extent numbering still contended after a fresh read", "ino", w.ino)
 		return int32Resp(errIO), nil
 	}
+
 	// The lock is still held, so what this transaction wrote is still the whole
 	// truth about the inode, and telling the cache saves the next operation on
 	// this file a read.  A transaction carrying anything this cannot account
 	// for publishes nothing and the cache is dropped on release instead.
-	if len(deferredReclaim) == 0 {
-		if m := afterCommit(ino, existing, rec, ops, rev); m != nil {
+	if len(w.deferredReclaim) == 0 {
+		if m := afterCommit(w.ino, w.existing, w.rec, ops, rev); m != nil {
 			lk.publishMeta(m)
 		}
 	}
 
 	// Only after the commit — before it, a transaction the generation guard
 	// rejects would have freed blocks the file still refers to.
-	for _, p := range plans {
+	for _, p := range w.plans {
 		s.freeReclaimed(p)
 	}
+	w.reclaimDeferred(ctx)
 
-	// What did not fit in the transaction, in a round trip each.  The write
-	// itself is published and correct; failing to reclaim what it buried only
-	// leaks blocks the scrubber will find.
-	for _, old := range deferredReclaim {
-		if rerr := s.reclaimCovered(ctx, old, offset, end, &nextChunk); rerr != nil {
-			s.log.Warn("buried extent not reclaimed, the scrubber will pick it up",
-				"ino", ino, "error", rerr)
-		}
-	}
-
-	return writtenResp(uint32(dataLen)), nil
+	return writtenResp(uint32(w.dataLen)), nil
 }
 
 // afterCommit returns an inode's metadata as a committed transaction left it,

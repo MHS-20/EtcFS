@@ -500,10 +500,10 @@ func (a *Allocator) ReleaseEmptyArenas(ctx context.Context) ([]uint64, error) {
 // findRun returns the first free run of blocks, at most max long.  A length of
 // 0 means the arena has no free block left.
 //
-// ponytail: linear bit scan from block 0, so a nearly-full arena costs a full
-// sweep per call.  Skipping fully-allocated words keeps that tolerable; switch
-// to a free-list or a rotating start hint if allocation ever shows up in a
-// profile.
+// ponytail: a linear bit scan, resumed from the previous allocation's end and
+// wrapping once, so a nearly-full arena costs at most one sweep per call.
+// Skipping fully-allocated words keeps that tolerable; a free-list is the
+// upgrade if allocation ever shows up in a profile.
 func (ar *Arena) findRun(max uint64) (start, length uint64) {
 	// Two passes: from the hint to the end, then from the start back to it, so
 	// a wrap costs no more than the single sweep this replaced.

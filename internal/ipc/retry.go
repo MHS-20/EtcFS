@@ -275,14 +275,14 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 	call := time.Now()
 
 	for attempt := 0; attempt < entryRetries; attempt++ {
-		e := s.lockEntryFor(ino)
+		e := s.locks.entryFor(ino)
 		if err := lockLocal(ctx, e, mode); err != nil {
 			return nil, err
 		}
 		// The entry can be evicted between the lookup and the local lock, and an
 		// evicted entry excludes nothing: the next caller builds a fresh one and
 		// takes a different mutex.  Start over on the entry that replaced it.
-		if !s.isCurrent(e) {
+		if !s.locks.isCurrent(e) {
 			unlockLocal(e, mode)
 			continue
 		}

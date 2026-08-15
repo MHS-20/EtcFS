@@ -95,16 +95,14 @@ type Service struct {
 	// last name can keep the record alive until the last one closes.
 	open *openFiles
 
-	// locks caches this node's inode locks past the operations that took
-	// them, so a repeat acquisition costs no etcd round trip. See lockcache.go.
-	lockMu sync.Mutex
-	locks  map[uint64]*lockEntry
+	// locks caches this node's inode locks past the operations that took them,
+	// so a repeat acquisition costs no etcd round trip. See lockcache.go for
+	// what a cached lock obliges this node to do before giving one up.
+	locks *lockMap
 
-	// recalling names the inodes with a recall already in flight, so that a
-	// burst of want events for one inode starts one yield rather than a race
-	// between several for the same key. See StartLockRevocation.
-	recallMu  sync.Mutex
-	recalling map[uint64]bool
+	// recalls names the inodes with a recall already in flight. See
+	// StartLockRevocation.
+	recalls *recallSet
 
 	// Fencing generation this node started with.  Every data-path commit is
 	// guarded against it, so once the fencing controller bumps gen:<node_id>
@@ -171,8 +169,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		alloc:          arena.NewAllocator(membership.NodeID(), store),
 		log:            log,
 		open:           newOpenFiles(),
-		locks:          make(map[uint64]*lockEntry),
-		recalling:      make(map[uint64]bool),
+		recalls:        newRecallSet(),
 		notifyServer:   &notifyServer{},
 		flushInterval:  opts.FlushInterval,
 		flushMaxBytes:  defaultFlushMaxBytes,
@@ -182,6 +179,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		readOnly:       opts.ReadOnly,
 		history:        opts.History,
 	}
+	s.locks = newLockMap(s.dropCachedLock)
 	if opts.Device != nil {
 		s.setBlockDevice(opts.Device, opts.WriteBarriers)
 	}

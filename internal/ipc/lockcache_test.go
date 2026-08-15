@@ -79,25 +79,25 @@ func TestSharedLocksReleaseIndependently(t *testing.T) {
 // it: the entry is the node-local exclusion, so dropping a busy one would let a
 // second operation acquire a fresh entry for the same inode and run alongside.
 func TestEvictionSkipsBusyEntries(t *testing.T) {
-	s := &Service{locks: make(map[uint64]*lockEntry)}
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil })}
 
 	// The oldest entry is the one eviction would pick first, and it is busy.
 	busy := &lockEntry{ino: 1, lastUsed: time.Unix(0, 0)}
 	busy.rw.Lock()
-	s.locks[1] = busy
+	s.locks.entries[1] = busy
 	for ino := uint64(2); ino <= lockCacheMax; ino++ {
-		s.locks[ino] = &lockEntry{ino: ino, lastUsed: time.Unix(int64(ino), 0)}
+		s.locks.entries[ino] = &lockEntry{ino: ino, lastUsed: time.Unix(int64(ino), 0)}
 	}
 
-	s.lockMu.Lock()
-	s.evictLocksLocked()
-	s.lockMu.Unlock()
+	s.locks.mu.Lock()
+	s.locks.evictLocked()
+	s.locks.mu.Unlock()
 
-	if _, ok := s.locks[1]; !ok {
+	if _, ok := s.locks.entries[1]; !ok {
 		t.Fatal("an inode with an operation in flight was evicted from the lock cache")
 	}
-	if len(s.locks) >= lockCacheMax {
-		t.Fatalf("cache still at %d entries, eviction made no room", len(s.locks))
+	if len(s.locks.entries) >= lockCacheMax {
+		t.Fatalf("cache still at %d entries, eviction made no room", len(s.locks.entries))
 	}
 	busy.rw.Unlock()
 }
@@ -107,12 +107,12 @@ func TestEvictionSkipsBusyEntries(t *testing.T) {
 // so two of this node's own operations would run against one inode believing
 // each holds it — the exclusion the cached etcd key no longer provides.
 func TestRecallKeepsTheEntryInTheCache(t *testing.T) {
-	s := &Service{locks: make(map[uint64]*lockEntry), log: testLogger()}
-	e := s.lockEntryFor(7)
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil }), log: testLogger()}
+	e := s.locks.entryFor(7)
 
 	s.recallLock(7)
 
-	if got := s.lockEntryFor(7); got != e {
+	if got := s.locks.entryFor(7); got != e {
 		t.Fatal("recall replaced the cache entry; the node-local lock no longer excludes anything")
 	}
 	if e.holder != "" {
@@ -123,8 +123,8 @@ func TestRecallKeepsTheEntryInTheCache(t *testing.T) {
 // A recall waits out the minimum hold time before taking the lock away, so
 // contention on one inode cannot turn every operation into a recall.
 func TestRecallHonoursTheMinimumHoldTime(t *testing.T) {
-	s := &Service{locks: make(map[uint64]*lockEntry), log: testLogger()}
-	e := s.lockEntryFor(7)
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil }), log: testLogger()}
+	e := s.locks.entryFor(7)
 	e.acquiredAt = time.Now()
 
 	start := time.Now()
@@ -137,18 +137,18 @@ func TestRecallHonoursTheMinimumHoldTime(t *testing.T) {
 // An operation holding an entry that has since been evicted must not proceed
 // on it: the entry excludes nothing once it is out of the cache.
 func TestEvictedEntryIsNotCurrent(t *testing.T) {
-	s := &Service{locks: make(map[uint64]*lockEntry)}
-	e := s.lockEntryFor(7)
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil })}
+	e := s.locks.entryFor(7)
 
-	if !s.isCurrent(e) {
+	if !s.locks.isCurrent(e) {
 		t.Fatal("a freshly cached entry reports as stale")
 	}
 
-	s.lockMu.Lock()
-	delete(s.locks, 7)
-	s.lockMu.Unlock()
+	s.locks.mu.Lock()
+	delete(s.locks.entries, 7)
+	s.locks.mu.Unlock()
 
-	if s.isCurrent(e) {
+	if s.locks.isCurrent(e) {
 		t.Fatal("an evicted entry still reports as the cache's entry for its inode")
 	}
 }
@@ -158,14 +158,14 @@ func TestEvictedEntryIsNotCurrent(t *testing.T) {
 // re-acquired under a fresh session holds a live key, and dropping it with the
 // dead one would discard writes that are still publishable.
 func TestSessionLossDropsOnlyTheCachesUnderTheDeadLease(t *testing.T) {
-	s := &Service{locks: make(map[uint64]*lockEntry), log: testLogger()}
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil }), log: testLogger()}
 
 	const dead, live = clientv3.LeaseID(11), clientv3.LeaseID(12)
-	stale := s.lockEntryFor(7)
+	stale := s.locks.entryFor(7)
 	stale.holder, stale.lease = "11-a", dead
 	stale.meta, stale.metaFor = &inodeMeta{}, "11-a"
 
-	fresh := s.lockEntryFor(8)
+	fresh := s.locks.entryFor(8)
 	fresh.holder, fresh.lease = "12-a", live
 	fresh.meta, fresh.metaFor = &inodeMeta{}, "12-a"
 

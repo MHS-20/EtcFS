@@ -37,11 +37,8 @@ import (
 const (
 	// lockCacheMax bounds the number of inodes whose locks are kept.  Every
 	// cached lock is a key held in etcd and a peer's potential recall, so the
-	// cache is not free to leave unbounded even ignoring memory.
-	//
-	// ponytail: eviction is a linear sweep of the map, which is fine at this
-	// size and against how rarely it runs.  An LRU list is the upgrade if the
-	// inode fan-out of a real workload ever makes the sweep hot.
+	// cache is not free to leave unbounded even ignoring memory.  What happens
+	// when it is reached is lockMap.evictLocked.
 	lockCacheMax = 4096
 
 	// entryRetries bounds how many times an acquisition restarts because the
@@ -124,16 +121,14 @@ type lockEntry struct {
 	// which part of that belief etcd has not been told yet.  See delegate.go.
 	pending *pending
 
-	lastUsed time.Time // guarded by Service.lockMu
+	lastUsed time.Time // guarded by lockMap.mu
 }
 
 // hasPending reports whether an inode has writes this node has acknowledged
 // and not yet published.  Takes no lock on the entry itself, so it is safe on
 // a path that must not block behind an operation in flight.
 func (s *Service) hasPending(ino uint64) bool {
-	s.lockMu.Lock()
-	e := s.locks[ino]
-	s.lockMu.Unlock()
+	e := s.locks.lookup(ino)
 	if e == nil {
 		return false
 	}
@@ -150,9 +145,7 @@ func (s *Service) hasPending(ino uint64) bool {
 // which is the size before the write.  A peer's stat still reads etcd and lags
 // by up to the flush interval, which is the delegation's cost.
 func (s *Service) pendingSize(ino uint64) (uint64, bool) {
-	s.lockMu.Lock()
-	e := s.locks[ino]
-	s.lockMu.Unlock()
+	e := s.locks.lookup(ino)
 	if e == nil {
 		return 0, false
 	}
@@ -249,72 +242,6 @@ func (e *lockEntry) dropMeta() {
 // flapping the key between modes, one commit each way.
 func covers(held, want metadata.LockMode) bool {
 	return held == metadata.LockExclusive || held == want
-}
-
-// lockEntryFor returns the cache entry for an inode, creating it if needed.
-func (s *Service) lockEntryFor(ino uint64) *lockEntry {
-	s.lockMu.Lock()
-	defer s.lockMu.Unlock()
-
-	e := s.locks[ino]
-	if e == nil {
-		s.evictLocksLocked()
-		e = &lockEntry{ino: ino}
-		s.locks[ino] = e
-	}
-	e.lastUsed = time.Now()
-	return e
-}
-
-// isCurrent reports whether e is still the cache's entry for its inode.  An
-// operation that has taken e's local lock must check this before proceeding:
-// an entry evicted out from under it excludes nothing, because the next caller
-// builds a fresh entry and takes a different mutex.
-func (s *Service) isCurrent(e *lockEntry) bool {
-	s.lockMu.Lock()
-	defer s.lockMu.Unlock()
-	return s.locks[e.ino] == e
-}
-
-// evictLocksLocked drops cached locks until the cache has room, oldest first.
-// Only an entry no operation currently holds can go, so a full cache of busy
-// inodes grows past the bound rather than blocking; the bound is a target, not
-// an invariant.
-func (s *Service) evictLocksLocked() {
-	for len(s.locks) >= lockCacheMax {
-		var oldest uint64
-		var victim *lockEntry
-		for ino, e := range s.locks {
-			// TryLock rather than Lock: an entry with an operation in flight is
-			// skipped, never waited for.  Evicting it would let the next caller
-			// build a second entry for the same inode and run alongside the
-			// operation this one is excluding.
-			if !e.rw.TryLock() {
-				continue
-			}
-			if victim == nil || e.lastUsed.Before(victim.lastUsed) {
-				if victim != nil {
-					victim.rw.Unlock()
-				}
-				oldest, victim = ino, e
-				continue
-			}
-			e.rw.Unlock()
-		}
-		if victim == nil {
-			return
-		}
-		if err := s.dropCachedLock(victim, "eviction"); err != nil {
-			// Its writes are not published, so its lock cannot be given up.
-			// Leaving it in the cache keeps the buffer reachable by the flush
-			// interval; the cache runs over its bound until then, which the
-			// bound already tolerates.
-			victim.rw.Unlock()
-			return
-		}
-		delete(s.locks, oldest)
-		victim.rw.Unlock()
-	}
 }
 
 // dropCachedLock publishes anything this node has buffered for the inode and
@@ -459,34 +386,16 @@ func (s *Service) StartLockRevocation(ctx context.Context) {
 				if !ok || node == s.store.NodeID() {
 					continue
 				}
-				if !s.beginRecall(ino) {
+				if !s.recalls.begin(ino) {
 					continue
 				}
 				go func(ino uint64) {
-					defer s.endRecall(ino)
+					defer s.recalls.end(ino)
 					s.recallLock(ino)
 				}(ino)
 			}
 		}
 	}()
-}
-
-// beginRecall claims the right to recall an inode, reporting false if one is
-// already in flight.
-func (s *Service) beginRecall(ino uint64) bool {
-	s.recallMu.Lock()
-	defer s.recallMu.Unlock()
-	if s.recalling[ino] {
-		return false
-	}
-	s.recalling[ino] = true
-	return true
-}
-
-func (s *Service) endRecall(ino uint64) {
-	s.recallMu.Lock()
-	defer s.recallMu.Unlock()
-	delete(s.recalling, ino)
 }
 
 // recallLock yields a cached lock to a peer that has asked for it — the
@@ -498,9 +407,7 @@ func (s *Service) endRecall(ino uint64) {
 // longer looks at, and the node-local exclusion that the cached key no longer
 // provides would be gone with it.
 func (s *Service) recallLock(ino uint64) {
-	s.lockMu.Lock()
-	e := s.locks[ino]
-	s.lockMu.Unlock()
+	e := s.locks.lookup(ino)
 	if e == nil {
 		return
 	}
@@ -571,12 +478,7 @@ func (s *Service) StartSessionWatch(ctx context.Context) {
 // an inode under it, and that entry's key is live.  Entries are left in the
 // map, as a recall leaves them — only what the key vouched for is dropped.
 func (s *Service) dropCachesForLease(lease clientv3.LeaseID) {
-	s.lockMu.Lock()
-	entries := make([]*lockEntry, 0, len(s.locks))
-	for _, e := range s.locks {
-		entries = append(entries, e)
-	}
-	s.lockMu.Unlock()
+	entries := s.locks.all()
 
 	dropped := 0
 	for _, e := range entries {
@@ -599,13 +501,7 @@ func (s *Service) dropCachesForLease(lease clientv3.LeaseID) {
 // answering, and a peer blocked on one of them should not have to wait for
 // that.
 func (s *Service) ReleaseCachedLocks() {
-	s.lockMu.Lock()
-	entries := make([]*lockEntry, 0, len(s.locks))
-	for ino, e := range s.locks {
-		entries = append(entries, e)
-		delete(s.locks, ino)
-	}
-	s.lockMu.Unlock()
+	entries := s.locks.drain()
 
 	for _, e := range entries {
 		e.rw.Lock()

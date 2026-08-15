@@ -319,14 +319,12 @@ func (s *Service) bufferAccounted(ops int, bytes int64) {
 // request.  If every buffer is in flight the total stays over the cap until
 // they finish, which overshoots by at most one write per inode in flight.
 func (s *Service) drainBuffers(ctx context.Context, skip *lockEntry) {
-	s.lockMu.Lock()
-	entries := make([]*lockEntry, 0, len(s.locks))
-	for _, e := range s.locks {
+	var entries []*lockEntry
+	for _, e := range s.locks.all() {
 		if e != skip {
 			entries = append(entries, e)
 		}
 	}
-	s.lockMu.Unlock()
 
 	for _, e := range entries {
 		if s.bufferedBytes.Load() <= s.bufferMaxBytes {
@@ -664,12 +662,7 @@ func (s *Service) flushInode(ctx context.Context, ino uint64) error {
 // cached locks are given up on shutdown, so a peer that takes an inode next
 // sees the writes this node acknowledged.
 func (s *Service) FlushAll(ctx context.Context, trigger string) {
-	s.lockMu.Lock()
-	entries := make([]*lockEntry, 0, len(s.locks))
-	for _, e := range s.locks {
-		entries = append(entries, e)
-	}
-	s.lockMu.Unlock()
+	entries := s.locks.all()
 
 	for _, e := range entries {
 		e.rw.Lock()
@@ -706,12 +699,7 @@ func (s *Service) StartFlusher(ctx context.Context) {
 }
 
 func (s *Service) flushExpired(ctx context.Context) {
-	s.lockMu.Lock()
-	entries := make([]*lockEntry, 0, len(s.locks))
-	for _, e := range s.locks {
-		entries = append(entries, e)
-	}
-	s.lockMu.Unlock()
+	entries := s.locks.all()
 
 	deadline := time.Now().Add(-s.flushInterval)
 	for _, e := range entries {

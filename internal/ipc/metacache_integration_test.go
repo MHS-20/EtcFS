@@ -20,9 +20,7 @@ import (
 
 // cachedMetaFor returns what the service has cached for an inode, or nil.
 func cachedMetaFor(svc *Service, ino uint64) *inodeMeta {
-	svc.lockMu.Lock()
-	e := svc.locks[ino]
-	svc.lockMu.Unlock()
+	e := svc.locks.lookup(ino)
 	if e == nil {
 		return nil
 	}
