@@ -16,6 +16,7 @@ N0="${COMPARE_PUB_IPS[0]}"
 
 bash "$INFRA_DIR/bootstrap-cluster.sh" "$ETCFS_STATE" || die "bootstrap-cluster.sh failed"
 wait_for_fuse_mount "$N0" 60 2 || die "etcfs never mounted on $N0"
+$SSH_CMD "ec2-user@$N0" "sudo dnf install -y fio >/dev/null 2>&1 || sudo yum install -y fio >/dev/null 2>&1"
 
 run_fio "etcfs" "directory=$FUSE_MOUNTPOINT
 filename_format=fio.\$jobname.\$jobnum.\$filenum" 8M psync "${ETCFS_BENCH_JOBS:-4}" 1 "${ETCFS_BENCH_RUNTIME:-30}"

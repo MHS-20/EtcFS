@@ -28,7 +28,11 @@ export ETCFS_VOLUME_SIZE="${ETCFS_VOLUME_SIZE:-20}"
 source "$INFRA_DIR/state.sh"
 source "$COMPARE_SCRIPT_DIR/../bench-lib.sh"
 
-RESULTS_DIR="$PROJECT_ROOT/benchmark-results/compare/$COMPARE_BACKEND"
+# Not $PROJECT_ROOT: state.sh derives that from $0, which here is bench-*.sh
+# (three directories deeper than scripts/infra/*.sh, where state.sh assumes
+# it's invoked from), so it resolves one level too high once state.sh is
+# sourced from this directory instead of run as a top-level script itself.
+RESULTS_DIR="$COMPARE_PROJECT_ROOT/benchmark-results/compare/$COMPARE_BACKEND"
 mkdir -p "$RESULTS_DIR"
 
 compare_provision() {
@@ -42,15 +46,19 @@ compare_provision() {
     done
 }
 
-# compare_destroy — always run from a `trap ... EXIT`, best-effort: a failed
-# benchmark run must not leave billing infra behind (see chaos-lib.sh's
-# teardown_cluster for the same "async is not worth the orphan risk here"
-# call, made the other way — this one blocks, since bench-*.sh scripts run
-# one at a time from a shell, not from a chaos loop that needs its next
-# iteration unblocked).
+# compare_destroy — always run from a `trap ... EXIT`. Fire-and-forget, same
+# pattern as scripts/test/chaos-lib.sh's own teardown_cluster: nohup+disown so
+# the calling bench-*.sh's own exit isn't gated on instance termination /
+# volume deletion actually completing, which is what lets independent
+# backends run back-to-back (or in parallel, in separate shells) without one
+# backend's teardown blocking the next backend's provisioning. destroy-infra.sh
+# underneath is still the same synchronous, confirms-every-step script — this
+# just moves the wait off the critical path, it doesn't skip it.
 compare_destroy() {
-    log "=== [$COMPARE_BACKEND] tearing down ==="
-    bash "$INFRA_DIR/destroy-infra.sh" --force || log "WARNING: [$COMPARE_BACKEND] teardown reported leftover resources — check AWS console for ClusterName=$ETCFS_CLUSTER"
+    log "=== [$COMPARE_BACKEND] tearing down (async) ==="
+    nohup bash "$INFRA_DIR/destroy-infra.sh" --force \
+        > "$COMPARE_PROJECT_ROOT/teardown-${COMPARE_BACKEND}.log" 2>&1 &
+    disown
 }
 
 # compare_export_backing <server_pub_ip> <server_priv_ip> <client_pub_ips...>
@@ -65,12 +73,33 @@ compare_destroy() {
 # asked to give every backend — has no per-node-local storage to hand out;
 # an NFS re-export is the closest same-shaped substitute, not how either
 # product would be deployed in production. Their own reports say so.
+# compare_open_port <from_port> [to_port] — self-referencing SG ingress rule,
+# same pattern as create-infra.sh's own etcd rules. create-infra.sh only opens
+# etcd's own ports (2379/2380) plus 9090/9100 — every backend here needs its
+# own protocol's port opened before its first cross-node connection, or that
+# connection hangs until TCP's own timeout instead of failing fast.
+compare_open_port() {
+    local from="$1" to="${2:-$1}"
+    local sg; sg=$(state_get sg_id | tr -d '"')
+    aws ec2 authorize-security-group-ingress --group-id "$sg" \
+        --protocol tcp --port "${from}-${to}" --source-group "$sg" >/dev/null 2>&1 || true
+}
+
+# compare_open_port_udp — same, for corosync's totem transport (5405/udp).
+compare_open_port_udp() {
+    local from="$1" to="${2:-$1}"
+    local sg; sg=$(state_get sg_id | tr -d '"')
+    aws ec2 authorize-security-group-ingress --group-id "$sg" \
+        --protocol udp --port "${from}-${to}" --source-group "$sg" >/dev/null 2>&1 || true
+}
+
 BACKING_PATH=/mnt/compare-backing
 compare_export_backing() {
     local server_pub="$1" server_priv="$2"
     shift 2
     local client_pubs=("$@")
 
+    compare_open_port 2049
     local dev
     dev=$(detect_ebs_dev "$server_pub")
     [[ -n "$dev" ]] || die "compare_export_backing: no EBS device found on $server_pub"
@@ -102,10 +131,12 @@ compare_export_backing() {
 # volume instead would mean either corrupting it (concurrent ext4 mounts on
 # one Multi-Attach device) or relaying every brick through NFS, which is not
 # how the product is deployed and would benchmark the relay, not the product.
-# Prints one device path per node, in input order. Volume IDs are appended to
-# COMPARE_LOCAL_VOL_IDS (global array) so compare_destroy_local_volumes can
-# find them again.
-COMPARE_LOCAL_VOL_IDS=()
+# Prints one device path per node, in input order. Every volume is tagged
+# ClusterName=$ETCFS_CLUSTER,Name=<cluster>-local so compare_destroy_local_volumes
+# can find them again by tag instead of by an in-memory list — this function
+# is normally called as `mapfile ... < <(compare_create_local_volumes ...)`,
+# and process substitution runs the function in a subshell, so any plain
+# variable/array it set would never be visible to the caller once it returns.
 compare_create_local_volumes() {
     local iops="$1"
     shift
@@ -119,21 +150,33 @@ compare_create_local_volumes() {
         aws ec2 wait volume-available --volume-ids "$vol_id" 2>/dev/null || true
         aws ec2 attach-volume --volume-id "$vol_id" --instance-id "$inst" --device /dev/sdg >/dev/null
         aws ec2 wait volume-in-use --volume-ids "$vol_id" 2>/dev/null || true
-        COMPARE_LOCAL_VOL_IDS+=("$vol_id")
         dev=$($SSH_CMD "ec2-user@$pub" "for d in /dev/nvme2n1 /dev/sdg /dev/xvdg; do [[ -b \$d ]] && echo \$d && break; done")
         [[ -n "$dev" ]] || die "compare_create_local_volumes: device not visible on $pub"
         echo "$dev"
     done
 }
 
+# compare_destroy_local_volumes — sweeps by tag rather than an in-memory list,
+# so it also catches volumes from an earlier attempt of this same backend
+# that failed before reaching its own teardown (this suite's iterate-until-
+# green workflow leaves exactly that behind otherwise — every failed retry's
+# local volumes, orphaned and still billing). Async, same as compare_destroy:
+# force-detach (--force, no wait for "available") and delete immediately —
+# a delete that lands before the detach is fully processed just fails and
+# retries a few times in the background, off the caller's critical path.
 compare_destroy_local_volumes() {
-    local vol_id
-    for vol_id in "${COMPARE_LOCAL_VOL_IDS[@]}"; do
-        aws ec2 detach-volume --volume-id "$vol_id" >/dev/null 2>&1 || true
-        aws ec2 wait volume-available --volume-ids "$vol_id" 2>/dev/null || true
-        aws ec2 delete-volume --volume-id "$vol_id" >/dev/null 2>&1 \
-            || log "WARNING: local volume $vol_id was not deleted — check manually"
-    done
+    (
+        for vol_id in $(aws ec2 describe-volumes \
+            --filters "Name=tag:ClusterName,Values=$ETCFS_CLUSTER" "Name=tag:Name,Values=${ETCFS_CLUSTER}-local" \
+            --query 'Volumes[].VolumeId' --output text 2>/dev/null); do
+            aws ec2 detach-volume --volume-id "$vol_id" --force >/dev/null 2>&1 || true
+            for _ in 1 2 3 4 5; do
+                aws ec2 delete-volume --volume-id "$vol_id" >/dev/null 2>&1 && break
+                sleep 5
+            done
+        done
+    ) > "$COMPARE_PROJECT_ROOT/teardown-${COMPARE_BACKEND}-local-volumes.log" 2>&1 &
+    disown
 }
 
 # compare_summary_row <label> <fio_json> — appends one row to this backend's

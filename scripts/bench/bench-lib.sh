@@ -44,7 +44,12 @@ iodepth=$depth
 stonewall
 "
     echo "$job" | $SSH_CMD "ec2-user@$N0" "cat > /tmp/${label}.fio"
-    $SSH_CMD "ec2-user@$N0" \
+    # timeout, generously above the job's own two-stanza runtime budget: a
+    # backend whose I/O errors out on every op (auth failure, dead backing
+    # store) can leave fio retrying indefinitely instead of failing fast —
+    # seen directly against a misconfigured MinIO, where fio sat for 25+
+    # minutes past its 30s runtime instead of erroring out.
+    timeout "$((runtime * 4 + 120))" $SSH_CMD "ec2-user@$N0" \
         "sudo fio /tmp/${label}.fio --output-format=json --output=/tmp/${label}.json"
     scp $SSH_OPTS "ec2-user@$N0:/tmp/${label}.json" "$RESULTS_DIR/${label}.json" >/dev/null
 }
