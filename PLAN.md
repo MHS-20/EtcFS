@@ -247,7 +247,7 @@ Porcupine models: namespace, extent, lock, generation), `specs/Fencing.tla`
 
 ### 9.1 Invariants to state once and check everywhere
 
-- [ ] Write them down as a numbered list, each with where it is enforced and
+- [x] Write them down as a numbered list, each with where it is enforced and
       which check would catch a violation:
       1. No two nodes hold conflicting locks on one inode, and no lock
          decision is ever made from a read — only from a transaction, or from
@@ -268,7 +268,7 @@ Porcupine models: namespace, extent, lock, generation), `specs/Fencing.tla`
 
 ### 9.2 Model checking
 
-- [ ] TLA+: extend `Fencing.tla` (or a sibling spec) with the cached lock,
+- [x] TLA+: extend `Fencing.tla` (or a sibling spec) with the cached lock,
       modelled as cached and recallable rather than per-operation —
       acquire/want-key/recall/minimum hold time/lease loss while holding one —
       and the delegation: buffered extents and data, flush, flush rejected
@@ -277,48 +277,51 @@ Porcupine models: namespace, extent, lock, generation), `specs/Fencing.tla`
       `NoDoubleWriter`/`StaleWriteRejected`. Add `.cfg`s that break each guard
       (the existing `Fencing*Bug.cfg` pattern) so the spec is shown to catch
       its own violations.
-- [ ] Model the cached view against etcd truth explicitly: what a node believes
+- [x] Model the cached view against etcd truth explicitly: what a node believes
       an inode's extents and size are versus what is published, and that a
       recall reconciles them. This is the property the metadata cache and both
       data caches all rest on, and no current spec names it.
-- [ ] Porcupine `lock.go`: hold intervals are now the operation's, a subset of
+- [x] Porcupine `lock.go`: hold intervals are now the operation's, a subset of
       the true etcd hold. Confirm sound, or widen to the cached hold.
-- [ ] Porcupine `extent.go`: reads may now be served from a cached list, from
+- [x] Porcupine `extent.go`: reads may now be served from a cached list, from
       a kernel page this node cached, or from a write still buffered in RAM,
       and writes may be unpublished at crash time. Add an fsync barrier event
       to the history and relax the model to "a read never contradicts any write
       that was flushed, or any write from the same node".
-- [ ] New model: block ownership over time, from the extent history — catches
+- [x] New model: block ownership over time, from the extent history — catches
       invariant 3 and 4 directly, which no current model covers.
-- [ ] Page-cache invalidation as its own property: no node serves a kernel-
+- [x] Page-cache invalidation as its own property: no node serves a kernel-
       cached page for an inode after it has yielded that inode's lock. Needs a
       history event for the invalidation, or it cannot be checked at all.
 
 ### 9.3 Chaos
 
-- [ ] S8 cross-node contention on one inode: two nodes writing the same file
+- [x] S8 cross-node contention on one inode: two nodes writing the same file
       so recall actually fires. Nothing in S1–S7 exercises it — the 1000-IOPS
       run was single-client.
-- [ ] S9 crash with a full buffer: assert exactly the unflushed writes are
+- [x] S9 crash with a full buffer: assert exactly the unflushed writes are
       missing, everything fsynced survives, and no extent references a freed
       block afterwards (run `fsck` + a scrub pass as the assertion).
-- [ ] S10 lease loss under sustained write load: node keeps writing, its
+- [x] S10 lease loss under sustained write load: node keeps writing, its
       session dies, a peer takes the inode. Assert the partitioned node's
       flush is rejected and its blocks come back.
-- [ ] S11 flush failure injection: etcd unavailable at flush time. Assert the
+- [x] S11 flush failure injection: etcd unavailable at flush time. Assert the
       buffer survives, `fsync` returns `EIO` and keeps returning it, and no
       partial publication.
-- [ ] S12 recall storm: many inodes contended at once, assert no deadlock, no
+- [x] S12 recall storm: many inodes contended at once, assert no deadlock, no
       lock left behind, bounded latency. Recall now invalidates kernel pages
       too, on a path that can deadlock against writeback — this is where that
       shows up if it is wrong.
-- [ ] S13 read-after-recall across nodes with page caching on: node A reads
+- [x] S13 read-after-recall across nodes with page caching on: node A reads
       (kernel caches), node B writes, node A reads again. Must see B's data.
       The single-client benchmark run never exercised any of this.
-- [ ] Turn `VERIFY_HISTORY=1` on by default in the docker chaos suite, and
+- [x] Turn `VERIFY_HISTORY=1` on by default in the docker chaos suite, and
       make a violation fail the run rather than warn.
 - [ ] Re-run `pjdfstest`, `integrity-fuzz.sh`, `stress-test.sh` against the
       deferred path.
+- [ ] S8–S13 are implemented for `docker` only; their `aws` branches log
+      "not implemented" and return. Port them once there is a cluster to
+      test the port against — an untested AWS branch is worse than none.
 
 ### 9.4 Race and fault coverage
 

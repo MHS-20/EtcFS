@@ -25,23 +25,29 @@ logerr() {
 
 source "$SCRIPT_DIR/chaos-lib.sh"
 
-# S9/S10/S11 need etcfsctl (fsck/scrub) against the docker cluster's etcd,
-# which has no host-published port. Build it statically — same CGO_ENABLED=0
-# build the meta image itself uses — and run it from inside a container
-# already on the cluster's network instead of teaching the host how to reach
-# etcd's container-only DNS names.
+# S9/S10 need etcfsctl (fsck/scrub) against the cluster's etcd, which neither
+# transport exposes to this host: docker publishes no port for it, and the AWS
+# members listen on private addresses. So the binary is built statically — the
+# same CGO_ENABLED=0 build the meta image uses, which also makes it runnable on
+# Amazon Linux — and shipped to a node that is already on the cluster's network,
+# rather than teaching the host how to reach either.
 ETCFSCTL_BIN="$REPORT_DIR/etcfsctl-static"
 build_etcfsctl() {
     [[ -x "$ETCFSCTL_BIN" ]] && return 0
-    ( cd "$PROJECT_ROOT" && CGO_ENABLED=0 go build -o "$ETCFSCTL_BIN" ./cmd/etcfsctl ) 2>&1 | tee -a "$REPORT_DIR/chaos.log"
+    ( cd "$PROJECT_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$ETCFSCTL_BIN" ./cmd/etcfsctl ) 2>&1 | tee -a "$REPORT_DIR/chaos.log"
     [[ -x "$ETCFSCTL_BIN" ]]
 }
 run_etcfsctl() {
-    if [[ "$MODE" != "docker" ]]; then echo "run_etcfsctl: not implemented for aws"; return 1; fi
     build_etcfsctl || { echo "etcfsctl build failed"; return 1; }
-    docker cp "$ETCFSCTL_BIN" "$M1:/tmp/etcfsctl" >/dev/null 2>&1
-    docker exec "$M1" chmod +x /tmp/etcfsctl >/dev/null 2>&1
-    docker exec "$M1" /tmp/etcfsctl --etcd-endpoints=http://etcfs-etcd1:2379,http://etcfs-etcd2:2379,http://etcfs-etcd3:2379 "$@"
+    if [[ "$MODE" == "docker" ]]; then
+        docker cp "$ETCFSCTL_BIN" "$M1:/tmp/etcfsctl" >/dev/null 2>&1
+        docker exec "$M1" chmod +x /tmp/etcfsctl >/dev/null 2>&1
+        docker exec "$M1" /tmp/etcfsctl --etcd-endpoints=http://etcfs-etcd1:2379,http://etcfs-etcd2:2379,http://etcfs-etcd3:2379 "$@"
+        return
+    fi
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -q \
+        "$ETCFSCTL_BIN" "ec2-user@$N1:/tmp/etcfsctl" 2>/dev/null
+    runcmd60 "$N1" "chmod +x /tmp/etcfsctl && sudo /tmp/etcfsctl --etcd-endpoints=$(etcd_endpoints) $*"
 }
 
 # assert_storage_clean <label> [fsck] — assert the on-disk state has no leaks,
@@ -55,23 +61,29 @@ run_etcfsctl() {
 # chaos-arena-reclaim.sh does, for exactly this reason.
 assert_storage_clean() {
     local label="$1" want_fsck="${2:-}"
-    log "  waiting 35s for a scrub pass to reclaim superseded extents..."
-    sleep 35
-    local ok=1 out
-    if [[ -n "$want_fsck" ]]; then
-        out=$(run_etcfsctl fsck 2>&1)
-        log "  $(echo "$out" | head -1)"
-        if ! echo "$out" | grep -q "^fsck: 0 errors"; then
-            ok=0
-            echo "$out" | tail -10 | while IFS= read -r l; do log "    $l"; done
+    # Reclaim is asynchronous (the scrubber runs every 30s on each node), and
+    # the node that owns the superseded extents may have just been restarted,
+    # so its first pass is up to a full interval away. The invariant is that
+    # storage settles clean, not that it is clean at one arbitrary instant —
+    # so poll for it rather than sleeping a fixed guess and asserting once.
+    local ok=0 out fsck_out="" scrub_out="" k
+    log "  polling fsck/scrub until storage settles (up to 100s)..."
+    for ((k = 0; k < 100; k += 20)); do
+        sleep 20
+        ok=1
+        if [[ -n "$want_fsck" ]]; then
+            fsck_out=$(run_etcfsctl fsck 2>&1)
+            echo "$fsck_out" | grep -q "^fsck: 0 errors" || ok=0
         fi
-    fi
-    out=$(run_etcfsctl scrub 2>&1)
-    log "  $(echo "$out" | head -1)"
-    if ! echo "$out" | grep -q "^scrub: 0 anomalies"; then
-        ok=0
-        echo "$out" | tail -10 | while IFS= read -r l; do log "    $l"; done
-    fi
+        scrub_out=$(run_etcfsctl scrub 2>&1)
+        echo "$scrub_out" | grep -q "^scrub: 0 anomalies" || ok=0
+        [[ "$ok" -eq 1 ]] && break
+    done
+    for out in "$fsck_out" "$scrub_out"; do
+        [[ -z "$out" ]] && continue
+        log "  $(echo "$out" | head -1)"
+        [[ "$ok" -eq 1 ]] || echo "$out" | tail -10 | while IFS= read -r l; do log "    $l"; done
+    done
     # shellcheck disable=SC2015
     [[ "$ok" -eq 1 ]] && { PASS=$((PASS+1)); log "  PASS: $label"; } || { FAIL=$((FAIL+1)); log "  FAIL: $label"; }
 }
@@ -263,7 +275,6 @@ run_s7() {
 
 run_s8() {
     log "======== S8: Cross-node contention on one inode ========"
-    if [[ "$MODE" == "aws" ]]; then log "  SKIP: not implemented for aws"; return; fi
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; return; fi
     if ! writef "$N1" "seed" "s8-shared.txt"; then FAIL=$((FAIL+1)); log "  FAIL: seed write did not land"; dump_logs "$N1"; return; fi
 
@@ -281,7 +292,7 @@ run_s8() {
     # Both writers must complete: contention is a reason to wait for the other
     # node's recall, never a reason to hand the caller an error.
     # shellcheck disable=SC2015
-    [[ "$WFAIL" -eq 0 ]] && { PASS=$((PASS+1)); log "  PASS: both contending writers completed"; } || { FAIL=$((FAIL+1)); log "  FAIL: $WFAIL/2 contending writers errored"; dump_logs "$M1"; }
+    [[ "$WFAIL" -eq 0 ]] && { PASS=$((PASS+1)); log "  PASS: both contending writers completed"; } || { FAIL=$((FAIL+1)); log "  FAIL: $WFAIL/2 contending writers errored"; dump_logs "$(meta_of 1)"; }
 
     local V
     V=$(readf "$N3" "s8-shared.txt")
@@ -289,30 +300,29 @@ run_s8() {
     [[ "$V" == "$A" || "$V" == "$B" ]] && { PASS=$((PASS+1)); log "  PASS: final content matches one writer, no interleave/corruption"; } || { FAIL=$((FAIL+1)); log "  FAIL: content corrupted or interleaved"; }
 
     # The recall is logged at debug ("yielded a cached inode lock to a peer",
-    # internal/ipc/lockcache.go), which is why the meta nodes run --log-level=2
-    # in docker-compose.yml: at the default level this assertion could never
-    # match, whether or not a recall happened.
-    local RECALL_SEEN=0 c
-    for c in "$M1" "$M2"; do
-        docker logs "$c" 2>&1 | grep -q "yielded a cached inode lock" && RECALL_SEEN=1
+    # internal/ipc/lockcache.go), which is why the metadata daemons run at
+    # --log-level=2 in both transports: at the default level this assertion
+    # could never match, whether or not a recall happened.
+    local RECALL_SEEN=0 i
+    for i in 1 2; do
+        meta_log "$i" | grep -q "yielded a cached inode lock" && RECALL_SEEN=1
     done
     # shellcheck disable=SC2015
-    [[ "$RECALL_SEEN" -eq 1 ]] && { PASS=$((PASS+1)); log "  PASS: recall observed — a node yielded its cached lock to a peer"; } || { FAIL=$((FAIL+1)); log "  FAIL: no recall observed"; dump_logs "$M1"; dump_logs "$M2"; }
+    [[ "$RECALL_SEEN" -eq 1 ]] && { PASS=$((PASS+1)); log "  PASS: recall observed — a node yielded its cached lock to a peer"; } || { FAIL=$((FAIL+1)); log "  FAIL: no recall observed"; dump_logs "$(meta_of 1)"; dump_logs "$(meta_of 2)"; }
 }
 
 run_s9() {
     log "======== S9: Crash with a full buffer ========"
-    if [[ "$MODE" == "aws" ]]; then log "  SKIP: not implemented for aws"; return; fi
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; return; fi
     if ! writef "$N1" "synced-data" "s9-synced.txt"; then FAIL=$((FAIL+1)); log "  FAIL: pre-crash write did not land"; dump_logs "$N1"; return; fi
-    docker exec "$N1" sh -c "dd if=/dev/null of=/mnt/etcfuse/s9-synced.txt bs=1 count=0 conv=notrunc,fsync 2>/dev/null" >/dev/null 2>&1
+    runcmd "$N1" "dd if=/dev/null of=/mnt/etcfuse/s9-synced.txt bs=1 count=0 conv=notrunc,fsync 2>/dev/null" >/dev/null 2>&1
 
     # Unflushed: written with no explicit fsync, right before the kill —
     # whether it lands is a genuine race with the flush interval, so this is
     # informational only, not an assertion.
     writef "$N1" "unflushed-data" "s9-unflushed.txt" || true
 
-    local R=$(restart_pair "$M1" "$N1")
+    local R=$(restart_node 1)
     [[ "$R" == "OK" ]] || log "  WARN: n1 did not remount cleanly ($R)"
 
     local VS
@@ -330,15 +340,17 @@ run_s9() {
 
 run_s10() {
     log "======== S10: Lease loss under sustained write load ========"
-    if [[ "$MODE" == "aws" ]]; then log "  SKIP: not implemented for aws"; return; fi
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; return; fi
     if ! writef "$N1" "seed" "s10-file.txt"; then FAIL=$((FAIL+1)); log "  FAIL: seed write did not land"; dump_logs "$N1"; return; fi
 
     # Disconnect only n1's meta container — its etcd session dies, but its
     # FUSE peer keeps talking to it over the local unix socket and keeps
     # issuing writes, unlike S3's whole-node partition.
-    log "  Disconnecting n1's meta (etcd session only) from the network..."
-    docker network disconnect docker_etcfuse-net "$M1" 2>/dev/null
+    log "  Cutting n1's metadata daemon off etcd (its session dies, the mount stays)..."
+    if ! isolate_etcd 1; then
+        FAIL=$((FAIL+1)); log "  FAIL: could not cut n1 off etcd — the fault was never injected"
+        rejoin_etcd 1; return
+    fi
 
     writef "$N1" "n1-during-session-loss" "s10-file.txt" || true
 
@@ -352,9 +364,10 @@ run_s10() {
     # actually fired and its flush is rejected, not just delayed.
     log "  Waiting past n1's self-fence window..."
     sleep 35
-    docker network connect docker_etcfuse-net "$M1" 2>/dev/null
-    local R=$(restart_pair "$M1" "$N1")
+    rejoin_etcd 1
+    local R=$(restart_node 1)
     [[ "$R" == "OK" ]] || log "  WARN: n1 did not remount cleanly ($R)"
+    wait_writable 1 || log "  WARN: n1 is not serving writes again yet"
 
     log "  Confirming n1's blocks were reclaimed, not double-referenced..."
     assert_storage_clean "no leaked/double-referenced blocks"
@@ -362,26 +375,48 @@ run_s10() {
 
 run_s11() {
     log "======== S11: Flush failure injection (etcd unavailable) ========"
-    if [[ "$MODE" == "aws" ]]; then log "  SKIP: not implemented for aws"; return; fi
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; return; fi
     if ! writef "$N1" "seed" "s11-file.txt"; then FAIL=$((FAIL+1)); log "  FAIL: seed write did not land"; dump_logs "$N1"; return; fi
 
-    log "  Cutting n1's meta off etcd..."
-    docker network disconnect docker_etcfuse-net "$M1" 2>/dev/null
+    log "  Cutting n1's metadata daemon off etcd..."
+    if ! isolate_etcd 1; then
+        FAIL=$((FAIL+1)); log "  FAIL: could not cut n1 off etcd — the fault was never injected"
+        rejoin_etcd 1; return
+    fi
 
     # The buffer must still accept the write locally...
     writef "$N1" "buffered-during-outage" "s11-file.txt" || true
 
     # ...but an explicit fsync must surface EIO while etcd stays unreachable,
     # not silently succeed or hang, and keep failing on repeat.
-    local EIO_COUNT=0 k out
+    #
+    # runcmd30, not runcmd: a FUSE request is bounded by config.RequestTimeout
+    # (10s), and under a black-holed network — which is how the AWS transport
+    # injects this, via iptables DROP, unlike docker's detach where etcd is
+    # refused outright — that whole bound is spent waiting before the error can
+    # be returned. A 10s harness budget therefore races the very bound it is
+    # checking and kills dd just as EIO arrives (rc=124, reported as "no EIO").
+    # Two failure shapes are both correct here, and which one comes back depends
+    # only on how far into the outage the attempt lands: EIO while the node is
+    # merely unable to publish, and ECONNABORTED once its self-fence watchdog
+    # (2-3x the lease TTL) has torn the FUSE session down. Demanding EIO every
+    # time made the watchdog doing its job look like a failure. What must never
+    # happen is a *successful* fsync while the flush cannot commit.
+    local FAILED_COUNT=0 EIO_COUNT=0 k out
     for k in 1 2 3; do
-        out=$(docker exec "$N1" sh -c "dd if=/dev/zero of=/mnt/etcfuse/s11-file.txt bs=1 count=1 conv=notrunc,fsync 2>&1")
-        echo "$out" | grep -qi "input/output error\|i/o error" && EIO_COUNT=$((EIO_COUNT+1))
+        out=$(runcmd30 "$N1" "dd if=/dev/zero of=/mnt/etcfuse/s11-file.txt bs=1 count=1 conv=notrunc,fsync 2>&1")
+        if echo "$out" | grep -qi "input/output error\|i/o error"; then
+            EIO_COUNT=$((EIO_COUNT+1)); FAILED_COUNT=$((FAILED_COUNT+1))
+        elif echo "$out" | grep -qi "connection abort\|transport endpoint is not connected"; then
+            FAILED_COUNT=$((FAILED_COUNT+1))
+            log "    fsync attempt $k hit the self-fenced mount (expected past the fence window)"
+        else
+            log "    fsync attempt $k neither failed nor fenced: $(echo "$out" | tr '\n' ' ' | cut -c1-120)"
+        fi
         sleep 1
     done
     # shellcheck disable=SC2015
-    [[ "$EIO_COUNT" -eq 3 ]] && { PASS=$((PASS+1)); log "  PASS: fsync kept returning EIO while etcd was unreachable"; } || { FAIL=$((FAIL+1)); log "  FAIL: fsync did not consistently return EIO ($EIO_COUNT/3)"; }
+    [[ "$FAILED_COUNT" -eq 3 && "$EIO_COUNT" -ge 1 ]] && { PASS=$((PASS+1)); log "  PASS: fsync never succeeded while etcd was unreachable ($EIO_COUNT EIO, $((FAILED_COUNT-EIO_COUNT)) fenced)"; } || { FAIL=$((FAIL+1)); log "  FAIL: fsync did not consistently fail ($FAILED_COUNT/3 failed, $EIO_COUNT EIO)"; }
 
     # No partial publication: a peer must never see a value that never
     # actually committed.
@@ -391,15 +426,15 @@ run_s11() {
     [[ "$V2" == "seed" ]] && { PASS=$((PASS+1)); log "  PASS: no partial publication visible to a peer"; } || { FAIL=$((FAIL+1)); log "  FAIL: peer saw unpublished data: '$V2'"; }
 
     log "  Restoring n1's etcd connectivity..."
-    docker network connect docker_etcfuse-net "$M1" 2>/dev/null
+    rejoin_etcd 1
     sleep 5
-    local R=$(restart_pair "$M1" "$N1")
+    local R=$(restart_node 1)
     [[ "$R" == "OK" ]] || log "  WARN: n1 did not remount cleanly after etcd recovery ($R)"
+    wait_writable 1 || log "  WARN: n1 is not serving writes again yet"
 }
 
 run_s12() {
     log "======== S12: Recall storm ========"
-    if [[ "$MODE" == "aws" ]]; then log "  SKIP: not implemented for aws"; return; fi
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; return; fi
 
     # Pre-create the files, so the storm is contention on existing inodes rather
@@ -430,7 +465,7 @@ run_s12() {
     # queue outrunning the acquisition budget, which is what lockKeyAttempts
     # exists to cover.
     # shellcheck disable=SC2015
-    [[ "$FAILED_WRITES" -eq 0 ]] && { PASS=$((PASS+1)); log "  PASS: every contended write completed, none returned an error"; } || { FAIL=$((FAIL+1)); log "  FAIL: $FAILED_WRITES/15 contended writes failed"; dump_logs "$M1"; }
+    [[ "$FAILED_WRITES" -eq 0 ]] && { PASS=$((PASS+1)); log "  PASS: every contended write completed, none returned an error"; } || { FAIL=$((FAIL+1)); log "  FAIL: $FAILED_WRITES/15 contended writes failed"; dump_logs "$(meta_of 1)"; }
 
     # "No lock left behind" is NOT "no lock keys in etcd": a cached lock is
     # deliberately held past the operation that took it (internal/ipc/lockcache.go),
@@ -445,12 +480,11 @@ run_s12() {
         writef "$N2" "post-storm-$i" "s12-f$i.txt" || STUCK=$((STUCK+1))
     done
     # shellcheck disable=SC2015
-    [[ "$STUCK" -eq 0 ]] && { PASS=$((PASS+1)); log "  PASS: every contended inode still acquirable, no lock stranded"; } || { FAIL=$((FAIL+1)); log "  FAIL: $STUCK/5 inodes left locked against the cluster"; dump_logs "$M1"; }
+    [[ "$STUCK" -eq 0 ]] && { PASS=$((PASS+1)); log "  PASS: every contended inode still acquirable, no lock stranded"; } || { FAIL=$((FAIL+1)); log "  FAIL: $STUCK/5 inodes left locked against the cluster"; dump_logs "$(meta_of 1)"; }
 }
 
 run_s13() {
     log "======== S13: Read-after-recall across nodes (page cache) ========"
-    if [[ "$MODE" == "aws" ]]; then log "  SKIP: not implemented for aws"; return; fi
     if ! check_mount "$N1"; then FAIL=$((FAIL+1)); log "  FAIL: FUSE mount not ready"; return; fi
     if ! writef "$N1" "version-1" "s13-file.txt"; then FAIL=$((FAIL+1)); log "  FAIL: initial write did not land"; dump_logs "$N1"; return; fi
 

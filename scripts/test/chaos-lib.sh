@@ -84,6 +84,27 @@ if [[ "$MODE" == "docker" ]]; then
     heal_node()      { docker network connect docker_etcfuse-net "$1" 2>/dev/null; docker network connect docker_etcfuse-net "$2" 2>/dev/null; }
     etcdctl_on()     { docker exec etcfs-etcd1 etcdctl --endpoints=http://127.0.0.1:2379 "$@"; }
 
+    # ---- Node-indexed operations (1|2|3), identical in meaning across modes.
+    # S8-S13 are written against these rather than against container names or
+    # IPs, because the two transports disagree about what a "node" even is:
+    # docker splits the FUSE and metadata daemons into a container each, AWS
+    # runs both on one instance. A scenario that spelled either out could only
+    # ever run on one of them.
+    node_ip()   { eval "echo \$N$1"; }
+    meta_of()   { eval "echo \$M$1"; }
+    restart_node() { restart_pair "$(meta_of "$1")" "$(node_ip "$1")"; }
+
+    # isolate_etcd <idx> — cut this node's metadata daemon off etcd while
+    # leaving the FUSE daemon talking to it over their shared socket, so the
+    # node keeps serving I/O with no way to commit it. Detaching the meta
+    # container from the network is exactly that separation.
+    isolate_etcd() { docker network disconnect docker_etcfuse-net "$(meta_of "$1")" 2>/dev/null; }
+    rejoin_etcd()  { docker network connect docker_etcfuse-net "$(meta_of "$1")" 2>/dev/null; }
+
+    # meta_log <idx> — the metadata daemon's log, for scenarios asserting on
+    # something only it reports (S8's recall).
+    meta_log() { docker logs "$(meta_of "$1")" 2>&1; }
+
     provision_cluster() {
         log "  Building + starting docker-compose cluster..."
         $COMPOSE down -v >/dev/null 2>&1 || true
@@ -347,12 +368,35 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         " 2>/dev/null
     }
 
+    # ensure_volume_attached <public_ip> — re-attach the shared volume to this
+    # node if fencing took it away.
+    #
+    # Control-plane fencing works by detaching the EBS volume from the fenced
+    # node, so once a node has self-fenced its block device is simply gone and
+    # the daemon cannot start: "open /dev/nvme1n1 with O_DIRECT: no such file or
+    # directory". Restarting a fenced node therefore has to undo the fence
+    # first, exactly as scripts/infra/bootstrap-cluster.sh does on re-bootstrap.
+    ensure_volume_attached() {
+        local pub="$1" vol_id inst attached
+        vol_id=$(jq -r '.volume_id // empty' "$PROJECT_ROOT/$STATE_FILE")
+        inst=$(jq -r --arg ip "$pub" '.compute_instance_ids[(.compute_public_ips | index($ip))] // empty' "$PROJECT_ROOT/$STATE_FILE" 2>/dev/null)
+        [[ -n "$vol_id" && -n "$inst" ]] || return 0
+        attached=$(aws ec2 describe-volumes --volume-ids "$vol_id" \
+            --query "Volumes[0].Attachments[?InstanceId=='$inst'] | length(@)" --output text 2>/dev/null)
+        [[ "$attached" == "0" ]] || return 0
+        logerr "    $inst has no attachment to $vol_id (fenced) — re-attaching"
+        aws ec2 attach-volume --volume-id "$vol_id" --instance-id "$inst" --device /dev/sdf >/dev/null 2>&1 \
+            || logerr "    re-attach failed for $inst"
+        sleep 10
+    }
+
     # restart_daemons <ip> <node_id> [ebs_volume_id] [ec2_instance_id]
     # The last two args are optional and opt this node's daemon into
     # dual-confirmed external fencing (see provision_cluster's daemon-start
     # block); omitted, restart preserves prior single-signal behavior.
     restart_daemons() {
         local etcd=$(etcd_endpoints); local tag=$(jq -r '.cluster_name' "$PROJECT_ROOT/$STATE_FILE")
+        ensure_volume_attached "$1"
         local fence_flags=""
         [[ -n "${3:-}" && -n "${4:-}" ]] && fence_flags="--ebs-volume-id=$3 --ec2-instance-id=$4"
         # ETCFS_FENCE_MODE=nvme replaces control-plane fencing with
@@ -386,7 +430,7 @@ for d in json.load(sys.stdin).get('blockdevices', []):
           # go of the fd.
           for k in \$(seq 1 5); do sudo umount /mnt/etcfuse 2>/dev/null && break; sleep 1; done
           sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
-          sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=$CHAOS_LEASE_TTL $dev_flag --log-level=1 $fence_flags > /tmp/meta.log 2>&1 &
+          sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock --etcd-endpoints=$etcd --node-id=$2 --cluster-name=$tag --lease-ttl=$CHAOS_LEASE_TTL $dev_flag --log-level=2 $fence_flags > /tmp/meta.log 2>&1 &
           # A restart right after a partition heals can legitimately need
           # this long: the node's own local etcd
           # has to rejoin raft and the client has to reconnect and ride out a
@@ -567,7 +611,7 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ec2-user@"$pub" "
             sudo nohup /usr/local/bin/etcfuse-meta --listen=/run/etcfuse/etcfuse.sock \
                 --etcd-endpoints=$endpoints --node-id=n$id --cluster-name=$TAG \
-                --lease-ttl=$CHAOS_LEASE_TTL --block-device=/dev/nvme1n1 --log-level=1 \
+                --lease-ttl=$CHAOS_LEASE_TTL --block-device=/dev/nvme1n1 --log-level=2 \
                 --ebs-volume-id=$vol_id --ec2-instance-id=$inst > /tmp/meta.log 2>&1 &
             sleep 4
             sudo nohup /usr/local/bin/etcfuse --socket=/run/etcfuse/etcfuse.sock \
@@ -609,4 +653,103 @@ for d in json.load(sys.stdin).get('blockdevices', []):
         aws ec2 terminate-instances --instance-ids "$inst" >/dev/null 2>&1
         rm -f "$(node_info_file "$id")"
     }
+
+    # ---- Node-indexed operations (1|2|3), identical in meaning across modes.
+    # See the docker branch's copy for why S8-S13 are written against these
+    # rather than against a container name or an IP.
+    #
+    # On AWS both daemons live on one instance, so there is no meta "host"
+    # distinct from the node: meta_of and node_ip are the same address, and
+    # what separates the two daemons is which of them the fault is aimed at.
+    node_ip()   { eval "echo \$N$1"; }
+    meta_of()   { eval "echo \$N$1"; }
+    restart_node() { restart_daemons "$(node_ip "$1")" "n$1"; }
+
+    # isolate_etcd <idx> — cut this node's metadata daemon off etcd while the
+    # FUSE daemon keeps talking to it over their shared unix socket.
+    #
+    # Docker detaches the meta container from the network; here both daemons
+    # share a host, so the separation has to be made by port instead: DROP the
+    # etcd client and peer ports to every peer, which takes the metadata
+    # daemon's session and this node's own etcd member (which loses quorum)
+    # while leaving the socket, the mount and the block device untouched. This
+    # is what scripts/test/isolate-node.sh does, inlined for the same reason
+    # resolve_block_device is.
+    # Returns non-zero if the node can still reach a peer's etcd afterwards.
+    # A fault injection that quietly does nothing is worse than one that fails:
+    # the scenario goes on to assert partitioned behaviour against a healthy
+    # cluster and reports the product broken. That is exactly what happened
+    # when iptables turned out not to be installed.
+    isolate_etcd() {
+        local idx="$1"
+        local ip self rules="" p peer=""
+        ip=$(node_ip "$idx")
+        self=$(jq -r ".compute_ips[$((idx - 1))]" "$PROJECT_ROOT/$STATE_FILE")
+
+        # Amazon Linux 2023 ships without iptables, so the tool this depends on
+        # has to be put there first. It is done here rather than at provision
+        # time so that the one helper that needs it is the one that guarantees
+        # it — a provisioning step whose failure was swallowed by `|| true` is
+        # how the rules came to be applied by a binary that did not exist.
+        # runcmd* swallow the exit status (they append `|| echo ERR:$?`), so
+        # this asks for the answer in the output rather than in $?.
+        local have
+        have=$(runcmd30 "$ip" "sudo test -x /usr/sbin/iptables && echo yes || echo no")
+        if [[ "$have" != *yes* ]]; then
+            have=$(runcmd60 "$ip" "sudo dnf install -y iptables-nft >/dev/null 2>&1; sudo test -x /usr/sbin/iptables && echo yes || echo no")
+        fi
+        if [[ "$have" != *yes* ]]; then
+            logerr "    isolate_etcd($idx): iptables is not available and could not be installed"
+            return 1
+        fi
+        while read -r p; do
+            [[ -z "$p" || "$p" == "$self" ]] && continue
+            peer="$p"
+            rules+=" sudo iptables -A OUTPUT -d $p -p tcp --dport 2379 -j DROP;"
+            rules+=" sudo iptables -A OUTPUT -d $p -p tcp --dport 2380 -j DROP;"
+            rules+=" sudo iptables -A INPUT -s $p -p tcp -j DROP;"
+        done < <(jq -r '.compute_ips[]' "$PROJECT_ROOT/$STATE_FILE")
+        runcmd30 "$ip" "$rules true" >/dev/null
+
+        local probe
+        probe=$(runcmd30 "$ip" "timeout 3 bash -c '</dev/tcp/$peer/2379' 2>/dev/null && echo REACHABLE || echo BLOCKED")
+        if [[ "$probe" != *BLOCKED* ]]; then
+            logerr "    isolate_etcd($idx): etcd on $peer is still reachable — fault not injected"
+            return 1
+        fi
+        return 0
+    }
+    rejoin_etcd() {
+        local ip; ip=$(node_ip "$1")
+        # -F rather than deleting the rules one by one: the harness is the only
+        # thing adding any, and a partially-restored node is a worse state to
+        # leave a later scenario in than a fully flushed one.
+        runcmd30 "$ip" "sudo iptables -F OUTPUT; sudo iptables -F INPUT; true" >/dev/null
+    }
+
+    # meta_log <idx> — the metadata daemon's log (restart_daemons writes it to
+    # /tmp/meta.log).
+    meta_log() { runcmd30 "$(node_ip "$1")" "sudo cat /tmp/meta.log 2>/dev/null"; }
 fi
+
+# wait_writable <idx> [timeout_s] — block until the node can actually serve a
+# write, not merely until its mount exists.
+#
+# restart_node returns as soon as /mnt/etcfuse is mounted, which is earlier than
+# the point at which a write commits: after a partition heals the node's own etcd
+# member still has to rejoin raft, and the first requests through it come back
+# "etcdserver: leader changed" until an election settles. Proceeding at mount
+# time made the *next* scenario's seed write fail with EIO and report the
+# filesystem broken for a fault the previous scenario had injected.
+wait_writable() {
+    local idx="$1" limit="${2:-60}" ip k
+    ip=$(node_ip "$idx")
+    for ((k = 0; k < limit; k += 3)); do
+        if check_mount "$ip" && writef "$ip" "ready" ".ready-n$idx.txt" 2>/dev/null; then
+            return 0
+        fi
+        sleep 3
+    done
+    logerr "    wait_writable($idx): node still could not serve a write after ${limit}s"
+    return 1
+}
