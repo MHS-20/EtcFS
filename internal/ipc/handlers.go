@@ -358,7 +358,7 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 
 	// A create hands back an open descriptor, and the release that closes it
 	// arrives like any other, so it has to be counted like any other.
-	s.retain(rec.Ino)
+	s.open.retain(rec.Ino)
 
 	// The descriptor a create hands back is answered like any open: a page can
 	// only be filled by a read that reached the daemon under this inode's lock,
@@ -404,7 +404,7 @@ func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error
 			return int32Resp(errnoFor(err, errIO)), nil
 		}
 	}
-	s.retain(ino)
+	s.open.retain(ino)
 	return openResp(s.cacheableOpen(flags)), nil
 }
 
@@ -437,7 +437,7 @@ func (s *Service) handleRelease(ctx context.Context, payload []byte) ([]byte, er
 	if !r.ok {
 		return int32Resp(errInval), nil
 	}
-	if s.release(ino) {
+	if s.open.release(ino) {
 		// The last descriptor on a file whose names are all gone: nothing can
 		// reach it any more, so the record and its attributes go now. Its
 		// extents are left to the scrubber, exactly as an ordinary unlink
@@ -447,44 +447,6 @@ func (s *Service) handleRelease(ctx context.Context, payload []byte) ([]byte, er
 		}
 	}
 	return okResp(), nil
-}
-
-// retain records one more open descriptor for an inode on this node.
-func (s *Service) retain(ino uint64) {
-	s.openMu.Lock()
-	defer s.openMu.Unlock()
-	s.openCount[ino]++
-}
-
-// release drops one descriptor and reports whether the inode was the last one
-// standing for a file that has already lost its name.
-func (s *Service) release(ino uint64) bool {
-	s.openMu.Lock()
-	defer s.openMu.Unlock()
-	if s.openCount[ino] > 1 {
-		s.openCount[ino]--
-		return false
-	}
-	delete(s.openCount, ino)
-	if s.orphaned[ino] {
-		delete(s.orphaned, ino)
-		return true
-	}
-	return false
-}
-
-// heldOpen reports whether this node still has the inode open, and remembers
-// that its deletion is now this node's responsibility.  Called from inside the
-// unlink transaction's planning, under the same lock a release takes, so a
-// close racing the unlink cannot leave the record with nobody to remove it.
-func (s *Service) heldOpen(ino uint64) bool {
-	s.openMu.Lock()
-	defer s.openMu.Unlock()
-	if s.openCount[ino] == 0 {
-		return false
-	}
-	s.orphaned[ino] = true
-	return true
 }
 
 // MKDIR payload:  [u64:parent][u32:name_len][name][u32:mode][u32:umask][u32:uid][u32:gid]
@@ -519,7 +481,7 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errInval), nil
 	}
 
-	err := s.store.AtomicUnlinkKeepingOpen(ctx, parent, name, s.heldOpen)
+	err := s.store.AtomicUnlinkKeepingOpen(ctx, parent, name, s.open.heldOpen)
 	if err != nil {
 		return int32Resp(errnoFor(err, errNoEnt)), nil // ENOENT unless fenced
 	}
@@ -598,15 +560,71 @@ const (
 
 const setattrPayloadLen = 8 + 8 + 4 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 4
 
+// setattrFields is a SETATTR request's payload after decoding: every field the
+// kernel may carry, whether or not the valid mask selects it.
+type setattrFields struct {
+	size                uint64
+	mode, uid, gid      uint32
+	atime, mtime, ctime time.Time
+}
+
+// applySetattr writes the selected fields onto the record.
+//
+// A pure function of (record, mask, fields, now) — the truncate, the lock and
+// the compare-and-set stay in the handler. What is worth isolating is the
+// decision table itself: which bit selects which field, and the two rules that
+// are not a plain assignment.
+func applySetattr(rec *metadata.InodeRecord, valid uint32, f setattrFields, now time.Time) {
+	if valid&fattrSize != 0 {
+		rec.Size = f.size
+	}
+	if valid&fattrMode != 0 {
+		// The kernel sends a whole st_mode, but chmod may not change what kind
+		// of file this is.  Keeping the stored type bits is what stops a chmod
+		// on a symlink or a device node quietly turning it into something else.
+		rec.Mode = (rec.Mode & metadata.S_IFMT) | (f.mode &^ metadata.S_IFMT)
+	}
+	if valid&fattrUID != 0 {
+		rec.UID = f.uid
+	}
+	if valid&fattrGID != 0 {
+		rec.GID = f.gid
+	}
+	if valid&fattrAtime != 0 {
+		rec.Atime = f.atime
+	}
+	if valid&fattrMtime != 0 {
+		rec.Mtime = f.mtime
+	}
+	if valid&fattrCtime != 0 {
+		rec.Ctime = f.ctime
+	}
+	if valid&fattrAtimeNow != 0 {
+		rec.Atime = now
+	}
+	if valid&fattrMtimeNow != 0 {
+		rec.Mtime = now
+	}
+	// Any attribute change is a status change, unless the caller set ctime
+	// itself.
+	if valid&(fattrMode|fattrUID|fattrGID|fattrSize) != 0 && valid&fattrCtime == 0 {
+		rec.Ctime = now
+	}
+}
+
 func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, error) {
 	r := newReader(payload)
 	ino := r.u64()
 	r.u64() // fh
 	valid := r.u32()
-	newSize := r.u64()
-	mode, uid, gid := r.u32(), r.u32(), r.u32()
+	var f setattrFields
+	f.size = r.u64()
+	f.mode, f.uid, f.gid = r.u32(), r.u32(), r.u32()
 	atime, mtime, ctime := r.u64(), r.u64(), r.u64()
 	atimeNsec, mtimeNsec, ctimeNsec := r.u32(), r.u32(), r.u32()
+	f.atime = time.Unix(int64(atime), int64(atimeNsec))
+	f.mtime = time.Unix(int64(mtime), int64(mtimeNsec))
+	f.ctime = time.Unix(int64(ctime), int64(ctimeNsec))
 	if !r.ok {
 		return int32Resp(errInval), nil
 	}
@@ -642,51 +660,17 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	// Shrinking releases the extents past the new end, and that runs before the
 	// size is published: metadata-then-data, so no reader can still resolve a
 	// range whose blocks have already gone back to the arena.
-	if valid&fattrSize != 0 && newSize < rec.Size {
-		if terr := s.truncate(ctx, ino, newSize); terr != nil {
+	if valid&fattrSize != 0 && f.size < rec.Size {
+		if terr := s.truncate(ctx, ino, f.size); terr != nil {
 			// Reporting success here would tell the caller the file had shrunk
 			// while every extent past the new end was still readable — which is
 			// what a fenced node did, since the guard rejects its writes.
 			s.log.Error("truncate failed, size not changed", "ino", ino, "error", terr)
-			return int32Resp(errnoFor(terr, -5)), nil
+			return int32Resp(errnoFor(terr, errIO)), nil
 		}
 	}
 
-	now := time.Now()
-	if valid&fattrSize != 0 {
-		rec.Size = newSize
-	}
-	if valid&fattrMode != 0 {
-		// The kernel sends a whole st_mode, but chmod may not change what kind
-		// of file this is.  Keeping the stored type bits is what stops a chmod
-		// on a symlink or a device node quietly turning it into something else.
-		rec.Mode = (rec.Mode & metadata.S_IFMT) | (mode &^ metadata.S_IFMT)
-	}
-	if valid&fattrUID != 0 {
-		rec.UID = uid
-	}
-	if valid&fattrGID != 0 {
-		rec.GID = gid
-	}
-	if valid&fattrAtime != 0 {
-		rec.Atime = time.Unix(int64(atime), int64(atimeNsec))
-	}
-	if valid&fattrMtime != 0 {
-		rec.Mtime = time.Unix(int64(mtime), int64(mtimeNsec))
-	}
-	if valid&fattrCtime != 0 {
-		rec.Ctime = time.Unix(int64(ctime), int64(ctimeNsec))
-	}
-	if valid&fattrAtimeNow != 0 {
-		rec.Atime = now
-	}
-	if valid&fattrMtimeNow != 0 {
-		rec.Mtime = now
-	}
-	// Any attribute change is a status change.
-	if valid&(fattrMode|fattrUID|fattrGID|fattrSize) != 0 && valid&fattrCtime == 0 {
-		rec.Ctime = now
-	}
+	applySetattr(rec, valid, f, time.Now())
 
 	// Pinned to the revision the record was read at, so a concurrent update to
 	// a different field is not silently overwritten by this one.

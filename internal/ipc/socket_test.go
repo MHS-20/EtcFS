@@ -3,6 +3,7 @@ package ipc
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -165,5 +166,65 @@ func TestCreateRespCarriesKeepCacheAfterTheEntry(t *testing.T) {
 		if got := binary.BigEndian.Uint32(b[entry:]); got != want {
 			t.Fatalf("keep_cache = %d, want %d", got, want)
 		}
+	}
+}
+
+// The SETATTR mask decides which fields move and which are ignored. It is a
+// pure function of the record, the mask and the payload, so it is tested
+// directly rather than through a store: a field applied without its bit is a
+// silent attribute change, and one ignored despite its bit is a lost chmod.
+func TestApplySetattrHonoursTheValidMask(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	sent := time.Unix(1_000, 0)
+	fields := setattrFields{
+		size: 4096, mode: metadata.ModeFile | 0600, uid: 7, gid: 9,
+		atime: sent, mtime: sent, ctime: sent,
+	}
+	base := func() *metadata.InodeRecord {
+		return &metadata.InodeRecord{
+			Size: 10, Mode: metadata.ModeDir | 0755, UID: 1, GID: 2,
+			Atime: time.Unix(1, 0), Mtime: time.Unix(2, 0), Ctime: time.Unix(3, 0),
+		}
+	}
+
+	// Nothing selected: nothing moves, not even ctime.
+	rec := base()
+	applySetattr(rec, 0, fields, now)
+	if *rec != *base() {
+		t.Errorf("an empty mask changed the record: %+v", rec)
+	}
+
+	// A chmod keeps the file's type and stamps ctime.
+	rec = base()
+	applySetattr(rec, fattrMode, fields, now)
+	if rec.Mode != metadata.ModeDir|0600 {
+		t.Errorf("mode = %#o, want the stored type with the new permissions", rec.Mode)
+	}
+	if !rec.Ctime.Equal(now) {
+		t.Errorf("ctime = %v, want %v: an attribute change is a status change", rec.Ctime, now)
+	}
+	if rec.Size != 10 || rec.UID != 1 || rec.GID != 2 {
+		t.Errorf("a mode-only setattr moved another field: %+v", rec)
+	}
+
+	// An explicit ctime wins over the implicit stamp.
+	rec = base()
+	applySetattr(rec, fattrMode|fattrCtime, fields, now)
+	if !rec.Ctime.Equal(sent) {
+		t.Errorf("ctime = %v, want the caller's %v", rec.Ctime, sent)
+	}
+
+	// *_NOW overrides the timestamp carried in the same payload.
+	rec = base()
+	applySetattr(rec, fattrAtime|fattrAtimeNow|fattrMtime, fields, now)
+	if !rec.Atime.Equal(now) {
+		t.Errorf("atime = %v, want now (%v)", rec.Atime, now)
+	}
+	if !rec.Mtime.Equal(sent) {
+		t.Errorf("mtime = %v, want the caller's %v", rec.Mtime, sent)
+	}
+	// Timestamps alone are not a status change.
+	if !rec.Ctime.Equal(time.Unix(3, 0)) {
+		t.Errorf("ctime = %v, want it untouched by a timestamp-only setattr", rec.Ctime)
 	}
 }

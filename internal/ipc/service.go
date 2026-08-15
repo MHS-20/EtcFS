@@ -91,13 +91,9 @@ type Service struct {
 	// Nil unless --history-log was given, and a nil recorder records nothing.
 	history *history.Recorder
 
-	// openFiles counts this node's open descriptors per inode, so an unlink of
-	// the last name can keep the record alive until the last one closes.
-	openMu    sync.Mutex
-	openCount map[uint64]int
-	// orphaned holds inodes this node unlinked while it still had them open:
-	// the last release deletes the record.
-	orphaned map[uint64]bool
+	// open counts this node's open descriptors per inode, so an unlink of the
+	// last name can keep the record alive until the last one closes.
+	open *openFiles
 
 	// locks caches this node's inode locks past the operations that took
 	// them, so a repeat acquisition costs no etcd round trip. See lockcache.go.
@@ -127,8 +123,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		watchdog:       watchdog,
 		alloc:          arena.NewAllocator(membership.NodeID(), store),
 		log:            log,
-		openCount:      make(map[uint64]int),
-		orphaned:       make(map[uint64]bool),
+		open:           newOpenFiles(),
 		locks:          make(map[uint64]*lockEntry),
 		recalling:      make(map[uint64]bool),
 		notifyServer:   &notifyServer{},
