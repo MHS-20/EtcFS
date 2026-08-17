@@ -272,8 +272,10 @@ func ListenPrivate(sockPath string) (net.Listener, error) {
 // straight off the wire and used as an allocation size, so an unbounded field
 // lets a desynchronised peer ask for 4 GiB.  The largest legitimate frame is a
 // write payload plus its fixed header, and the C daemon caps its own reads at
-// the same number.
-const maxFrameLen = 1 << 20 // 1 MiB
+// the same number.  The +28 is that header (ino + offset + size + uid + flags,
+// see ec_write's payload in pkg/fuse/ops.c) — without it, a write of exactly
+// the negotiated max_write size (1 MiB) is rejected as over the limit.
+const maxFrameLen = 1<<20 + 28 // 1 MiB write payload + its fixed header
 
 func recvReq(r io.Reader) (uint16, []byte, error) {
 	var hdr [6]byte

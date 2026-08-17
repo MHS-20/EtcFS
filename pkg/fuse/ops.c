@@ -52,8 +52,10 @@
 #define IPC_OP_LSEEK       34
 #define IPC_OP_FALLOCATE   35
 
-/* Must match maxFrameLen in internal/ipc/socket.go. */
-#define IPC_MAX_FRAME_LEN (1u << 20)
+/* Must match maxFrameLen in internal/ipc/socket.go: 1 MiB write payload plus
+ * its 28-byte fixed header (ino + offset + size + uid + flags, see
+ * ec_write's payload below). */
+#define IPC_MAX_FRAME_LEN ((1u << 20) + 28)
 
 #define MAX_NAME_LEN 255
 /* A symlink target is a path, not a name: bounded by PATH_MAX, not NAME_MAX. */

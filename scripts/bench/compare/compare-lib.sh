@@ -207,7 +207,17 @@ compare_create_local_volumes() {
         aws ec2 wait volume-available --volume-ids "$vol_id" 2>/dev/null || true
         aws ec2 attach-volume --volume-id "$vol_id" --instance-id "$inst" --device /dev/sdg >/dev/null
         aws ec2 wait volume-in-use --volume-ids "$vol_id" 2>/dev/null || true
-        dev=$($SSH_CMD "ec2-user@$pub" "for d in /dev/nvme2n1 /dev/sdg /dev/xvdg; do [[ -b \$d ]] && echo \$d && break; done")
+        # Retried: "volume-in-use" is the attachment's AWS-side state, not a
+        # guarantee the guest kernel has enumerated the device node yet — at
+        # higher node counts (several attaches firing close together) that lag
+        # is long enough for a single-shot check to miss it and leave the
+        # caller's devs[] short an entry.
+        dev=""
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            dev=$($SSH_CMD "ec2-user@$pub" "for d in /dev/nvme2n1 /dev/sdg /dev/xvdg; do [[ -b \$d ]] && echo \$d && break; done")
+            [[ -n "$dev" ]] && break
+            sleep 3
+        done
         [[ -n "$dev" ]] || die "compare_create_local_volumes: device not visible on $pub"
         echo "$dev"
     done
@@ -327,7 +337,7 @@ compare_parallel_fio() {
     done
     local pid
     for pid in "${pids[@]}"; do wait "$pid" || die "compare_parallel_fio: a node failed during $label"; done
-    jq -s 'map(.jobs[0].write.bw // 0) | add / 1024 | . * 100 | round / 100' "${jsons[@]}"
+    jq -s 'map(.jobs[0].write.bw // 0) | (add // 0) / 1024 | . * 100 | round / 100' "${jsons[@]}"
 }
 
 # compare_fio_bw_mibps <json> <read|write> — fio reports bw in KiB/s.
@@ -369,7 +379,7 @@ compare_parallel_fio() {
     local files=("$RESULTS_DIR/${label}"-*.json)
     shopt -u nullglob
     [[ "${#files[@]}" -gt 0 ]] || die "compare_parallel_fio: no results came back for $label"
-    jq -s 'map(.jobs[0].write.bw // 0) | add / 1024 | . * 100 | round / 100' "${files[@]}"
+    jq -s 'map(.jobs[0].write.bw // 0) | (add // 0) / 1024 | . * 100 | round / 100' "${files[@]}"
 }
 
 # ---- shared-directory metadata concurrency ----

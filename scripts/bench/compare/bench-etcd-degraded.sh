@@ -51,6 +51,7 @@ phase one-member-down
 log "Injecting ${DELAY_MS}ms on etcd's peer port between the surviving members..."
 for ip in "${COMPARE_PUB_IPS[@]:0:2}"; do
     $SSH_CMD "ec2-user@$ip" "set -e
+        command -v tc >/dev/null || sudo dnf install -y iproute-tc >/dev/null 2>&1 || sudo yum install -y iproute-tc >/dev/null 2>&1
         IFACE=\$(ip route get 8.8.8.8 | awk '{print \$5; exit}')
         sudo tc qdisc add dev \$IFACE root handle 1: prio
         sudo tc qdisc add dev \$IFACE parent 1:3 handle 30: netem delay ${DELAY_MS}ms

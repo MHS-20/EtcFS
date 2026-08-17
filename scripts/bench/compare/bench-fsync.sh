@@ -16,14 +16,19 @@ RUNTIME="${ETCFS_BENCH_RUNTIME:-60}"
 compare_begin
 compare_mount 0
 
-# sync=dsync opens with O_DSYNC; iodepth 1 and psync keep one write in flight,
-# which is the latency this scenario is about — a deeper queue would report a
-# throughput number that hides it.
+# fdatasync=1 issues an fdatasync(2) after every write, which forces the same
+# durable-per-write cost O_DSYNC would (every write pays a device write plus,
+# on etcfs, a Raft commit) without depending on fio's sync=dsync string form —
+# that syntax needs fio 3.20+, and gfs2/gluster's AL2 AMI ships an older fio
+# that only parses sync as a bool and fails the job outright ("failed parsing
+# sync=dsync"). iodepth 1 and psync keep one write in flight, which is the
+# latency this scenario is about — a deeper queue would report a throughput
+# number that hides it.
 json=$(compare_run_job "fsync-$COMPARE_BACKEND" "$N0" "$RUNTIME" "
 [global]
 ioengine=psync
 direct=0
-sync=dsync
+fdatasync=1
 filename=$MOUNT_PATH/dsync.dat
 size=1G
 runtime=$RUNTIME

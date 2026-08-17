@@ -57,7 +57,10 @@ PEM="${PEM_PATH/#\~/$HOME}"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes -i $PEM"
 SSH_CMD="ssh $SSH_OPTS"
 
-log()  { echo "[$(date +%T)] $*"; }
+# stderr, not stdout: several callers capture a function's real return value
+# via $(...) (e.g. compare_run_job's result path) and would otherwise pick up
+# every log() line printed during that call as part of the value.
+log()  { echo "[$(date +%T)] $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
 # ---- State file helpers ----

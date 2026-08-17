@@ -40,8 +40,14 @@ baseline=$(compare_parallel_fio "join-baseline" "$RUNTIME" "$LOAD_JOB" "${SURVIV
 
 compare_etcfs_snapshot_cmdline "$JOINER"
 log "Taking $JOINER out cleanly, then timing its rejoin under load..."
-compare_kill_node "$JOINER"
-sleep "${ETCFS_LEASE_TTL_SECONDS:-15}"
+# SIGTERM + explicit unmount, not compare_kill_node (SIGKILL): a killed daemon
+# is indistinguishable from a crash to the fencing controller, which detaches
+# the joiner's EBS attachment for real after lease expiry — the same pattern
+# bench-rejoin-load.sh's own "Clean leave" comment calls out. That leaves the
+# device physically gone for compare_etcfs_start's restart, which then hangs
+# forever in its untimed poll loop waiting for a mount that can never appear.
+$SSH_CMD "ec2-user@$JOINER" "sudo killall etcfuse-meta etcfuse 2>/dev/null; sudo umount -l $MOUNT_PATH 2>/dev/null; true"
+sleep 5
 
 # The survivors' load and the join have to overlap, so the load runs in the
 # background and its aggregate is read back off its own JSONs afterwards
@@ -51,7 +57,7 @@ load_pid=$!
 sleep 2
 join_s=$(compare_etcfs_start "$JOINER")
 wait "$load_pid"
-during=$(jq -s 'map(.jobs[0].write.bw // 0) | add / 1024 | . * 100 | round / 100' \
+during=$(jq -s 'map(.jobs[0].write.bw // 0) | (add // 0) / 1024 | . * 100 | round / 100' \
     "$RESULTS_DIR"/join-during-*.json)
 
 compare_headline join-latency join_s "$join_s" s

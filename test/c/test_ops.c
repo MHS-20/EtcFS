@@ -157,7 +157,7 @@ static void test_name_bounds_match_the_protocol(void)
 {
     assert(MAX_NAME_LEN == 255); /* NAME_MAX */
     assert(MAX_TARGET_LEN == 4095) /* PATH_MAX - 1 */;
-    assert(IPC_MAX_FRAME_LEN == (1u << 20));
+    assert(IPC_MAX_FRAME_LEN == (1u << 20) + 28); /* 1 MiB write payload + its fixed header */
 }
 
 /* ---- per-thread IPC connections ---- */

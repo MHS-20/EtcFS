@@ -258,22 +258,78 @@ compare_etcfs_snapshot_cmdline() {
         || die "compare_etcfs_snapshot_cmdline: no running daemons on $1"
 }
 
+# compare_reattach_volume_if_missing <pub_ip> — re-attaches COMPARE_VOL_ID to
+# that node's instance if the shared device isn't there, the same recovery
+# scripts/infra/bootstrap-cluster.sh already does for a full cluster rebuild.
+# External fencing detaches on purpose and never puts a volume back by itself
+# (see bootstrap-cluster.sh's own comment) — this is a benchmark script
+# standing in for the operator action that fencing expects to follow it.
+compare_reattach_volume_if_missing() {
+    local ip="$1" i inst
+    $SSH_CMD "ec2-user@$ip" "[[ -e /dev/nvme1n1 ]]" 2>/dev/null && return 0
+    for i in "${!COMPARE_PUB_IPS[@]}"; do
+        [[ "${COMPARE_PUB_IPS[$i]}" == "$ip" ]] && break
+    done
+    inst=$(state_get compute_instance_ids | jq -r ".[$i]")
+    [[ -n "$inst" && "$inst" != "null" ]] || die "compare_reattach_volume_if_missing: no instance id for $ip"
+    log "  $ip ($inst) has lost its device (fenced), reattaching $COMPARE_VOL_ID..."
+    aws ec2 attach-volume --volume-id "$COMPARE_VOL_ID" --instance-id "$inst" --device /dev/sdf >/dev/null 2>&1 || true
+    aws ec2 wait volume-in-use --volume-ids "$COMPARE_VOL_ID" 2>/dev/null || true
+    local n
+    for n in 1 2 3 4 5 6 7 8 9 10; do
+        $SSH_CMD "ec2-user@$ip" "[[ -e /dev/nvme1n1 ]]" 2>/dev/null && return 0
+        sleep 2
+    done
+    die "compare_reattach_volume_if_missing: device still missing on $ip after reattach"
+}
+
 # compare_etcfs_start <pub_ip> — prints seconds from process start to a mount
 # that answers a write, which is the join-latency number.
+#
+# Reattaches the shared volume first if it is missing. A "clean leave" here is
+# still a lease expiry from the fencing controller's point of view — etcd's
+# watch API cannot tell an explicit lease Revoke() from a TTL timeout, both
+# arrive as the same delete event, so the surviving nodes fence (detach) the
+# departing node's EBS attachment exactly as they would for a crash. That is a
+# deliberate property of the external-fencing design (see TODO.md), not
+# something this benchmark should route around by skipping fencing — the
+# realistic rejoin cost on this system today includes reattaching, so this
+# measures that honestly rather than assuming a leave the daemon cannot
+# actually promise.
 compare_etcfs_start() {
-    local ip="$1"
+    local ip="$1" start_s
+    start_s=$(compare_epoch)
+    compare_reattach_volume_if_missing "$ip"
+    # 120s, not 60: under concurrent write load on the survivors (the caller's
+    # own fio job, running the whole time this restarts), the joiner's first
+    # etcd writes (membership register, arena claim) contend with that load
+    # for commit throughput, and 60s was tight enough to fail a run that was
+    # still making progress, not stuck.
     $SSH_CMD "ec2-user@$ip" "
-        s=\$(date +%s.%N)
         sudo umount -l $FUSE_MOUNTPOINT 2>/dev/null
         sudo rm -f /run/etcfuse/etcfuse.sock /run/etcfuse/etcfuse-notify.sock
         sudo sh -c 'nohup \$(cat /tmp/meta.cmd) >> /tmp/meta.log 2>&1 &'
+        # etcfuse (the FUSE client) does not retry a missing socket — it exits
+        # immediately if /run/etcfuse/etcfuse.sock isn't there yet, which a bare
+        # back-to-back launch races against etcfuse-meta creating it.
+        # bootstrap-cluster.sh's own first-boot sequence sidesteps this with a
+        # flat sleep between the two; polling for the socket is the same fix
+        # without waiting longer than the daemon actually needs.
+        sock_deadline=\$((\$(date +%s) + 30))
+        until sudo test -S /run/etcfuse/etcfuse.sock; do
+            [[ \$(date +%s) -lt \$sock_deadline ]] || { echo 'compare_etcfs_start: etcfuse-meta never created its socket' >&2; exit 1; }
+            sleep 0.1
+        done
         sudo sh -c 'nohup \$(cat /tmp/fuse.cmd) >> /tmp/fuse.log 2>&1 &'
+        deadline=\$((\$(date +%s) + 120))
         until sudo mountpoint -q $FUSE_MOUNTPOINT && \
               sudo dd if=/dev/zero of=$FUSE_MOUNTPOINT/join-probe.\$\$ bs=4k count=1 >/dev/null 2>&1; do
+            [[ \$(date +%s) -lt \$deadline ]] || { echo 'compare_etcfs_start: mount never came up within 120s' >&2; exit 1; }
             sleep 0.05
         done
         sudo rm -f $FUSE_MOUNTPOINT/join-probe.* 2>/dev/null
-        e=\$(date +%s.%N)
-        awk -v s=\$s -v e=\$e 'BEGIN{printf \"%.3f\", e-s}'
-    "
+    " || die "compare_etcfs_start: daemon on $ip never produced a working mount"
+    local end_s
+    end_s=$(compare_epoch)
+    awk -v s="$start_s" -v e="$end_s" 'BEGIN{printf "%.3f", e-s}'
 }
