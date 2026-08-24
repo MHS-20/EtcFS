@@ -436,26 +436,25 @@ func stopOnSignalOrFence(ctx context.Context, cancel context.CancelFunc,
 	return fenced
 }
 
-// leaveCluster releases this node's arenas once it is serving nothing.
+// leaveCluster gives back everything this node holds, once it is serving
+// nothing, and announces that it went on purpose.
 //
 // A departing node is its own proof of quiescence — the IPC server has stopped,
 // so no further write can be issued from here — which is what a fenced node
 // needs an external Fencer to establish.  Skipping this is what made arena
 // space leak on every departure, graceful or not.
+//
+// The order is the announcement's meaning.  Locks, then arenas, then the
+// departure marker: by the time peers can see the marker this node holds
+// nothing, which is the claim the marker makes and the claim they check it
+// against.  Announcing first would publish it while a release was still in
+// flight, and a peer that believed it would skip the fence that is the only
+// thing able to reclaim what had not come back.
 func leaveCluster(cfg *config.Config, svc *ipc.Service, store *metadata.Store,
 	membership *metadata.Membership, log *config.Logger) {
 	// A context of its own: the daemon's is already cancelled by now.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	released, err := membership.Leave(ctx, store)
-	switch {
-	case err != nil:
-		log.Warn("arenas not all released on shutdown, that space stays leaked",
-			"node", cfg.NodeID, "released", released, "error", err)
-	case len(released) > 0:
-		log.Info("released arenas on shutdown", "node", cfg.NodeID, "arenas", released)
-	}
 
 	// Cached inode locks first: their keys outlive the operations that took
 	// them, so nothing else has dropped them, and a peer blocked on one should
@@ -468,5 +467,15 @@ func leaveCluster(cfg *config.Config, svc *ipc.Service, store *metadata.Store,
 	if err := store.CloseLockSession(); err != nil {
 		log.Warn("lock session not closed, stale lock keys expire with its lease",
 			"node", cfg.NodeID, "error", err)
+	}
+
+	released, err := membership.Leave(ctx, store)
+	switch {
+	case err != nil:
+		log.Warn("arenas not all released on shutdown, that space stays leaked; "+
+			"peers will fence this node rather than take its word for a clean departure",
+			"node", cfg.NodeID, "released", released, "error", err)
+	case len(released) > 0:
+		log.Info("released arenas on shutdown", "node", cfg.NodeID, "arenas", released)
 	}
 }

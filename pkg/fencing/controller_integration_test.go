@@ -453,3 +453,108 @@ func TestController_AbandonsFenceWhenNodeLeftAndReturned(t *testing.T) {
 	assert.Len(t, owned.Kvs, 1,
 		"the arena the restarted node re-claimed must not be released to a peer")
 }
+
+// The departure protocol.
+//
+// A node that shuts down on purpose used to be indistinguishable from one that
+// crashed — etcd reports an explicit lease revoke and a lease that timed out as
+// the same delete — so the cluster severed its device access on the way out and
+// it could not simply be restarted. These pin the three things that make
+// skipping that fence safe.
+
+// A node that released everything and announced its departure is left alone.
+func TestController_DoesNotFenceANodeThatLeftOnPurpose(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	stub := &stubFencer{}
+	c.SetFencer(stub)
+
+	// A gen: key is what makes the sweep consider a node at all; without one
+	// this test would pass whether or not the departure marker did anything.
+	_, err := store.EnsureGenerationKey(ctx, "departing-node")
+	require.NoError(t, err)
+	_, err = store.Put(ctx, metadata.MembershipKey("departing-node"),
+		[]byte(`{"node_id":"departing-node","instance_id":"i-0123456789"}`))
+	require.NoError(t, err)
+
+	marked, err := store.MarkDeparted(ctx, "departing-node")
+	require.NoError(t, err)
+	require.True(t, marked, "precondition: a live member can announce its departure")
+
+	c.reconcile(ctx)
+
+	assert.Equal(t, 0, stub.called, "a node that left on purpose must not be severed")
+	gen, err := store.GetGeneration(ctx, "departing-node")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), gen, "a clean departure is not an epoch boundary")
+	intents, err := store.ListFenceIntents(ctx)
+	require.NoError(t, err)
+	assert.NotContains(t, intents, "departing-node")
+}
+
+// The claim is checked against the cluster's own records, not believed. A node
+// still recorded as owning an arena has not given up what it says it gave up,
+// and its arena can only be reclaimed by fencing it.
+func TestController_FencesADepartingNodeThatStillOwnsArenas(t *testing.T) {
+	c, store, ctx := testController(t, "controller-node")
+	stub := &stubFencer{}
+	c.SetFencer(stub)
+
+	_, err := store.EnsureGenerationKey(ctx, "liar-node")
+	require.NoError(t, err)
+	_, err = store.Put(ctx, metadata.MembershipKey("liar-node"),
+		[]byte(`{"node_id":"liar-node","instance_id":"i-0123456789"}`))
+	require.NoError(t, err)
+	_, err = store.Put(ctx, metadata.ArenaOwnerKey("liar-node", 7), []byte("1"))
+	require.NoError(t, err)
+
+	marked, err := store.MarkDeparted(ctx, "liar-node")
+	require.NoError(t, err)
+	require.True(t, marked)
+
+	c.reconcile(ctx)
+
+	assert.Equal(t, 1, stub.called,
+		"a departure contradicted by the arena records must still be fenced")
+	gen, err := store.GetGeneration(ctx, "liar-node")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), gen)
+}
+
+// The transaction is conditioned on the node still being a member, so a node
+// whose lease has already timed out cannot go back and call its departure
+// intentional. This is what stops a partitioned node writing itself an
+// exemption from the protocol built to contain it.
+func TestMarkDeparted_RefusedOnceTheLeaseIsGone(t *testing.T) {
+	_, store, ctx := testController(t, "controller-node")
+
+	marked, err := store.MarkDeparted(ctx, "expired-node")
+	require.NoError(t, err)
+	assert.False(t, marked, "a node with no membership key cannot announce a departure")
+
+	departed, err := store.HasDeparted(ctx, "expired-node")
+	require.NoError(t, err)
+	assert.False(t, departed, "the refused transaction must not have written a marker")
+}
+
+// The marker and the membership delete are one transaction, so a controller can
+// never see the departure without already being able to see the marker. A
+// marker that landed after the delete would leave exactly the window in which a
+// clean departure is fenced anyway.
+func TestMarkDeparted_IsAtomicWithLeavingMembership(t *testing.T) {
+	_, store, ctx := testController(t, "controller-node")
+
+	_, err := store.Put(ctx, metadata.MembershipKey("atomic-node"), []byte(`{"node_id":"atomic-node"}`))
+	require.NoError(t, err)
+
+	marked, err := store.MarkDeparted(ctx, "atomic-node")
+	require.NoError(t, err)
+	require.True(t, marked)
+
+	alive, err := store.Get(ctx, metadata.MembershipKey("atomic-node"))
+	require.NoError(t, err)
+	assert.Nil(t, alive, "the same transaction must have removed the node from membership")
+
+	departed, err := store.HasDeparted(ctx, "atomic-node")
+	require.NoError(t, err)
+	assert.True(t, departed)
+}

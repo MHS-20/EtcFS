@@ -176,6 +176,13 @@ func (m *Membership) grantAndRegister(ctx context.Context) (clientv3.LeaseID, er
 	if _, derr := m.client.Delete(ctx, FenceDoneKey(m.nodeID)); derr != nil {
 		m.reportf("membership: could not drop stale fence mark: %v", derr)
 	}
+	// A departure marker describes the departure it was written for, not this
+	// node forever.  Dropping it as the node comes back is what makes the next
+	// departure judged on its own merits rather than inheriting a clean bill
+	// from the last one.
+	if _, derr := m.client.Delete(ctx, DepartedKey(m.nodeID)); derr != nil {
+		m.reportf("membership: could not drop stale departure marker: %v", derr)
+	}
 
 	m.mu.Lock()
 	m.leaseID = resp.ID
@@ -206,6 +213,26 @@ func (m *Membership) grantAndRegister(ctx context.Context) (clientv3.LeaseID, er
 // released" rather than racing this one.
 func (m *Membership) Leave(ctx context.Context, store *Store) ([]uint64, error) {
 	released, err := store.ReleaseArena(ctx, m.nodeID)
+
+	// Announce the departure as intentional, so peers skip fencing this node
+	// and it can be restarted without its device being detached first.
+	//
+	// Only when every arena really did come back.  The marker says "I have
+	// given up everything I held", and a release that failed part way means
+	// this node is still recorded as owning a range — which its peers must be
+	// free to reclaim the only way they safely can, by fencing it.  Claiming a
+	// clean departure here would be the one case where the claim is a lie the
+	// node itself could have known about.
+	if err == nil {
+		marked, merr := store.MarkDeparted(ctx, m.nodeID)
+		switch {
+		case merr != nil:
+			m.reportf("membership: could not announce departure, peers will fence this node: %v", merr)
+		case !marked:
+			m.reportf("membership: lease had already expired, so this departure cannot be announced as intentional")
+		}
+	}
+
 	m.revokeLease(ctx)
 	return released, err
 }

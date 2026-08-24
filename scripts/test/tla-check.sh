@@ -47,6 +47,7 @@ CHECKS=(
     "Fencing:FencingNoIncarnationCheck:fail:NoHealthyNodeSevered"
     "Fencing:FencingNoGuard:fail:StaleWriteRejected"
     "Fencing:FencingArenaBug:fail:ReleasedArenaHasNoLiveWriter"
+    "Fencing:FencingDepartureNotQuiescent:fail:ReleasedArenaHasNoLiveWriter"
     "CachedLock:CachedLock:pass:"
     "CachedLock:CachedLockNoLeaseIdentity:fail:NoTwoHolders"
     "CachedLock:CachedLockNoFlushKeyCheck:fail:NoPublishWithoutLock"

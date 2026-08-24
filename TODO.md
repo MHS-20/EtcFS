@@ -384,29 +384,29 @@ worth one review pass together when the cluster gets bigger:
 
 ## Reliability / resilience / hardening
 
-- [ ] **No way for a leaving node to skip external fencing.** A graceful
-      shutdown (`leaveCluster` in `cmd/etcfuse-meta/main.go`) already revokes
-      the node's membership lease synchronously before exit — but etcd's watch
-      API cannot tell an explicit `Revoke()` from a TTL timeout; both surface
-      to a watcher as the same delete event. The surviving nodes' fencing
-      controller therefore treats every membership-key disappearance as a
-      possible crash and detaches the departing node's EBS volume regardless
-      of intent, discovered when `scripts/bench/compare/bench-join-latency.sh`
-      and `bench-rejoin-load.sh`'s own "clean leave" comment turned out not to
-      hold: even a SIGTERM'd node gets its device detached out from under it,
-      and the benchmark scripts now reattach it manually before restarting
-      (`compare_reattach_volume_if_missing` in `compare-backends.sh`) rather
-      than measuring a leave path the daemon cannot currently promise.
-      This is arguably correct as a safety default — a node's own claim to be
-      leaving cleanly is exactly the kind of self-report a fencing system
-      should not trust blindly, since a partitioned node could make the same
-      claim. Closing the gap for the common case (an intentional leave, not a
-      partition) needs a real protocol addition, not a one-line fix: something
-      like a "departing" marker key the leaving node writes and revokes
-      *before* dropping its membership lease, which the fencing controller
-      checks for and honors within a short grace window before deciding to
-      fence. Getting the grace window and the check ordering right against a
-      genuinely partitioned node claiming the same thing is the hard part.
+- [x] ~~**No way for a leaving node to skip external fencing.**~~ **Done.**
+      A node that shuts down gracefully now gives back its cached locks, its
+      lock session and its arenas, and then writes `departed:<node_id>` in the
+      *same transaction* that deletes its membership key. Peers see the marker
+      and skip the fence, so a clean leave no longer detaches the node's volume
+      and it can simply be restarted.
+      Three things make that safe without trusting the node: the marker is
+      atomic with leaving membership (so no controller can see the departure
+      without the marker, which removes any need for a grace window or a
+      clock); the transaction is conditioned on the membership key still
+      existing (so a node whose lease already timed out — the partitioned one —
+      cannot go back and claim its departure was intentional); and the
+      controller honours it only where the cluster's own arena records agree
+      (a node still recorded as an owner is fenced anyway). Both reads fail
+      into fencing.
+      Modelled in TLA+ as `LeaveCleanly`, with
+      `specs/FencingDepartureNotQuiescent.cfg` as the mutation: a departure
+      announced by a node that returned its arenas but never stopped breaks
+      `ReleasedArenaHasNoLiveWriter`. The obvious mutation — announcing while
+      still owning arenas — proves nothing, because the controller's own check
+      catches it; the ordering is what needed a model.
+      The benchmark scripts' manual reattach stays for a node that was really
+      fenced, but no longer stands in for a leave the daemon could not promise.
 - [x] ~~The C side never reconnects.~~ **Done.** `ipc_sync` drops the thread's
       fd on any failure (broken stream, oversized frame, truncation) and
       `SIGPIPE` is ignored, so the next request reconnects; covered by

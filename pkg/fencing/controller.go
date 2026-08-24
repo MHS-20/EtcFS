@@ -138,6 +138,12 @@ func (c *Controller) Run(ctx context.Context) {
 				if ev.PrevKv != nil {
 					instanceID = metadata.InstanceIDFromMembership(ev.PrevKv.Value)
 				}
+				if c.departedCleanly(ctx, nodeID) {
+					c.log.Info("node left the cluster on purpose, not fencing it",
+						"node", nodeID, "instance", instanceID)
+					metrics.FencedNodes.WithLabelValues("departed").Inc()
+					continue
+				}
 				c.log.Warn("membership key deleted, initiating fence",
 					"node", nodeID, "instance", instanceID)
 				// Record the intent on the watch goroutine, before the fence
@@ -474,6 +480,13 @@ func (c *Controller) reconcile(ctx context.Context) {
 		if fenced[nodeID] && !owed {
 			continue // gone, and already fenced for this departure
 		}
+		if !owed && c.departedCleanly(ctx, nodeID) {
+			// Checked here as well as on the watch path, because the sweep is
+			// authoritative: it fences whatever is missing from membership
+			// whether or not any controller saw it go, and a clean departure is
+			// missing from membership like any other.
+			continue
+		}
 		if !owed {
 			// The membership value carried the instance ID and is already gone,
 			// so a fence discovered this way has nothing to detach.  Recording
@@ -515,4 +528,44 @@ func (c *Controller) GenerationGuard(ctx context.Context, nodeID string) (client
 		return clientv3.Cmp{}, fmt.Errorf("generation guard: %w", err)
 	}
 	return metadata.WithGenerationGuard(nodeID, gen), nil
+}
+
+// departedCleanly reports whether a node took itself out of the cluster on
+// purpose, and may therefore be left alone.
+//
+// The marker alone is not the answer. A node writes it only after its IPC
+// server has stopped and every arena it held has been returned, and it can only
+// write it while still holding a live membership lease — but a marker is still
+// a statement a node made about itself, and the one node this protocol exists
+// to contain is the one whose statements cannot be trusted. So the claim is
+// checked against the cluster's own records: a node the arena bookkeeping still
+// shows as an owner has not given up what it says it gave up, and is fenced
+// exactly as it would have been before.
+//
+// Both reads failing open — into fencing — is deliberate. Fencing a node that
+// left cleanly costs a detach and a manual reattach; not fencing one that did
+// not leave cleanly is how two nodes end up writing to one arena.
+func (c *Controller) departedCleanly(ctx context.Context, nodeID string) bool {
+	departed, err := c.store.HasDeparted(ctx, nodeID)
+	if err != nil {
+		c.log.Error("cannot read departure marker, treating this as a crash",
+			"node", nodeID, "error", err)
+		return false
+	}
+	if !departed {
+		return false
+	}
+
+	owns, err := c.store.OwnsArenas(ctx, nodeID)
+	if err != nil {
+		c.log.Error("cannot check the arenas of a departing node, treating this as a crash",
+			"node", nodeID, "error", err)
+		return false
+	}
+	if owns {
+		c.log.Warn("node announced a clean departure but still owns arenas, fencing it anyway",
+			"node", nodeID)
+		return false
+	}
+	return true
 }

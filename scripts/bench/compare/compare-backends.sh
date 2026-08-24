@@ -286,16 +286,13 @@ compare_reattach_volume_if_missing() {
 # compare_etcfs_start <pub_ip> — prints seconds from process start to a mount
 # that answers a write, which is the join-latency number.
 #
-# Reattaches the shared volume first if it is missing. A "clean leave" here is
-# still a lease expiry from the fencing controller's point of view — etcd's
-# watch API cannot tell an explicit lease Revoke() from a TTL timeout, both
-# arrive as the same delete event, so the surviving nodes fence (detach) the
-# departing node's EBS attachment exactly as they would for a crash. That is a
-# deliberate property of the external-fencing design (see TODO.md), not
-# something this benchmark should route around by skipping fencing — the
-# realistic rejoin cost on this system today includes reattaching, so this
-# measures that honestly rather than assuming a leave the daemon cannot
-# actually promise.
+# Reattaches the shared volume first if it is missing, which a clean leave no
+# longer causes: a node that shuts down gracefully gives back its locks and
+# arenas and then announces the departure in the same transaction that removes
+# it from membership, so its peers can tell an intentional leave from a crash
+# and do not detach it. The reattach stays because a node that was killed, or
+# one whose arena release failed, is still fenced for real — and fencing never
+# puts a volume back by itself (see bootstrap-cluster.sh's own comment).
 compare_etcfs_start() {
     local ip="$1" start_s
     start_s=$(compare_epoch)

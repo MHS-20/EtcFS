@@ -52,6 +52,10 @@ const (
 	PrefixFencePending = "fence_pending:"
 	PrefixFenceClaim   = "fence_claim:"
 	PrefixFenceDone    = "fence_done:"
+	// PrefixDeparted records that a node took itself out of the cluster after
+	// releasing everything it held, so its peers can tell an intentional leave
+	// from a crash and skip fencing it. See fence.go.
+	PrefixDeparted = "departed:"
 
 	KeyInodeAllocCounter = "inode_alloc_counter"
 )

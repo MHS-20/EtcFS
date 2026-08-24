@@ -167,11 +167,15 @@ var (
 		Help: "This node's current fencing generation.",
 	})
 
-	// FencedNodes counts nodes this node's fencing controller has fenced, by
-	// outcome (fenced, failed).
+	// FencedNodes counts the departures this node's fencing controller acted
+	// on, by outcome: "fenced", "failed", and "departed" for a node that
+	// announced an intentional leave and was deliberately not fenced.  The
+	// last is the one worth graphing next to the others — a cluster whose
+	// scale-ins show up as "fenced" rather than "departed" is detaching
+	// volumes it did not need to.
 	FencedNodes = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "etcfuse_fenced_nodes_total",
-		Help: "Nodes fenced by this node's fencing controller, by outcome.",
+		Help: "Departures acted on by this node's fencing controller, by outcome.",
 	}, []string{"outcome"})
 )
 

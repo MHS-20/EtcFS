@@ -196,3 +196,96 @@ func (s *Store) ClaimFence(ctx context.Context, nodeID string, ttl time.Duration
 func (s *Store) ReleaseFenceClaim(ctx context.Context, leaseID clientv3.LeaseID) error {
 	return s.RevokeLease(ctx, leaseID)
 }
+
+// Departure marker: how a node says it left on purpose.
+//
+//	departed:<node_id> = <RFC3339 timestamp>
+//
+// etcd's watch API cannot tell an explicit Revoke from a lease that timed out;
+// both reach a watcher as the same delete of membership:<node_id>.  A fencing
+// controller therefore had to treat every departure as a possible crash and
+// sever the node's device access, which meant a node shutting down cleanly had
+// its volume detached out from under it and could not simply be restarted.
+//
+// The marker closes that, and it is trustworthy for three reasons that have
+// nothing to do with taking the node's word for it:
+//
+//  1. It is written in the *same transaction* that deletes the membership key,
+//     so no controller can observe the departure without already being able to
+//     see the marker.  There is no grace window to tune and no clock in the
+//     argument.
+//  2. The transaction is conditioned on the membership key still existing, so
+//     only a node that is still a live member at that moment can write one.  A
+//     node whose lease has already timed out — the partitioned node, the hung
+//     node, the one this whole protocol exists to contain — cannot go back and
+//     claim its departure was intentional.
+//  3. Honouring it is conditional on the cluster's own records agreeing: a node
+//     that claims a clean departure while still owning arenas is fenced anyway
+//     (see fencing.Controller).  The claim is checked, not believed.
+//
+// The node writes it only once it is provably quiescent — its IPC server has
+// stopped, so no further write can be issued from it — and only once every
+// arena it held has actually been returned.
+
+func DepartedKey(nodeID string) string {
+	return fmt.Sprintf("%s%s", PrefixDeparted, nodeID)
+}
+
+// MarkDeparted atomically records an intentional departure and removes the
+// node from membership, reporting whether the transaction was applied.
+//
+// A false return means the node was no longer a live member when it tried —
+// its lease had already expired — so it has no standing to declare the
+// departure intentional and its peers will fence it as they always did.
+//
+// Deleting the membership key here rather than leaving it to the lease revoke
+// is what makes the two atomic.  Written raw: a departing node's own
+// generation may already have been bumped by a fence in flight, and a node that
+// cannot announce its departure because it is being fenced is exactly the node
+// whose announcement would be worth least.
+func (s *Store) MarkDeparted(ctx context.Context, nodeID string) (bool, error) {
+	key := MembershipKey(nodeID)
+	resp, err := s.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.CreateRevision(key), "!=", 0)).
+		Then(
+			clientv3.OpPut(DepartedKey(nodeID), time.Now().UTC().Format(time.RFC3339)),
+			clientv3.OpDelete(key),
+		).Commit()
+	if err != nil {
+		return false, fmt.Errorf("mark %s departed: %w", nodeID, err)
+	}
+	return resp.Succeeded, nil
+}
+
+// HasDeparted reports whether a node left the cluster on purpose.
+func (s *Store) HasDeparted(ctx context.Context, nodeID string) (bool, error) {
+	value, err := s.Get(ctx, DepartedKey(nodeID))
+	if err != nil {
+		return false, fmt.Errorf("read departure marker %s: %w", nodeID, err)
+	}
+	return value != nil, nil
+}
+
+// ClearDeparted removes a node's departure marker, which its next registration
+// does so that a later departure is judged on its own merits.
+func (s *Store) ClearDeparted(ctx context.Context, nodeID string) error {
+	if _, err := s.client.Delete(ctx, DepartedKey(nodeID)); err != nil {
+		return fmt.Errorf("clear departure marker %s: %w", nodeID, err)
+	}
+	return nil
+}
+
+// OwnsArenas reports whether the cluster still records any arena as belonging
+// to a node.
+//
+// This is what turns a departing node's claim into something checkable.  A node
+// that says it left cleanly has, by its own account, given every arena back;
+// if the records disagree, the claim does not hold and the node is fenced like
+// any other.
+func (s *Store) OwnsArenas(ctx context.Context, nodeID string) (bool, error) {
+	kvs, err := s.GetPrefix(ctx, ArenaNodePrefix(nodeID))
+	if err != nil {
+		return false, fmt.Errorf("read arena ownership of %s: %w", nodeID, err)
+	}
+	return len(kvs) > 0, nil
+}
