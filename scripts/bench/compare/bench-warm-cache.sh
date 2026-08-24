@@ -16,9 +16,18 @@
 # obligation at all.
 #
 # The working set is deliberately small enough to fit in page cache with room
-# to spare — a set that does not fit measures eviction policy instead.
+# to spare — a set that does not fit measures eviction policy instead — and the
+# whole of it is read sequentially between the two passes.
 #
-# ETCFS_WARM_SET (default 512M) sizes the working set.
+# That pre-warm is not a nicety. Random 4 KiB reads at a device-bound ~1000 IOPS
+# touch only ~124 MiB in a 30 s pass, so with a 512 MiB set the "warm" pass was
+# still reading blocks that had never been cached and the result came out at
+# exactly 1.00x. Reading the file end to end guarantees the set really is
+# resident, which makes the comparison decisive in both directions: a warm pass
+# that is still device-bound after this means the kernel is not caching at all,
+# not that the cache was cold.
+#
+# ETCFS_WARM_SET (default 256M) sizes the working set.
 # ETCFS_WARM_RUNTIME (default 30) is the seconds per pass.
 #
 # Usage:
@@ -28,7 +37,7 @@ export COMPARE_BACKEND="${COMPARE_BACKEND:-etcfs}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/compare-lib.sh"
 
-SET_SIZE="${ETCFS_WARM_SET:-512M}"
+SET_SIZE="${ETCFS_WARM_SET:-256M}"
 RUNTIME="${ETCFS_WARM_RUNTIME:-30}"
 SET_MB=$(( $(numfmt --from=iec "$SET_SIZE") / 1048576 ))
 
@@ -62,9 +71,25 @@ compare_drop_caches "$N0"
 cold_json=$(compare_run_job "warm-cache-cold" "$N0" "$RUNTIME" "$(job)")
 cold_iops=$(compare_fio_iops "$cold_json" read)
 
-# No drop this time: the pass above is what warmed it.
+# Read the whole file so the set is genuinely resident, rather than relying on
+# whatever fraction the random cold pass happened to touch.
+log "Pre-warming the page cache with a full sequential read..."
+$SSH_CMD "ec2-user@$N0" "sudo dd if=$MOUNT_PATH/warmset.dat of=/dev/null bs=1M status=none"
+
+# Count the READ requests that actually reach the daemon across the warm pass.
+# This is what makes the result interpretable rather than merely a number: if
+# the kernel is serving from its page cache the daemon sees almost none, and if
+# it is not, the daemon sees one per read. Without it, "warm equals cold" cannot
+# be told apart from "the cache works but something keeps dropping it".
+reads_before=$(compare_etcfs_read_ops "$N0")
+
 warm_json=$(compare_run_job "warm-cache-warm" "$N0" "$RUNTIME" "$(job)")
 warm_iops=$(compare_fio_iops "$warm_json" read)
+
+reads_after=$(compare_etcfs_read_ops "$N0")
+if [[ -n "$reads_before" && -n "$reads_after" ]]; then
+    compare_headline warm-cache daemon_reads_during_warm "$((reads_after - reads_before))" reads
+fi
 
 compare_headline warm-cache read_iops_cold "$cold_iops" iops
 compare_headline warm-cache read_iops_warm "$warm_iops" iops

@@ -45,6 +45,22 @@ compare_mount_etcfs() {
     done
     MOUNT_PATH="$FUSE_MOUNTPOINT"
     BENCH_NODES=("${COMPARE_PUB_IPS[@]}")
+
+    # Whether the kernel is allowed to cache this mount's data pages, reported
+    # rather than assumed. The daemon only answers an open as cacheable while a
+    # cache-invalidation client is connected to take those pages back again, and
+    # the C side makes exactly one connect attempt at startup with no retry and
+    # no message of its own -- so a lost race leaves --page-cache silently inert
+    # and every read measurement device-bound, which is indistinguishable from
+    # the coordination layer simply being slow.
+    for ip in "${COMPARE_PUB_IPS[@]}"; do
+        if $SSH_CMD "ec2-user@$ip" "sudo grep -q 'notify: client connected' /tmp/meta.log" 2>/dev/null; then
+            log "  $ip: cache-invalidation client connected (page cache available)"
+        else
+            log "  $ip: WARNING cache-invalidation client NOT connected — the kernel will not"
+            log "      cache this mount's pages, so every read is device-bound"
+        fi
+    done
 }
 
 compare_mount_nfs() {

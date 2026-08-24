@@ -293,6 +293,15 @@ compare_remote_time() {
 
 compare_epoch() { date +%s.%N; }
 
+# compare_etcfs_read_ops <pub_ip> — the daemon's own count of READ operations
+# served, from its Prometheus endpoint. Empty for a non-etcfs backend, which has
+# no such counter; callers treat that as "not measurable" rather than zero.
+compare_etcfs_read_ops() {
+    [[ "$COMPARE_BACKEND_BASE" == "etcfs" ]] || return 0
+    $SSH_CMD "ec2-user@$1" \
+        "curl -s --max-time 5 http://127.0.0.1:9090/metrics | awk '/^etcfuse_fuse_ops_total\{op=\"read\"\}/ {printf \"%d\", \$2}'" 2>/dev/null
+}
+
 # compare_drop_caches <pub_ip>... — empty the kernel's page, dentry and inode
 # caches, so the next read is genuinely cold. Any measurement of a warm cache
 # needs a cold one to be worth anything, and writing a file leaves it cached.
