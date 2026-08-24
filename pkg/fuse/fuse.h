@@ -22,6 +22,12 @@
 /* Maximum number of FUSE worker threads */
 #define ETCFS_MAX_THREADS 16
 
+/* NAME_MAX: the longest single path component the filesystem accepts.  Shared,
+ * because a name arrives over two different sockets — a request on the metadata
+ * IPC socket and a cache invalidation on the notification one — and both bound
+ * their buffers by it. */
+#define MAX_NAME_LEN 255
+
 /* Default cache timeouts (seconds) */
 #define ETCFS_ENTRY_TIMEOUT    1.0
 #define ETCFS_ATTR_TIMEOUT     1.0

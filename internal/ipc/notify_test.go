@@ -2,8 +2,10 @@ package ipc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +60,65 @@ func TestNotifyBreakerTripsOnRepeatedAckTimeouts(t *testing.T) {
 	// nothing for the breaker to protect.
 	if err := n.send([]byte("msg"), false); err != nil {
 		t.Fatalf("unacknowledged send failed while the breaker was tripped: %v", err)
+	}
+}
+
+// Two notifications written back to back share one read on a stream socket.
+// The name used to carry no length, so the reader could only take "the rest of
+// what arrived" as the name — which swallowed the message behind it and left
+// every later header being read from the middle of one. Nothing recovered from
+// that: acknowledged messages stopped being recognised, the release waiting on
+// one timed out, and the connection was dropped for good, which switched the
+// kernel's page cache off for the life of the mount.
+//
+// The reader below is the C one in pkg/fuse/fuse.c, in the only terms that
+// matter: header, declared length, exactly that many bytes.
+func TestNotifyMessagesAreSelfDelimiting(t *testing.T) {
+	type msg struct {
+		typ  uint32
+		ino  uint64
+		name string
+	}
+	want := []msg{
+		{notifyInvalEntry, 42, "first-name"},
+		{notifyInvalEntry, 42, "a-much-longer-second-name"},
+		{notifyInvalInode, 7, ""},
+		{notifyInvalEntry, 1, strings.Repeat("x", notifyMaxName)},
+	}
+
+	var stream []byte
+	for _, m := range want {
+		stream = append(stream, notifyMsg(m.typ, m.ino, m.name)...)
+	}
+
+	var got []msg
+	for len(stream) > 0 {
+		if len(stream) < notifyHeaderLen {
+			t.Fatalf("%d bytes left over, less than one header", len(stream))
+		}
+		nlen := binary.BigEndian.Uint32(stream[12:16])
+		if nlen > notifyMaxName {
+			t.Fatalf("name length %d exceeds the reader's buffer, so the stream is out of step", nlen)
+		}
+		if uint32(len(stream)) < notifyHeaderLen+nlen {
+			t.Fatalf("message declares %d name bytes but only %d remain", nlen, len(stream)-notifyHeaderLen)
+		}
+		got = append(got, msg{
+			typ:  binary.BigEndian.Uint32(stream[0:4]),
+			ino:  binary.BigEndian.Uint64(stream[4:12]),
+			name: string(stream[notifyHeaderLen : notifyHeaderLen+nlen]),
+		})
+		stream = stream[notifyHeaderLen+nlen:]
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("recovered %d messages from the stream, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("message %d: got {%d %d %q}, want {%d %d %q}",
+				i, got[i].typ, got[i].ino, got[i].name, want[i].typ, want[i].ino, want[i].name)
+		}
 	}
 }
 

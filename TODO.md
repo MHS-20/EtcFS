@@ -57,10 +57,11 @@ and one of them cannot be published even for etcfs yet.
       and gfs2 reads metadata off the local device, so both should do well here.
       Note the working set must sweep inside the client's entry timeout: 2000
       names gives 1.54x on etcfs purely because names expire mid-sweep.
-- [ ] **Warm page cache, all backends.** Blocked on the page-cache defect below
-      rather than on machine time. etcfs currently measures 1.08x with every
-      read reaching the daemon, so publishing it would document a bug as a
-      design property. Fix first, then measure all five.
+- [ ] **Warm page cache, all backends.** The page-cache defect that blocked this
+      is fixed but the fix is unmeasured: the 1.08x on record was taken with
+      every read reaching the daemon, so it documents a bug rather than a design
+      property. Re-run etcfs first and check `daemon_reads_during_warm`, then
+      measure all five.
 - [ ] **Deep walk at 80k files.** The 20k run gives 5.768s cold / 2.316s warm
       (2.49x, against no warm benefit at all before the metadata caching). It
       cannot replace the published figure because that one is 80k files — the
@@ -98,31 +99,22 @@ Existing scripts and reports, with a reason to run them again.
 
 ## Reliability
 
-- [ ] **The kernel page cache is inert.** `--page-cache` defaults to true,
-      reports itself available, and does nothing: a warm pass over a 256 MiB
-      working set that had just been read end to end still sent every one of its
-      30,283 reads to the daemon, and ran at the volume's IOPS rather than RAM
-      speed. The cache-invalidation client was connected on all three nodes, so
-      `cacheableOpen` returns true and the open is answered with `keep_cache=1`
-      and `direct_io=0` — the kernel is permitted to cache and does not.
-      This is not a benchmark artifact and it is not the negative-dentry or
-      readdir caching, both of which demonstrably work on the same mount. It
-      also means every read number in the suite is measured on a filesystem
-      whose read cache does nothing, so the coordination layer is currently
-      carrying blame for a ceiling the caching layer was meant to lift.
-      Two things to check, cheapest first: log the `keep_cache` decision in
-      `handleOpen` and read it off a live node, to confirm what is actually on
-      the wire rather than inferring it; and build with `FUSE_CAP_AUTO_INVAL_DATA`
-      unset, since that flag makes the kernel revalidate attributes and drop the
-      data cache when they appear to move, and it is enabled by libfuse default.
-      `bench-warm-cache.sh` already reports `daemon_reads_during_warm`, so either
-      test is one run.
-- [ ] **The C notify client never retries.** `notify_thread` in `pkg/fuse/fuse.c`
-      makes exactly one `connect()`; on failure it closes the socket and returns,
-      with no retry and no log line. A lost startup race therefore leaves the
-      node unable to invalidate anything for the life of the process, and leaves
-      `--page-cache` silently off with nothing reporting it. Not the cause of the
-      inert cache above — the client was connected — but the same failure would
-      be invisible if it ever happened. `compare_mount_etcfs` now warns when it
-      has, which is a benchmark-side workaround for something the daemon should
-      say itself.
+- [x] **The kernel page cache was inert.** A warm pass over a 256 MiB working
+      set that had just been read end to end still sent every one of its 30,283
+      reads to the daemon, at the volume's IOPS rather than RAM speed. The cause
+      was the notification protocol, not the caching logic: `INVAL_ENTRY` carried
+      its name with no length, so the C reader recovered it as "whatever arrived
+      with the header" and two messages sharing one read desynchronised the
+      stream for good. After that `INVAL_INODE` was never recognised, its
+      acknowledgement never came, the five-second wait expired and the connection
+      was dropped — and since the C side connected once at startup and never
+      again, `cacheableOpen` answered every later open with `keep_cache=0` for
+      the life of the mount. The startup connect the benchmark probes for had
+      succeeded, which is why the mount reported the cache as available while
+      serving nothing from it. Names are length-prefixed now, the client
+      reconnects, and the daemon warns the first time it has to answer an open
+      as non-cacheable.
+      Still to do: re-run `bench-warm-cache.sh` and confirm
+      `daemon_reads_during_warm` collapses. Every read number in the suite was
+      measured with the read cache doing nothing, so they understate the
+      filesystem and overstate the coordination layer's share of the ceiling.

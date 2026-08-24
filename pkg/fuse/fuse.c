@@ -23,41 +23,146 @@
 
 #include <fuse3/fuse_lowlevel.h>
 
-static void *notify_thread(void *arg)
+/*
+ * Cache invalidation client.
+ *
+ * Connects to the metadata daemon's notification socket and calls the kernel on
+ * its behalf: only this process holds the FUSE session handle.  The wire format
+ * is one fixed header, then a name of the length it declares — see the comment
+ * at the top of internal/ipc/notify.go for why the length is there.
+ *
+ * This connection is what makes the kernel's page cache available at all.  The
+ * daemon answers an open as cacheable only while a client is connected to take
+ * those pages back before it yields the inode's lock, so a mount whose notify
+ * client is not up serves every read from the daemon, and says nothing about
+ * why.  Hence the retry, and hence the logging on both edges.
+ */
+
+#define NOTIFY_HDR_LEN     16
+#define NOTIFY_INVAL_ENTRY 1
+#define NOTIFY_INVAL_INODE 2
+
+/* Reconnection backoff, in milliseconds: fast enough that losing the race with
+ * a daemon still binding its socket costs nothing, slow enough that a daemon
+ * that is simply not there does not spin. */
+#define NOTIFY_RETRY_MIN_MS 100
+#define NOTIFY_RETRY_MAX_MS 5000
+
+/* Set at teardown so the thread stops reconnecting and can be joined.  The
+ * session it calls into is destroyed once this returns, so it has to be gone by
+ * then rather than merely asked to stop. */
+static volatile sig_atomic_t notify_stop;
+
+/* The live connection, so teardown can unblock a thread parked in read().
+ * Guarded because the two ends run on different threads. */
+static pthread_mutex_t notify_fd_mu = PTHREAD_MUTEX_INITIALIZER;
+static int notify_fd = -1;
+
+static void notify_fd_set(int fd)
 {
-    struct etcfs_context *ctx = (struct etcfs_context *) arg;
-    const char *path = getenv("ETCFS_NOTIFY_SOCKET");
-    if (!path)
-        path = "/run/etcfuse/etcfuse-notify.sock";
+    pthread_mutex_lock(&notify_fd_mu);
+    notify_fd = fd;
+    pthread_mutex_unlock(&notify_fd_mu);
+}
+
+static void notify_fd_shutdown(void)
+{
+    pthread_mutex_lock(&notify_fd_mu);
+    if (notify_fd >= 0)
+        shutdown(notify_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&notify_fd_mu);
+}
+
+/* Reads exactly len bytes, or reports failure.  A stream socket is free to
+ * return a message in as many pieces as it likes, and a reader that treats a
+ * short read as a framing error drops connections that were perfectly fine. */
+static int read_full(int fd, void *buf, size_t len)
+{
+    uint8_t *p = (uint8_t *) buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n > 0) {
+            p += n;
+            len -= (size_t) n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        return -1;
+    }
+    return 0;
+}
+
+static uint32_t notify_u32(const uint8_t *p)
+{
+    return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | ((uint32_t) p[2] << 8) |
+           (uint32_t) p[3];
+}
+
+static uint64_t notify_u64(const uint8_t *p)
+{
+    return ((uint64_t) notify_u32(p) << 32) | (uint64_t) notify_u32(p + 4);
+}
+
+/* Sleeps in slices so teardown does not have to wait out a full backoff. */
+static void notify_sleep_ms(unsigned ms)
+{
+    while (ms > 0 && !notify_stop) {
+        unsigned slice = ms < 50 ? ms : 50;
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = (long) slice * 1000000L};
+        nanosleep(&ts, NULL);
+        ms -= slice;
+    }
+}
+
+static int notify_connect(const char *path)
+{
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
-        return NULL;
+        return -1;
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
     if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        int saved = errno;
         close(fd);
-        return NULL;
+        errno = saved;
+        return -1;
     }
+    return fd;
+}
 
-    uint8_t hdr[12];
-    while (read(fd, hdr, 12) == 12) {
-        uint32_t typ = ((uint32_t) hdr[0] << 24) | ((uint32_t) hdr[1] << 16) |
-                       ((uint32_t) hdr[2] << 8) | (uint32_t) hdr[3];
-        uint64_t parent = ((uint64_t) hdr[4] << 56) | ((uint64_t) hdr[5] << 48) |
-                          ((uint64_t) hdr[6] << 40) | ((uint64_t) hdr[7] << 32) |
-                          ((uint64_t) hdr[8] << 24) | ((uint64_t) hdr[9] << 16) |
-                          ((uint64_t) hdr[10] << 8) | (uint64_t) hdr[11];
-        if (typ == 1) {
-            char name[256];
-            ssize_t n = read(fd, name, sizeof(name) - 1);
-            if (n > 0) {
-                name[n] = '\0';
-                fuse_lowlevel_notify_inval_entry(ctx->notify_se, parent, name, strlen(name));
-            }
-        } else if (typ == 2) {
+/* Serves one connection until it closes, fails, or stops making sense. */
+static void notify_serve(struct etcfs_context *ctx, int fd)
+{
+    uint8_t hdr[NOTIFY_HDR_LEN];
+
+    while (!notify_stop && read_full(fd, hdr, sizeof(hdr)) == 0) {
+        uint32_t typ = notify_u32(hdr);
+        uint64_t ino = notify_u64(hdr + 4);
+        uint32_t nlen = notify_u32(hdr + 12);
+
+        /* Nothing sends a longer name, so this header did not begin where a
+         * message begins and every later one would be read from the middle of
+         * a message.  There is no resynchronising a stream with no delimiters:
+         * the connection is dropped and the loop below builds a fresh one. */
+        if (nlen > MAX_NAME_LEN) {
+            etcfs_log(ETCFS_LOG_ERROR,
+                      "cache-invalidation stream is out of step (name length %u); reconnecting",
+                      nlen);
+            return;
+        }
+
+        char name[MAX_NAME_LEN + 1];
+        if (nlen > 0 && read_full(fd, name, nlen) < 0)
+            return;
+        name[nlen] = '\0';
+
+        if (typ == NOTIFY_INVAL_ENTRY) {
+            fuse_lowlevel_notify_inval_entry(ctx->notify_se, ino, name, nlen);
+        } else if (typ == NOTIFY_INVAL_INODE) {
             /* Drop the kernel's data pages for one inode, then acknowledge.
              * The backend is holding that inode's lock open until this reply
              * arrives: a peer that took the inode while pages were still
@@ -67,15 +172,65 @@ static void *notify_thread(void *arg)
              * This runs on the notify thread and must keep doing so.  A
              * request thread calling it can deadlock against the kernel's own
              * writeback of the inode being invalidated. */
-            int rc = fuse_lowlevel_notify_inval_inode(ctx->notify_se, parent, 0, 0);
+            int rc = fuse_lowlevel_notify_inval_inode(ctx->notify_se, ino, 0, 0);
             /* ENOENT means the kernel has no such inode cached, which is the
              * outcome the caller wanted. */
             uint8_t ack = (rc == 0 || rc == -ENOENT) ? 0 : 1;
             if (write(fd, &ack, 1) != 1)
-                break;
+                return;
+        } else {
+            etcfs_log(ETCFS_LOG_ERROR, "unknown cache-invalidation message type %u; reconnecting",
+                      typ);
+            return;
         }
     }
-    close(fd);
+}
+
+static void *notify_thread(void *arg)
+{
+    struct etcfs_context *ctx = (struct etcfs_context *) arg;
+    const char *path = getenv("ETCFS_NOTIFY_SOCKET");
+    if (!path)
+        path = "/run/etcfuse/etcfuse-notify.sock";
+
+    unsigned backoff_ms = NOTIFY_RETRY_MIN_MS;
+    int complained = 0;
+
+    while (!notify_stop) {
+        int fd = notify_connect(path);
+        if (fd < 0) {
+            /* Said once per outage rather than once per attempt, at a level the
+             * default log setting shows: an unreachable socket here is the
+             * difference between a mount that caches data pages and one that
+             * does not, and the old code failed at it in silence. */
+            if (!complained) {
+                etcfs_log(ETCFS_LOG_WARN,
+                          "cannot reach the cache-invalidation socket %s (%s); retrying. "
+                          "Until this connects the kernel caches none of this mount's file "
+                          "data and every read goes to the metadata daemon",
+                          path, strerror(errno));
+                complained = 1;
+            }
+            notify_sleep_ms(backoff_ms);
+            backoff_ms =
+                backoff_ms >= NOTIFY_RETRY_MAX_MS / 2 ? NOTIFY_RETRY_MAX_MS : backoff_ms * 2;
+            continue;
+        }
+
+        etcfs_log(ETCFS_LOG_INFO, "cache-invalidation client connected to %s", path);
+        backoff_ms = NOTIFY_RETRY_MIN_MS;
+        complained = 0;
+
+        notify_fd_set(fd);
+        notify_serve(ctx, fd);
+        notify_fd_set(-1);
+        close(fd);
+
+        if (!notify_stop)
+            etcfs_log(ETCFS_LOG_WARN,
+                      "the cache-invalidation connection dropped; reconnecting. Data pages "
+                      "stay uncached until it is back");
+    }
     return NULL;
 }
 
@@ -420,7 +575,15 @@ after_cleanup:
         ret = fuse_session_loop_mt(se, &loop_config);
     }
 
-    /* cleanup */
+    /* cleanup — the notify thread first.  It calls into the session on every
+     * message, and it now reconnects rather than exiting at the first failure,
+     * so leaving it running would let it enter a session that is being
+     * destroyed underneath it.  The shutdown is what unblocks it: it spends
+     * almost all of its life parked in a read that nothing else will end. */
+    notify_stop = 1;
+    notify_fd_shutdown();
+    pthread_join(ntid, NULL);
+
     fuse_session_unmount(se);
     fuse_session_destroy(se);
     close(ipc_fd);

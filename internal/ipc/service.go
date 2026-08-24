@@ -73,6 +73,10 @@ type Service struct {
 	// this filesystem's data, so a later release knows it cannot skip the
 	// invalidation just because no client happens to be connected now.
 	pagesCached atomic.Bool
+	// noPageCacheLogged keeps the "opens are not cacheable" warning to one per
+	// outage rather than one per open.  Cleared again when an open is answered
+	// as cacheable, so a second outage is reported like the first.
+	noPageCacheLogged atomic.Bool
 
 	// serving records that the IPC socket has been accepted on, which is the
 	// point from which a mount can actually be answered.  Reported by the

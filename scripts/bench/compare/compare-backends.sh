@@ -48,11 +48,12 @@ compare_mount_etcfs() {
 
     # Whether the kernel is allowed to cache this mount's data pages, reported
     # rather than assumed. The daemon only answers an open as cacheable while a
-    # cache-invalidation client is connected to take those pages back again, and
-    # the C side makes exactly one connect attempt at startup with no retry and
-    # no message of its own -- so a lost race leaves --page-cache silently inert
-    # and every read measurement device-bound, which is indistinguishable from
-    # the coordination layer simply being slow.
+    # cache-invalidation client is connected to take those pages back again, so
+    # a mount without one leaves --page-cache inert and every read measurement
+    # device-bound, which is indistinguishable from the coordination layer
+    # simply being slow. The C side retries the connection and both daemons now
+    # log the outage, but a run whose numbers are only interpretable when the
+    # cache was available should still check rather than trust it.
     for ip in "${COMPARE_PUB_IPS[@]}"; do
         if $SSH_CMD "ec2-user@$ip" "sudo grep -q 'notify: client connected' /tmp/meta.log" 2>/dev/null; then
             log "  $ip: cache-invalidation client connected (page cache available)"

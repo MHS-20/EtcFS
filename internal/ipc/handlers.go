@@ -485,9 +485,21 @@ func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error
 // reaches the kernel's write path through different code, and narrowing the
 // open is cheaper than widening what has been checked.
 func (s *Service) cacheableOpen(flags uint32) bool {
-	if !s.pageCache || flags&oDSync != 0 || !s.notifyServer.connected() {
+	if !s.pageCache || flags&oDSync != 0 {
 		return false
 	}
+	if !s.notifyServer.connected() {
+		// The one condition here that is a fault rather than a setting, and the
+		// one that used to be invisible: a mount whose notify client never
+		// connected serves every read from the daemon and looks, from any
+		// measurement, exactly like a slow coordination layer.
+		if !s.noPageCacheLogged.Swap(true) {
+			s.log.Warn("no cache-invalidation client is connected, so the kernel is not " +
+				"allowed to cache this mount's file data; every read will reach the daemon")
+		}
+		return false
+	}
+	s.noPageCacheLogged.Store(false)
 	s.pagesCached.Store(true)
 	return true
 }

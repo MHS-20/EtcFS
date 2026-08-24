@@ -57,7 +57,8 @@
  * ec_write's payload below). */
 #define IPC_MAX_FRAME_LEN ((1u << 20) + 28)
 
-#define MAX_NAME_LEN 255
+/* MAX_NAME_LEN comes from fuse.h; the notification reader bounds its buffer by
+ * the same constant. */
 /* A symlink target is a path, not a name: bounded by PATH_MAX, not NAME_MAX. */
 #define MAX_TARGET_LEN 4095
 

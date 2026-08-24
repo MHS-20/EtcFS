@@ -18,10 +18,21 @@ import (
 // Kernel cache invalidation.
 //
 // The C daemon holds the FUSE session handle, so anything that has to reach the
-// kernel's own caches goes over this socket for it to call.  Two messages:
+// kernel's own caches goes over this socket for it to call.  Every message is
+// one fixed header, then a name of the length that header declares:
 //
-//	1  INVAL_ENTRY  [u32:1][u64:parent][name]  — a dentry another node changed
-//	2  INVAL_INODE  [u32:2][u64:ino]           — the data pages of one inode
+//	[u32:type][u64:ino][u32:name_len][name]
+//
+//	1  INVAL_ENTRY  a dentry another node changed; ino is the parent
+//	2  INVAL_INODE  the data pages of one inode; name_len is 0
+//
+// The length is not decoration.  This is a stream socket, so a reader that has
+// to recover the name as "whatever arrived with the header" gets it right only
+// while exactly one message is in flight: two written back to back share a read,
+// the second is swallowed as part of the first one's name, and every header
+// after that is taken from the middle of a message.  Nothing recovers from that
+// — the acknowledged messages below stop being recognised, the release waiting
+// on one times out, and the connection is dropped as unusable.
 //
 // INVAL_INODE is acknowledged and INVAL_ENTRY is not, because only the first
 // has a caller that must not proceed until it has happened: the pages of an
@@ -35,6 +46,17 @@ import (
 const (
 	notifyInvalEntry = 1
 	notifyInvalInode = 2
+
+	// notifyHeaderLen is the fixed part of every message: type, inode and the
+	// length of the name that follows.
+	notifyHeaderLen = 16
+
+	// notifyMaxName is MAX_NAME_LEN in pkg/fuse/fuse.h, which is NAME_MAX.  A
+	// longer name cannot be created through the mount, so one reaching here is a
+	// record this daemon did not write; it is dropped rather than framed, since
+	// the C side rejects the frame by closing a connection that carries every
+	// other invalidation too.
+	notifyMaxName = 255
 
 	// notifyAckTimeout bounds how long a lock release waits for the kernel to
 	// drop an inode's pages.  Generous, because the call is against the kernel
@@ -83,6 +105,18 @@ type notifyServer struct {
 	// reconnection would never reach its limit.  Any successful ack clears it.
 	ackTimeouts int
 	brokenUntil time.Time
+}
+
+// notifyMsg frames one notification, header and name together, so that it
+// reaches the socket as a single write and the reader can take it apart without
+// guessing where it ends.
+func notifyMsg(typ uint32, ino uint64, name string) []byte {
+	b := make([]byte, notifyHeaderLen+len(name))
+	binary.BigEndian.PutUint32(b[0:4], typ)
+	binary.BigEndian.PutUint64(b[4:12], ino)
+	binary.BigEndian.PutUint32(b[12:16], uint32(len(name)))
+	copy(b[notifyHeaderLen:], name)
+	return b
 }
 
 // send writes one message and, when ack is set, waits for the C daemon to
@@ -226,13 +260,15 @@ func (s *Service) sendInvalEntry(parent, name string) {
 	if parentIno == 0 {
 		return
 	}
+	if len(name) > notifyMaxName {
+		s.log.Warn("notify: dirent name too long to invalidate; it stays cached on this node until it times out",
+			"parent", parentIno, "len", len(name))
+		return
+	}
 	s.log.Info("notify: inval_entry", "parent", parentIno, "name", name)
 
-	buf := make([]byte, 12+len(name))
-	binary.BigEndian.PutUint32(buf[0:4], notifyInvalEntry)
-	binary.BigEndian.PutUint64(buf[4:12], parentIno)
-	copy(buf[12:], name)
-	if err := s.notifyServer.send(buf, false); err != nil && !errors.Is(err, errNoNotifyClient) {
+	if err := s.notifyServer.send(notifyMsg(notifyInvalEntry, parentIno, name), false); err != nil &&
+		!errors.Is(err, errNoNotifyClient) {
 		s.log.Warn("notify: inval_entry not delivered", "parent", parentIno, "name", name, "error", err)
 	}
 }
@@ -267,11 +303,8 @@ func (s *Service) invalidatePages(ino uint64) error {
 		s.recordPageInval(ino, pageInvalNotCached, now, now)
 		return nil
 	}
-	buf := make([]byte, 12)
-	binary.BigEndian.PutUint32(buf[0:4], notifyInvalInode)
-	binary.BigEndian.PutUint64(buf[4:12], ino)
 	call := time.Now()
-	err := s.notifyServer.send(buf, true)
+	err := s.notifyServer.send(notifyMsg(notifyInvalInode, ino, ""), true)
 	switch {
 	case err == nil:
 		s.recordPageInval(ino, pageInvalDone, call, time.Now())
