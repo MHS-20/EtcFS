@@ -282,6 +282,36 @@ static void test_fixed_reply_widths_match_the_daemon(void)
     assert(4 + 5 * 8 + 3 * 4 == 56);         /* STATFS */
 }
 
+/* A missing name comes back as a *successful* LOOKUP carrying inode 0, which
+ * is how FUSE spells an absence the kernel is allowed to cache.  ec_lookup
+ * reads it with the same sequence it reads a found entry with, so what has to
+ * hold is that the errno check in ipc_call lets it through and the reader ends
+ * on a non-zero entry_timeout: an errno here would drop the caching, and a
+ * short parse would make ec_lookup answer EIO for a file that is merely
+ * absent. */
+static void test_a_negative_entry_parses_as_a_cacheable_absence(void)
+{
+    uint8_t reply[104];
+    memset(reply, 0, sizeof(reply));
+    uint32_t off = 0;
+    off += wb_u32(reply + off, 0); /* errno: success */
+    off += wb_u64(reply + off, 0); /* ino 0: the entry is negative */
+    off += 6 * 8 + 9 * 4;          /* the zeroed attr block */
+    off += wb_u32(reply + off, 1); /* entry_timeout */
+    off += wb_u32(reply + off, 0); /* attr_timeout: no inode to describe */
+    assert(off == sizeof(reply));
+
+    struct rbuf r = rb_new(reply, sizeof(reply));
+    assert((int32_t) rb_u32(&r) == 0);
+    assert(rb_u64(&r) == 0);
+    struct etcfs_attr a;
+    rb_attr(&r, &a);
+    assert(rb_u32(&r) == 1); /* entry_timeout: the kernel may remember this */
+    assert(rb_u32(&r) == 0);
+    assert(r.ok);
+    assert(r.off == sizeof(reply));
+}
+
 int main(void)
 {
     test_rb_reads_big_endian();
@@ -295,6 +325,7 @@ int main(void)
     test_each_thread_gets_its_own_ipc_connection();
     test_a_failed_exchange_reconnects_on_the_next_request();
     test_fixed_reply_widths_match_the_daemon();
+    test_a_negative_entry_parses_as_a_cacheable_absence();
 
     printf("test/c: all checks passed\n");
     return 0;

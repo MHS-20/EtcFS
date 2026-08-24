@@ -19,11 +19,11 @@ func recordedNamespaceHistory() []history.Entry {
 		}
 	}
 	return []history.Entry{
-		entry("lookup", 1, 10, 20, nameReq(1, "f"), errnoResp(-2)),
+		entry("lookup", 1, 10, 20, nameReq(1, "f"), negativeEntryResp()),
 		entry("create", 5, 30, 40, nameReq(1, "f"), inoResp(42)),
 		entry("lookup", 1, 50, 60, nameReq(1, "f"), inoResp(42)),
 		entry("unlink", 7, 70, 80, nameReq(1, "f"), errnoResp(0)),
-		entry("lookup", 1, 90, 100, nameReq(1, "f"), errnoResp(-2)),
+		entry("lookup", 1, 90, 100, nameReq(1, "f"), negativeEntryResp()),
 	}
 }
 
@@ -49,4 +49,12 @@ func inoResp(ino uint64) []byte {
 	binary.BigEndian.PutUint32(b, 0)
 	binary.BigEndian.PutUint64(b[4:], ino)
 	return b
+}
+
+// negativeEntryResp is how the daemon reports a name that is not there: a
+// successful reply carrying inode 0, which is the only form the kernel can
+// cache. Read literally it says the name is taken by inode 0, so the decoder
+// has to recognise it — hence a test that feeds it the real frame.
+func negativeEntryResp() []byte {
+	return inoResp(0)
 }

@@ -165,12 +165,39 @@ func (n *notifyServer) connected() bool {
 	return n.conn != nil
 }
 
+// StartNotificationServer watches every dirent in the cluster and tells the
+// kernel about each change, so a name created or removed on one node stops
+// being cached on the others.
 func (s *Service) StartNotificationServer(ctx context.Context) {
-	prefix := metadata.PrefixDirent
-	ch := s.store.Watch(ctx, prefix, clientv3.WithPrefix())
+	go s.watchDirents(ctx, func() clientv3.WatchChan {
+		return s.store.Watch(ctx, metadata.PrefixDirent, clientv3.WithPrefix())
+	})
+}
 
-	go func() {
-		for resp := range ch {
+// rewatchDelay keeps a watch that fails immediately and repeatedly from
+// becoming a busy loop against etcd.  Short enough that the gap it adds stays
+// well inside the entry timeout that bounds the staleness anyway.
+const rewatchDelay = 100 * time.Millisecond
+
+// watchDirents turns every dirent change into an invalidation, re-opening the
+// watch each time it ends.
+//
+// The re-opening matters more than it looks: this is the only thing that
+// invalidates a cached name, a cached absence of a name, and a cached directory
+// listing, and etcd ends a watch for reasons that have nothing to do with this
+// process stopping — a compaction past the watched revision is the usual one.
+// A single drain of the channel used to end the invalidations for the lifetime
+// of the daemon while it went on serving happily, with nothing in the logs to
+// say so.
+//
+// A re-opened watch starts from current, so changes during the gap are missed
+// rather than replayed.  That is what the entry and attribute timeouts are for:
+// they bound how long any of those caches can outlive a notification that never
+// came, which is why they stay short whether the watch is healthy or not.
+func (s *Service) watchDirents(ctx context.Context, open func() clientv3.WatchChan) {
+	prefix := metadata.PrefixDirent
+	for ctx.Err() == nil {
+		for resp := range open() {
 			for _, ev := range resp.Events {
 				key := string(ev.Kv.Key)
 				parts := strings.SplitN(key[len(prefix):], "/", 2)
@@ -180,7 +207,17 @@ func (s *Service) StartNotificationServer(ctx context.Context) {
 				s.sendInvalEntry(parts[0], parts[1])
 			}
 		}
-	}()
+		if ctx.Err() != nil {
+			return
+		}
+		s.log.Warn("the dirent watch ended; re-establishing it. Names changed " +
+			"elsewhere in the gap stay cached on this node until they time out")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(rewatchDelay):
+		}
+	}
 }
 
 func (s *Service) sendInvalEntry(parent, name string) {

@@ -415,6 +415,10 @@ static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
         fuse_reply_err(req, EIO);
         return;
     }
+    /* ep.ino == 0 is a negative entry, not a failure: the daemon answers a
+     * name that is not there that way so the kernel can cache the absence for
+     * entry_timeout instead of asking again on every probe.  fuse_reply_entry
+     * turns it back into ENOENT for the caller. */
     fuse_reply_entry(req, &ep);
 }
 
@@ -652,11 +656,33 @@ static void ec_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
     fuse_reply_open(req, fi);
 }
 
+/*
+ * ec_opendir — hand back a handle, and let the kernel keep the listing it is
+ * about to read.
+ *
+ * cache_readdir (FOPEN_CACHE_DIR) is what stops a repeated walk of a tree from
+ * costing one etcd prefix scan per directory per pass, which is why a warm
+ * `find` used to cost exactly what a cold one did.  The kernel drops a cached
+ * listing when the directory's i_version moves or its mtime changes, and both
+ * happen here:
+ *
+ *   - every change to a dirent anywhere in the cluster reaches this node as an
+ *     INVAL_ENTRY, and the kernel's handling of one bumps the parent's
+ *     i_version;
+ *   - every create and unlink also moves the parent directory's mtime in etcd,
+ *     so a node that missed the notification still drops the listing as soon
+ *     as the parent's attributes expire.
+ *
+ * The second is the reason this does not depend on the notification path being
+ * healthy, and it is also why the root directory is excluded: root has no inode
+ * record, its attributes are synthesised below with a fixed mtime, and a cached
+ * listing of it would have only the notification to invalidate it.
+ */
 static void ec_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    (void) ino;
     struct etcfs_context *ctx = fuse_req_userdata(req);
     fi->fh = next_file_handle(ctx);
+    fi->cache_readdir = (ino == FUSE_ROOT_ID) ? 0 : 1;
     fuse_reply_open(req, fi);
 }
 

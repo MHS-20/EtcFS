@@ -503,6 +503,20 @@ func statfsResp(blocks, bfree, files, ffree uint64) []byte {
 	return b.b
 }
 
+// How long the kernel may answer from its own caches before asking again.
+//
+// entryTimeoutSecs covers a name's existence, and is backed by the cluster-wide
+// watch on the dirent prefix: a change made anywhere reaches every node as an
+// INVAL_ENTRY, so the timeout is the fail-safe for a watch that is not
+// delivering rather than the mechanism coherence rests on.  attrTimeoutSecs
+// covers an inode's attributes, which nothing watches — a peer's write or chmod
+// changes them with no notification at all — so that one is the whole guarantee
+// and must stay short.
+const (
+	entryTimeoutSecs = 1
+	attrTimeoutSecs  = 1
+)
+
 // entryResp answers every op that returns a directory entry — LOOKUP, MKDIR,
 // MKNOD, SYMLINK, LINK, and CREATE through createResp:
 //
@@ -518,8 +532,38 @@ func entryResp(ino uint64, rec *metadata.InodeRecord) []byte {
 	b.w32(0) // success
 	b.w64(ino)
 	b.wAttr(rec)
-	b.w32(1) // entry_timeout (seconds)
-	b.w32(1) // attr_timeout (seconds)
+	b.w32(entryTimeoutSecs)
+	b.w32(attrTimeoutSecs)
+	return b.b
+}
+
+// negativeEntryResp answers a LOOKUP for a name that is not there, in the form
+// that lets the kernel remember the absence.
+//
+// FUSE reserves inode 0 in an entry reply for exactly this: the reply means
+// "no such name", and its entry_timeout says for how long further lookups of
+// that name may be answered without asking again.  Returning ENOENT instead —
+// which is what this did — leaves the kernel nothing to cache, so a program
+// that repeatedly probes for files that do not exist (a compiler walking an
+// include path, a package manager looking for an optional config) pays an IPC
+// round trip and an etcd read on every probe.
+//
+// The timeout is the same one a *found* name gets, and deliberately so: both
+// are invalidated by the same dirent watch, so nothing justifies trusting one
+// longer than the other.  The window either way is one second of a name's
+// existence being stale on this node, which is the guarantee positive entries
+// have always had.
+//
+// attr_timeout is zero because there is no inode for it to describe; the
+// zeroed attr block is there only to keep the reply the width the C parser
+// expects.
+func negativeEntryResp() []byte {
+	var b buf
+	b.w32(0) // the lookup was answered — the name simply is not there
+	b.w64(0) // ino 0: negative entry
+	b.wAttr(&metadata.InodeRecord{})
+	b.w32(entryTimeoutSecs)
+	b.w32(0)
 	return b.b
 }
 
@@ -527,7 +571,7 @@ func attrResp(rec *metadata.InodeRecord) []byte {
 	var b buf
 	b.w32(0) // error = success
 	b.wAttr(rec)
-	b.w32(1) // attr_timeout
+	b.w32(attrTimeoutSecs)
 	return b.b
 }
 

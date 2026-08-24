@@ -49,6 +49,11 @@ func errnoFor(err error, fallback int32) int32 {
 
 // LOOKUP payload: [u64:parent][u32:name_len][name_bytes]
 // Response: [i32:error][u64:ino][u64×9+u32×6:attr][u32:entry_timeout][u32:attr_timeout]
+//
+// A name that is not there is answered as a negative entry — errno 0 with
+// ino 0 — rather than as ENOENT, so the kernel can cache the absence; see
+// negativeEntryResp.  A lookup that could not be *decided* still fails, since
+// caching "not there" is only sound when the store said so.
 func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, error) {
 	r := newReader(payload)
 	parent, name := r.u64(), r.str()
@@ -62,7 +67,7 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errIO), nil
 	}
 	if ino == 0 {
-		return int32Resp(errNoEnt), nil
+		return negativeEntryResp(), nil
 	}
 
 	rec, err := s.store.GetInode(ctx, ino)
@@ -182,8 +187,8 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 			rec = &metadata.InodeRecord{Ino: e.Ino}
 		}
 		b.wAttr(s.withPendingSize(rec))
-		b.w32(1) // entry_timeout (seconds)
-		b.w32(1) // attr_timeout (seconds)
+		b.w32(entryTimeoutSecs)
+		b.w32(attrTimeoutSecs)
 	}
 
 	return b.b, nil

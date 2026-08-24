@@ -67,20 +67,35 @@ alternatives (NFS, JuiceFS, GFS2, OCFS2) cannot do cheaply.
       Nothing of this exists yet: no `pkg/backup`, no `etcfsctl backup`/
       `restore`, no bounded pin. The backup-cost benchmark below is blocked on
       it and was deliberately not written.
-- [ ] **Metadata-lookup caching.** Repeated `stat`/`open`/`readdir` on paths
-      that do not change — build systems, `find`, package managers probing for
-      files — are untouched by the data-path work, which was all block I/O.
-      Reuses the existing `dirent:` prefix watch and its invalidation, so no
-      new coherence protocol is needed.
-      - Negative-dentry caching: `ec_lookup` replies to a failed lookup with
-        `fuse_reply_err`, so the kernel gets nothing to cache. Replying via
-        `fuse_reply_entry` with `ino=0` and `entry_timeout>0` makes ENOENT
-        cacheable; the watch's `inval_entry` on create already evicts a stale
-        negative on the other end.
-      - Daemon-side readdir result caching, keyed like the lock and metadata
-        caches, to avoid a repeat etcd listing on this node's own re-`readdir`.
-      - Neither is measurable with the current benchmark suite, which is pure
-        4 KiB block I/O: needs a `stat`/`find`/`ls -R` scenario, cold and warm.
+- [x] ~~**Metadata-lookup caching.**~~ **Done**, as two kernel-side caches on
+      the existing `dirent:` watch, with no new coherence protocol.
+      - Negative-dentry caching: a LOOKUP the store confirms is absent now
+        answers with a negative entry (errno 0, `ino=0`, `entry_timeout=1`)
+        instead of ENOENT, so the kernel can cache the absence. A lookup that
+        could not be *decided* — etcd failure, or a dirent naming a missing
+        inode — still returns an errno, which caches nothing.
+      - Directory-listing caching: `opendir` returns `FOPEN_CACHE_DIR`, so a
+        repeat walk stops re-issuing READDIR and, behind it, an etcd prefix
+        scan per directory. The kernel drops a cached listing on the parent's
+        `i_version` (bumped by every `inval_entry`) or its mtime (moved in etcd
+        by every create and unlink), so the notification makes it prompt and
+        the mtime bounds it at `attr_timeout` if the notification never comes.
+        Root is excluded: it has no inode record, its attrs are synthesised
+        with a fixed mtime, and it would have only the notification.
+      - The daemon-side readdir cache in the original sketch was deliberately
+        not written. It is the one piece with no fail-safe: directories take no
+        inode lock, so there is nothing to key it by the way the metadata cache
+        is keyed, and a watch-only invalidation would weaken readdir from
+        linearizable to bounded-staleness with nothing bounding it. Moving the
+        same listing into the kernel's cache gets the repeat-walk win with an
+        invalidation path that already existed.
+      - Found along the way: the `dirent:` watch was drained by a single
+        `range` and never re-opened, so an etcd compaction past the watched
+        revision ended every invalidation for the life of the daemon while it
+        went on serving. Fixed — it re-opens and says so.
+      - Still unmeasured: the deep-walk benchmark covers the listing half cold
+        and warm, but nothing exercises repeated `stat` on names that do not
+        exist, which is what the negative cache is for.
 - [ ] Put etcd's WAL on its own volume (`--wal-dir`) in `deploy/`. Ops config
       rather than a feature, but it stops WAL fsyncs competing with snapshot
       and compaction I/O, which is the standard etcd recommendation and cheap.
@@ -90,7 +105,7 @@ alternatives (NFS, JuiceFS, GFS2, OCFS2) cannot do cheaply.
 Worst cases (write-per-Raft-commit pain):
 
 - Batch creates — coalesce multiple inode creates into one Raft proposal (smallfile storm, fsync writes)
-- Metadata-lookup caching — negative-dentry + readdir caching, already scoped in TODO, closes the deep-walk warm-cache gap entirely
+- ~~Metadata-lookup caching~~ — done; needs a re-run of the deep-walk benchmark to say how much of the warm-cache gap it actually closed
 - WAL on its own volume — cheap, already a TODO item, helps commit latency under load generally
 
 Best cases (push the wins further):

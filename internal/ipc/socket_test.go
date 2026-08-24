@@ -53,6 +53,7 @@ func TestFixedWidthRepliesMatchTheCDaemon(t *testing.T) {
 		// out so the two files can be compared by eye without adding them up.
 		{"CREATE, as an absolute width", createResp(1, rec, true), 108},
 		{"LOOKUP, as an absolute width", entryResp(1, rec), 104},
+		{"LOOKUP negative entry", negativeEntryResp(), 4 + 8 + attrWireSize + 4 + 4},
 		{"GETATTR, as an absolute width", attrResp(rec), 92},
 		{"STATFS, as an absolute width", statfsResp(0, 0, 0, 0), 56},
 	}
@@ -60,6 +61,41 @@ func TestFixedWidthRepliesMatchTheCDaemon(t *testing.T) {
 		if len(c.reply) != c.want {
 			t.Errorf("%s: the daemon writes %d bytes, ops.c reads %d", c.op, len(c.reply), c.want)
 		}
+	}
+}
+
+// A name that is not there is answered as a cacheable absence rather than as
+// ENOENT: errno 0, inode 0, and an entry_timeout for the kernel to remember it
+// by. Getting any of the three wrong is a different bug each time — a non-zero
+// errno caches nothing, a non-zero inode invents a file, and a zero timeout
+// makes the reply cost a round trip without saving one.
+func TestNegativeEntryIsCacheableAbsence(t *testing.T) {
+	b := negativeEntryResp()
+
+	if errno := int32(binary.BigEndian.Uint32(b[0:4])); errno != 0 {
+		t.Errorf("errno = %d, want 0: a negative entry is a successful reply", errno)
+	}
+	if ino := binary.BigEndian.Uint64(b[4:12]); ino != 0 {
+		t.Errorf("ino = %d, want 0: inode 0 is what marks the entry negative", ino)
+	}
+
+	timeouts := b[len(b)-8:]
+	if entry := binary.BigEndian.Uint32(timeouts[0:4]); entry != entryTimeoutSecs {
+		t.Errorf("entry_timeout = %d, want %d", entry, entryTimeoutSecs)
+	}
+	// There is no inode for an attr_timeout to describe, and the attr block
+	// carries nothing but zeroes.
+	if attr := binary.BigEndian.Uint32(timeouts[4:8]); attr != 0 {
+		t.Errorf("attr_timeout = %d, want 0", attr)
+	}
+
+	// A cached absence may not outlive a cached presence: both are invalidated
+	// by the same dirent watch, so trusting one longer than the other would be
+	// arbitrary.
+	positive := entryResp(1, &metadata.InodeRecord{})
+	if got := binary.BigEndian.Uint32(positive[len(positive)-8 : len(positive)-4]); got != entryTimeoutSecs {
+		t.Errorf("a found name gets entry_timeout %d, a missing one %d: they must match",
+			got, entryTimeoutSecs)
 	}
 }
 

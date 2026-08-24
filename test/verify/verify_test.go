@@ -214,3 +214,33 @@ func TestDecodedHistoryChecksLikeADirectOne(t *testing.T) {
 		t.Fatal("a linearizable recorded history was rejected")
 	}
 }
+
+// The daemon reports a missing name as a successful lookup carrying inode 0,
+// so the checker has to read that as an absence and not as a name owned by
+// inode 0. Getting it wrong is worse than a false alarm: the model would
+// record the name as taken, and a later create of it would look like a
+// violation while a genuinely lost entry would not.
+func TestNegativeEntryDecodesAsAnAbsence(t *testing.T) {
+	ops, err := DecodeNamespace(recordedNamespaceHistory())
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, op := range ops {
+		if op.Kind != KindLookup {
+			continue
+		}
+		if op.Errno == 0 && op.Ino == 0 {
+			t.Fatal("a negative entry decoded as a successful lookup of inode 0")
+		}
+	}
+
+	// And the model still catches a lookup that contradicts a create: the
+	// relaxation above must not have made every negative lookup unfalsifiable.
+	contradiction := []Op{
+		{Kind: KindCreate, Node: "n1", Parent: 1, Name: "f", Ino: 42, Call: 10, Ret: 20},
+		{Kind: KindLookup, Node: "n1", Parent: 1, Name: "f", Errno: errnoENOENT, Call: 30, Ret: 40},
+	}
+	if check(t, contradiction, AllLinearizable, 0) {
+		t.Fatal("a lookup reporting a name absent after its own node created it was accepted")
+	}
+}

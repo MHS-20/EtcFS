@@ -243,6 +243,14 @@ func DecodeNamespace(entries []history.Entry) ([]Op, error) {
 				op.Ino = ino
 			}
 		}
+		// A lookup that found nothing answers with errno 0 and inode 0 — a
+		// negative entry, which is the form the kernel can cache — so what it
+		// reports is still that the name was absent, and the model has to read
+		// it as such.  Taking it at face value would record the name as taken
+		// by inode 0 and turn every honest ENOENT into a violation.
+		if kind == KindLookup && op.Errno == 0 && op.Ino == 0 {
+			op.Errno = errnoENOENT
+		}
 		ops = append(ops, op)
 	}
 	return ops, nil
