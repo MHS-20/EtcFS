@@ -210,24 +210,51 @@ compare_mount_juicefs() {
 
 # ---- node failure ----
 #
-# compare_kill_node <pub_ip> — take that node out the way a crash would: no
-# clean unmount, no chance to release anything it holds. What "that node" even
-# means differs by backend, and two of them have no such thing:
-#   etcfs    both daemons; its lease then expires and the guard fences it
-#   gfs2     corosync + dlm; the survivors fence and replay its journal
-#   gluster  glusterd + its brick daemon; the replica set loses one copy
-#   nfs      the server. There is no partial failure to measure: every client
-#            is out until it comes back, which is the number to publish.
-#   juicefs  redis + minio on node0, same story as nfs — the metadata and
-#            object stores are the single point, not the client.
+# compare_kill_node <pub_ip> — take that node out the way a real failure would.
+#
+# The three shared-device backends are killed identically, and that is the whole
+# point: the machine is powered off through sysrq, so nothing runs an exit path,
+# nothing unmounts, nothing releases a lock, and no daemon gets to notice it is
+# dying. Killing hand-picked daemons instead measured a different failure per
+# backend — `killall -9 corosync dlm_controld` in particular is an orderly
+# membership change, which is most of what "fence plus journal replay" was
+# supposed to cost, so gfs2 was being asked to recover from something far milder
+# than etcfs was. A comparison is only worth publishing if the fault is the same.
+#
+# The two server-mediated backends have no comparable partial failure — the
+# server IS the filesystem — so they get an outage instead: the ports are
+# blocked before the processes are killed, because stopping a service lets its
+# clients drain into a socket that is still accepting, and a graceful stop can
+# complete long after the probe's next write has already been acknowledged. The
+# block is what makes the outage begin at a known instant.
+#
+# Powering the victim off is deliberately not undone: the survivor is what is
+# being measured, and a victim that reboots and rejoins mid-run changes what the
+# survivor is recovering from. Teardown destroys the cluster regardless.
 compare_kill_node() {
     local ip="$1"
     case "$COMPARE_BACKEND_BASE" in
-        etcfs)   $SSH_CMD "ec2-user@$ip" "sudo killall -9 etcfuse-meta etcfuse 2>/dev/null; true" ;;
-        gfs2)    $SSH_CMD "ec2-user@$ip" "sudo killall -9 corosync dlm_controld 2>/dev/null; true" ;;
-        gluster) $SSH_CMD "ec2-user@$ip" "sudo killall -9 glusterd glusterfsd 2>/dev/null; true" ;;
-        nfs)     $SSH_CMD "ec2-user@$ip" "sudo systemctl kill -s SIGKILL nfs-server 2>/dev/null; sudo systemctl stop nfs-server 2>/dev/null; true" ;;
-        juicefs) $SSH_CMD "ec2-user@$ip" "sudo killall -9 redis-server redis6-server minio 2>/dev/null; true" ;;
+        etcfs | gfs2 | gluster)
+            # The connection dies with the machine, so a failed ssh here is the
+            # expected outcome rather than an error.
+            $SSH_CMD -o ConnectTimeout=5 "ec2-user@$ip" \
+                "sudo sh -c 'echo 1 > /proc/sys/kernel/sysrq; echo o > /proc/sysrq-trigger' &" \
+                >/dev/null 2>&1 || true
+            ;;
+        nfs)
+            $SSH_CMD "ec2-user@$ip" "
+                sudo iptables -I INPUT -p tcp --dport 2049 -j DROP
+                sudo iptables -I OUTPUT -p tcp --sport 2049 -j DROP
+                sudo systemctl kill -s SIGKILL nfs-server 2>/dev/null
+                true"
+            ;;
+        juicefs)
+            $SSH_CMD "ec2-user@$ip" "
+                sudo iptables -I INPUT -p tcp --dport 6379 -j DROP
+                sudo iptables -I INPUT -p tcp --dport 9000 -j DROP
+                sudo killall -9 redis-server redis6-server minio 2>/dev/null
+                true"
+            ;;
         *) die "compare_kill_node: unknown backend $COMPARE_BACKEND" ;;
     esac
 }

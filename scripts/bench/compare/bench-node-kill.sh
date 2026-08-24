@@ -5,14 +5,22 @@
 #
 # Both nodes hammer one shared file so the victim genuinely owns its lock at
 # the moment it dies; the survivor's probe log then gives the interval from
-# the kill to its next successful write. What is being compared:
+# the kill to its next successful write.
+#
+# The three shared-device backends are killed the same way — the machine is
+# powered off, with no exit path and nothing released — so what is compared is
+# one fault, not three:
 #   etcfs    lease expiry plus a generation guard — no reboot, no replay
 #   gfs2     the survivors fence the dead node and replay its journal
 #   gluster  the replica set drops to two copies
-#   nfs      the server IS the filesystem: killing it is a total outage for
-#            every client, not a partial degradation. Reported anyway, as
-#            that is exactly the difference worth publishing.
-#   juicefs  same shape as nfs — redis + minio on node0 are the single point.
+#
+# The other two have no comparable partial failure and get an outage instead,
+# with the server's ports blocked so it begins at a known instant:
+#   nfs      the server IS the filesystem: every client is out until it returns
+#   juicefs  same shape — redis + minio on node0 are the single point
+#
+# A resume time from those last two is not a recovery number and is not read as
+# one; it is published because the difference is the point.
 #
 # ETCFS_KILL_SETTLE (default 20) is how long the load runs before the kill.
 #

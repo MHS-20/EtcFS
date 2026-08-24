@@ -55,7 +55,7 @@ beyond this quick start:
 |---|---|
 | **[Deployment](docs/deployment/index.md)** | Terraform module, binaries/containers, configuration, `etcfsctl`, Prometheus + Grafana |
 | **[Architecture](https://mhs-20.github.io/EtcFS/architecture/fuse/fuse-architecture/)** | FUSE layer, metadata model, storage substrate, consistency, fencing, reliability, cluster ops — one doc per subsystem |
-| **[Reports](https://mhs-20.github.io/EtcFS/reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario/)** | Chaos-testing and benchmark results, by date |
+| **[Reports](https://mhs-20.github.io/EtcFS/reports/chaos-reports/fresh-cluster-per-scenario/)** | Chaos-testing and benchmark results, by date |
 | **[Background](https://mhs-20.github.io/EtcFS/background/etcd_raft_research/)** | Research behind the design decisions: etcd/Raft internals, cluster-FS survey, VFS/FUSE, userspace FS patterns |
 
 Read the relevant subsystem doc before making a design decision that touches

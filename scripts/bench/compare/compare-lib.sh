@@ -293,6 +293,16 @@ compare_remote_time() {
 
 compare_epoch() { date +%s.%N; }
 
+# compare_drop_caches <pub_ip>... — empty the kernel's page, dentry and inode
+# caches, so the next read is genuinely cold. Any measurement of a warm cache
+# needs a cold one to be worth anything, and writing a file leaves it cached.
+compare_drop_caches() {
+    local ip
+    for ip in "$@"; do
+        $SSH_CMD "ec2-user@$ip" "sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+    done
+}
+
 # compare_div <a> <b> [scale] — awk rather than bash arithmetic: every ratio
 # here (MiB/s, ops/s, percentages) is fractional.
 compare_div() {
