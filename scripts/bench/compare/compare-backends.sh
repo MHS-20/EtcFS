@@ -55,12 +55,17 @@ compare_mount_etcfs() {
     # log the outage, but a run whose numbers are only interpretable when the
     # cache was available should still check rather than trust it.
     for ip in "${COMPARE_PUB_IPS[@]}"; do
-        if $SSH_CMD "ec2-user@$ip" "sudo grep -q 'notify: client connected' /tmp/meta.log" 2>/dev/null; then
-            log "  $ip: cache-invalidation client connected (page cache available)"
-        else
-            log "  $ip: WARNING cache-invalidation client NOT connected — the kernel will not"
-            log "      cache this mount's pages, so every read is device-bound"
-        fi
+        case "$(compare_etcfs_page_cache "$ip")" in
+            up) log "  $ip: cache-invalidation client connected (page cache available)" ;;
+            down)
+                log "  $ip: WARNING the cache-invalidation client connected and was then lost —"
+                log "      the kernel is no longer allowed to cache this mount's pages"
+                ;;
+            *)
+                log "  $ip: WARNING no cache-invalidation client has ever connected — the kernel"
+                log "      will not cache this mount's pages, so every read is device-bound"
+                ;;
+        esac
     done
 }
 

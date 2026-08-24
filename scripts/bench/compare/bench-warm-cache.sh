@@ -87,6 +87,11 @@ warm_json=$(compare_run_job "warm-cache-warm" "$N0" "$RUNTIME" "$(job)")
 warm_iops=$(compare_fio_iops "$warm_json" read)
 
 reads_after=$(compare_etcfs_read_ops "$N0")
+
+# Re-checked after the pass, not only at mount time: the state that matters is
+# the one the measurement ran under, and the client can be lost in between.
+cache_state=$(compare_etcfs_page_cache "$N0")
+[[ "$cache_state" == "up" ]] || log "WARNING page cache was '$cache_state' after the warm pass; the numbers below are device-bound"
 if [[ -n "$reads_before" && -n "$reads_after" ]]; then
     compare_headline warm-cache daemon_reads_during_warm "$((reads_after - reads_before))" reads
 fi

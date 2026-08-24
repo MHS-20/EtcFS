@@ -302,6 +302,21 @@ compare_etcfs_read_ops() {
         "curl -s --max-time 5 http://127.0.0.1:9090/metrics | awk '/^etcfuse_fuse_ops_total\{op=\"read\"\}/ {printf \"%d\", \$2}'" 2>/dev/null
 }
 
+# compare_etcfs_page_cache <pub_ip> — whether the daemon is currently answering
+# opens as cacheable: "up", "down", or "never" if it has had no client at all.
+#
+# Last line wins, because both messages mark a transition and what matters is
+# the state they leave behind. Grepping for the startup "client connected" line
+# alone is what let a mount report the cache as available while serving nothing
+# from it: that line stays in the log after the connection dies.
+compare_etcfs_page_cache() {
+    [[ "$COMPARE_BACKEND_BASE" == "etcfs" ]] || return 0
+    $SSH_CMD "ec2-user@$1" "sudo awk '
+        /notify: client connected/ { s = \"up\" }
+        /no cache-invalidation client is connected/ { s = \"down\" }
+        END { print (s == \"\" ? \"never\" : s) }' /tmp/meta.log" 2>/dev/null
+}
+
 # compare_drop_caches <pub_ip>... — empty the kernel's page, dentry and inode
 # caches, so the next read is genuinely cold. Any measurement of a warm cache
 # needs a cold one to be worth anything, and writing a file leaves it cached.
