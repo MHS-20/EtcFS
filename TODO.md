@@ -86,13 +86,18 @@ alternatives (NFS, JuiceFS, GFS2, OCFS2) cannot do cheaply.
         that does not offer it. Root is excluded too: it has no inode record,
         its attrs are synthesised with a fixed mtime, and it would have only
         the notification.
-      - Still open, and the cold half of the same problem: every READDIR does a
-        full `ListDirents` prefix scan and then slices out the page asked for,
-        so filling a large directory's listing costs one whole scan per page.
-        The kernel cache removes the *refills*, not that. The fix is neither
-        cache — page the etcd read itself (`GetPrefix` from the last key
-        returned, with a limit), which is strictly less work at identical
-        linearizability.
+      - The cold half of the same problem is fixed too, and separately: every
+        READDIR used to do a full `ListDirents` prefix scan and then slice out
+        the page asked for, so a scan read the whole directory once per page.
+        Measured at 5000 entries with readdirplus: 209 calls, 1,045,000 entries
+        read from etcd, 2.98s. A scan is sequential, so the daemon now
+        remembers the last name it handed out and resumes from it with a
+        limited range read; the same listing does one full read and 0.40s.
+        A request that does not continue the previous reply falls back to the
+        old count-from-the-start path, so a miss is slow and never wrong, and
+        `etcfuse_readdir_page_total` says which is happening.
+        No consistency change: a cursor is a name used as the start of a fresh
+        linearizable read, not a cached listing, and nothing pins a revision.
       - The daemon-side readdir cache in the original sketch was deliberately
         not written. It is the one piece with no fail-safe: directories take no
         inode lock, so there is nothing to key it by the way the metadata cache

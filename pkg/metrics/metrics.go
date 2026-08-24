@@ -61,6 +61,17 @@ var (
 		Help: "Data-path metadata lookups, by whether the lock-held cache answered them.",
 	}, []string{"result"})
 
+	// ReaddirPage counts READDIR calls that resumed from where the previous
+	// reply stopped ("resumed") against those that had to read the directory
+	// and count from the start ("rescanned").  A sequential scan resumes for
+	// every page after the first, so a listing-heavy workload sitting at
+	// rescanned means something is defeating the cursor — concurrent scans of
+	// one directory, or seekdir — and paying a full read per page for it.
+	ReaddirPage = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_readdir_page_total",
+		Help: "READDIR pages served, by whether the listing resumed or was re-read from the start.",
+	}, []string{"result"})
+
 	// PendingExtents holds how many metadata keys are buffered but not yet
 	// published.  Together with PendingBytes it is the size of what a crash
 	// would lose right now, which is the number an operator weighing the flush

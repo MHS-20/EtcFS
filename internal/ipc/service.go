@@ -104,6 +104,11 @@ type Service struct {
 	// StartLockRevocation.
 	recalls *recallSet
 
+	// dirCursors remembers where each directory's last listing stopped, so a
+	// sequential scan reads forward instead of counting from the start. See
+	// readdircursor.go.
+	dirCursors *dirCursors
+
 	// Fencing generation this node started with.  Every data-path commit is
 	// guarded against it, so once the fencing controller bumps gen:<node_id>
 	// this node's commits stop being accepted by etcd.
@@ -170,6 +175,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		log:            log,
 		open:           newOpenFiles(),
 		recalls:        newRecallSet(),
+		dirCursors:     newDirCursors(),
 		notifyServer:   &notifyServer{},
 		flushInterval:  opts.FlushInterval,
 		flushMaxBytes:  defaultFlushMaxBytes,

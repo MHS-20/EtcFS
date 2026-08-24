@@ -9,6 +9,7 @@ import (
 
 	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 // Metadata operation handlers: everything answerable from etcd alone.
@@ -135,21 +136,10 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 		return int32Resp(errInval), nil
 	}
 
-	entries, err := s.store.ListDirents(ctx, ino)
+	entries, err := s.direntPage(ctx, ino, offset, size, plus)
 	if err != nil {
 		return int32Resp(errIO), nil
 	}
-
-	// The cookie of an entry is its 1-based position, so the kernel's offset is
-	// the count already returned.  Resuming here rather than sending the whole
-	// directory every time is what keeps a large directory from being
-	// materialised in full on each of the calls it takes to read it.
-	if offset >= uint64(len(entries)) {
-		entries = nil
-	} else {
-		entries = entries[offset:]
-	}
-	entries = truncateToBuffer(entries, size, plus)
 
 	// One round trip for every inode record rather than one per entry: readdir
 	// on a directory of a thousand files used to be a thousand sequential etcd
@@ -192,6 +182,74 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 	}
 
 	return b.b, nil
+}
+
+// direntPage returns the entries one READDIR should answer with.
+//
+// The fast path reads forward from the name the previous reply ended on, so a
+// full scan of a directory costs one pass over it rather than one pass per
+// page.  It applies when the request continues exactly where the last one
+// stopped, which a sequential scan always does; anything else reads the
+// directory and slices by position, which is what every request did before this
+// existed and is what makes a missed cursor slow rather than wrong.
+//
+// Both paths end in truncateToBuffer, so what fits in the kernel's buffer is
+// decided in one place from the names actually read.
+func (s *Service) direntPage(ctx context.Context, ino, offset uint64, size uint32, plus bool) ([]metadata.DirentEntry, error) {
+	var entries []metadata.DirentEntry
+
+	if after, resuming := s.dirCursors.resumeAt(ino, offset); resuming {
+		metrics.ReaddirPage.WithLabelValues("resumed").Inc()
+		page, err := s.store.ListDirentsAfter(ctx, ino, after, pageLimit(size, plus))
+		if err != nil {
+			return nil, err
+		}
+		entries = page
+	} else {
+		metrics.ReaddirPage.WithLabelValues("rescanned").Inc()
+		all, err := s.store.ListDirents(ctx, ino)
+		if err != nil {
+			return nil, err
+		}
+		// The cookie of an entry is its 1-based position, so the kernel's
+		// offset is the count already returned.
+		if offset >= uint64(len(all)) {
+			all = nil
+		} else {
+			all = all[offset:]
+		}
+		entries = all
+	}
+
+	entries = truncateToBuffer(entries, size, plus)
+	if n := len(entries); n > 0 {
+		s.dirCursors.record(ino, offset+uint64(n), entries[n-1].Name)
+	}
+	return entries, nil
+}
+
+// pageLimit is how many entries to ask etcd for to fill a reply buffer of
+// size bytes.
+//
+// Derived from the *smallest* an entry's framing can be, so the answer is an
+// upper bound: reading a few more than fit costs one comparison each in
+// truncateToBuffer, while reading too few would silently shorten the listing
+// into an extra round trip. A size of zero means the caller set no bound.
+func pageLimit(size uint32, plus bool) int64 {
+	if size == 0 {
+		return 0
+	}
+	const minDirentCost = 24 + 8 // fuse_dirent, plus the shortest padded name
+	cost := minDirentCost
+	if plus {
+		cost += 128 // fuse_entry_out
+	}
+	if limit := int64(size) / int64(cost); limit > 0 {
+		return limit
+	}
+	// A reply always carries at least one entry, because an empty one is how a
+	// listing ends; truncateToBuffer makes the same allowance.
+	return 1
 }
 
 // truncateToBuffer drops the entries that would not fit in the kernel's reply

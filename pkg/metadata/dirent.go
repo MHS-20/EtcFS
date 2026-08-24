@@ -78,6 +78,47 @@ func (s *Store) ListDirents(ctx context.Context, parent uint64) ([]DirentEntry, 
 	return entries, nil
 }
 
+// ListDirentsAfter returns at most limit entries of a directory, beginning at
+// the first name that sorts strictly after `after` — or at the first name in
+// the directory when `after` is empty.
+//
+// This is the read a paginated listing wants: etcd has no notion of "skip the
+// first N keys", so serving a page by position means reading every key before
+// it, and a listing that does that once per page reads the whole directory once
+// per page.  Resuming from the last name returned instead makes one full scan
+// cost one pass over the directory however many pages it takes.
+//
+// A limit of zero means no limit.  The read is linearizable, exactly as the
+// whole-directory listing is: paging changes how much is read, not how fresh it
+// is.
+func (s *Store) ListDirentsAfter(ctx context.Context, parent uint64, after string, limit int64) ([]DirentEntry, error) {
+	prefix := DirentPrefix(parent)
+	start := prefix
+	if after != "" {
+		// A key's successor: etcd's range start is inclusive, and the caller
+		// has already been given `after`.
+		start = DirentKey(parent, after) + "\x00"
+	}
+
+	opts := []clientv3.OpOption{clientv3.WithRange(clientv3.GetPrefixRangeEnd(prefix))}
+	if limit > 0 {
+		opts = append(opts, clientv3.WithLimit(limit))
+	}
+	resp, err := s.read(ctx, start, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("list dirents %d after %q: %w", parent, after, err)
+	}
+
+	entries := make([]DirentEntry, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		entries = append(entries, DirentEntry{
+			Name: extractNameFromKey(string(kv.Key), parent),
+			Ino:  DecodeUint64(kv.Value),
+		})
+	}
+	return entries, nil
+}
+
 // DirentEntry is a directory listing entry.
 type DirentEntry struct {
 	Name string
