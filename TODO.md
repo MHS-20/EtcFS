@@ -28,37 +28,6 @@ alternatives (NFS, JuiceFS, GFS2, OCFS2) cannot do cheaply.
       about how long a stalled request may hang.
       The fault injection is now the same across the three shared-device
       backends, so the comparison is finally worth running (see the follow-ups).
-- [ ] **Backup and restore, driven by the revision log.** A backup at revision
-      R is two paired artifacts: `etcdctl snapshot save` for the namespace, and
-      the blocks the extent keys at R name, streamed to a second volume or to
-      object storage. Paired, they restore a point-in-time filesystem;
-      separately, neither is worth much.
-      Incremental falls out of the design: diffing etcd revisions R1→R2 yields
-      exactly the extent keys that changed, so the changed blocks are known
-      without a scan, a hash pass, or dirty-bit tracking.
-      Needs a *bounded* pin — blocks referenced at R must survive until the
-      copy has read them, and are freed as soon as the run finishes. That is a
-      far cheaper thing than the open-ended pinning snapshots wanted, and it is
-      the only reason to keep any pin mechanism at all. Restore is the half to
-      write first — an untested restore is not a backup.
-      Without it the scheme is silently wrong, not merely lossy: writes are
-      copy-on-write, so modifying a file frees its old blocks immediately
-      (`freeBlocks` → `alloc.Free` returns the range to the node's bitmap on the
-      spot), and a block reallocated to another inode before the backup reads it
-      makes the copy hold that other file's bytes under the first file's name.
-      Likely cheapest shape — a **free floor** rather than a pinned block set:
-      one cluster-visible epoch saying "nothing freed after revision R may be
-      reallocated until this run ends". One number instead of a set, consulted
-      once per free instead of per range, and self-limiting because the run is
-      bounded; blocks freed during the run simply leak until it finishes.
-      It has to be cluster-wide either way — the run happens on one node while
-      the blocks sit in arenas owned by others, each with its own in-memory
-      bitmap — so the free path, `Allocator.Reconstruct` (which rebuilds the
-      bitmap from live extents, and would otherwise un-pin across a restart) and
-      the scrubber all have to respect it, and etcd compaction has to be held
-      past R for the duration.
-      Nothing of this exists yet: no `pkg/backup`, no `etcfsctl backup`/
-      `restore`, no floor.
 - [ ] Put etcd's WAL on its own volume (`--wal-dir`) in `deploy/`. Ops config
       rather than a feature, but it stops WAL fsyncs competing with snapshot
       and compaction I/O, which is the standard etcd recommendation and cheap.
@@ -75,36 +44,41 @@ Worst cases (write-per-Raft-commit pain):
 
 Best cases (push the wins further):
 
-- Backup/restore from the revision log — unlocks a whole benchmark category
-  currently blocked, and plays to the etcd-MVCC strength.
 
-## Benchmarks — not yet written
+## Benchmarks — etcfs measured, other backends outstanding
 
-- [ ] **Backup cost.** Time for a full and an incremental backup of a populated
-      filesystem, and the throughput hit on writers while one runs. The
-      incremental number is the interesting one: it should scale with churn
-      since the last run, not with filesystem size, because the changed blocks
-      come from a revision diff rather than a scan.
-      Blocked on the feature above: timing a backup nothing can restore from
-      would publish a number for something the product cannot do.
-- [ ] **Read-mostly with warm page cache.** Extends `bench-etcfs.sh` with
-      `ETCFS_BENCH_DIRECT=0` to every backend, repeated reads of a working set
-      that fits in RAM. Tests whether the lock-scoped page cache is competitive
-      with backends that cache without a coherence protocol.
-- [ ] **Repeated `stat` on names that do not exist.** Nothing exercises the
-      negative-dentry cache: the suite is block I/O plus the deep walk, and
-      neither probes for absent files the way a compiler walking an include
-      path or a package manager looking for an optional config does.
+Each of these has a validated script and an etcfs number. None can be published
+as a comparison until the other four backends are run under the *same* harness,
+and one of them cannot be published even for etcfs yet.
+
+- [ ] **Negative lookup, all backends.** etcfs: 1073.5 us cold, 2.10 us warm,
+      511x, on 200 names swept 200 times. A single-column report is honest but
+      the scenario exists to be compared — nfs has attribute caching of its own
+      and gfs2 reads metadata off the local device, so both should do well here.
+      Note the working set must sweep inside the client's entry timeout: 2000
+      names gives 1.54x on etcfs purely because names expire mid-sweep.
+- [ ] **Warm page cache, all backends.** Blocked on the page-cache defect below
+      rather than on machine time. etcfs currently measures 1.08x with every
+      read reaching the daemon, so publishing it would document a bug as a
+      design property. Fix first, then measure all five.
+- [ ] **Deep walk at 80k files.** The 20k run gives 5.768s cold / 2.316s warm
+      (2.49x, against no warm benefit at all before the metadata caching). It
+      cannot replace the published figure because that one is 80k files — the
+      other backends do not need re-running, only etcfs at a matching size.
+- [ ] **Node kill, all five backends.** etcfs under the hardened fault: 0.007s
+      resume, 1.513s max stall, 1 failed op — against 0.249s / 3.501s published
+      under the old one. This one *must* be all five: the harness change was to
+      every backend (sysrq power-off for the shared-device three, port blocks
+      for the two server-mediated ones), so the published gfs2/gluster/nfs/
+      juicefs numbers were measured under a milder fault. Dropping the new etcfs
+      column into that table would compare a power-off against an orderly
+      membership change, which flatters etcfs and is the same unfairness the
+      hardening removed, pointed the other way.
 
 ## Benchmarks — re-runs and follow-ups
 
 Existing scripts and reports, with a reason to run them again.
 
-- [ ] **Deep directory walks, after the metadata caching.** The published run
-      is the "before": zero warm-cache benefit, 8.8s warm against gfs2's
-      0.125s. Kernel-side dentry and listing caching plus the readdir cursor
-      have landed since; nothing has re-measured the gap they were meant to
-      close.
 - [ ] **Join latency, without the reattach.** The published 4.49s and 31%
       survivor impact both include an EBS reattach that a clean leave no longer
       causes, since a departing node is not fenced any more. Re-running now
@@ -116,39 +90,39 @@ Existing scripts and reports, with a reason to run them again.
       faster volume before the expected gap can show at all — and the producer
       side of `bench-handoff.sh` should now set `user.etcfs.publish` before the
       consumer starts, which is what the number was supposed to measure.
-- [ ] **Node-kill recovery, with comparable kill mechanisms.** EtcFS resumed
-      slowest, but nfs/juicefs resumed in ~10-15ms, which suggests their kill
-      paths under-simulate a real failure rather than that they recover 20x
-      faster. Not readable as a result until the five are killed alike.
 - [ ] **Arena fragmentation, over a day rather than ten minutes.** No
       fragmentation trend appeared in the short soak, but the run is too short
       to mean much and the script's headline ratio compares against a pre-churn
       outlier sample. The script already supports the long run; it is unrun,
       and the metric needs a fixed baseline first.
 
-## Known ceilings (deliberate, revisit under load)
+## Reliability
 
-The `ponytail:` markers are scattered; they are the same class of decision and
-worth one review pass together when the cluster gets bigger:
-
-- [ ] Linear sweeps: lock-cache eviction (`lockmap.go`), buffered-run scan
-      (`delegate.go`), flusher tick over the lock cache (`delegate.go`), arena
-      bit scan (`pkg/arena/allocator.go`), readdir-cursor eviction
-      (`readdircursor.go`). Reviewed: all are pure performance, none is on a
-      path with a measured problem, and each already names its upgrade. Left
-      alone deliberately; revisit with a profile, not by guessing.
-- [ ] One notify socket and one C-side thread (`notify.go`): a slow
-      `INVAL_INODE` serialises every other invalidation, and invalidation
-      blocks a lock release. Reviewed and left: a second connection changes the
-      order invalidations reach the kernel in, which is exactly what the cache
-      coherence argument rests on. The unresponsive-client breaker already
-      bounds the damage a wedged client can do.
-- [ ] `pagesCached` is a one-way latch for the process lifetime
-      (`service.go`): once any open was answered cacheable, every later key
-      release pays an invalidation round trip even for inodes never cached.
-      Per-inode tracking would cost a map but skip the common case.
-      Reviewed and left: deciding per inode that an invalidation can be skipped
-      is a coherence decision, not an optimisation — the latch is the
-      fail-safe direction, and the cost is one round trip on a path that is
-      already yielding a lock. Worth doing only with a measurement that says
-      it matters and a test that pins the skip condition.
+- [ ] **The kernel page cache is inert.** `--page-cache` defaults to true,
+      reports itself available, and does nothing: a warm pass over a 256 MiB
+      working set that had just been read end to end still sent every one of its
+      30,283 reads to the daemon, and ran at the volume's IOPS rather than RAM
+      speed. The cache-invalidation client was connected on all three nodes, so
+      `cacheableOpen` returns true and the open is answered with `keep_cache=1`
+      and `direct_io=0` — the kernel is permitted to cache and does not.
+      This is not a benchmark artifact and it is not the negative-dentry or
+      readdir caching, both of which demonstrably work on the same mount. It
+      also means every read number in the suite is measured on a filesystem
+      whose read cache does nothing, so the coordination layer is currently
+      carrying blame for a ceiling the caching layer was meant to lift.
+      Two things to check, cheapest first: log the `keep_cache` decision in
+      `handleOpen` and read it off a live node, to confirm what is actually on
+      the wire rather than inferring it; and build with `FUSE_CAP_AUTO_INVAL_DATA`
+      unset, since that flag makes the kernel revalidate attributes and drop the
+      data cache when they appear to move, and it is enabled by libfuse default.
+      `bench-warm-cache.sh` already reports `daemon_reads_during_warm`, so either
+      test is one run.
+- [ ] **The C notify client never retries.** `notify_thread` in `pkg/fuse/fuse.c`
+      makes exactly one `connect()`; on failure it closes the socket and returns,
+      with no retry and no log line. A lost startup race therefore leaves the
+      node unable to invalidate anything for the life of the process, and leaves
+      `--page-cache` silently off with nothing reporting it. Not the cause of the
+      inert cache above — the client was connected — but the same failure would
+      be invisible if it ever happened. `compare_mount_etcfs` now warns when it
+      has, which is a benchmark-side workaround for something the daemon should
+      say itself.
