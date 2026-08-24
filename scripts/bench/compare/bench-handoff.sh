@@ -10,6 +10,15 @@
 # object storage). The gap should widen with size, which is what the sweep is
 # for.
 #
+# On etcfs the producer publishes the file before B reads it (the
+# user.etcfs.publish attribute), which yields the inode's cached lock so the
+# consumer finds it free instead of having to recall it. Without that the recall
+# round trip lands in B's time-to-first-byte.
+#
+# The default 1000-IOPS volume caps every backend well below where the gap
+# shows; raise ETCFS_VOLUME_IOPS (and ETCFS_VOLUME_SIZE, since io2 allows 500
+# IOPS per GiB) for a run whose bandwidth numbers mean anything.
+#
 # Usage:
 #   COMPARE_BACKEND=etcfs ./bench-handoff.sh
 #   ETCFS_HANDOFF_SIZES="1M 64M 1G 8G" COMPARE_BACKEND=gfs2 ./bench-handoff.sh
@@ -44,6 +53,20 @@ size=$size
 rw=write
 end_fsync=1
 " >/dev/null
+
+    # etcfs only: hand the file over explicitly rather than making B recall it.
+    # A lock key outlives the operation that took it, so after the write above A
+    # still holds this inode; without the publish, B's first read has to write a
+    # want key, wait for A's revocation watch to notice it and for A to yield,
+    # and only then acquire — which lands in the time-to-first-byte below and is
+    # not what "handoff at device speed" is supposed to measure. Every other
+    # backend has no equivalent, which is part of the comparison.
+    if [[ "$COMPARE_BACKEND_BASE" == "etcfs" ]]; then
+        # python3 rather than setfattr: it ships on these AMIs and the attr
+        # package does not, and this needs no new install step on the write path.
+        $SSH_CMD "ec2-user@$A" \
+            "sudo python3 -c 'import os,sys; os.setxattr(sys.argv[1], \"user.etcfs.publish\", b\"1\")' $path"
+    fi
 
     $SSH_CMD "ec2-user@$B" "sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null"
     ttfb=$(compare_remote_time "$B" "sudo dd if=$path bs=4k count=1 iflag=direct")

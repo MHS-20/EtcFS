@@ -13,9 +13,21 @@ alternatives (NFS, JuiceFS, GFS2, OCFS2) cannot do cheaply.
 - [ ] **Sub-second recovery, measured.** GFS2/OCFS2 fence by STONITH and replay
       the dead node's journal before anyone resumes I/O. Here metadata is
       already Raft-committed and fencing is a generation guard, so recovery is
-      lease expiry with no reboot and no replay. Nothing exercises this as a
-      *number* yet: the node-kill benchmark exists but its result is not a clean
-      comparison (see the follow-ups below).
+      lease expiry with no reboot and no replay.
+      The claim needs restating before it is published, because "sub-second" is
+      not true of the tail and cannot be made true by tuning: a survivor blocked
+      on a dead node's cached lock waits for that lock's lease to expire, and
+      the lease TTL has a floor. `SelfFenceWindow(ttl) = 2*ttl` must exceed
+      `RequestTimeout` (10s), so a TTL below ~5s is rejected outright — the
+      daemon would exit before a stalled request could fail cleanly. The
+      published 0.249s median with a 3.501s worst case is therefore expected
+      behaviour under the 10s default, not a bug.
+      What is defensible: *sub-second median resume, with the tail bounded by
+      the lock lease TTL and no journal replay at any point*. Lowering the floor
+      at all means moving `RequestTimeout` too, which is a separate decision
+      about how long a stalled request may hang.
+      The fault injection is now the same across the three shared-device
+      backends, so the comparison is finally worth running (see the follow-ups).
 - [ ] **Backup and restore, driven by the revision log.** A backup at revision
       R is two paired artifacts: `etcdctl snapshot save` for the namespace, and
       the blocks the extent keys at R name, streamed to a second volume or to
