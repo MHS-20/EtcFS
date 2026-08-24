@@ -485,6 +485,17 @@ func (s *Service) handleOpen(ctx context.Context, payload []byte) ([]byte, error
 // reaches the kernel's write path through different code, and narrowing the
 // open is cheaper than widening what has been checked.
 func (s *Service) cacheableOpen(flags uint32) bool {
+	// Logged rather than inferred.  Whether the kernel may cache an open's pages
+	// is decided from three inputs and reported to the C side as a single bit,
+	// and a mount that turns out not to be caching gives no way to tell which
+	// input said no -- or whether the bit was what the C side acted on.
+	defer func() {
+		s.log.Debug("OPEN cacheability", "flags", flags,
+			"page_cache", s.pageCache,
+			"dsync", flags&oDSync != 0,
+			"notify_client", s.notifyServer.connected())
+	}()
+
 	if !s.pageCache || flags&oDSync != 0 {
 		return false
 	}

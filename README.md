@@ -46,6 +46,57 @@ etcfsctl --etcd-endpoints=http://127.0.0.1:2379 status
 Full flag reference and every config knob:
 [Configuration](docs/deployment/configuration.md).
 
+## How it measures up
+
+Five filesystems, each on its own isolated 3-node AWS cluster with a dedicated
+1000-IOPS io2 Multi-Attach volume — `scripts/bench/compare/`. Full method and
+caveats in [Reports](https://mhs-20.github.io/EtcFS/reports/benchmark-reports/negative-lookup/).
+
+**Where EtcFS wins — repeated negative lookups.** The pattern a compiler walking
+an include path or a build system checking timestamps generates. EtcFS answers a
+repeated probe for a missing name from the kernel's negative dentry cache with no
+upcall at all, at 2.10 us:
+
+| vs. | their warm latency | EtcFS advantage |
+|---|---|---|
+| gfs2 | 5.40 us | **2.6x faster** |
+| nfs | 3.64 us | **1.7x faster** |
+| juicefs | 322.89 us | **154x faster** |
+| gluster | 693.36 us | **330x faster** |
+
+Gluster and JuiceFS do not cache absences at all here — Gluster's warm pass is
+*slower* than its cold one.
+
+**Where EtcFS loses.**
+
+| Case | EtcFS | Best competitor | Deficit |
+|---|---|---|---|
+| Cold negative lookup | 1,073.50 us | 9.50 us (gfs2) | **113x slower** |
+| randwrite IOPS (`direct=1`) | 681 | 1,041 (gluster) | **35% lower** |
+| randread IOPS (`direct=1`) | 1,016 | 66,937 (juicefs) | see note |
+
+Cold negative lookup is EtcFS's weakest measured result anywhere: every first
+probe is an etcd round trip, and the caching only pays when the same absent names
+are probed again inside the entry timeout. On writes, one Raft commit per
+structural mutation is the standing cost of putting durable truth in etcd. The
+randread column is not a like-for-like loss — JuiceFS/NFS/Gluster's large figures
+are client-cache artifacts under `direct=1`, which EtcFS honours strictly; see
+the [comparison report](https://mhs-20.github.io/EtcFS/reports/benchmark-reports/etcfs-vs-juicefs-gluster-gfs2-nfs/).
+
+**Where it makes no difference — a warm page cache.** All five converge on
+~600k IOPS on a RAM-resident working set (EtcFS 626k, gfs2 616k, gluster 609k,
+nfs 602k, juicefs 573k). That is the kernel page cache and every backend gets it.
+EtcFS reaches it while holding data pages only under the inode's lock and
+invalidating them before yielding it — the coherence obligation is free on this
+workload, but it is not an advantage, and the frequently-quoted "622x warm
+speedup" is an artifact of a device-bound cold baseline that gfs2 and gluster
+share.
+
+Not yet claimable: fencing and recovery against the other four. The
+[node-kill](https://mhs-20.github.io/EtcFS/reports/benchmark-reports/node-kill-recovery/)
+harness has two defects that invalidate three of its five columns, and it is
+being re-run.
+
 ## Documentation
 
 The [documentation site](https://mhs-20.github.io/EtcFS/) covers everything

@@ -23,9 +23,27 @@
 # touch only ~124 MiB in a 30 s pass, so with a 512 MiB set the "warm" pass was
 # still reading blocks that had never been cached and the result came out at
 # exactly 1.00x. Reading the file end to end guarantees the set really is
-# resident, which makes the comparison decisive in both directions: a warm pass
-# that is still device-bound after this means the kernel is not caching at all,
-# not that the cache was cold.
+# resident.
+#
+# The pre-warm only survives because of the two fio settings below, and both
+# are off fio's defaults:
+#
+#   invalidate=0   fio otherwise calls posix_fadvise(POSIX_FADV_DONTNEED) over
+#                  the whole file as it opens it, which throws away the cache
+#                  the pre-warm just built -- every time, immediately before the
+#                  pass that exists to measure it.
+#   fadvise_hint=0 fio otherwise declares POSIX_FADV_RANDOM, which sets the
+#                  file's readahead to zero. With the pre-warm discarded, that
+#                  leaves the pass rebuilding the cache one 4 KiB page per
+#                  device I/O, and at ~1000 IOPS it never catches up inside
+#                  30 s.
+#
+# Together they made this scenario report a working page cache as an inert one:
+# warm equal to cold, every read reaching the daemon, on a filesystem that
+# serves a genuinely warm 256 MiB set at over a million IOPS. Anything measuring
+# a *cache* has to leave the cache alone; the O_DIRECT scenarios elsewhere in
+# the suite are the ones that want a cold read, and they ask for it with
+# direct=1 rather than by discarding what another step deliberately built.
 #
 # ETCFS_WARM_SET (default 256M) sizes the working set.
 # ETCFS_WARM_RUNTIME (default 30) is the seconds per pass.
@@ -58,6 +76,8 @@ numjobs=1
 time_based=1
 runtime=$RUNTIME
 group_reporting=1
+invalidate=0
+fadvise_hint=0
 EOF
 }
 
