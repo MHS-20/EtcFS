@@ -422,14 +422,29 @@ func (s *Service) recallLock(ino uint64) {
 		time.Sleep(minHoldTime - held)
 	}
 
-	e.rw.Lock()
-	defer e.rw.Unlock()
-	if err := s.dropCachedLock(e, "recall"); err != nil {
+	if err := s.yieldCachedLock(ino, "recall"); err != nil {
 		s.log.Error("cached inode lock not yielded: this node's writes to it are not published",
 			"ino", ino, "error", err)
 		return
 	}
 	s.log.Debug("yielded a cached inode lock to a peer", "ino", ino)
+}
+
+// yieldCachedLock publishes whatever this node has buffered for an inode and
+// gives up its cached lock key, so the next node to want the inode finds it
+// free instead of having to ask for it back.
+//
+// Holding the entry's write lock is what makes the drop safe: no operation of
+// this node's can be running under the key while it is being given up.  An
+// inode this node holds no key for is nothing to yield, and succeeds.
+func (s *Service) yieldCachedLock(ino uint64, trigger string) error {
+	e := s.locks.lookup(ino)
+	if e == nil {
+		return nil
+	}
+	e.rw.Lock()
+	defer e.rw.Unlock()
+	return s.dropCachedLock(e, trigger)
 }
 
 // sessionPollInterval is how often the session watcher looks for a session to

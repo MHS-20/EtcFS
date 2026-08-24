@@ -31,6 +31,16 @@ func privilegedXattrPrefix(name string) bool {
 	return strings.HasPrefix(name, "trusted.")
 }
 
+// xattrPublish is the name a writer sets to hand a file over to another node
+// at device speed.  See Service.publishInode.
+//
+// An extended attribute rather than a new operation because it needs no new
+// wire opcode, no C-side handler and no library: `setfattr`, os.setxattr and
+// every language's equivalent already reach it, which is what an application
+// in a pipeline actually has to hand.  The user namespace because the caller
+// is an ordinary process, not an operator.
+const xattrPublish = "user.etcfs.publish"
+
 // SETXATTR payload: [u64:ino][u32:name_len][name][u32:value_len][value][u32:flags][u32:uid][u32:gid]
 // Response: [i32:error]
 func (s *Service) handleSetxattr(ctx context.Context, payload []byte) ([]byte, error) {
@@ -44,10 +54,50 @@ func (s *Service) handleSetxattr(ctx context.Context, payload []byte) ([]byte, e
 		return int32Resp(errPerm), nil
 	}
 
+	// An action, not an attribute: it is carried out and deliberately not
+	// stored, so it never appears in a listing and reading it back gives
+	// ENODATA.  Storing it would leave a file permanently carrying the record
+	// of a handoff that happened once.
+	if name == xattrPublish {
+		if err := s.publishInode(ctx, ino); err != nil {
+			s.log.Warn("publish: cannot hand the inode over", "ino", ino, "error", err)
+			return int32Resp(errIO), nil
+		}
+		return okResp(), nil
+	}
+
 	if err := s.store.SetXattr(ctx, ino, name, value, flags); err != nil {
 		return int32Resp(errnoFor(err, errIO)), nil
 	}
 	return okResp(), nil
+}
+
+// publishInode hands a file over to whichever node reads it next: it puts this
+// node's buffered writes on the device and in etcd, and then gives up the
+// inode's cached lock key without waiting for anyone to ask for it.
+//
+// Handing off without this costs a full recall round trip. The lock key
+// outlives the operation that took it, so a producer that has finished writing
+// still holds it; the consumer on another node has to write a want key, wait
+// for the producer's revocation watch to see it, and only then acquire — three
+// etcd round trips plus the minimum hold time, paid on the consumer's critical
+// path. Publishing moves all of that to the producer, before the consumer
+// arrives, so what the consumer finds is a free lock and extents already
+// committed. It then reads the same physical blocks the producer wrote: only
+// the extent map crossed the network.
+//
+// The device is not flushed here. A shared device is opened with O_DIRECT, so
+// the write to it was the publication; the buffered fallback exists only for an
+// unshared device, where there is no other node to hand anything to.
+//
+// A write racing this on the same node lands in a buffer this call has already
+// published, and is left for the next flush — publishing is a statement that
+// the writer has finished, and it is the caller's to make truthfully.
+func (s *Service) publishInode(ctx context.Context, ino uint64) error {
+	if err := s.flushInode(ctx, ino); err != nil {
+		return err
+	}
+	return s.yieldCachedLock(ino, "publish")
 }
 
 // GETXATTR payload: [u64:ino][u32:name_len][name]
