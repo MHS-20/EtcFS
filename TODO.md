@@ -80,8 +80,19 @@ alternatives (NFS, JuiceFS, GFS2, OCFS2) cannot do cheaply.
         `i_version` (bumped by every `inval_entry`) or its mtime (moved in etcd
         by every create and unlink), so the notification makes it prompt and
         the mtime bounds it at `attr_timeout` if the notification never comes.
-        Root is excluded: it has no inode record, its attrs are synthesised
-        with a fixed mtime, and it would have only the notification.
+        The mtime half only works where `FUSE_AUTO_INVAL_DATA` is negotiated —
+        the kernel gates the refresh on it — so `init` now asks for it
+        explicitly and the listing cache is switched off entirely on a kernel
+        that does not offer it. Root is excluded too: it has no inode record,
+        its attrs are synthesised with a fixed mtime, and it would have only
+        the notification.
+      - Still open, and the cold half of the same problem: every READDIR does a
+        full `ListDirents` prefix scan and then slices out the page asked for,
+        so filling a large directory's listing costs one whole scan per page.
+        The kernel cache removes the *refills*, not that. The fix is neither
+        cache — page the etcd read itself (`GetPrefix` from the last key
+        returned, with a limit), which is strictly less work at identical
+        linearizability.
       - The daemon-side readdir cache in the original sketch was deliberately
         not written. It is the one piece with no fail-safe: directories take no
         inode lock, so there is nothing to key it by the way the metadata cache

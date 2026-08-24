@@ -116,4 +116,9 @@ int etcfs_ipc_fd(void);
  * connected. */
 void etcfs_ipc_drop(void);
 
+/* Whether the kernel negotiated FUSE_AUTO_INVAL_DATA, and so whether a cached
+ * directory listing has anything bounding how long a lost invalidation can
+ * leave it stale.  Valid only once the FUSE session has been initialised. */
+int etcfs_dir_cache_allowed(void);
+
 #endif /* ETCFS_FUSE_H */

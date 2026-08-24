@@ -674,15 +674,18 @@ static void ec_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
  *     as the parent's attributes expire.
  *
  * The second is the reason this does not depend on the notification path being
- * healthy, and it is also why the root directory is excluded: root has no inode
- * record, its attributes are synthesised below with a fixed mtime, and a cached
- * listing of it would have only the notification to invalidate it.
+ * healthy -- but only where the kernel actually re-reads that mtime, which it
+ * does when a listing is asked for from the start and FUSE_AUTO_INVAL_DATA was
+ * negotiated, and not otherwise.  So the cache is offered only when it was, and
+ * never for the root directory: root has no inode record, its attributes are
+ * synthesised below with a fixed mtime, and a cached listing of it would have
+ * only the notification to invalidate it.
  */
 static void ec_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     struct etcfs_context *ctx = fuse_req_userdata(req);
     fi->fh = next_file_handle(ctx);
-    fi->cache_readdir = (ino == FUSE_ROOT_ID) ? 0 : 1;
+    fi->cache_readdir = (ino != FUSE_ROOT_ID && etcfs_dir_cache_allowed()) ? 1 : 0;
     fuse_reply_open(req, fi);
 }
 

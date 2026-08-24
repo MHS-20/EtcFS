@@ -219,11 +219,38 @@ void etcfs_ipc_drop(void)
 
 /* ---- FUSE init callback ---- */
 
+/* Whether the kernel agreed to FUSE_AUTO_INVAL_DATA, which is the whole reason
+ * a cached directory listing is safe to hand out.  Without it the kernel never
+ * re-reads a directory's mtime when a listing it has cached is asked for again,
+ * so that listing is invalidated only by an INVAL_ENTRY notification — and
+ * nothing then bounds how long a notification that never arrived leaves it
+ * stale.  Read by ec_opendir through etcfs_dir_cache_allowed. */
+static int dir_cache_allowed;
+
+int etcfs_dir_cache_allowed(void)
+{
+    return dir_cache_allowed;
+}
+
 static void etcfs_init(void *userdata, struct fuse_conn_info *conn)
 {
     (void) userdata;
     conn->want |= FUSE_CAP_READDIRPLUS;
     conn->want |= FUSE_CAP_ASYNC_READ;
+
+    /* Asked for explicitly even though libfuse enables it by default: the
+     * directory-listing cache's only bound on a missed invalidation depends on
+     * it, and a safety argument should not rest on a default nothing in this
+     * source mentions.  conn->capable is what the kernel offered, so a kernel
+     * too old to offer it turns the listing cache off rather than leaving it
+     * running with nothing to bound it. */
+    conn->want |= FUSE_CAP_AUTO_INVAL_DATA;
+    dir_cache_allowed = (conn->capable & FUSE_CAP_AUTO_INVAL_DATA) != 0;
+    if (!dir_cache_allowed)
+        etcfs_log(ETCFS_LOG_WARN,
+                  "this kernel does not offer FUSE_AUTO_INVAL_DATA, so a cached directory "
+                  "listing could outlive a lost invalidation without bound; "
+                  "directory listings will not be cached");
 }
 
 /* ---- main entry ---- */
