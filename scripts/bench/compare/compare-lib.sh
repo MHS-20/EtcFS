@@ -465,6 +465,17 @@ compare_metadata_ops() {
     log "--- metadata concurrency: $label (${#ips[@]} nodes x $per_node files in $dir) ---"
     $SSH_CMD "ec2-user@${ips[0]}" "sudo mkdir -p $dir && sudo chmod 777 $dir"
 
+    # A previous run of this label left one file per node it used, and the node
+    # IPs differ between runs — so without this the glob below reads both runs
+    # and reports whichever was slower. It is scoped to this label rather than
+    # the whole results directory, which holds every other scenario's output.
+    rm -f "$RESULTS_DIR/${label}"-*.elapsed
+
+    # The trailing newline is load-bearing. These files are concatenated below,
+    # and awk's %.3f without one glues every node's number into a single token:
+    # "18.320" and "18.366" become "18.32018.366", which `sort -g` reads as one
+    # value and awk then parses as 18.32018 — so the "slowest node" silently
+    # became the first file in glob order with the rest as trailing digits.
     local remote="
         p=\$(hostname -s)
         s=\$(date +%s.%N)
@@ -472,7 +483,7 @@ compare_metadata_ops() {
         for i in \$(seq 1 $per_node); do stat $dir/\$p-\$i >/dev/null; done
         for i in \$(seq 1 $per_node); do rm -f $dir/\$p-\$i; done
         e=\$(date +%s.%N)
-        awk -v s=\$s -v e=\$e 'BEGIN{printf \"%.3f\", e-s}'
+        awk -v s=\$s -v e=\$e 'BEGIN{printf \"%.3f\\n\", e-s}'
     "
     local ip pids=() i=0
     for ip in "${ips[@]}"; do

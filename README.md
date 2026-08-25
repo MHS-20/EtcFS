@@ -127,23 +127,30 @@ random-write throughput (934 IOPS against gluster's 1041 and gfs2's 973):
 
 | Case | EtcFS | Best competitor | Deficit |
 |---|---|---|---|
-| 80k-file untar | 3327 s | 29.8 s (gfs2) | **112x slower** |
-| Shared-directory metadata, 3 nodes | 180 ops/s | 1515 ops/s (gfs2) | **8.4x slower** |
+| 80k-file untar | 2244 s | 29.8 s (gfs2) | **75x slower** |
+| Shared-directory metadata, 3 nodes | 327 ops/s | 1515 ops/s (gfs2) | **4.6x slower** |
 | O_DSYNC 4 KiB writes | 155 IOPS | 989 (gfs2) | **6.4x slower** |
-| Cold negative lookup | 1474 us | 10.5 us (gfs2) | **140x slower** |
-| `du -s` over 80k files | 197 s | 0.41 s (nfs) | **480x slower** |
+| `du -s` over 80k files | 128 s | 0.41 s (nfs) | **312x slower** |
 
 One Raft commit per structural mutation is the standing cost of putting durable
-truth in etcd, and it is not a rounding error.
+truth in etcd, and it is not a rounding error. It does come down: taking the
+inode-number reservation and the parent directory's timestamp off the per-file
+path moved the first two rows from 112x and 8.4x. It does not come down to
+nothing — the transaction that publishes a name commits before `create()`
+returns, and
+[deferring that is a wrong answer rather than a durability trade](docs/design-decisions.md#creates-are-not-deferred-into-a-batch).
 
 **Where it makes no difference.** A warm page cache: all five converge on
 530–620k IOPS on a RAM-resident working set, which is RAM, not a filesystem.
 EtcFS reaches it while holding data pages only under the inode's lock (zero
 reads reached the daemon across the warm pass), so the coherence obligation is
-free here — but it is not an advantage. Repeated *negative* lookups are the same
-story: EtcFS answers a cached absence in 8.81 us, the same order as gfs2
-(5.40 us) and nfs (3.68 us), and 31–57x faster than juicefs and gluster, which
-do not cache absences at all.
+free here — but it is not an advantage.
+
+**Where the caches earn their keep.** A missing name costs 110 us cold and
+2.21 us warm — second and first of the five respectively, against 1474 us and
+8.81 us before the directory name-set prefetch and a one-minute entry timeout
+backed by a cluster-wide watch. gluster and juicefs do not cache absences at
+all.
 
 ## Documentation
 
