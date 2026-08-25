@@ -6,41 +6,10 @@ work is not kept here — it lives in the docs and in the reports under
 `docs/reports/`, with `benchmark-reports/overview.md` as the ledger of where
 EtcFS wins and loses.
 
-# Creation file commits: what is left
-
-A created-and-written file cost six Raft commits. Four are gone (see
-`docs/design-decisions.md#creates-are-not-deferred-into-a-batch` for the list and
-`docs/architecture/metadata/namespace-operations.md` for how the lock rides the
-create). Two remain, and only one of them looks removable:
-
-- **The create transaction itself.** Not deferrable: a batched create answers
-  `create()` before the exclusivity comparison it depends on has been evaluated,
-  and making it safe means locking directories. Argued out in Design Decisions.
-- **The extent publication `close()` forces.** Deferring it *was* built and
-  reverted: a peer's `stat` takes no inode lock, so nothing recalls this node's
-  lock on its behalf and the peer reads a stale size — an empty file where a
-  complete one was just closed. Chaos went 20 → 13. Removing this commit needs
-  the attribute path answerable across nodes without it, which is its own piece
-  of work and probably means the dirent/attr watch carrying the size.
-
 ## Ideas to improve the worst cases
 
-Each heading is a measured loss from `overview.md`. None of these is measured;
-they are the hypotheses worth testing, with the risk each one carries.
-
-**Small-file storm and shared-directory metadata concurrency.** See
-`overview.md` for the current numbers; both are commit-bound and the count is
-what moves them. What is left of that count is the section above, and neither
-remaining commit has a cheap answer — batching the create is argued out in
-Design Decisions, and deferring the close needs the attribute path fixed first.
-
-**Shared-file write bandwidth — 61.7 MiB/s at 6 nodes, 7.3x behind gfs2, and
-falling as nodes are added.**
-
-- *Byte-range locks.* The whole inode is the lock unit today, so six writers to
-  disjoint offsets of one file serialise on a single key. Range locks would let
-  them proceed in parallel; the cost is a range structure in the lock key and a
-  harder recall path.
+A measured loss from `overview.md` with no decision recorded against it yet.
+The rest have one — see `docs/design-decisions.md`.
 
 **Single-node random writes — 21.7% of the raw device's IOPS.**
 
@@ -53,6 +22,18 @@ falling as nodes are added.**
 
 ## Outstanding benchmark work
 
+- [ ] **Re-run the 80k storm and the comparison table.** The headline figures in
+      `smallfile-storm.md` and `overview.md` predate the 2026-08-25 commit
+      reduction (lock key in the create transaction, batched key releases) and
+      have not been re-measured; each arm is ~40 minutes.
+- [ ] **Benchmark on non-burstable instances, serially.** `t3.medium` runs out
+      of CPU credits within minutes of a sustained untar — CloudWatch showed
+      `CPUCreditBalance` pinned at 0 for the whole of an hour-long run — and
+      several clusters were running concurrently on one account. That combination
+      manufactured a 1.54x "regression" out of nothing. Use
+      `ETCFS_INSTANCE_TYPE=m5.large` for long runs, one at a time, and check the
+      credit balance afterwards. The storm's run-to-run spread at 10k files on
+      t3.medium is ±20%, which is larger than anything the commit count can move.
 - [ ] **A fenced GFS2 comparison.** The node-kill run measures an *unfenced*
       GFS2 cluster, where the survivors' lockspace stops for good — so there is
       no recovery time to divide by, and none should be quoted. Configure real
@@ -78,7 +59,3 @@ falling as nodes are added.**
       8 GiB handoff is pinned to the t3.medium's own EBS ceiling (254.14 MiB/s
       measured on the same instance), so the scenario currently measures the
       hardware rather than any backend.
-
-
-# Future Extension
-Cross-file / cross-directory atomicity does not exist. Each inode is independently consistent; there is no multi-inode transaction, no snapshot spanning several files. An application that needs "these three files change together, atomically, cluster-wide" gets nothing from the filesystem for that — it has to build it itself.

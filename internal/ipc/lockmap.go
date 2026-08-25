@@ -21,6 +21,10 @@ type lockMap struct {
 	mu      sync.Mutex
 	entries map[uint64]*lockEntry
 
+	// evicting marks a sweep in flight, which runs with mu dropped. See
+	// evictLocked.
+	evicting bool
+
 	// drop publishes the entries' buffers and gives up their etcd keys, in one
 	// transaction, returning those whose keys are gone. It runs with each
 	// entry's write lock held and the set's mutex held.
@@ -39,8 +43,14 @@ func (m *lockMap) entryFor(ino uint64) *lockEntry {
 	e := m.entries[ino]
 	if e == nil {
 		m.evictLocked()
-		e = &lockEntry{ino: ino}
-		m.entries[ino] = e
+		// evictLocked drops the set's mutex while it gives the keys up, so the
+		// inode may have been inserted by someone else in the meantime.
+		// Overwriting it would leave two entries for one inode, one of them
+		// holding an etcd key nothing would ever release.
+		if e = m.entries[ino]; e == nil {
+			e = &lockEntry{ino: ino}
+			m.entries[ino] = e
+		}
 	}
 	e.lastUsed = time.Now()
 	return e
@@ -99,25 +109,54 @@ func (m *lockMap) drain() []*lockEntry {
 // bound by up to a batch, which is what the bound already tolerates in the
 // other direction.
 //
+// **The set's mutex is released while the keys are given up**, and that is not
+// an optimisation.  Yielding a key invalidates the inode's kernel pages, which
+// is a synchronous round trip to the FUSE daemon and a notify into the kernel;
+// a batch of them is that cost lockEvictBatch times over.  This mutex is taken
+// by every operation on the node (entryFor, lookup, isCurrent), so holding it
+// across the batch stalls the whole node for the length of the sweep — measured
+// as a 1.25x loss on an untar, which is more than batching the commits wins.
+// One victim at a time hid it, because one round trip is short.
+//
+// The victims stay in the set while they are dropped, holding their own write
+// locks.  An operation that arrives for one of those inodes finds the entry,
+// blocks on its lock, and on waking sees the entry is no longer current and
+// starts again on the one that replaced it — the eviction race lockInode
+// already handles.  Removing them from the set first would instead let that
+// operation build a *second* entry for an inode this node still holds the key
+// for, and its own exclusive acquisition would then be blocked by that key
+// forever.
+//
 // Only an entry no operation currently holds can go, so a full set of busy
 // inodes grows past the bound rather than blocking; the bound is a target, not
 // an invariant.
 func (m *lockMap) evictLocked() {
-	if len(m.entries) < lockCacheMax {
+	if len(m.entries) < lockCacheMax || m.evicting {
 		return
 	}
 	victims := m.claimVictimsLocked(lockEvictBatch)
 	if len(victims) == 0 {
 		return
 	}
+
+	// One sweep at a time: a second one entering while this has the mutex
+	// dropped would pick its own victims and pay its own stall for room this
+	// one is already making.
+	m.evicting = true
+	m.mu.Unlock()
+
+	released := m.drop(victims, "eviction")
+	for _, e := range victims {
+		e.rw.Unlock()
+	}
+
+	m.mu.Lock()
+	m.evicting = false
 	// Entries whose keys could not be given up — their writes are unpublished,
 	// or their pages are not invalidated — are not returned and stay in the set
 	// with their buffers reachable by the flush interval.
-	for _, e := range m.drop(victims, "eviction") {
+	for _, e := range released {
 		delete(m.entries, e.ino)
-	}
-	for _, e := range victims {
-		e.rw.Unlock()
 	}
 }
 
