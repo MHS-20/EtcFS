@@ -914,10 +914,10 @@ func (s *Service) flushDue(ctx context.Context, due []*lockEntry) {
 	}
 }
 
-// FSYNC/FSYNCDIR payload: [u64:ino]
+// FSYNC/FLUSH/FSYNCDIR payload: [u64:ino]
 // Response: [i32:error]
 //
-// Both publish what this node is holding for the inode and block until it
+// All three publish what this node is holding for the inode and block until it
 // commits, which is what makes the acknowledgement mean what fsync promises.
 // A flush that failed for a transient reason keeps its buffer and keeps
 // returning EIO here until one commits.
@@ -952,55 +952,4 @@ func (s *Service) handleFsync(ctx context.Context, payload []byte) ([]byte, erro
 		}
 	}
 	return okResp(), nil
-}
-
-// FLUSH payload: [u64:ino]
-// Response: [i32:error]
-//
-// close() sends this, and it is not fsync.  It used to be answered as fsync:
-// the buffer was published and the caller waited for the commit, so every
-// closed file cost a Raft commit of its own — which for an unpacking archive is
-// a commit per file, on a path where nothing asked for durability.
-//
-// close() does not promise durability and never did; what it promises is that a
-// failure the descriptor already suffered is reported rather than swallowed,
-// and that is what is answered here.  The buffer stays buffered and is
-// published by the interval sweep, together with every other inode closed in
-// the same window (see flushEntries) — so the commit still happens, within the
-// flush interval, for one commit instead of N.
-//
-// What a peer sees is unchanged.  It cannot read this file without taking its
-// lock, and it cannot take its lock without recalling this node's, which
-// publishes the buffer before the key is yielded.  Coherence is the lock
-// protocol's, not this call's; only durability is deferred, by the same
-// interval and to the same bound that write delegation already deferred it by.
-// A caller that wants more calls fsync, which still commits before it answers.
-func (s *Service) handleFlush(_ context.Context, payload []byte) ([]byte, error) {
-	r := newReader(payload)
-	ino := r.u64()
-	if !r.ok {
-		return int32Resp(errInval), nil
-	}
-	if err := s.pendingError(ino); err != nil {
-		s.log.Warn("close: this inode's deferred writes have not been published",
-			"ino", ino, "error", err)
-		return int32Resp(errIO), nil
-	}
-	return okResp(), nil
-}
-
-// pendingError returns the failure a flush of this inode's buffer last hit and
-// has not yet recovered from, so that close() reports what the descriptor
-// already suffered.  Nil when the buffer is clean, empty, or absent.
-func (s *Service) pendingError(ino uint64) error {
-	e := s.locks.lookup(ino)
-	if e == nil {
-		return nil
-	}
-	e.keyMu.Lock()
-	defer e.keyMu.Unlock()
-	if e.pending == nil {
-		return nil
-	}
-	return e.pending.err
 }

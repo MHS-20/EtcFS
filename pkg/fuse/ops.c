@@ -1051,7 +1051,7 @@ static void ec_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
     fuse_reply_err(req, 0);
 }
 /* Ask the backend to publish everything it is holding for this inode, and wait
- * for it.  fsync and fsyncdir go through here: a write is acknowledged before
+ * for it.  fsync, fsyncdir and flush go through here: a write is acknowledged before
  * its extent reaches etcd, so neither can be answered locally any more, and a
  * failure has to reach the caller rather than be swallowed. */
 static void ec_sync_inode(fuse_req_t req, fuse_ino_t ino)
@@ -1062,18 +1062,19 @@ static void ec_sync_inode(fuse_req_t req, fuse_ino_t ino)
     ipc_reply_status(req, IPC_OP_FSYNC, payload, off);
 }
 
-/* close() sends this, and it is a weaker request than fsync: POSIX asks close()
- * to surface an error the descriptor already suffered, not to make the writes
- * durable.  Sending it as fsync cost a Raft commit per closed file on a path
- * that never asked for one; the backend answers this opcode from what it
- * already knows and leaves the publication to its own flush interval. */
+/* close() sends this, so it is where a program that never calls fsync still
+ * gets its writes published before the descriptor goes away.
+ *
+ * That commit is not the durability POSIX declines to promise at close(); it is
+ * what makes a file closed on one node readable in full on another.  A peer's
+ * stat does not take the inode's lock, so nothing recalls this node's on its
+ * behalf, and a peer that reads a size etcd has not been told about stops at
+ * the old one.  Answering close() without publishing was measured against the
+ * chaos suite and broke exactly that. */
 static void ec_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     (void) fi;
-    uint8_t payload[8];
-    uint32_t off = wb_u64(payload, ino);
-
-    ipc_reply_status(req, IPC_OP_FLUSH, payload, off);
+    ec_sync_inode(req, ino);
 }
 /* datasync is ignored: this filesystem has no attribute state that outlives a
  * write independently of the extent publishing it, so both halves of the
