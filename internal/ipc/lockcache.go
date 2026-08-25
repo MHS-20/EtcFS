@@ -754,16 +754,16 @@ func (s *Service) ReleaseCachedLocks() {
 // hold began somewhere inside — the same statement ensureLockKey records for an
 // acquisition of its own, and the one the mutual-exclusion checker needs in
 // order to see this key at all.
-func (s *Service) seedCreatedLock(ino uint64, holder string, rec *metadata.InodeRecord, call, ret time.Time) {
+// It reports whether the lock was cached.  A refusal leaves a key in etcd that
+// no cache entry names, so the caller must delete it — see discardCreatedLock.
+func (s *Service) seedCreatedLock(ino uint64, holder string, rec *metadata.InodeRecord, call, ret time.Time) bool {
 	lease, ok := metadata.LockHolderLease(holder)
 	if !ok {
-		// The token is minted here and parsed here, so this cannot happen
-		// without a change to its format; not caching the lock is the harmless
-		// way to be wrong about it, since the key is still released by the
-		// session lease.
-		s.log.Error("a created inode's lock holder token has no lease in it, so its lock is not cached",
+		// The token is minted and parsed by the same package, so this cannot
+		// happen without a change to its format.
+		s.log.Error("a created inode's lock holder token has no lease in it",
 			"ino", ino, "holder", holder)
-		return
+		return false
 	}
 
 	e := s.locks.entryFor(ino)
@@ -771,12 +771,11 @@ func (s *Service) seedCreatedLock(ino uint64, holder string, rec *metadata.Inode
 	defer e.keyMu.Unlock()
 	// An entry that already holds a key for this inode number is a number handed
 	// out twice, which the allocator does not do.  Leaving the existing entry
-	// alone is still the safe answer: overwriting the holder would orphan a key
-	// only the old token names.
+	// alone is the safe answer: overwriting the holder would orphan a key only
+	// the old token names, which is exactly what the caller's delete avoids.
 	if e.holder != "" {
-		s.log.Error("a created inode already had a cached lock, so the one taken with it is not cached",
-			"ino", ino)
-		return
+		s.log.Error("a created inode already had a cached lock", "ino", ino)
+		return false
 	}
 	e.holder, e.lease, e.mode, e.acquiredAt = holder, lease, metadata.LockExclusive, ret
 	// The create transaction is the whole of what etcd holds for this inode: the
@@ -785,17 +784,19 @@ func (s *Service) seedCreatedLock(ino uint64, holder string, rec *metadata.Inode
 	// validity rule every other cached snapshot obeys.
 	e.meta, e.metaFor = &inodeMeta{rec: rec}, holder
 	s.recordKeyEvent(ino, metadata.LockExclusive, lockEventAcquire, call, ret, call)
+	return true
 }
 
-// discardCreatedLock deletes a lock key a failed create may nonetheless have
-// written.
+// discardCreatedLock deletes a lock key the create may have written and that
+// nothing is going to release.
 //
 // A create that reports failure has usually written nothing — the transaction
 // that would have taken the lock is the one that did not commit.  The exception
 // is a commit whose reply was lost, which is reported as a failure and leaves
 // the key standing under this node's session lease, held by a token no cache
 // entry names.  Nothing would ever release it, and every peer that wanted the
-// inode would block on it until this node exited.
+// inode would block on it until this node exited.  A create that succeeded but
+// whose lock the cache refused reaches here for the same reason.
 //
 // So the key is deleted rather than reasoned about.  The token names exactly
 // one key and only this call ever had it, so the delete cannot touch a lock

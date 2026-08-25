@@ -464,8 +464,10 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 		}
 		return int32Resp(errnoFor(err, errExist)), nil // EEXIST unless fenced
 	}
-	if holder != "" {
-		s.seedCreatedLock(ino, holder, rec, call, time.Now())
+	if holder != "" && !s.seedCreatedLock(ino, holder, rec, call, time.Now()) {
+		// The key is in etcd and nothing names it, so it has to go; the first
+		// write acquires the lock the way it did before.
+		s.discardCreatedLock(ino, holder)
 	}
 	s.dirents.created(parent, name)
 
