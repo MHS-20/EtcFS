@@ -283,6 +283,27 @@ func TestIntegration_InodeAllocation(t *testing.T) {
 	assert.Equal(t, FirstUsableIno+1, next)
 }
 
+func TestIntegration_ReserveCounterHandsOutDisjointBlocks(t *testing.T) {
+	store := testStore(t, "node-1")
+	ctx := context.Background()
+
+	const block = 1024
+	first, err := store.ReserveCounter(ctx, KeyInodeAllocCounter, FirstUsableIno, block)
+	require.NoError(t, err)
+	assert.Equal(t, FirstUsableIno, first)
+
+	// The whole block is reserved, not just its first number: the next caller
+	// starts past the end of it or two nodes hand out the same inode.
+	second, err := store.ReserveCounter(ctx, KeyInodeAllocCounter, FirstUsableIno, block)
+	require.NoError(t, err)
+	assert.Equal(t, first+block, second)
+
+	// A single value still follows the block rather than reusing it.
+	next, err := store.NextCounter(ctx, KeyInodeAllocCounter, FirstUsableIno)
+	require.NoError(t, err)
+	assert.Equal(t, second+block, next)
+}
+
 func TestIntegration_CounterIsUniqueUnderConcurrency(t *testing.T) {
 	store := testStore(t, "node-1")
 	ctx := context.Background()

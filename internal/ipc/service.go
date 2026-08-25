@@ -99,6 +99,10 @@ type Service struct {
 	// last name can keep the record alive until the last one closes.
 	open *openFiles
 
+	// inodes hands out inode numbers from a block reserved in etcd, so a create
+	// does not wait on Raft for its number. See inodealloc.go.
+	inodes *inodeBlocks
+
 	// locks caches this node's inode locks past the operations that took them,
 	// so a repeat acquisition costs no etcd round trip. See lockcache.go for
 	// what a cached lock obliges this node to do before giving one up.
@@ -178,6 +182,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		alloc:          arena.NewAllocator(membership.NodeID(), store),
 		log:            log,
 		open:           newOpenFiles(),
+		inodes:         newInodeBlocks(store),
 		recalls:        newRecallSet(),
 		dirCursors:     newDirCursors(),
 		notifyServer:   &notifyServer{},

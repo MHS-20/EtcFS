@@ -863,7 +863,8 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 // at all, not even between two processes on one node.  Leaving them unwired
 // gives fcntl() the same node-local-correct behavior flock() already has.
 
-// allocInode reserves an inode number from etcd.
+// allocInode reserves an inode number, from the block this node is holding
+// when it still has one and from etcd when it does not.  See inodealloc.go.
 //
 // Inodes 0 and 1 are both reserved: 0 is not a valid inode, and 1 is
 // FUSE_ROOT_ID — the root directory, which the C daemon answers for locally
@@ -871,5 +872,5 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 // overwrites the root inode record and makes the whole mount return EIO, so
 // the first allocation must be 2.
 func (s *Service) allocInode(ctx context.Context) (uint64, error) {
-	return s.store.NextCounter(ctx, metadata.KeyInodeAllocCounter, metadata.FirstUsableIno)
+	return s.inodes.reserve(ctx)
 }
