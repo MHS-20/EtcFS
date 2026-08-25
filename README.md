@@ -135,15 +135,9 @@ random-write throughput (934 IOPS against gluster's 1041 and gfs2's 973):
 One Raft commit per structural mutation is the standing cost of putting durable
 truth in etcd, and it is not a rounding error. It does come down: taking the
 inode-number reservation and the parent directory's timestamp off the per-file
-path moved the first two rows from 112x and 8.4x. Two more have since gone — the
-inode's lock key rides the create transaction, and evicted keys are released a
-batch at a time — so a created-and-written file costs two commits and a fraction
-where it cost six. The untar row does not move with them: that scenario is no
-longer commit-bound, and the remaining effect is smaller than the benchmark's
-own spread ([why](docs/reports/benchmark-reports/smallfile-storm.md)).
-
-It does not come down to nothing — the transaction that publishes a name commits
-before `create()` returns, and
+path moved the first two rows from 112x and 8.4x. It does not come down to
+nothing — the transaction that publishes a name commits before `create()`
+returns, and
 [deferring that is a wrong answer rather than a durability trade](docs/design-decisions.md#creates-are-not-deferred-into-a-batch).
 
 **Where it makes no difference.** A warm page cache: all five converge on

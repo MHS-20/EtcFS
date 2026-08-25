@@ -837,7 +837,7 @@ func (s *Service) flushInode(ctx context.Context, ino uint64) error {
 // It takes them in the same chunks the interval sweep does, so it never holds
 // the whole cache's local locks across a commit.
 func (s *Service) FlushAll(ctx context.Context, trigger string) {
-	var held []*lockEntry
+	held := make([]*lockEntry, 0, flushBatchInodes)
 	for _, e := range s.locks.all() {
 		e.rw.Lock()
 		held = append(held, e)
@@ -889,7 +889,7 @@ func (s *Service) StartFlusher(ctx context.Context) {
 func (s *Service) flushExpired(ctx context.Context) {
 	deadline := time.Now().Add(-s.flushInterval)
 
-	var due []*lockEntry
+	due := make([]*lockEntry, 0, flushBatchInodes)
 	for _, e := range s.locks.all() {
 		e.keyMu.Lock()
 		expired := !e.pending.empty() && e.pending.since.Before(deadline)

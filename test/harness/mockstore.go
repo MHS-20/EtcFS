@@ -109,7 +109,26 @@ func (s *MockStore) Delete(ctx context.Context, key string) error {
 func (s *MockStore) GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.KeyValue, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.prefixLocked(prefix), nil
+}
 
+// GetPrefixes answers several prefixes from one snapshot, which is what a
+// caller rebuilding a consistent view of the tree needs: two GetPrefix calls
+// see two different states, and a write landing between them is visible through
+// one prefix and not the other.  Real etcd gets this from reading every range
+// at one revision; here it is the one lock held across all of them.
+func (s *MockStore) GetPrefixes(ctx context.Context, prefixes ...string) ([][]*mvccpb.KeyValue, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([][]*mvccpb.KeyValue, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		out = append(out, s.prefixLocked(prefix))
+	}
+	return out, nil
+}
+
+func (s *MockStore) prefixLocked(prefix string) []*mvccpb.KeyValue {
 	var kvs []*mvccpb.KeyValue
 	for k, v := range s.kv {
 		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
@@ -119,7 +138,7 @@ func (s *MockStore) GetPrefix(ctx context.Context, prefix string) ([]*mvccpb.Key
 	sort.Slice(kvs, func(i, j int) bool {
 		return string(kvs[i].Key) < string(kvs[j].Key)
 	})
-	return kvs, nil
+	return kvs
 }
 
 func (s *MockStore) Txn(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, error) {

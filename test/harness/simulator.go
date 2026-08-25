@@ -240,16 +240,20 @@ func (s *Simulator) simulateCrash() {
 	s.dirents = make(map[string]uint64)
 	s.locks = make(map[uint64]*metadata.LockRecord)
 
+	// Both prefixes from one snapshot.  A peer creating files while this node
+	// restarts publishes the inode before the dirent that names it, so one
+	// snapshot can never hold the second without the first — but reading the
+	// two ranges separately can, and that torn view fails the invariant check
+	// for a state no restart could actually observe.
 	ctx := context.Background()
-	kvs, _ := s.store.GetPrefix(ctx, metadata.PrefixInode)
-	for _, kv := range kvs {
+	snap, _ := s.store.GetPrefixes(ctx, metadata.PrefixInode, metadata.PrefixDirent)
+	for _, kv := range snap[0] {
 		rec := decodeInode(kv.Value)
 		if rec != nil {
 			s.inodes[rec.Ino] = rec
 		}
 	}
-	kvs, _ = s.store.GetPrefix(ctx, metadata.PrefixDirent)
-	for _, kv := range kvs {
+	for _, kv := range snap[1] {
 		ino := metadata.DecodeUint64(kv.Value)
 		s.dirents[string(kv.Key)] = ino
 	}

@@ -157,27 +157,11 @@ func (s *Store) Txn(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clie
 // A caller that keeps its own copy of what it just wrote needs that number: it
 // is what a later compare-and-set on those keys must compare against.
 func (s *Store) TxnRev(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, int64, error) {
-	resp, err := s.TxnResponse(ctx, ifs, thens, elses)
-	if err != nil {
-		return false, 0, err
-	}
-	return resp.Succeeded, resp.Header.Revision, nil
-}
-
-// TxnResponse is TxnRev with etcd's whole reply, for the callers that have to
-// know what an individual operation did rather than only whether the
-// transaction committed.
-//
-// A batch of deletes is the case that needs it: "the transaction committed"
-// says nothing about which of its keys were still there to delete, and that
-// distinction is what tells a lock this node dropped from one its lease had
-// already dropped for it.
-func (s *Store) TxnResponse(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (*clientv3.TxnResponse, error) {
 	guarded := ifs
 	if s.guard != nil {
 		cmp, _, ok := s.guard()
 		if !ok {
-			return nil, fmt.Errorf("txn: %w", ErrGuardUnavailable)
+			return false, 0, fmt.Errorf("txn: %w", ErrGuardUnavailable)
 		}
 		// Prepend so the guard is evaluated with the caller's comparisons in
 		// one atomic evaluation, not as a separate round trip that could race
@@ -185,16 +169,16 @@ func (s *Store) TxnResponse(ctx context.Context, ifs []clientv3.Cmp, thens, else
 		guarded = append([]clientv3.Cmp{cmp}, ifs...)
 	}
 
-	resp, err := s.txnRawResponse(ctx, guarded, thens, elses)
+	ok, rev, err := s.txnRaw(ctx, guarded, thens, elses)
 	if err != nil {
-		return nil, err
+		return false, 0, err
 	}
-	if !resp.Succeeded && s.guard != nil {
+	if !ok && s.guard != nil {
 		if fenced, ferr := s.guardFailed(ctx); ferr == nil && fenced {
-			return nil, fmt.Errorf("txn: %w", ErrFenced)
+			return false, 0, fmt.Errorf("txn: %w", ErrFenced)
 		}
 	}
-	return resp, nil
+	return ok, rev, nil
 }
 
 // txnRaw executes a transaction without the fencing guard.
@@ -205,27 +189,17 @@ func (s *Store) TxnResponse(ctx context.Context, ifs []clientv3.Cmp, thens, else
 // registration that runs before the generation is known.  Everything else must
 // use Txn.
 func (s *Store) txnRaw(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (bool, int64, error) {
-	resp, err := s.txnRawResponse(ctx, ifs, thens, elses)
-	if err != nil {
-		return false, 0, err
-	}
-	return resp.Succeeded, resp.Header.Revision, nil
-}
-
-// txnRawResponse is txnRaw with etcd's whole reply.  Same rules: unguarded, so
-// control-plane paths only.
-func (s *Store) txnRawResponse(ctx context.Context, ifs []clientv3.Cmp, thens, elses []clientv3.Op) (*clientv3.TxnResponse, error) {
 	resp, err := s.client.Txn(ctx).If(ifs...).Then(thens...).Else(elses...).Commit()
 	if err != nil {
 		metrics.EtcdTxns.WithLabelValues("error").Inc()
-		return nil, fmt.Errorf("txn: %w", err)
+		return false, 0, fmt.Errorf("txn: %w", err)
 	}
 	if resp.Succeeded {
 		metrics.EtcdTxns.WithLabelValues("committed").Inc()
 	} else {
 		metrics.EtcdTxns.WithLabelValues("rejected").Inc()
 	}
-	return resp, nil
+	return resp.Succeeded, resp.Header.Revision, nil
 }
 
 // guardFailed reports whether the installed guard no longer matches the stored

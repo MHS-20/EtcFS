@@ -20,12 +20,44 @@ The rest have one — see `docs/design-decisions.md`.
   on the data path and a larger `max_write` are the candidates once there is a
   profile to justify one.
 
-## Outstanding benchmark work
+## Next steps, ranked
 
-- [ ] **Re-run the 80k storm and the comparison table.** The headline figures in
-      `smallfile-storm.md` and `overview.md` predate the 2026-08-25 commit
-      reduction (lock key in the create transaction, batched key releases) and
-      have not been re-measured; each arm is ~40 minutes.
+**1. Split the cache-invalidation channel.** `pkg/fuse/fuse.c`'s `notify_thread`
+serves two kinds of traffic on one serial loop: `NOTIFY_INVAL_ENTRY`, which is
+fire-and-forget and arrives once per create from the dirent watch, and
+`NOTIFY_INVAL_INODE`, which the backend *blocks on* because it may not yield an
+inode's lock until the kernel's pages for it are gone. An unpacking archive
+floods the thread with the first, the second queues behind thousands of them,
+the backend's read deadline expires, and the connection is dropped as out of
+step — which disables page caching for the whole mount until the next open
+re-enables it, and then it happens again.
+
+This is head-of-line blocking between acknowledged and unacknowledged traffic
+sharing one channel, not slowness, so the fix is to separate them: their own
+socket and thread, or an entry-invalidation queue the notify thread drains
+without holding up acks. It is what blocks putting the inode's lock in the
+create transaction — one Raft commit per created-and-written file — and it is a
+fragility that will bite any future change touching invalidation concurrency.
+See `docs/design-decisions.md#the-create-time-lock-key-was-reverted`.
+
+**2. Guardrails on the comparison harness.** Refuse to start a run while another
+is in flight, and check `CPUCreditBalance` after any burstable-instance run. The
+combination of the two cost most of a day and manufactured a 1.54x "regression"
+that did not exist.
+
+**3. Decide about the batched cross-inode flush.** `Service.flushEntries` is in
+the tree, is correct, and is unmeasured — and it cannot help the small-file
+storm by construction, since `close()` publishes each file before the interval
+sweep ever sees it. Either measure it where it applies (concurrent writers
+across many inodes) or take it out. Unmeasured performance code is debt.
+
+**4. `bench-node-scaling.sh` at 8 and 16 nodes.** The one measurement that would
+support the central claim. Over 2/4/6 nodes GFS2 loses 47% of its
+shared-directory metadata throughput while EtcFS gains 34%, but GFS2 is still 4x
+faster in absolute terms at six, so "more scalable" is not claimable yet.
+
+## Pending benchmark work
+
 - [ ] **Benchmark on non-burstable instances, serially.** `t3.medium` runs out
       of CPU credits within minutes of a sustained untar — CloudWatch showed
       `CPUCreditBalance` pinned at 0 for the whole of an hour-long run — and
@@ -39,12 +71,7 @@ The rest have one — see `docs/design-decisions.md`.
       no recovery time to divide by, and none should be quoted. Configure real
       STONITH (`fence_aws` stops the instance through the AWS API) and re-run
       `bench-node-kill.sh` to get a like-for-like number against EtcFS's 2.19 s.
-- [ ] **`bench-node-scaling.sh` at 8 and 16 nodes.** Over 2/4/6 nodes GFS2 loses
-      47% of its shared-directory metadata throughput while EtcFS gains 34%, but
-      GFS2 is still 4x faster in absolute terms at six, so "Nx more scalable" is
-      not claimable yet. The crossing point, if there is one, is at 8/16
-      (`ETCFS_SCALE_NODES="2 4 8 16"`); this account's EC2 capacity is what
-      capped the run at six.
+
 - [ ] **`bench-arena-soak.sh`'s headline metric.** `avail_lost_per_live_byte`
       baselines on the script's first sample, taken before the churn has written
       anything, so the ratio is mostly the filesystem filling up for the first
@@ -59,3 +86,7 @@ The rest have one — see `docs/design-decisions.md`.
       8 GiB handoff is pinned to the t3.medium's own EBS ceiling (254.14 MiB/s
       measured on the same instance), so the scenario currently measures the
       hardware rather than any backend.
+
+
+# Future Extension
+Cross-file / cross-directory atomicity does not exist. Each inode is independently consistent; there is no multi-inode transaction, no snapshot spanning several files. An application that needs "these three files change together, atomically, cluster-wide" gets nothing from the filesystem for that — it has to build it itself.

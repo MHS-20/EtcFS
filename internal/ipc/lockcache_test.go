@@ -79,7 +79,7 @@ func TestSharedLocksReleaseIndependently(t *testing.T) {
 // it: the entry is the node-local exclusion, so dropping a busy one would let a
 // second operation acquire a fresh entry for the same inode and run alongside.
 func TestEvictionSkipsBusyEntries(t *testing.T) {
-	s := &Service{locks: newLockMap(func(es []*lockEntry, _ string) []*lockEntry { return es })}
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil })}
 
 	// The oldest entry is the one eviction would pick first, and it is busy.
 	busy := &lockEntry{ino: 1, lastUsed: time.Unix(0, 0)}
@@ -99,11 +99,6 @@ func TestEvictionSkipsBusyEntries(t *testing.T) {
 	if len(s.locks.entries) >= lockCacheMax {
 		t.Fatalf("cache still at %d entries, eviction made no room", len(s.locks.entries))
 	}
-	// A sweep gives up a whole batch, so the next lockEvictBatch-1 inodes cost
-	// no commit at all — which is the point of batching them.
-	if want := lockCacheMax - lockEvictBatch; len(s.locks.entries) != want {
-		t.Fatalf("cache at %d entries after one sweep, want %d", len(s.locks.entries), want)
-	}
 	busy.rw.Unlock()
 }
 
@@ -112,7 +107,7 @@ func TestEvictionSkipsBusyEntries(t *testing.T) {
 // so two of this node's own operations would run against one inode believing
 // each holds it — the exclusion the cached etcd key no longer provides.
 func TestRecallKeepsTheEntryInTheCache(t *testing.T) {
-	s := &Service{locks: newLockMap(func(es []*lockEntry, _ string) []*lockEntry { return es }), log: testLogger()}
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil }), log: testLogger()}
 	e := s.locks.entryFor(7)
 
 	s.recallLock(7)
@@ -128,7 +123,7 @@ func TestRecallKeepsTheEntryInTheCache(t *testing.T) {
 // A recall waits out the minimum hold time before taking the lock away, so
 // contention on one inode cannot turn every operation into a recall.
 func TestRecallHonoursTheMinimumHoldTime(t *testing.T) {
-	s := &Service{locks: newLockMap(func(es []*lockEntry, _ string) []*lockEntry { return es }), log: testLogger()}
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil }), log: testLogger()}
 	e := s.locks.entryFor(7)
 	e.acquiredAt = time.Now()
 
@@ -142,7 +137,7 @@ func TestRecallHonoursTheMinimumHoldTime(t *testing.T) {
 // An operation holding an entry that has since been evicted must not proceed
 // on it: the entry excludes nothing once it is out of the cache.
 func TestEvictedEntryIsNotCurrent(t *testing.T) {
-	s := &Service{locks: newLockMap(func(es []*lockEntry, _ string) []*lockEntry { return es })}
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil })}
 	e := s.locks.entryFor(7)
 
 	if !s.locks.isCurrent(e) {
@@ -163,7 +158,7 @@ func TestEvictedEntryIsNotCurrent(t *testing.T) {
 // re-acquired under a fresh session holds a live key, and dropping it with the
 // dead one would discard writes that are still publishable.
 func TestSessionLossDropsOnlyTheCachesUnderTheDeadLease(t *testing.T) {
-	s := &Service{locks: newLockMap(func(es []*lockEntry, _ string) []*lockEntry { return es }), log: testLogger()}
+	s := &Service{locks: newLockMap(func(*lockEntry, string) error { return nil }), log: testLogger()}
 
 	const dead, live = clientv3.LeaseID(11), clientv3.LeaseID(12)
 	stale := s.locks.entryFor(7)
