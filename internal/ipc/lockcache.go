@@ -10,6 +10,7 @@ import (
 
 	"github.com/MHS-20/EtcFS/pkg/arena"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
+	"github.com/MHS-20/EtcFS/pkg/metrics"
 )
 
 // Inode lock caching.
@@ -63,15 +64,31 @@ const (
 	contendedAttempts = 22
 
 	// minHoldTime is how long a freshly acquired lock is kept before a peer's
-	// recall is honoured.  Without it, sustained contention on one inode costs a
-	// recall and a want key per operation — two extra commits where the
-	// per-operation acquire this cache replaced cost one, so the cache would
-	// make the contended case worse than the case it was built to fix.
+	// recall is honoured, and the floor the adaptive hold below decays back to.
+	// Without it, sustained contention on one inode costs a recall and a want
+	// key per operation — two extra commits where the per-operation acquire this
+	// cache replaced cost one, so the cache would make the contended case worse
+	// than the case it was built to fix.
 	//
 	// This is GFS2's gl_hold_time and it makes the same trade: a bounded extra
 	// wait for the peer, in exchange for a bound on how often a lock can change
 	// hands.  It costs nothing when uncontended, since nothing recalls.
 	minHoldTime = 10 * time.Millisecond
+
+	// maxHoldTime caps how far that hold can grow under sustained contention.
+	//
+	// A fixed floor answers a recall that arrives moments after an acquisition,
+	// but not a workload where every handover does — six nodes writing disjoint
+	// ranges of one file, say, where the inode changes hands continuously and
+	// each turn buys one operation before the next recall.  There the hold has
+	// to grow, so a node amortises the handover over several operations instead
+	// of paying a round trip per turn.
+	//
+	// What the growth spends is the waiter's latency, so the ceiling is what
+	// keeps that honest: a peer blocked on an inode waits at most this long per
+	// handover, against an acquisition budget that runs to the request deadline.
+	// It is also the flush interval, which a recall already has to wait out.
+	maxHoldTime = 100 * time.Millisecond
 )
 
 // lockEntry is one inode's cached lock.
@@ -88,7 +105,14 @@ type lockEntry struct {
 	mode       metadata.LockMode // meaningful only while holder is set
 	holder     string
 	lease      clientv3.LeaseID // the session lease holder was written under
-	acquiredAt time.Time        // when holder was taken, for minHoldTime
+	acquiredAt time.Time        // when holder was taken, for the hold below
+
+	// holdTime is how long this inode's lock is kept before a recall is
+	// honoured.  It grows while handovers keep arriving inside the current hold
+	// and decays when they stop, so an inode nobody contends for costs nothing
+	// and one that is fought over stops changing hands on every operation.
+	// Zero means it has never been contended, and reads as minHoldTime.
+	holdTime time.Duration
 
 	// meta is the inode's record and extent list as last read or written by
 	// this node, and metaFor is the holder token they were read under.  A
@@ -436,12 +460,11 @@ func (s *Service) recallLock(ino uint64) {
 	// A lock taken moments ago is held to its minimum before being given up, so
 	// that contention on one inode cannot turn every single operation into a
 	// recall.  The holder keeps making progress during the wait.
-	e.keyMu.Lock()
-	held := time.Since(e.acquiredAt)
-	e.keyMu.Unlock()
-	if held < minHoldTime {
-		time.Sleep(minHoldTime - held)
+	held, hold := e.handoverHold()
+	if held < hold {
+		time.Sleep(hold - held)
 	}
+	metrics.LockHandoverHold.Observe(hold.Seconds())
 
 	if err := s.yieldCachedLock(ino, "recall"); err != nil {
 		s.log.Error("cached inode lock not yielded: this node's writes to it are not published",
@@ -449,6 +472,34 @@ func (s *Service) recallLock(ino uint64) {
 		return
 	}
 	s.log.Debug("yielded a cached inode lock to a peer", "ino", ino)
+}
+
+// handoverHold records a peer's request for this inode and returns how long the
+// lock has been held and how long it must be held before it is given up.
+//
+// The hold doubles when the request arrives inside the current one and halves
+// when it arrives after it, between the floor and the ceiling above. That is
+// the whole of the adaptation, and each half of it answers a real workload:
+// doubling is what stops six writers to one file paying a round trip per
+// operation, and halving is what stops an inode that was contended once from
+// making every later peer wait for a contention that has ended.
+//
+// Measured from the acquisition rather than from the last recall, because that
+// is the quantity the hold is trading against — how many of this node's own
+// operations one turn of the lock is worth.
+func (e *lockEntry) handoverHold() (held, hold time.Duration) {
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+
+	held = time.Since(e.acquiredAt)
+	hold = max(e.holdTime, minHoldTime)
+	if held < hold {
+		hold = min(hold*2, maxHoldTime)
+	} else {
+		hold = max(hold/2, minHoldTime)
+	}
+	e.holdTime = hold
+	return held, hold
 }
 
 // yieldCachedLock publishes whatever this node has buffered for an inode and

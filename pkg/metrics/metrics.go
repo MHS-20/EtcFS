@@ -45,6 +45,21 @@ var (
 		Buckets: prometheus.ExponentialBuckets(0.0001, 3, 10),
 	}, []string{"op"})
 
+	// LockHandoverHold observes how long a cached inode lock is held before a
+	// peer's recall is honoured, in seconds.
+	//
+	// It is the whole of the hysteresis trade, in one place: the value grows
+	// under sustained contention so a node amortises the handover over several
+	// operations, and what it spends is exactly this much of the waiting peer's
+	// latency.  A distribution pinned at the ceiling means an inode is being
+	// fought over continuously and the waiters are paying for it; one pinned at
+	// the floor means recalls are arriving after the holder was finished anyway.
+	LockHandoverHold = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "etcfuse_lock_handover_hold_seconds",
+		Help:    "How long a cached inode lock is held before a peer's recall is honoured.",
+		Buckets: prometheus.ExponentialBuckets(0.005, 2, 8),
+	})
+
 	// EtcdTxns counts etcd transactions, by outcome (committed, rejected, error).
 	EtcdTxns = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "etcfuse_etcd_txn_total",

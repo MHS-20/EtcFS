@@ -178,3 +178,43 @@ func TestSessionLossDropsOnlyTheCachesUnderTheDeadLease(t *testing.T) {
 		t.Fatal("a cache under a live session's lease was dropped with the dead one")
 	}
 }
+
+// The hold is the whole of the hysteresis trade: it grows while a peer keeps
+// asking for an inode the moment this node has taken it, and decays once the
+// asking stops. Both directions matter — the first is what stops six writers
+// to one file paying a round trip per operation, and the second is what stops
+// an inode contended once from making every later peer wait for it.
+func TestHandoverHoldGrowsUnderContentionAndDecaysAfterIt(t *testing.T) {
+	e := &lockEntry{ino: 1}
+
+	// Acquired just now, so every recall arrives inside the current hold.
+	e.acquiredAt = time.Now()
+	var hold time.Duration
+	for i := 0; i < 8; i++ {
+		_, hold = e.handoverHold()
+	}
+	if hold != maxHoldTime {
+		t.Errorf("hold = %s after sustained contention, want the %s ceiling", hold, maxHoldTime)
+	}
+
+	// The recalls now arrive well after the hold has passed, which is what a
+	// workload that has stopped fighting over the inode looks like.
+	e.acquiredAt = time.Now().Add(-time.Second)
+	for i := 0; i < 8; i++ {
+		_, hold = e.handoverHold()
+	}
+	if hold != minHoldTime {
+		t.Errorf("hold = %s after the contention ended, want the %s floor", hold, minHoldTime)
+	}
+}
+
+func TestHandoverHoldStartsAtTheFloor(t *testing.T) {
+	e := &lockEntry{ino: 1, acquiredAt: time.Now().Add(-time.Second)}
+	held, hold := e.handoverHold()
+	if hold != minHoldTime {
+		t.Errorf("hold = %s on a lock nothing has contended, want %s", hold, minHoldTime)
+	}
+	if held < time.Second {
+		t.Errorf("held = %s, want at least the second since it was acquired", held)
+	}
+}
