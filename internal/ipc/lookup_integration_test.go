@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
@@ -94,4 +95,58 @@ func TestLookupOfADanglingDirentIsNotCacheable(t *testing.T) {
 	if errno == 0 {
 		t.Fatal("a dirent pointing at a missing inode was answered as a valid entry")
 	}
+}
+
+// Once the dirent watch is running the daemon may answer an absence from its
+// own cached set of the directory's names, which is what takes the etcd round
+// trip off a probe for a file that is not there. The property that has to hold
+// alongside it is the one above: a name that comes into existence stops being
+// answered that way, and here it is the watch rather than a fresh read that
+// makes it stop.
+func TestLookupServesAbsenceFromTheCachedNameSet(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartNotificationServer(ctx)
+
+	// The first miss after the watch is up reads the directory; from there its
+	// names are known.  The watch is established asynchronously, and the cache
+	// is deliberately not consulted until it is, so the miss is repeated until
+	// one of them fills the set.
+	waitFor(t, "a miss to fill the directory's names", func() bool {
+		if _, ino, _ := lookupReply(t, svc, metadata.RootIno, "absent-one"); ino != 0 {
+			t.Fatalf("ino = %d for a name that was never created", ino)
+		}
+		return svc.dirents.absent(metadata.RootIno, "absent-two")
+	})
+
+	// A peer creates the name. Nothing on this node asked for it, so only the
+	// watch can take it out of the cached set.
+	const name = "arrives-from-a-peer"
+	rec, err := store.AtomicCreateFile(ctx, metadata.RootIno, name, 5151, 0o100644, 1000, 1000)
+	if err != nil {
+		t.Fatalf("create %q: %v", name, err)
+	}
+	waitFor(t, "the watch to record the new name", func() bool {
+		return !svc.dirents.absent(metadata.RootIno, name)
+	})
+
+	errno, ino, _ := lookupReply(t, svc, metadata.RootIno, name)
+	if errno != 0 || ino != rec.Ino {
+		t.Errorf("lookup after a peer's create: errno %d ino %d, want 0 and %d", errno, ino, rec.Ino)
+	}
+}
+
+// waitFor polls until cond holds or the test gives up, for the one thing here
+// that is genuinely asynchronous: an etcd watch delivering.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }

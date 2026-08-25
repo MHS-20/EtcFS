@@ -61,6 +61,18 @@ var (
 		Help: "Data-path metadata lookups, by whether the lock-held cache answered them.",
 	}, []string{"result"})
 
+	// DirentCache counts lookups of a name that is not there, by whether this
+	// node's cached set of the directory's names answered it ("hit") or it had
+	// to reach etcd ("miss").  A workload that probes for absent files — a
+	// compiler walking an include path is the canonical one — should sit near
+	// all hits after the first miss in each directory; sustained misses mean the
+	// directories are past the per-directory cap, or the dirent watch is not
+	// delivering and the cache is disarmed.
+	DirentCache = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_dirent_cache_total",
+		Help: "Name lookups, by whether the cached directory name set answered them.",
+	}, []string{"result"})
+
 	// ReaddirPage counts READDIR calls that resumed from where the previous
 	// reply stopped ("resumed") against those that had to read the directory
 	// and count from the start ("rescanned").  A sequential scan resumes for

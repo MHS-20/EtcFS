@@ -46,6 +46,9 @@ type watcher struct {
 	// the revision being resumed from — so changes were missed rather than
 	// replayed.  Whatever this watch keeps up to date is stale from here.
 	gap func()
+	// opened is called each time the watch is established, including the first.
+	// A cache that is only sound while this watch is delivering is armed here.
+	opened func()
 	// open, when set, supplies the watch channel instead of the store, given the
 	// revision to resume from (zero for "from current").  A test sets it to
 	// drive the re-opening without an etcd.
@@ -72,8 +75,13 @@ func (s *Service) runWatch(ctx context.Context, w watcher) {
 	var resume int64
 
 	for ctx.Err() == nil {
+		ch := s.channel(ctx, w, resume)
+		if w.opened != nil {
+			w.opened()
+		}
+
 		compacted := false
-		for resp := range s.channel(ctx, w, resume) {
+		for resp := range ch {
 			if resp.Canceled {
 				// A compaction past the resume point is the one cancellation
 				// that loses history; every other reason is answered by opening

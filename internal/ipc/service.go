@@ -120,6 +120,10 @@ type Service struct {
 	// StartLockRevocation.
 	recalls *recallSet
 
+	// dirents remembers directory name sets, so a lookup of a name that is not
+	// there is answered without reaching etcd. See direntcache.go.
+	dirents *direntCache
+
 	// dirCursors remembers where each directory's last listing stopped, so a
 	// sequential scan reads forward instead of counting from the start. See
 	// readdircursor.go.
@@ -200,6 +204,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		inodes:         newInodeBlocks(store),
 		recalls:        newRecallSet(),
 		dirCursors:     newDirCursors(),
+		dirents:        newDirentCache(entryTimeout(opts)),
 		notifyServer:   &notifyServer{},
 		flushInterval:  opts.FlushInterval,
 		flushMaxBytes:  defaultFlushMaxBytes,
@@ -216,6 +221,19 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		s.setBlockDevice(opts.Device, opts.WriteBarriers)
 	}
 	return s
+}
+
+// entryTimeout is how long a name's existence may be answered without asking
+// etcd, as a duration rather than the whole seconds the wire carries.
+//
+// The dirent cache is bounded by it for the same reason the kernel's negative
+// dentry is: both answer an absence, both are invalidated by the same watch,
+// and trusting one longer than the other would be arbitrary.
+func entryTimeout(opts Options) time.Duration {
+	if opts.EntryTimeout == 0 {
+		return config.DefaultEntryTimeout
+	}
+	return opts.EntryTimeout
 }
 
 // timeoutSecs converts a cache timeout to the whole seconds the FUSE reply

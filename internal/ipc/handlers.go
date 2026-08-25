@@ -62,14 +62,28 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errInval), nil
 	}
 
+	// A name this node's cached set of the directory says is not there is
+	// answered without a round trip.  Only an absence is answered that way; a
+	// name the set knows about still goes to etcd, so nothing here can invent a
+	// file or hand back the wrong inode.  See direntcache.go.
+	if s.direntsAbsent(parent, name) {
+		return s.negativeEntryResp(), nil
+	}
+
 	ino, err := s.store.LookupDirent(ctx, parent, name)
 	if err != nil {
 		s.log.Warn("lookup dirent", "parent", parent, "name", name, "error", err)
 		return int32Resp(errIO), nil
 	}
 	if ino == 0 {
+		// The first miss in a directory is what pays for the rest of them: one
+		// range read now answers every later probe of a name that is not there.
+		s.prefetchDirents(ctx, parent)
 		return s.negativeEntryResp(), nil
 	}
+	// etcd has just said the name is there, which is at least as strong as the
+	// watch saying so.
+	s.dirents.observed(parent, name, true)
 
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
@@ -432,6 +446,7 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 	if err != nil {
 		return int32Resp(errnoFor(err, errExist)), nil // EEXIST unless fenced
 	}
+	s.dirents.created(parent, name)
 
 	// A create hands back an open descriptor, and the release that closes it
 	// arrives like any other, so it has to be counted like any other.
@@ -568,6 +583,7 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 	if err != nil {
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
+	s.dirents.created(parent, name)
 
 	return s.entryResp(rec.Ino, rec), nil
 }
@@ -585,6 +601,7 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 	if err != nil {
 		return int32Resp(errnoFor(err, errNoEnt)), nil // ENOENT unless fenced
 	}
+	s.dirents.deleted(parent, name)
 	return okResp(), nil
 }
 
@@ -600,6 +617,7 @@ func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, erro
 	if err := s.store.AtomicRmdir(ctx, parent, name); err != nil {
 		return int32Resp(errnoFor(err, errNoEnt)), nil
 	}
+	s.dirents.deleted(parent, name)
 	return okResp(), nil
 }
 
@@ -633,6 +651,8 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 	if err != nil {
 		return int32Resp(errnoFor(err, errExist)), nil // EEXIST or other, unless fenced
 	}
+	s.dirents.deleted(oldParent, oldName)
+	s.dirents.created(newParent, newName)
 	return okResp(), nil
 }
 
@@ -806,6 +826,7 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 	if err != nil {
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
+	s.dirents.created(parent, name)
 
 	return s.entryResp(ino, rec), nil
 }
@@ -830,6 +851,7 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 	if err != nil {
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
+	s.dirents.created(newParent, name)
 	return s.entryResp(ino, rec), nil
 }
 
@@ -853,6 +875,7 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 	if err != nil {
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
+	s.dirents.created(parent, name)
 
 	return s.entryResp(ino, rec), nil
 }

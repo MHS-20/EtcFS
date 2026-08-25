@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/MHS-20/EtcFS/pkg/metadata"
@@ -217,6 +218,7 @@ func (s *Service) StartNotificationServer(ctx context.Context) {
 		what:   "dirent",
 		prefix: metadata.PrefixDirent,
 		event:  s.direntChanged,
+		opened: s.dirents.arm,
 		gap:    s.direntWatchGap,
 	})
 }
@@ -242,12 +244,14 @@ func (s *Service) StartAttrInvalidation(ctx context.Context) {
 	})
 }
 
-// direntChanged turns one dirent change into an entry invalidation.
+// direntChanged turns one dirent change into an entry invalidation, and keeps
+// this node's own cached name set for that directory in step with it.
 func (s *Service) direntChanged(ev *clientv3.Event) {
 	parent, name, ok := metadata.ParseDirentKey(string(ev.Kv.Key))
 	if !ok {
 		return
 	}
+	s.dirents.observed(parent, name, ev.Type != mvccpb.DELETE)
 	s.sendInvalEntry(parent, name)
 }
 
@@ -255,8 +259,13 @@ func (s *Service) direntChanged(ev *clientv3.Event) {
 // name on this node may now describe a directory as it no longer is, and
 // nothing but the entry timeout will correct it.
 func (s *Service) direntWatchGap() {
-	s.log.Error("names changed elsewhere were missed; every cached name on this node " +
-		"is trusted only until it times out")
+	// The daemon's own name sets describe directories as they were before
+	// changes nothing will ever deliver, so they go outright.  The kernel's
+	// dentries cannot be enumerated and so cannot be dropped; they expire on the
+	// entry timeout, which is what that timeout is for.
+	s.dirents.reset()
+	s.log.Error("names changed elsewhere were missed; this node's cached directory " +
+		"listings were dropped and every cached name is trusted only until it times out")
 }
 
 // inodeChanged drops the kernel's cached attributes for an inode a peer wrote.
