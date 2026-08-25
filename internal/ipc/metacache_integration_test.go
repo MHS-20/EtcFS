@@ -182,7 +182,7 @@ func TestIntegration_CachedLockIsDroppedWhenItsSessionIsReplaced(t *testing.T) {
 
 	// Any acquisition on any inode now mints a fresh session, which is what
 	// makes a liveness check answer "yes" again.
-	if _, err := store.AtomicCreateFile(ctx, metadata.RootIno, t.Name()+"-other", other, 0o100644, 1000, 1000); err != nil {
+	if _, err := store.AtomicCreateFile(ctx, metadata.RootIno, t.Name()+"-other", other, 0o100644, 1000, 1000, metadata.CreateExtra{}); err != nil {
 		t.Fatalf("seed second inode: %v", err)
 	}
 	if _, err := svc.handleWrite(ctx, writePayload(other, 0, block, 0)); err != nil {

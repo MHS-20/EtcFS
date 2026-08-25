@@ -609,3 +609,89 @@ func (s *Service) ReleaseCachedLocks() {
 		e.rw.Unlock()
 	}
 }
+
+// Taking a new file's lock in the transaction that creates it.
+//
+// A file that is written after it is created — which is every file an
+// unpacking archive makes — used to pay a Raft commit for its lock the moment
+// the first write arrived.  It does not have to: the inode number is known when
+// the name is published, and no peer can be contending for a number nobody has
+// been told about, so the lock key rides the create transaction and the cache
+// is seeded from it.  The first write then finds the lock already held and the
+// metadata already known, and reaches the device without touching etcd at all.
+//
+// What the create transaction asserts is exactly what an ordinary acquisition
+// asserts — that no key blocks this one (metadata.PrepareLock) — so nothing
+// about the lock is weakened by taking it this way.  What is new is the failure
+// mode below.
+
+// seedCreatedLock records a lock this node took in a create transaction, and
+// the metadata that transaction published, so the operations that follow the
+// create need neither an acquisition nor a read.
+//
+// call and ret bracket the create transaction, which is the interval the key's
+// hold began somewhere inside — the same statement ensureLockKey records for an
+// acquisition of its own, and the one the mutual-exclusion checker needs in
+// order to see this key at all.
+func (s *Service) seedCreatedLock(ino uint64, holder string, rec *metadata.InodeRecord, call, ret time.Time) {
+	lease, ok := metadata.LockHolderLease(holder)
+	if !ok {
+		// The token is minted here and parsed here, so this cannot happen
+		// without a change to its format; not caching the lock is the harmless
+		// way to be wrong about it, since the key is still released by the
+		// session lease.
+		s.log.Error("a created inode's lock holder token has no lease in it, so its lock is not cached",
+			"ino", ino, "holder", holder)
+		return
+	}
+
+	e := s.locks.entryFor(ino)
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+	// An entry that already holds a key for this inode number is a number handed
+	// out twice, which the allocator does not do.  Leaving the existing entry
+	// alone is still the safe answer: overwriting the holder would orphan a key
+	// only the old token names.
+	if e.holder != "" {
+		s.log.Error("a created inode already had a cached lock, so the one taken with it is not cached",
+			"ino", ino)
+		return
+	}
+	e.holder, e.lease, e.mode, e.acquiredAt = holder, lease, metadata.LockExclusive, ret
+	// The create transaction is the whole of what etcd holds for this inode: the
+	// record it wrote, and no extents at all.  That is a snapshot taken under a
+	// key this node has held continuously ever since, which is exactly the
+	// validity rule every other cached snapshot obeys.
+	e.meta, e.metaFor = &inodeMeta{rec: rec}, holder
+	s.recordKeyEvent(ino, metadata.LockExclusive, lockEventAcquire, call, ret, call)
+}
+
+// discardCreatedLock deletes a lock key a failed create may nonetheless have
+// written.
+//
+// A create that reports failure has usually written nothing — the transaction
+// that would have taken the lock is the one that did not commit.  The exception
+// is a commit whose reply was lost, which is reported as a failure and leaves
+// the key standing under this node's session lease, held by a token no cache
+// entry names.  Nothing would ever release it, and every peer that wanted the
+// inode would block on it until this node exited.
+//
+// So the key is deleted rather than reasoned about.  The token names exactly
+// one key and only this call ever had it, so the delete cannot touch a lock
+// anyone else took, and a key that was never written costs one delete of
+// nothing on a path that is already failing.  It runs off the request, because
+// the request has already been answered and this must happen either way.
+func (s *Service) discardCreatedLock(ino uint64, holder string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
+		defer cancel()
+		err := retryEtcd(ctx, func(rctx context.Context) error {
+			_, rerr := s.store.ReleaseLock(rctx, ino, metadata.LockExclusive, holder)
+			return rerr
+		})
+		if err != nil {
+			s.log.Error("a failed create's lock key was not deleted; it will block peers on that inode until this node exits",
+				"ino", ino, "error", err)
+		}
+	}()
+}

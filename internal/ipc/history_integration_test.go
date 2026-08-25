@@ -217,7 +217,7 @@ func TestIntegration_RecordedDataPathHistoryIsConsistent(t *testing.T) {
 	for i := range names {
 		names[i] = fmt.Sprintf("shared-%d", i)
 		if _, err := metadata.NewStore(cli, "n1").AtomicCreateFile(ctx, metadata.RootIno, names[i],
-			uint64(900+i), metadata.ModeFile|0644, 0, 0); err != nil {
+			uint64(900+i), metadata.ModeFile|0644, 0, 0, metadata.CreateExtra{}); err != nil {
 			t.Fatalf("seed inode %d: %v", i, err)
 		}
 	}

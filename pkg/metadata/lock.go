@@ -249,6 +249,40 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 	return holder, nil
 }
 
+// PrepareLock mints a holder token and the write that takes an inode's lock,
+// for a caller that will commit it inside a transaction of its own rather than
+// on its own round trip.
+//
+// The comparison is the same one AcquireLock evaluates — the blocking range
+// must be empty — so a lock taken this way is taken under exactly the rule
+// every other lock is, not under an assumption about the caller's inode.  What
+// the caller gains is only that the assertion and its write ride a transaction
+// it was going to commit anyway.
+//
+// The caller owns what it mints: a transaction that does not commit leaves no
+// key, and one whose reply is lost leaves a key only this holder token names.
+// See internal/ipc.handleCreate for how that second case is settled.
+func (s *Store) PrepareLock(ino uint64, mode LockMode, ttl time.Duration) (string, clientv3.Cmp, clientv3.Op, error) {
+	if mode != LockShared && mode != LockExclusive {
+		return "", clientv3.Cmp{}, clientv3.Op{},
+			fmt.Errorf("prepare lock ino %d: unknown mode %q (%w)", ino, mode, ErrInvalid)
+	}
+	sess, err := s.lockSession(ttl)
+	if err != nil {
+		return "", clientv3.Cmp{}, clientv3.Op{}, fmt.Errorf("prepare lock ino %d: session: %w", ino, err)
+	}
+
+	holder := fmt.Sprintf("%d-%d", sess.Lease(), s.lockSeq.Add(1))
+	blocked := LockPrefix(ino)
+	if mode == LockShared {
+		blocked = LockModePrefix(ino, LockExclusive)
+	}
+	return holder,
+		clientv3.Compare(clientv3.CreateRevision(blocked), "=", 0).WithPrefix(),
+		clientv3.OpPut(LockKey(ino, mode, holder), s.nodeID, clientv3.WithLease(sess.Lease())),
+		nil
+}
+
 // ReleaseLock drops one holder's lock, reporting whether the key was still
 // there to drop.
 //

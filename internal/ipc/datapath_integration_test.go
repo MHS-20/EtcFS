@@ -75,7 +75,7 @@ func newTestService(t *testing.T) (*Service, *metadata.Store) {
 func seedFile(t *testing.T, store *metadata.Store, ino uint64, mode uint32) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := store.AtomicCreateFile(ctx, metadata.RootIno, t.Name(), ino, mode, 1000, 1000); err != nil {
+	if _, err := store.AtomicCreateFile(ctx, metadata.RootIno, t.Name(), ino, mode, 1000, 1000, metadata.CreateExtra{}); err != nil {
 		t.Fatalf("seed inode %d: %v", ino, err)
 	}
 }
@@ -476,7 +476,7 @@ func TestIntegration_WriteClearsSetIDBits(t *testing.T) {
 	// Root keeps them, the way a process holding CAP_FSETID does.
 	const rootIno = 7007
 	if _, err := store.AtomicCreateFile(ctx, metadata.RootIno, t.Name()+"-root", rootIno,
-		metadata.ModeFile|metadata.S_ISUID|0777, 0, 0); err != nil {
+		metadata.ModeFile|metadata.S_ISUID|0777, 0, 0, metadata.CreateExtra{}); err != nil {
 		t.Fatalf("seed inode: %v", err)
 	}
 	if _, err := svc.handleWrite(ctx, writePayload(rootIno, 0, []byte("x"), 0)); err != nil {

@@ -442,9 +442,30 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errnoFor(err, errNoSpace)), nil
 	}
 
-	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, applyUmask(mode, umask), uid, gid)
+	// The exclusive lock on the file rides the transaction that creates it, so
+	// the write that follows the create needs no acquisition of its own.  A
+	// failure to mint it is not a reason to fail the create: the create still
+	// commits, and the first write acquires the lock the way it always did.
+	holder, lockCmp, lockOp, lerr := s.store.PrepareLock(ino, metadata.LockExclusive, inodeLockTTL)
+	extra := metadata.CreateExtra{}
+	if lerr != nil {
+		s.log.Warn("cannot take a new file's lock with its create; the first write will acquire it",
+			"ino", ino, "error", lerr)
+		holder = ""
+	} else {
+		extra = metadata.CreateExtra{Cmps: []clientv3.Cmp{lockCmp}, Ops: []clientv3.Op{lockOp}}
+	}
+
+	call := time.Now()
+	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, applyUmask(mode, umask), uid, gid, extra)
 	if err != nil {
+		if holder != "" {
+			s.discardCreatedLock(ino, holder)
+		}
 		return int32Resp(errnoFor(err, errExist)), nil // EEXIST unless fenced
+	}
+	if holder != "" {
+		s.seedCreatedLock(ino, holder, rec, call, time.Now())
 	}
 	s.dirents.created(parent, name)
 

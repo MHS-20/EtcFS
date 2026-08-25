@@ -135,6 +135,19 @@ func extractNameFromKey(key string, parent uint64) string {
 	return key
 }
 
+// CreateExtra is whatever a create folds into its own transaction beyond the
+// dirent and the inode record: a symlink's target, or the exclusive lock the
+// creating node takes on the inode it is about to write.
+//
+// It exists so that a caller with something to assert can assert it *with* the
+// create rather than after it.  A create is already one transaction; anything
+// that can ride it costs no second Raft commit, and anything that cannot ride
+// it costs one per file.
+type CreateExtra struct {
+	Cmps []clientv3.Cmp
+	Ops  []clientv3.Op
+}
+
 // atomicCreate publishes a new inode and the name that refers to it in one
 // transaction, together with whatever else the file type needs (a symlink's
 // target, say).  Every creating operation goes through here: an inode written
@@ -143,19 +156,19 @@ func extractNameFromKey(key string, parent uint64) string {
 //
 // The transaction asserts both that the name is free and that the inode number
 // is unused, so a create that loses either race writes nothing at all.
-func (s *Store) atomicCreate(ctx context.Context, parent uint64, name string, rec *InodeRecord, extra ...clientv3.Op) error {
+func (s *Store) atomicCreate(ctx context.Context, parent uint64, name string, rec *InodeRecord, extra CreateExtra) error {
 	fail := func(err error) error {
 		return fmt.Errorf("atomic create %d/%q: %w", parent, name, err)
 	}
 	build := func() ([]clientv3.Cmp, []clientv3.Op, error) {
-		cmps := []clientv3.Cmp{
+		cmps := append([]clientv3.Cmp{
 			clientv3.Compare(clientv3.CreateRevision(DirentKey(parent, name)), "=", 0),
 			clientv3.Compare(clientv3.CreateRevision(InodeKey(rec.Ino)), "=", 0),
-		}
+		}, extra.Cmps...)
 		ops := append([]clientv3.Op{
 			PutDirent(parent, name, rec.Ino),
 			clientv3.OpPut(InodeKey(rec.Ino), string(EncodeInode(rec))),
-		}, extra...)
+		}, extra.Ops...)
 		if rec.Mode&S_IFMT != ModeDir {
 			return cmps, ops, nil
 		}
@@ -266,10 +279,11 @@ func (s *Store) touchDir(ctx context.Context, ino uint64) {
 }
 
 // AtomicCreateFile creates a regular file and its directory entry in a single
-// etcd transaction.
-func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string, ino uint64, mode uint32, uid, gid uint32) (*InodeRecord, error) {
+// etcd transaction, together with whatever the caller folds in through extra —
+// which for a node that is about to write the file is its exclusive lock on it.
+func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string, ino uint64, mode uint32, uid, gid uint32, extra CreateExtra) (*InodeRecord, error) {
 	rec := NewInodeRecord(ino, mode, uid, gid)
-	return rec, s.atomicCreate(ctx, parent, name, rec)
+	return rec, s.atomicCreate(ctx, parent, name, rec, extra)
 }
 
 // AtomicCreateDir creates a directory (mkdir) in a single etcd transaction.
@@ -279,7 +293,7 @@ func (s *Store) AtomicCreateFile(ctx context.Context, parent uint64, name string
 func (s *Store) AtomicCreateDir(ctx context.Context, parent uint64, name string, ino uint64, mode uint32, uid, gid uint32) (*InodeRecord, error) {
 	rec := NewInodeRecord(ino, mode|ModeDir, uid, gid)
 	rec.Size = 4096
-	return rec, s.atomicCreate(ctx, parent, name, rec)
+	return rec, s.atomicCreate(ctx, parent, name, rec, CreateExtra{})
 }
 
 // AtomicCreateSymlink creates a symlink inode, its target record and its
@@ -289,7 +303,8 @@ func (s *Store) AtomicCreateSymlink(ctx context.Context, parent uint64, name str
 	// an access check consults — so the mode is fixed rather than umask-masked.
 	rec := NewInodeRecord(ino, ModeSymlink|0777, uid, gid)
 	rec.Size = uint64(len(target))
-	return rec, s.atomicCreate(ctx, parent, name, rec, clientv3.OpPut(InodeSymlinkKey(ino), target))
+	return rec, s.atomicCreate(ctx, parent, name, rec,
+		CreateExtra{Ops: []clientv3.Op{clientv3.OpPut(InodeSymlinkKey(ino), target)}})
 }
 
 // AtomicCreateNode creates a device node, FIFO or socket (mknod) and its
@@ -297,7 +312,7 @@ func (s *Store) AtomicCreateSymlink(ctx context.Context, parent uint64, name str
 func (s *Store) AtomicCreateNode(ctx context.Context, parent uint64, name string, ino uint64, mode, rdev uint32, uid, gid uint32) (*InodeRecord, error) {
 	rec := NewInodeRecord(ino, mode, uid, gid)
 	rec.Rdev = rdev
-	return rec, s.atomicCreate(ctx, parent, name, rec)
+	return rec, s.atomicCreate(ctx, parent, name, rec, CreateExtra{})
 }
 
 // AtomicLink adds a second name for an existing inode: the new dirent and the

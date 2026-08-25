@@ -66,7 +66,7 @@ func TestLookupStopsBeingNegativeOnceTheNameExists(t *testing.T) {
 		t.Fatalf("ino = %d before the create, want 0", ino)
 	}
 
-	rec, err := store.AtomicCreateFile(context.Background(), metadata.RootIno, name, 4242, 0o100644, 1000, 1000)
+	rec, err := store.AtomicCreateFile(context.Background(), metadata.RootIno, name, 4242, 0o100644, 1000, 1000, metadata.CreateExtra{})
 	if err != nil {
 		t.Fatalf("create %q: %v", name, err)
 	}
@@ -123,7 +123,7 @@ func TestLookupServesAbsenceFromTheCachedNameSet(t *testing.T) {
 	// A peer creates the name. Nothing on this node asked for it, so only the
 	// watch can take it out of the cached set.
 	const name = "arrives-from-a-peer"
-	rec, err := store.AtomicCreateFile(ctx, metadata.RootIno, name, 5151, 0o100644, 1000, 1000)
+	rec, err := store.AtomicCreateFile(ctx, metadata.RootIno, name, 5151, 0o100644, 1000, 1000, metadata.CreateExtra{})
 	if err != nil {
 		t.Fatalf("create %q: %v", name, err)
 	}

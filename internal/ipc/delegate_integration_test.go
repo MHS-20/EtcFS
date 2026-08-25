@@ -267,7 +267,7 @@ func TestIntegration_BufferedPayloadIsCappedAcrossInodes(t *testing.T) {
 		// Not seedFile: it names every inode after the test, and this one needs
 		// a directory entry per inode.
 		if _, err := store.AtomicCreateFile(context.Background(), metadata.RootIno,
-			fmt.Sprintf("%s-%d", t.Name(), i), ino, 0o100644, 1000, 1000); err != nil {
+			fmt.Sprintf("%s-%d", t.Name(), i), ino, 0o100644, 1000, 1000, metadata.CreateExtra{}); err != nil {
 			t.Fatalf("seed inode %d: %v", ino, err)
 		}
 		writeAt(t, svc, ino, 0, block)

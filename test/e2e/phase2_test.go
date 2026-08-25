@@ -130,16 +130,16 @@ func seedTestData(t *testing.T, ctx context.Context, store *metadata.Store) {
 	_, err := store.Put(ctx, metadata.InodeKey(rootIno), metadata.EncodeInode(&rootRec))
 	require.NoError(t, err)
 
-	_, err = store.AtomicCreateFile(ctx, rootIno, "hello.txt", 10, 0644, 1000, 1000)
+	_, err = store.AtomicCreateFile(ctx, rootIno, "hello.txt", 10, 0644, 1000, 1000, metadata.CreateExtra{})
 	require.NoError(t, err)
 
-	_, err = store.AtomicCreateFile(ctx, rootIno, "empty", 11, 0644, 1000, 1000)
+	_, err = store.AtomicCreateFile(ctx, rootIno, "empty", 11, 0644, 1000, 1000, metadata.CreateExtra{})
 	require.NoError(t, err)
 
 	_, err = store.AtomicCreateDir(ctx, rootIno, "subdir", 20, metadata.ModeDir|0755, 1000, 1000)
 	require.NoError(t, err)
 
-	_, err = store.AtomicCreateFile(ctx, 20, "nested.txt", 21, 0644, 1000, 1000)
+	_, err = store.AtomicCreateFile(ctx, 20, "nested.txt", 21, 0644, 1000, 1000, metadata.CreateExtra{})
 	require.NoError(t, err)
 }
 

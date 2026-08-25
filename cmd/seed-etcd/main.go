@@ -118,7 +118,7 @@ func main() {
 				_, err = store.Put(ctx, metadata.InodeSymlinkKey(e.ino), []byte(e.target))
 			}
 		} else {
-			_, err = store.AtomicCreateFile(ctx, e.parent, e.name, e.ino, e.mode, e.uid, e.gid)
+			_, err = store.AtomicCreateFile(ctx, e.parent, e.name, e.ino, e.mode, e.uid, e.gid, metadata.CreateExtra{})
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error creating %d/%s (ino %d): %v\n", e.parent, e.name, e.ino, err)

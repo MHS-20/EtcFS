@@ -67,7 +67,7 @@ func TestReaddirScanCost(t *testing.T) {
 		for i := 0; i < n; i++ {
 			name := fmt.Sprintf("entry-%06d", i)
 			if _, err := store.AtomicCreateFile(ctx, dirIno, name,
-				dirIno*100+uint64(i), 0o100644, 1000, 1000); err != nil {
+				dirIno*100+uint64(i), 0o100644, 1000, 1000, metadata.CreateExtra{}); err != nil {
 				t.Fatalf("seed %s: %v", name, err)
 			}
 		}
@@ -148,7 +148,7 @@ func TestPagedScanReturnsEveryNameExactlyOnce(t *testing.T) {
 		// Deliberately uneven name lengths: a fixed width would hide an error
 		// in the per-entry size estimate the page limit is derived from.
 		name := fmt.Sprintf("f%0*d", 1+i%20, i)
-		if _, err := store.AtomicCreateFile(ctx, dirIno, name, dirIno*100+uint64(i), 0o100644, 1000, 1000); err != nil {
+		if _, err := store.AtomicCreateFile(ctx, dirIno, name, dirIno*100+uint64(i), 0o100644, 1000, 1000, metadata.CreateExtra{}); err != nil {
 			t.Fatalf("seed %s: %v", name, err)
 		}
 		want = append(want, name)
@@ -182,7 +182,7 @@ func TestScanIsCorrectWithoutACursor(t *testing.T) {
 	want := make([]string, 0, n)
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("entry-%04d", i)
-		if _, err := store.AtomicCreateFile(ctx, dirIno, name, dirIno*100+uint64(i), 0o100644, 1000, 1000); err != nil {
+		if _, err := store.AtomicCreateFile(ctx, dirIno, name, dirIno*100+uint64(i), 0o100644, 1000, 1000, metadata.CreateExtra{}); err != nil {
 			t.Fatalf("seed %s: %v", name, err)
 		}
 		want = append(want, name)
