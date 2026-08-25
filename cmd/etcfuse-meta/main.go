@@ -299,6 +299,10 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	// records but never returns their blocks, so disk space leaks on every
 	// deletion.
 	scrubber.SetReclaimer(svc.Reclaimer())
+	// A scrub pass takes no inode lock, so without this it can free blocks
+	// under a read on this node that has already resolved the extent naming
+	// them.  The check is a lookup in this node's own lock cache.
+	scrubber.SetInodeLocks(svc)
 	// The range check compares against the real device rather than a hardcoded
 	// ceiling; without a device attached it is skipped.
 	scrubber.SetDeviceSize(svc.Allocator().DeviceSize())

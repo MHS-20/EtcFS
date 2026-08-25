@@ -299,6 +299,23 @@ type recordedReclaimer struct{ s *Service }
 func (r recordedReclaimer) Free(diskOff, size uint64) { r.s.freeBlocks(diskOff, size) }
 func (r recordedReclaimer) Owns(diskOff uint64) bool  { return r.s.alloc.Owns(diskOff) }
 
+// Holds reports whether this node has anything cached for an inode's lock, and
+// so whether an operation here may still be resolving that inode's extents.
+//
+// The background scrubber asks before it hands an extent's blocks back to the
+// allocator: it takes no inode lock itself, so without this it can free blocks
+// under a read on this node that resolved them and has not yet issued its
+// device read.  See scrub.InodeLocks for the whole of that argument.
+//
+// The answer is deliberately an over-approximation. An entry outlives the
+// operation that made it — a released or recalled lock leaves it in place, and
+// it goes only on eviction — so an inode this node has merely touched recently
+// reads as held. That costs a reclaim deferred to a later pass, which is
+// nothing; the opposite error costs a read of another file's data.
+func (s *Service) Holds(ino uint64) bool {
+	return s.locks.lookup(ino) != nil
+}
+
 // Store returns the underlying metadata store.
 func (s *Service) Store() *metadata.Store {
 	return s.store

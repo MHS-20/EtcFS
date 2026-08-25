@@ -107,3 +107,80 @@ func TestAutoFixLeavesExtentThatMovedSinceTheScan(t *testing.T) {
 		t.Fatalf("blocks freed from a stale finding: freed %d", rec.freed)
 	}
 }
+
+// lockedInodes answers the reclaim path's "may an operation here still be
+// reading this?" question, and can be made to change its answer between the
+// pre-delete check and the post-delete one — which is the window the held-range
+// list exists for.
+type lockedInodes struct {
+	held      map[uint64]bool
+	holdAfter map[uint64]bool // becomes held from the second question on
+	asked     map[uint64]int
+}
+
+func (l *lockedInodes) Holds(ino uint64) bool {
+	if l.asked == nil {
+		l.asked = map[uint64]int{}
+	}
+	l.asked[ino]++
+	if l.holdAfter[ino] && l.asked[ino] > 1 {
+		return true
+	}
+	return l.held[ino]
+}
+
+// A pass that finds a locked inode leaves the extent alone entirely: the record
+// stays, so the finding is simply re-made once the inode goes quiet, and no
+// blocks are handed out under a reader that has already resolved them.
+func TestAutoFixLeavesAnExtentWhoseInodeIsLockedHere(t *testing.T) {
+	store := orphanStore(11, 11)
+	rec := &countingReclaimer{}
+	s := New(store, "node", time.Hour, silentLogger{})
+	s.SetReclaimer(rec)
+	s.SetInodeLocks(&lockedInodes{held: map[uint64]bool{7: true}})
+
+	s.RunScrubPass(context.Background())
+
+	if store.dels != 0 {
+		t.Fatalf("extent of a locked inode deleted: %d deletes", store.dels)
+	}
+	if rec.freed != 0 {
+		t.Fatalf("blocks of a locked inode freed: freed %d", rec.freed)
+	}
+}
+
+// The narrow case: nothing held the inode when the pass checked, and a read
+// started while the delete was in flight.  The record is gone by then, so the
+// blocks cannot be left for a later pass to re-find — they are held back
+// instead, and given to the allocator once the inode is quiet.
+func TestAutoFixHoldsBlocksWhoseInodeWasLockedDuringTheDelete(t *testing.T) {
+	store := orphanStore(11, 11)
+	rec := &countingReclaimer{}
+	locks := &lockedInodes{holdAfter: map[uint64]bool{7: true}}
+	s := New(store, "node", time.Hour, silentLogger{})
+	s.SetReclaimer(rec)
+	s.SetInodeLocks(locks)
+
+	s.RunScrubPass(context.Background())
+
+	if store.dels != 1 {
+		t.Fatalf("orphan extent not deleted: %d deletes", store.dels)
+	}
+	if rec.freed != 0 {
+		t.Fatalf("blocks freed while the inode was locked: freed %d", rec.freed)
+	}
+	if len(s.held) != 1 {
+		t.Fatalf("blocks neither freed nor held back: %d held ranges", len(s.held))
+	}
+
+	// The inode goes quiet, and the next pass gives the blocks back.
+	locks.holdAfter, locks.held, locks.asked = nil, nil, nil
+	s.RunScrubPass(context.Background())
+
+	if rec.freed != 4096 {
+		t.Fatalf("held blocks not reclaimed once the inode was quiet: freed %d", rec.freed)
+	}
+	if len(s.held) != 0 {
+		t.Fatalf("held ranges not cleared: %d", len(s.held))
+	}
+}

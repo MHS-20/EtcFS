@@ -67,10 +67,28 @@ type Scrubber struct {
 	// against a guessed limit.
 	deviceSize uint64
 
+	// locks answers whether a reclaim would race a read on this node.  Nil in
+	// an offline check, where there is no daemon to race — see InodeLocks.
+	locks InodeLocks
+
 	mu           sync.Mutex
 	lastRun      time.Time
 	anomalies    []Result
 	totalChecked int64
+
+	// held are the disk ranges of extents this pass has already deleted but
+	// could not free, because the inode was locked here between the delete and
+	// the free.  They are retried at the start of every later pass: the record
+	// naming them is gone, so nothing but this list can give them back, and
+	// nothing else can reach them in the meantime.
+	held []heldRange
+}
+
+// heldRange is one reclaimed disk range waiting for its inode to go quiet.
+type heldRange struct {
+	ino     uint64
+	diskOff uint64
+	length  uint64
 }
 
 // Reclaimer returns a disk range to the block allocator, and reports which
@@ -85,6 +103,31 @@ type Scrubber struct {
 type Reclaimer interface {
 	Free(diskOff, size uint64)
 	Owns(diskOff uint64) bool
+}
+
+// InodeLocks reports whether this node still has an inode's lock cached, which
+// is the question the reclaim path has to ask before it hands blocks back.
+//
+// A scrub pass takes no inode lock — one per inode across a whole-keyspace scan
+// would be its own scalability problem — so it can run alongside a read on this
+// node that has already resolved an extent and not yet issued its device read.
+// Deleting that extent's record is harmless to such a reader; freeing its blocks
+// is not, because the allocator may hand them to another file before the read
+// lands. The gap is real without a further conspiracy: the reader's own lock
+// key can have been deleted by a lease expiry this node has not observed, a
+// peer can have taken the inode and buried that extent, and the pass then sees
+// it as dead through no fault of its own.
+//
+// The scrubber's revision-conditional delete does not close this. That
+// comparison exists so two passes cannot free the same extent twice; it says
+// nothing about a reader that resolved the extent before the delete.
+//
+// So the answer is a local map lookup and not a round trip: an entry in the
+// lock cache means an operation on this node may still be holding something it
+// resolved, and the blocks wait.
+type InodeLocks interface {
+	// Holds reports whether anything is cached for this inode's lock.
+	Holds(ino uint64) bool
 }
 
 // Logger is the logging interface used by the scrubber.
@@ -119,6 +162,19 @@ func (s *Scrubber) SetReclaimer(r Reclaimer) {
 	s.reclaimer = r
 }
 
+// SetInodeLocks attaches this node's lock cache, so a reclaim can tell whether
+// an operation here may still be reading the extent it is about to free.
+// See InodeLocks.
+func (s *Scrubber) SetInodeLocks(l InodeLocks) {
+	s.locks = l
+}
+
+// lockedHere reports whether this node has the inode's lock cached.  Without a
+// lock cache attached there is no daemon serving reads, and so nothing to race.
+func (s *Scrubber) lockedHere(ino uint64) bool {
+	return s.locks != nil && s.locks.Holds(ino)
+}
+
 // Run starts the scrub loop.  Blocks until ctx is cancelled.
 func (s *Scrubber) Run(ctx context.Context) {
 	ticker := time.NewTicker(s.interval)
@@ -144,6 +200,10 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 	s.mu.Unlock()
 
 	s.log.Info("scrub pass starting")
+
+	// Ranges an earlier pass deleted but could not free get another chance
+	// before anything new is scanned.
+	s.releaseHeldRanges()
 
 	snap, err := s.Scan(ctx)
 	if err != nil {
@@ -178,6 +238,16 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 		if s.reclaimer == nil || !s.reclaimer.Owns(r.DiskOff) {
 			continue
 		}
+		// An operation on this node may still be holding this extent as it
+		// resolved it, and freeing the blocks under it is what would let a
+		// later allocation overwrite what that read is about to fetch.  The
+		// finding is simply re-made next pass, by which time the inode is
+		// usually quiet.  See InodeLocks.
+		if s.lockedHere(r.Ino) {
+			s.log.Info("scrub auto-fix: inode is locked here, extent left for a later pass",
+				"ino", r.Ino, "key", r.Key)
+			continue
+		}
 		s.log.Info("scrub auto-fix: reclaiming extent", "type", r.Type, "detail", r.Detail)
 		// Delete first: the blocks must stop being reachable through metadata
 		// before they can be handed to another allocation, or a reader
@@ -204,7 +274,7 @@ func (s *Scrubber) RunScrubPass(ctx context.Context) {
 			continue
 		}
 		if r.Length > 0 {
-			s.reclaimer.Free(r.DiskOff, r.Length)
+			s.freeOrHold(r.Ino, r.DiskOff, r.Length)
 		}
 	}
 
@@ -642,4 +712,60 @@ func (s *Scrubber) LastRun() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastRun
+}
+
+// freeOrHold returns a deleted extent's blocks to the allocator, unless the
+// inode became locked here while the delete was in flight.
+//
+// The check above the delete narrows this window; it cannot close it, because a
+// read can begin between that check and the transaction committing.  So the
+// question is asked again on the far side of the delete, where the answer is
+// the one that matters: the record is already gone, so nothing else can reach
+// these blocks, and holding them costs a retry rather than a leak.
+func (s *Scrubber) freeOrHold(ino, diskOff, length uint64) {
+	if !s.lockedHere(ino) {
+		s.reclaimer.Free(diskOff, length)
+		return
+	}
+	s.mu.Lock()
+	s.held = append(s.held, heldRange{ino: ino, diskOff: diskOff, length: length})
+	depth := len(s.held)
+	s.mu.Unlock()
+	s.log.Info("scrub auto-fix: inode locked here after the delete, blocks held back",
+		"ino", ino, "disk_off", diskOff, "waiting", depth)
+}
+
+// releaseHeldRanges gives back the blocks of extents an earlier pass deleted
+// while their inode was locked here, for every inode that has since gone quiet.
+//
+// An inode that stays locked keeps its ranges held indefinitely, which is the
+// safe direction: the blocks are unreachable — their extent records are gone —
+// so nothing can hand them out, and a restart rebuilds the allocator's bitmap
+// from the records that remain, which is to say without them.
+func (s *Scrubber) releaseHeldRanges() {
+	if s.reclaimer == nil {
+		return
+	}
+	s.mu.Lock()
+	held := s.held
+	s.held = nil
+	s.mu.Unlock()
+
+	var still []heldRange
+	for _, h := range held {
+		if s.lockedHere(h.ino) {
+			still = append(still, h)
+			continue
+		}
+		s.reclaimer.Free(h.diskOff, h.length)
+	}
+
+	if len(still) == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.held = append(still, s.held...)
+	depth := len(s.held)
+	s.mu.Unlock()
+	s.log.Info("scrub auto-fix: blocks still held back by locked inodes", "ranges", depth)
 }
