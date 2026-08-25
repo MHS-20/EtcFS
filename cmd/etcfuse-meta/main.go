@@ -321,6 +321,13 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	svc.StartLockRevocation(ctx)
 	svc.StartSessionWatch(ctx)
 	svc.StartFlusher(ctx)
+	// A directory's timestamp is owed a commit by every entry added to or
+	// removed from it, and that commit is not foldable into the namespace
+	// transaction itself.  Coalescing them under the same interval that governs
+	// extent publication is what stops an unpacking tar paying two Raft commits
+	// per file; zero keeps every timestamp written through, as it keeps every
+	// extent written through.
+	store.StartDirTouchBatching(ctx, cfg.MetadataFlushInterval, log)
 	if cfg.MetadataFlushInterval > 0 {
 		log.Info("deferring extent publication; a crash loses writes not yet flushed or fsynced",
 			"flush_interval", cfg.MetadataFlushInterval, "write_data_cache", cfg.WriteDataCache)
@@ -455,6 +462,11 @@ func leaveCluster(cfg *config.Config, svc *ipc.Service, store *metadata.Store,
 	// A context of its own: the daemon's is already cancelled by now.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	// Directory timestamps this node queued rather than committed.  They go
+	// before the locks, because after the locks are gone a peer may already be
+	// changing the same directories and the queue would be writing over them.
+	store.FlushDirTimes(ctx, 0)
 
 	// Cached inode locks first: their keys outlive the operations that took
 	// them, so nothing else has dropped them, and a peer blocked on one should

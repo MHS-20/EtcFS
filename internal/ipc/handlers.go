@@ -77,25 +77,39 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errIO), nil
 	}
 
-	return entryResp(ino, s.withPendingSize(rec)), nil
+	return entryResp(ino, s.withPending(rec)), nil
 }
 
-// withPendingSize replaces a record's size with the size this node's own
-// unpublished writes have left the file at.
+// withPending replaces the parts of a record that this node has changed and not
+// yet published: a file's size, and a directory's timestamps.
 //
 // etcd is behind by up to the flush interval for an inode this node is writing,
-// so without this a write followed by a stat on the same node reports the size
-// from before the write.  A peer's stat still reads etcd and still lags: that
-// lag is what deferring publication costs, and it is bounded by the flush
-// interval.  Copying rather than mutating keeps the cached record immutable,
-// which every other reader of it relies on.
-func (s *Service) withPendingSize(rec *metadata.InodeRecord) *metadata.InodeRecord {
-	size, found := s.pendingSize(rec.Ino)
-	if !found || size == rec.Size {
+// and by up to the same interval for a directory this node has added an entry
+// to, so without this a write or a create followed by a stat on the same node
+// reports the state from before it.  A peer's stat still reads etcd and still
+// lags: that lag is what deferring publication costs, and it is bounded by the
+// same interval.  Copying rather than mutating keeps the cached record
+// immutable, which every other reader of it relies on.
+func (s *Service) withPending(rec *metadata.InodeRecord) *metadata.InodeRecord {
+	updated := *rec
+	changed := false
+
+	if size, found := s.pendingSize(rec.Ino); found && size != rec.Size {
+		updated.Size = size
+		changed = true
+	}
+	// Only forward: a queued timestamp older than the record's own has already
+	// been superseded by something that committed its own — a mkdir folds the
+	// parent's new mtime into its transaction — and reporting it would take the
+	// directory's clock backwards.
+	if at, queued := s.store.PendingDirTime(rec.Ino); queued && rec.Mtime.Before(at) {
+		updated.Mtime, updated.Ctime = at, at
+		changed = true
+	}
+
+	if !changed {
 		return rec
 	}
-	updated := *rec
-	updated.Size = size
 	return &updated
 }
 
@@ -113,7 +127,7 @@ func (s *Service) handleGetattr(ctx context.Context, payload []byte) ([]byte, er
 		return int32Resp(errNoEnt), nil
 	}
 
-	return attrResp(s.withPendingSize(rec)), nil
+	return attrResp(s.withPending(rec)), nil
 }
 
 // READDIR payload: [u64:ino][u64:offset][u32:size]
@@ -176,7 +190,7 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 		if rec == nil {
 			rec = &metadata.InodeRecord{Ino: e.Ino}
 		}
-		b.wAttr(s.withPendingSize(rec))
+		b.wAttr(s.withPending(rec))
 		b.w32(entryTimeoutSecs)
 		b.w32(attrTimeoutSecs)
 	}

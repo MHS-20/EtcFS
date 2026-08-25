@@ -724,19 +724,27 @@ func (s *Service) flushExpired(ctx context.Context) {
 	}
 }
 
-// FSYNC/FLUSH payload: [u64:ino]
+// FSYNC/FLUSH/FSYNCDIR payload: [u64:ino]
 // Response: [i32:error]
 //
-// Both publish this inode's deferred writes and block until the transaction
+// All three publish what this node is holding for the inode and block until it
 // commits, which is what makes the acknowledgement mean what fsync promises.
 // A flush that failed for a transient reason keeps its buffer and keeps
 // returning EIO here until one commits.
+//
+// For a directory the deferred state is its timestamp rather than any extent,
+// and the flush of it is what makes fsyncdir mean something: a create is
+// published by its own transaction before it is acknowledged, but the parent's
+// clock is queued (see the directory write-behind in pkg/metadata) and a caller
+// that asked for the directory to be durable is asking for that too.
 func (s *Service) handleFsync(ctx context.Context, payload []byte) ([]byte, error) {
 	r := newReader(payload)
 	ino := r.u64()
 	if !r.ok {
 		return int32Resp(errInval), nil
 	}
+
+	s.store.FlushDirTimes(ctx, ino)
 
 	if err := s.flushInode(ctx, ino); err != nil {
 		s.log.Warn("fsync: cannot publish deferred writes", "ino", ino, "error", err)

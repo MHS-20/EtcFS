@@ -1078,14 +1078,16 @@ static void ec_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_f
     (void) fi;
     ec_sync_inode(req, ino);
 }
-/* Namespace operations are never deferred — they commit before they are
- * acknowledged — so there is nothing for a directory fsync to wait on. */
+/* Namespace operations commit before they are acknowledged, so the entries
+ * themselves need no waiting for.  The directory's own timestamp does: the
+ * backend queues it rather than paying a second commit per entry, and a caller
+ * that asked for the directory to be durable is asking for that to be
+ * published. */
 static void ec_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
 {
-    (void) ino;
     (void) datasync;
     (void) fi;
-    fuse_reply_err(req, 0);
+    ec_sync_inode(req, ino);
 }
 static void ec_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                     struct fuse_file_info *fi)

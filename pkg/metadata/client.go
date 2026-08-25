@@ -49,6 +49,12 @@ type Store struct {
 	// guard leaves transactions unguarded — correct only for control-plane
 	// stores (see SetGuard).
 	guard GuardFunc
+
+	// dirTouch, when set, coalesces the directory timestamp updates that follow
+	// namespace mutations instead of committing one per mutation.  Nil writes
+	// each one through.  See dirtouch.go.
+	dirTouchMu sync.Mutex
+	dirTouch   *dirTouch
 }
 
 // NewStore creates a Store backed by the given etcd client.

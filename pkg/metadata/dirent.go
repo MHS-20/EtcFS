@@ -252,21 +252,17 @@ func (s *Store) adjustDirNlink(ctx context.Context, ino uint64, delta int) (nlin
 // other. A timestamp one commit late is a better trade than a namespace
 // operation that fails under concurrency, which is also why a failure here is
 // reported to the caller's log and not to the caller.
+//
+// With batching started (see dirtouch.go) the commit is queued rather than made
+// here, so a stream of entries into one directory costs one timestamp commit
+// per interval instead of one per entry.
 func (s *Store) touchDir(ctx context.Context, ino uint64) {
-	_ = retryCAS(ctx, fmt.Sprintf("touch dir %d", ino), func() (bool, error) {
-		rec, rev, err := s.GetInodeRev(ctx, ino)
-		if err != nil {
-			return false, err
-		}
-		if rec == nil {
-			return true, nil
-		}
-		rec.Mtime = time.Now()
-		rec.Ctime = rec.Mtime
-		return s.Txn(ctx,
-			[]clientv3.Cmp{InodeUnchanged(ino, rev)},
-			[]clientv3.Op{clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec)))}, nil)
-	})
+	now := time.Now()
+	if t := s.dirTouches(); t != nil {
+		t.queue(ino, now)
+		return
+	}
+	_ = s.commitDirTime(ctx, ino, now)
 }
 
 // AtomicCreateFile creates a regular file and its directory entry in a single
