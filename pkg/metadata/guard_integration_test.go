@@ -50,7 +50,7 @@ func fence(t *testing.T, store *Store, nodeID string) {
 func TestGuard_NamespaceOpsSucceedWhenNotFenced(t *testing.T) {
 	store, ctx := guardedStore(t, "guard-node")
 
-	_, err := store.AtomicCreateFile(ctx, 1, "file", 100, 0644, 1000, 1000)
+	_, err := store.AtomicCreateFile(ctx, 1, "file", 100, 0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	_, err = store.AtomicCreateDir(ctx, 1, "dir", 101, 0755, 1000, 1000)
@@ -68,13 +68,13 @@ func TestGuard_NamespaceOpsRejectedWhenFenced(t *testing.T) {
 
 	// Seed entries to delete/rename *before* fencing, so the fenced-path
 	// assertions fail on the guard rather than on a missing key.
-	_, err := store.AtomicCreateFile(ctx, 1, "victim", 200, 0644, 1000, 1000)
+	_, err := store.AtomicCreateFile(ctx, 1, "victim", 200, 0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	fence(t, store, "guard-node")
 
 	t.Run("create", func(t *testing.T) {
-		_, err := store.AtomicCreateFile(ctx, 1, "new", 201, 0644, 1000, 1000)
+		_, err := store.AtomicCreateFile(ctx, 1, "new", 201, 0644, 1000, 1000, CreateExtra{})
 		assert.ErrorIs(t, err, ErrFenced)
 	})
 
@@ -112,7 +112,7 @@ func TestGuard_NamespaceOpsRejectedWhenFenced(t *testing.T) {
 func TestGuard_FencedNodeLeavesStateIntact(t *testing.T) {
 	store, ctx := guardedStore(t, "guard-node")
 
-	_, err := store.AtomicCreateFile(ctx, 1, "keeper", 300, 0644, 1000, 1000)
+	_, err := store.AtomicCreateFile(ctx, 1, "keeper", 300, 0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	fence(t, store, "guard-node")
@@ -129,11 +129,11 @@ func TestGuard_FencedNodeLeavesStateIntact(t *testing.T) {
 func TestGuard_CASFailureIsNotReportedAsFenced(t *testing.T) {
 	store, ctx := guardedStore(t, "guard-node")
 
-	_, err := store.AtomicCreateFile(ctx, 1, "dup", 400, 0644, 1000, 1000)
+	_, err := store.AtomicCreateFile(ctx, 1, "dup", 400, 0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	// Same name again: fails on the caller's own comparison, not the guard.
-	_, err = store.AtomicCreateFile(ctx, 1, "dup", 401, 0644, 1000, 1000)
+	_, err = store.AtomicCreateFile(ctx, 1, "dup", 401, 0644, 1000, 1000, CreateExtra{})
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrFenced)
 	assert.ErrorIs(t, err, ErrExists)
@@ -186,7 +186,7 @@ func TestGuard_UnguardedStoreUnaffected(t *testing.T) {
 
 	require.NoError(t, store.PutGeneration(ctx, "plain-node", 7))
 
-	_, err := store.AtomicCreateFile(ctx, 1, "plain", 500, 0644, 1000, 1000)
+	_, err := store.AtomicCreateFile(ctx, 1, "plain", 500, 0644, 1000, 1000, CreateExtra{})
 	assert.NoError(t, err, "unguarded store must not consult the generation")
 }
 
@@ -200,7 +200,7 @@ func TestGuard_UnavailableGuardFailsClosed(t *testing.T) {
 		return clientv3.Cmp{}, 0, false
 	})
 
-	_, err := store.AtomicCreateFile(ctx, 1, "nope", 600, 0644, 1000, 1000)
+	_, err := store.AtomicCreateFile(ctx, 1, "nope", 600, 0644, 1000, 1000, CreateExtra{})
 	assert.ErrorIs(t, err, ErrGuardUnavailable)
 
 	_, err = store.Put(ctx, InodeKey(600), []byte("nope"))

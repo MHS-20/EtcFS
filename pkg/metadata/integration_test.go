@@ -508,7 +508,7 @@ func TestIntegration_AtomicCreateFile(t *testing.T) {
 	_, err := store.CreateInode(ctx, parent, 0755|uint32(1<<31), 0, 0)
 	require.NoError(t, err)
 
-	rec, err := store.AtomicCreateFile(ctx, parent, "test.txt", 100, 0644, 1000, 1000)
+	rec, err := store.AtomicCreateFile(ctx, parent, "test.txt", 100, 0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 	assert.Equal(t, uint64(100), rec.Ino)
 	assert.Equal(t, uint32(0644), rec.Mode)
@@ -533,7 +533,7 @@ func TestIntegration_AtomicUnlinkFile(t *testing.T) {
 	_, err := store.CreateInode(ctx, parent, 0755|uint32(1<<31), 0, 0)
 	require.NoError(t, err)
 
-	_, err = store.AtomicCreateFile(ctx, parent, "to-delete.txt", 200, 0644, 1000, 1000)
+	_, err = store.AtomicCreateFile(ctx, parent, "to-delete.txt", 200, 0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	err = store.AtomicUnlink(ctx, parent, "to-delete.txt")
@@ -572,7 +572,7 @@ func TestIntegration_ConcurrentCreatesNoCollision(t *testing.T) {
 			for f := 0; f < filesPerWorker; f++ {
 				name := fmt.Sprintf("w%d-f%d", workerID, f)
 				ino := uint64(workerID*1000 + f + 10000)
-				_, err := store.AtomicCreateFile(ctx, parent, name, ino, 0644, 1000, 1000)
+				_, err := store.AtomicCreateFile(ctx, parent, name, ino, 0644, 1000, 1000, CreateExtra{})
 				errCh <- err
 			}
 		}(w)
@@ -606,7 +606,7 @@ func TestIntegration_CreateFile(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create a file via AtomicCreateFile (Go handler path)
-	rec, err := store.AtomicCreateFile(ctx, parent, "newfile.txt", 3010, 0100644, 1000, 1000)
+	rec, err := store.AtomicCreateFile(ctx, parent, "newfile.txt", 3010, 0100644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 	assert.Equal(t, uint64(3010), rec.Ino)
 	assert.Equal(t, uint32(0100644), rec.Mode)
@@ -643,7 +643,7 @@ func TestIntegration_Unlink(t *testing.T) {
 
 	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
 	require.NoError(t, err)
-	_, err = store.AtomicCreateFile(ctx, parent, "todelete.txt", 3101, 0100644, 1000, 1000)
+	_, err = store.AtomicCreateFile(ctx, parent, "todelete.txt", 3101, 0100644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	err = store.AtomicUnlink(ctx, parent, "todelete.txt")
@@ -683,7 +683,7 @@ func TestIntegration_Rename(t *testing.T) {
 
 	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
 	require.NoError(t, err)
-	_, err = store.AtomicCreateFile(ctx, parent, "oldname.txt", 3131, 0100644, 1000, 1000)
+	_, err = store.AtomicCreateFile(ctx, parent, "oldname.txt", 3131, 0100644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	err = store.AtomicRename(ctx, parent, "oldname.txt", parent, "newname.txt", 3131, 0)
@@ -755,7 +755,7 @@ func TestIntegration_Link(t *testing.T) {
 
 	_, err := store.CreateInode(ctx, parent, 0755|ModeDir, 0, 0)
 	require.NoError(t, err)
-	_, err = store.AtomicCreateFile(ctx, parent, "original.txt", 3401, 0100644, 1000, 1000)
+	_, err = store.AtomicCreateFile(ctx, parent, "original.txt", 3401, 0100644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	// Hard link
@@ -848,7 +848,7 @@ func renameFixture(t *testing.T, s *Store, parent uint64, names ...string) map[s
 	inos := make(map[string]uint64, len(names))
 	for i, name := range names {
 		ino := parent*1000 + uint64(i) + 1
-		_, err := s.AtomicCreateFile(ctx, parent, name, ino, ModeFile|0644, 1000, 1000)
+		_, err := s.AtomicCreateFile(ctx, parent, name, ino, ModeFile|0644, 1000, 1000, CreateExtra{})
 		require.NoError(t, err, "seed %s", name)
 		inos[name] = ino
 	}
@@ -940,7 +940,7 @@ func TestIntegration_RenameRejectsNonEmptyDirectoryTarget(t *testing.T) {
 	require.NoError(t, err)
 	_, err = s.AtomicCreateDir(ctx, parent, "dst", dstDir, 0755, 1000, 1000)
 	require.NoError(t, err)
-	_, err = s.AtomicCreateFile(ctx, dstDir, "occupant", 8403, ModeFile|0644, 1000, 1000)
+	_, err = s.AtomicCreateFile(ctx, dstDir, "occupant", 8403, ModeFile|0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	err = s.AtomicRename(ctx, parent, "src", parent, "dst", srcDir, 0)
@@ -1139,7 +1139,7 @@ func TestIntegration_ConcurrentHardLinksAllCount(t *testing.T) {
 
 	_, err := s.AtomicCreateDir(ctx, RootIno, "nlink-race", parent, 0755, 1000, 1000)
 	require.NoError(t, err)
-	_, err = s.AtomicCreateFile(ctx, parent, "target", ino, ModeFile|0644, 1000, 1000)
+	_, err = s.AtomicCreateFile(ctx, parent, "target", ino, ModeFile|0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -1178,7 +1178,7 @@ func TestIntegration_ConcurrentUnlinksReachZeroAndFreeTheInode(t *testing.T) {
 
 	_, err := s.AtomicCreateDir(ctx, RootIno, "unlink-race", parent, 0755, 1000, 1000)
 	require.NoError(t, err)
-	_, err = s.AtomicCreateFile(ctx, parent, "name-0", ino, ModeFile|0644, 1000, 1000)
+	_, err = s.AtomicCreateFile(ctx, parent, "name-0", ino, ModeFile|0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 	for i := 1; i < names; i++ {
 		_, lerr := s.AtomicLink(ctx, ino, parent, fmt.Sprintf("name-%d", i))
@@ -1222,9 +1222,9 @@ func TestIntegration_RenameOverTargetPinsTheVictimInode(t *testing.T) {
 
 	_, err := s.AtomicCreateDir(ctx, RootIno, "rename-pin", parent, 0755, 1000, 1000)
 	require.NoError(t, err)
-	_, err = s.AtomicCreateFile(ctx, parent, "src", srcIno, ModeFile|0644, 1000, 1000)
+	_, err = s.AtomicCreateFile(ctx, parent, "src", srcIno, ModeFile|0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
-	_, err = s.AtomicCreateFile(ctx, parent, "victim", victimIno, ModeFile|0644, 1000, 1000)
+	_, err = s.AtomicCreateFile(ctx, parent, "victim", victimIno, ModeFile|0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	// Racing hard links against the replacement: whichever order they land in,
@@ -1319,9 +1319,9 @@ func TestIntegration_RefusedLinkLeavesNlinkAlone(t *testing.T) {
 
 	_, err := s.AtomicCreateDir(ctx, RootIno, "atomic-link", parent, 0755, 1000, 1000)
 	require.NoError(t, err)
-	_, err = s.AtomicCreateFile(ctx, parent, "file", 9601, ModeFile|0644, 1000, 1000)
+	_, err = s.AtomicCreateFile(ctx, parent, "file", 9601, ModeFile|0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
-	_, err = s.AtomicCreateFile(ctx, parent, "taken", 9602, ModeFile|0644, 1000, 1000)
+	_, err = s.AtomicCreateFile(ctx, parent, "taken", 9602, ModeFile|0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 
 	_, err = s.AtomicLink(ctx, 9601, parent, "taken")
@@ -1368,7 +1368,7 @@ func TestIntegration_RmdirRefusesADirectoryFilledUnderIt(t *testing.T) {
 	assert.Nil(t, rec, "an emptied directory is removed outright, not decremented")
 
 	// A file is not a directory, whatever the caller asked for.
-	_, err = s.AtomicCreateFile(ctx, parent, "file", 9703, ModeFile|0644, 1000, 1000)
+	_, err = s.AtomicCreateFile(ctx, parent, "file", 9703, ModeFile|0644, 1000, 1000, CreateExtra{})
 	require.NoError(t, err)
 	require.ErrorIs(t, s.AtomicRmdir(ctx, parent, "file"), ErrNotDir)
 }
@@ -1423,7 +1423,7 @@ func TestIntegration_NamespaceOpsTouchTheParentDirectory(t *testing.T) {
 	}
 
 	backdate()
-	_, err = store.AtomicCreateFile(ctx, parent, "f", 900, ModeFile|0644, 0, 0)
+	_, err = store.AtomicCreateFile(ctx, parent, "f", 900, ModeFile|0644, 0, 0, CreateExtra{})
 	require.NoError(t, err)
 	assertTouched("create")
 
@@ -1471,7 +1471,7 @@ func TestIntegration_DirectoryNlinkCountsSubdirectories(t *testing.T) {
 
 	// A file is not a subdirectory and must leave the count alone — this is
 	// also the path that must stay free of a pin on the parent.
-	_, err = store.AtomicCreateFile(ctx, parent, "f", 801, ModeFile|0644, 0, 0)
+	_, err = store.AtomicCreateFile(ctx, parent, "f", 801, ModeFile|0644, 0, 0, CreateExtra{})
 	require.NoError(t, err)
 	assert.Equal(t, uint32(3), nlink(parent), "a file changed the parent's count")
 
