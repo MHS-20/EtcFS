@@ -58,9 +58,7 @@ func (s *Store) StartDirTouchBatching(ctx context.Context, interval time.Duratio
 		return
 	}
 	t := &dirTouch{store: s, interval: interval, log: log, dirty: map[uint64]time.Time{}}
-	s.dirTouchMu.Lock()
-	s.dirTouch = t
-	s.dirTouchMu.Unlock()
+	s.dirTouch.Store(t)
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -77,11 +75,7 @@ func (s *Store) StartDirTouchBatching(ctx context.Context, interval time.Duratio
 }
 
 // dirTouches returns the queue, or nil when updates are written through.
-func (s *Store) dirTouches() *dirTouch {
-	s.dirTouchMu.Lock()
-	defer s.dirTouchMu.Unlock()
-	return s.dirTouch
-}
+func (s *Store) dirTouches() *dirTouch { return s.dirTouch.Load() }
 
 // PendingDirTime returns the timestamp a directory has been given but not yet
 // published, so this node answers its own stat of the directory with the change

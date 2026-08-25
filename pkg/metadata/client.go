@@ -53,8 +53,12 @@ type Store struct {
 	// dirTouch, when set, coalesces the directory timestamp updates that follow
 	// namespace mutations instead of committing one per mutation.  Nil writes
 	// each one through.  See dirtouch.go.
-	dirTouchMu sync.Mutex
-	dirTouch   *dirTouch
+	//
+	// An atomic rather than a mutex because every stat consults it — a
+	// directory's queued timestamp is what this node answers its own stat of
+	// that directory with — and a shared mutex on that path would have every
+	// FUSE thread queue behind the others for a pointer that is written once.
+	dirTouch atomic.Pointer[dirTouch]
 }
 
 // NewStore creates a Store backed by the given etcd client.
