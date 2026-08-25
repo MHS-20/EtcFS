@@ -834,17 +834,31 @@ func (s *Service) flushInode(ctx context.Context, ino uint64) error {
 //
 // It waits for each inode rather than skipping a busy one: nothing here is on a
 // request's critical path, and a buffer left behind is acknowledged data lost.
+// It takes them in the same chunks the interval sweep does, so it never holds
+// the whole cache's local locks across a commit.
 func (s *Service) FlushAll(ctx context.Context, trigger string) {
-	entries := s.locks.all()
-	for _, e := range entries {
+	var held []*lockEntry
+	for _, e := range s.locks.all() {
 		e.rw.Lock()
-	}
-	defer func() {
-		for _, e := range entries {
-			e.rw.Unlock()
+		held = append(held, e)
+		if len(held) == flushBatchInodes {
+			s.flushHeld(ctx, held, trigger)
+			held = held[:0]
 		}
-	}()
-	s.flushEntries(ctx, entries, trigger)
+	}
+	s.flushHeld(ctx, held, trigger)
+}
+
+// flushHeld publishes a chunk of entries whose local locks the caller holds,
+// and gives them back.
+func (s *Service) flushHeld(ctx context.Context, held []*lockEntry, trigger string) {
+	if len(held) == 0 {
+		return
+	}
+	s.flushEntries(ctx, held, trigger)
+	for _, e := range held {
+		e.rw.Unlock()
+	}
 }
 
 // StartFlusher publishes buffers that have been sitting longer than the flush
@@ -896,22 +910,11 @@ func (s *Service) flushExpired(ctx context.Context) {
 		// one of them waits that long.  Publishing in transaction-sized chunks
 		// bounds that wait at one commit however many inodes the sweep finds.
 		if len(due) == flushBatchInodes {
-			s.flushDue(ctx, due)
+			s.flushHeld(ctx, due, "interval")
 			due = due[:0]
 		}
 	}
-	s.flushDue(ctx, due)
-}
-
-// flushDue publishes a chunk of the sweep and gives the inodes back.
-func (s *Service) flushDue(ctx context.Context, due []*lockEntry) {
-	if len(due) == 0 {
-		return
-	}
-	s.flushEntries(ctx, due, "interval")
-	for _, e := range due {
-		e.rw.Unlock()
-	}
+	s.flushHeld(ctx, due, "interval")
 }
 
 // FSYNC/FLUSH/FSYNCDIR payload: [u64:ino]
