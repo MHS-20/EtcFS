@@ -46,6 +46,21 @@ source "$COMPARE_SCRIPT_DIR/../bench-lib.sh"
 RESULTS_DIR="$COMPARE_PROJECT_ROOT/benchmark-results/compare/$COMPARE_BACKEND"
 mkdir -p "$RESULTS_DIR"
 
+# compare_client_nodes <wanted> — provision enough nodes for <wanted> of them to
+# end up with the filesystem actually mounted, and export that count before
+# compare_provision reads it. gluster and juicefs spend node0 on the server (the
+# first brick / redis + object store) and never mount it there, so a scenario
+# that needs N clients needs N+1 nodes from them and N from everyone else.
+# Without this a three-node sweep silently becomes a two-node one for those two
+# backends, and the curves stop being comparable at the point that matters.
+compare_client_nodes() {
+    local want="$1"
+    case "$COMPARE_BACKEND_BASE" in
+        gluster|juicefs) export ETCFS_COMPUTE_NODES="$((want + 1))" ;;
+        *)               export ETCFS_COMPUTE_NODES="$want" ;;
+    esac
+}
+
 compare_provision() {
     log "=== [$COMPARE_BACKEND] provisioning 3-node cluster + ${ETCFS_VOLUME_IOPS}-IOPS Multi-Attach volume ==="
     bash "$INFRA_DIR/create-infra.sh"
@@ -249,15 +264,34 @@ compare_destroy_local_volumes() {
 # compare_summary_row <label> <fio_json> — appends one row to this backend's
 # own summary.json (an array of {label, write_iops, write_p99_us, read_iops,
 # read_p99_us}), the shape report.sh reads back across every backend.
+
+# compare_p99_us <json> <job_index> <read|write> — the 99th percentile of
+# completion latency, in microseconds, from either fio JSON dialect.
+#
+# fio 3.x reports `clat_ns.percentile` in nanoseconds; fio 2.14 — which is what
+# the AL2 AMI that gfs2 and gluster need still ships — reports
+# `clat.percentile` in microseconds and has no `clat_ns` at all. Reading only
+# the 3.x key made every p99 from those two backends come back as 0, which
+# earlier reports published as "missing data" rather than as the real figure it
+# was sitting next to.
+compare_p99_us() {
+    jq -r --argjson j "$2" --arg d "$3" '
+        (.jobs[$j][$d].clat_ns.percentile."99.000000") as $ns
+        | if $ns then ($ns / 1000 | round)
+          else ((.jobs[$j][$d].clat.percentile."99.000000" // 0) | round) end' "$1"
+}
+
 compare_summary_row() {
     local label="$1" file="$2"
     local row
-    row=$(jq --arg l "$label" '{
+    row=$(jq --arg l "$label" \
+        --argjson wp "$(compare_p99_us "$file" 0 write)" \
+        --argjson rp "$(compare_p99_us "$file" 1 read)" '{
         label: $l,
         write_iops: (.jobs[0].write.iops // 0 | round),
-        write_p99_us: ((.jobs[0].write.clat_ns.percentile."99.000000" // 0) / 1000 | round),
+        write_p99_us: $wp,
         read_iops: (.jobs[1].read.iops // 0 | round),
-        read_p99_us: ((.jobs[1].read.clat_ns.percentile."99.000000" // 0) / 1000 | round)
+        read_p99_us: $rp
     }' "$file")
     local summary="$RESULTS_DIR/summary.json"
     [[ -f "$summary" ]] || echo "[]" > "$summary"
@@ -514,21 +548,88 @@ compare_walk_tree() {
 # So the survivor writes in a loop the whole time, logging one line per
 # attempt, and the number is extracted from that log afterwards against the
 # kill's own timestamp.
+# A tag names the probe, so a node can run more than one at a time: the
+# takeover probe (writing a file the dead node held) has to run alongside the
+# survivor's own, and they cannot share a log.
 compare_probe_start() {
-    local ip="$1" path="$2"
-    $SSH_CMD "ec2-user@$ip" "sudo rm -f /tmp/probe.log /tmp/probe.stop; sudo touch $path" || true
-    $SSH_CMD -n -f "ec2-user@$ip" "sudo sh -c 'while [ ! -f /tmp/probe.stop ]; do
+    local ip="$1" path="$2" tag="${3:-probe}"
+    # timeout, because this touch is itself an operation on the filesystem under
+    # test: starting a probe on a file whose lock holder has just died can block
+    # for as long as the recovery being measured, and a synchronous ssh here
+    # would hang the whole scenario rather than record it.
+    timeout 20 $SSH_CMD "ec2-user@$ip" \
+        "sudo rm -f /tmp/$tag.log /tmp/$tag.stop; sudo timeout 10 touch $path" >/dev/null 2>&1 || true
+    $SSH_CMD -n -f "ec2-user@$ip" "sudo sh -c 'while [ ! -f /tmp/$tag.stop ]; do
         t=\$(date +%s.%N)
         if dd if=/dev/zero of=$path bs=4k count=1 conv=notrunc oflag=direct >/dev/null 2>&1; then
             echo \"\$t ok\"
         else
             echo \"\$t err\"
         fi
-    done > /tmp/probe.log' >/dev/null 2>&1"
+    done > /tmp/$tag.log' >/dev/null 2>&1"
 }
 
 compare_probe_stop() {
-    $SSH_CMD "ec2-user@$1" "sudo touch /tmp/probe.stop" || true
+    local tag="${2:-probe}"
+    $SSH_CMD "ec2-user@$1" "sudo touch /tmp/$tag.stop" || true
+}
+
+# ---- death watch: when the fault actually landed ----
+#
+# "Kill the victim" and "the victim is gone" are not the same instant, and the
+# gap between them is not small: a sysrq power-off is issued in milliseconds but
+# the machine was still answering 46 seconds later in one gluster run, because
+# the kernel still has to get through its own shutdown. Timing recovery from the
+# moment the kill was *issued* therefore charges every backend for its victim's
+# shutdown as if it were recovery, and hides the real one inside it.
+#
+# So a survivor watches the victim's own port five times a second for the whole
+# run and logs each attempt, and the death is read back out of that log
+# afterwards — the same shape as the I/O probe, and for the same reason.
+compare_death_watch_start() {
+    local watcher="$1" target_priv="$2" port="$3"
+    $SSH_CMD "ec2-user@$watcher" "rm -f /tmp/death.log /tmp/death.stop" || true
+    $SSH_CMD -n -f "ec2-user@$watcher" "sh -c 'while [ ! -f /tmp/death.stop ]; do
+        t=\$(date +%s.%N)
+        if timeout 1 bash -c \"</dev/tcp/$target_priv/$port\" >/dev/null 2>&1; then
+            echo \"\$t up\"
+        else
+            echo \"\$t down\"
+        fi
+        sleep 0.2
+    done > /tmp/death.log' >/dev/null 2>&1"
+}
+
+compare_death_watch_stop() {
+    $SSH_CMD "ec2-user@$1" "touch /tmp/death.stop" || true
+}
+
+# compare_death_watch_time <watcher> <since_epoch> — the epoch of the first
+# failed connection at or after <since_epoch>, or -1 if the target never stopped
+# answering. Prints the absolute epoch, not an interval: callers need it as the
+# origin for the recovery measurement, not only as a duration.
+compare_death_watch_time() {
+    local watcher="$1" t0="$2"
+    $SSH_CMD "ec2-user@$watcher" "cat /tmp/death.log" > "$RESULTS_DIR/death-$watcher.log" 2>/dev/null || true
+    awk -v t0="$t0" '$2 == "down" && $1 >= t0 { printf "%.3f", $1; found=1; exit } END { if (!found) print "-1" }' \
+        "$RESULTS_DIR/death-$watcher.log"
+}
+
+# compare_probe_silence <ip> <end_epoch> [tag] — seconds between the probe's
+# last successful write and <end_epoch>.
+#
+# This is the number that tells a filesystem which never stalled apart from one
+# that stopped answering altogether. Both look identical to
+# compare_probe_recovery: its "longest gap between consecutive successes" needs
+# a success on each side of the gap, so a probe that hangs and never writes
+# again closes no gap and reports a small stall from before the failure. A
+# client blocked forever on a dead server, or a lockspace stopped waiting for a
+# fence that never comes, is exactly that case.
+compare_probe_silence() {
+    local ip="$1" end="$2" tag="${3:-probe}"
+    awk -v e="$end" '$2 == "ok" { last = $1 } END {
+        if (last == "") { print "-1" } else { printf "%.3f", e - last }
+    }' "$RESULTS_DIR/$tag-$ip.log" 2>/dev/null || echo "-1"
 }
 
 # compare_probe_recovery <ip> <kill_epoch> — prints
@@ -537,8 +638,8 @@ compare_probe_stop() {
 # successes after it (the actual stall, if the first post-kill attempt happened
 # to land before the failure did), and how many attempts failed outright.
 compare_probe_recovery() {
-    local ip="$1" t0="$2"
-    $SSH_CMD "ec2-user@$ip" "sudo cat /tmp/probe.log" > "$RESULTS_DIR/probe-$ip.log"
+    local ip="$1" t0="$2" tag="${3:-probe}"
+    $SSH_CMD "ec2-user@$ip" "sudo cat /tmp/$tag.log" > "$RESULTS_DIR/$tag-$ip.log"
     awk -v t0="$t0" '
         $2 == "ok" {
             if (first == "" && $1 >= t0) first = $1
@@ -550,7 +651,7 @@ compare_probe_recovery() {
             if (first == "") { print "-1 -1", errs+0; exit }
             printf "%.3f %.3f %d\n", first - t0, gap + 0, errs + 0
         }
-    ' "$RESULTS_DIR/probe-$ip.log"
+    ' "$RESULTS_DIR/$tag-$ip.log"
 }
 
 source "$COMPARE_SCRIPT_DIR/compare-backends.sh"

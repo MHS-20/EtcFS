@@ -23,10 +23,13 @@ export COMPARE_BACKEND="${COMPARE_BACKEND:-etcfs}"
 SCALE_NODES="${ETCFS_SCALE_NODES:-2 4 8}"
 MAX=0
 for n in $SCALE_NODES; do [[ "$n" -gt "$MAX" ]] && MAX="$n"; done
-export ETCFS_COMPUTE_NODES="$MAX"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/compare-lib.sh"
+
+# The widest sweep point has to be reachable in *mounted* nodes, which is one
+# fewer than the cluster on the backends that spend node0 on a server.
+compare_client_nodes "$MAX"
 
 RUNTIME="${ETCFS_BENCH_RUNTIME:-30}"
 FILES="${ETCFS_META_FILES:-500}"

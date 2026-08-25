@@ -40,5 +40,4 @@ iodepth=1
 ")
 
 compare_headline fsync sync_write_iops "$(compare_fio_iops "$json" write)" ops/s
-compare_headline fsync sync_write_p99_us \
-    "$(jq -r '(.jobs[0].write.clat_ns.percentile."99.000000" // 0) / 1000 | round' "$json")" us
+compare_headline fsync sync_write_p99_us "$(compare_p99_us "$json" 0 write)" us

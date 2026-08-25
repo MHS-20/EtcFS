@@ -34,7 +34,7 @@ filename_format=fio.\$jobname.\$jobnum.\$filenum" 8M psync 4 1 "$RUNTIME"
     compare_headline etcd-degraded "${name}_read_iops" \
         "$(jq -r '.jobs[1].read.iops | round' "$RESULTS_DIR/degraded-$name.json")" ops/s
     compare_headline etcd-degraded "${name}_write_p99_us" \
-        "$(jq -r '(.jobs[0].write.clat_ns.percentile."99.000000" // 0) / 1000 | round' "$RESULTS_DIR/degraded-$name.json")" us
+        "$(compare_p99_us "$RESULTS_DIR/degraded-$name.json" 0 write)" us
 }
 
 compare_begin

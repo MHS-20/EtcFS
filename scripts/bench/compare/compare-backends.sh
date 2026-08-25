@@ -72,6 +72,7 @@ compare_mount_etcfs() {
 compare_mount_nfs() {
     compare_export_backing "${COMPARE_PUB_IPS[0]}" "${COMPARE_PRIV_IPS[0]}" "${COMPARE_PUB_IPS[@]:1}"
     MOUNT_PATH="$BACKING_PATH"
+    COMPARE_REMOTE_MOUNT_CMD="sudo mount -t nfs4 ${COMPARE_PRIV_IPS[0]}:$BACKING_PATH $BACKING_PATH"
     BENCH_NODES=("${COMPARE_PUB_IPS[@]:1}" "${COMPARE_PUB_IPS[0]}")
 }
 
@@ -128,6 +129,7 @@ logging {
         $SSH_CMD "ec2-user@$ip" "sudo mkdir -p /mnt/compare-gfs2 && sudo mount -t gfs2 -o noatime $dev /mnt/compare-gfs2"
     done
     MOUNT_PATH=/mnt/compare-gfs2
+    COMPARE_REMOTE_MOUNT_CMD="sudo mount -t gfs2 -o noatime $dev /mnt/compare-gfs2"
     BENCH_NODES=("${COMPARE_PUB_IPS[@]}")
 }
 
@@ -182,6 +184,7 @@ compare_mount_gluster() {
         [[ "$mount_all" == "1" ]] || break
     done
     MOUNT_PATH=/mnt/compare-gluster
+    COMPARE_REMOTE_MOUNT_CMD="sudo mount -t glusterfs ${COMPARE_PRIV_IPS[0]}:/compare-vol /mnt/compare-gluster"
 }
 
 compare_mount_juicefs() {
@@ -228,6 +231,84 @@ compare_mount_juicefs() {
     done
     sleep 3
     MOUNT_PATH=/mnt/compare-juicefs
+    COMPARE_REMOTE_MOUNT_CMD="sudo juicefs mount -d redis://${COMPARE_PRIV_IPS[0]}:6379/1 /mnt/compare-juicefs"
+}
+
+# ---- membership churn: one node leaves the filesystem and comes back ----
+#
+# The elasticity scenario needs "take this node out of the filesystem, then put
+# it back" for every backend, which is a different event in each:
+#
+#   etcfs    both daemons stop and restart — a node claims its own arena and
+#            announces its departure, so no peer is expected to pause
+#   gfs2     the mount joins and leaves the DLM lockspace, and every surviving
+#            node's lockspace is suspended while the membership changes; the
+#            leave also makes the survivors recover the leaver's journal
+#   gluster  a client mount attaches to and detaches from the volume
+#   nfs      a client mount, which the server absorbs on its own
+#   juicefs  a client mount against the shared redis + object store
+#
+# Only the first two have any reason to disturb the nodes already running,
+# which is precisely the number the scenario exists to take: the same event,
+# timed on the *other* nodes, across five backends.
+#
+# compare_elastic_joiner — the node whose churn is worth timing. Never the
+# server for a server-mediated backend: taking that out is bench-node-kill.sh's
+# scenario, and it stops the filesystem for everyone rather than testing
+# membership at all.
+compare_elastic_joiner() {
+    case "$COMPARE_BACKEND_BASE" in
+        nfs) echo "${BENCH_NODES[1]}" ;;   # BENCH_NODES ends with the server
+        *)   echo "${BENCH_NODES[-1]}" ;;
+    esac
+}
+
+# compare_leave_fs <pub_ip> — an orderly departure, not a kill. Prints nothing.
+compare_leave_fs() {
+    local ip="$1"
+    case "$COMPARE_BACKEND_BASE" in
+        etcfs)
+            # SIGTERM plus an explicit unmount, the same clean-leave path
+            # bench-join-latency.sh uses: a killed daemon is a crash to the
+            # fencing controller, which detaches the node's EBS attachment for
+            # real and turns the rejoin below into a fencing-recovery test.
+            compare_etcfs_snapshot_cmdline "$ip"
+            $SSH_CMD "ec2-user@$ip" \
+                "sudo killall etcfuse-meta etcfuse 2>/dev/null; sudo umount -l $MOUNT_PATH 2>/dev/null; true"
+            ;;
+        juicefs)
+            $SSH_CMD "ec2-user@$ip" "sudo umount $MOUNT_PATH 2>/dev/null || sudo umount -l $MOUNT_PATH 2>/dev/null; true"
+            ;;
+        *)
+            $SSH_CMD "ec2-user@$ip" "sudo umount $MOUNT_PATH 2>/dev/null || sudo umount -l $MOUNT_PATH 2>/dev/null; true"
+            ;;
+    esac
+}
+
+# compare_join_fs <pub_ip> — put that node back into the filesystem, printing
+# the seconds it took to reach a mount that answers a write. Timed on the node
+# for the same reason compare_remote_time is: an ssh round trip is the same
+# order as the number being taken.
+compare_join_fs() {
+    local ip="$1"
+    if [[ "$COMPARE_BACKEND_BASE" == "etcfs" ]]; then
+        compare_etcfs_start "$ip"
+        return
+    fi
+    [[ -n "${COMPARE_REMOTE_MOUNT_CMD:-}" ]] || die "compare_join_fs: no mount command recorded for $COMPARE_BACKEND"
+    $SSH_CMD "ec2-user@$ip" "
+        s=\$(date +%s.%N)
+        $COMPARE_REMOTE_MOUNT_CMD >/dev/null 2>&1
+        deadline=\$((\$(date +%s) + 120))
+        until sudo mountpoint -q $MOUNT_PATH && \
+              sudo dd if=/dev/zero of=$MOUNT_PATH/join-probe.\$\$ bs=4k count=1 >/dev/null 2>&1; do
+            [[ \$(date +%s) -lt \$deadline ]] || { echo 'compare_join_fs: mount never came up within 120s' >&2; exit 1; }
+            sleep 0.05
+        done
+        sudo rm -f $MOUNT_PATH/join-probe.* 2>/dev/null
+        e=\$(date +%s.%N)
+        awk -v s=\$s -v e=\$e 'BEGIN{printf \"%.3f\", e-s}'
+    " || die "compare_join_fs: $ip never produced a working mount"
 }
 
 # ---- node failure ----
@@ -243,42 +324,29 @@ compare_mount_juicefs() {
 # supposed to cost, so gfs2 was being asked to recover from something far milder
 # than etcfs was. A comparison is only worth publishing if the fault is the same.
 #
-# The two server-mediated backends have no comparable partial failure — the
-# server IS the filesystem — so they get an outage instead: the ports are
-# blocked before the processes are killed, because stopping a service lets its
-# clients drain into a socket that is still accepting, and a graceful stop can
-# complete long after the probe's next write has already been acknowledged. The
-# block is what makes the outage begin at a known instant.
+# The two server-mediated backends are killed exactly the same way, and for the
+# same reason. They have no partial failure to inject — the server IS the
+# filesystem — so the equivalent fault is losing the machine that runs it, which
+# is what the other three lose too. An earlier version blocked their ports and
+# killed their service processes instead, to make the outage begin at a known
+# instant; measurement showed that fault did not reliably land at all (`iptables
+# -I INPUT --dport 2049` left the NFS server answering on 2049 for the whole of
+# a 180 s run, and `systemctl kill nfs-server` does not stop the kernel's nfsd
+# threads), so the backend was being credited with surviving a failure it never
+# had. The known instant now comes from the death watch
+# (compare_death_watch_start), not from the shape of the fault, which frees the
+# fault to be the same one everywhere.
 #
 # Powering the victim off is deliberately not undone: the survivor is what is
 # being measured, and a victim that reboots and rejoins mid-run changes what the
 # survivor is recovering from. Teardown destroys the cluster regardless.
 compare_kill_node() {
     local ip="$1"
-    case "$COMPARE_BACKEND_BASE" in
-        etcfs | gfs2 | gluster)
-            # The connection dies with the machine, so a failed ssh here is the
-            # expected outcome rather than an error.
-            $SSH_CMD -o ConnectTimeout=5 "ec2-user@$ip" \
-                "sudo sh -c 'echo 1 > /proc/sys/kernel/sysrq; echo o > /proc/sysrq-trigger' &" \
-                >/dev/null 2>&1 || true
-            ;;
-        nfs)
-            $SSH_CMD "ec2-user@$ip" "
-                sudo iptables -I INPUT -p tcp --dport 2049 -j DROP
-                sudo iptables -I OUTPUT -p tcp --sport 2049 -j DROP
-                sudo systemctl kill -s SIGKILL nfs-server 2>/dev/null
-                true"
-            ;;
-        juicefs)
-            $SSH_CMD "ec2-user@$ip" "
-                sudo iptables -I INPUT -p tcp --dport 6379 -j DROP
-                sudo iptables -I INPUT -p tcp --dport 9000 -j DROP
-                sudo killall -9 redis-server redis6-server minio 2>/dev/null
-                true"
-            ;;
-        *) die "compare_kill_node: unknown backend $COMPARE_BACKEND" ;;
-    esac
+    # The connection dies with the machine, so a failed ssh here is the expected
+    # outcome rather than an error.
+    $SSH_CMD -o ConnectTimeout=5 "ec2-user@$ip" \
+        "sudo sh -c 'echo 1 > /proc/sys/kernel/sysrq; echo o > /proc/sysrq-trigger' &" \
+        >/dev/null 2>&1 || true
 }
 
 # compare_failure_target — the node whose loss is worth timing. For the

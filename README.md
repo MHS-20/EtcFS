@@ -8,11 +8,51 @@
 
 AWS EBS Multi-Attach will attach one io2 volume to sixteen instances at once. Kubernetes will hand it to you as a `ReadWriteMany` `volumeMode: Block` volume. Both then stop, and [the EBS CSI driver's documentation says why](https://github.com/kubernetes-sigs/aws-ebs-csi-driver/blob/master/docs/multi-attach.md): using it safely "requires application-level coordination (e.g. via I/O fencing)", and failure to do so "can result in data loss and silent data corruption". Put ext4 on a Multi-Attach volume and mount it twice and you will destroy it. The platform gives you the shared device and declines to make it safe.
 
-EtcFS is what goes on top. **etcd/Raft is the only source of durable truth**, and the shared device holds nothing but file bytes. No on-disk filesystem format, no kernel module, no bespoke distributed lock manager — a userspace FUSE daemon on each node presents POSIX semantics, backed by etcd for everything structural (namespace, inode metadata, locks, allocation) and direct block I/O for file content. The I/O fencing that AWS says you need is three independent layers, one of them enforced by the drive itself — see [Fencing](https://mhs-20.github.io/EtcFS/architecture/fencing/self-fencing-watchdog/).
+EtcFS is what goes on top. **etcd/Raft is the only source of durable truth**, and the shared device holds nothing but file bytes. No on-disk filesystem format, no kernel module, no bespoke distributed lock manager — a userspace FUSE daemon on each node presents POSIX semantics, backed by etcd for everything structural (namespace, inode metadata, locks, allocation) and direct block I/O for file content. The I/O fencing that AWS says you need is three independent layers, one of them enforced by the drive itself — see [Fencing](docs/architecture/fencing/self-fencing-watchdog.md).
 
 Traditional cluster filesystems (GFS2, OCFS2) keep durable truth *on disk* — inodes, bitmaps, a journal — and bolt a distributed lock manager on top to arbitrate access to it. EtcFS inverts that: etcd's replicated Raft log *is* the durable truth for every structural fact, and the disk is demoted to a flat, unformatted array of bytes addressed by extents `(logical_offset, disk_offset, length)` recorded in etcd. Atomicity, consistency, and metadata recovery come from etcd's existing quorum-replicated log almost for free, instead of a bespoke recovery protocol — at the cost of every structural operation being an etcd round trip, mitigated by client-side caching and keeping the hot data path (reads/writes to already-allocated extents) on direct block I/O with no etcd round trip at all.
 
-Status: implemented and under hardening. See [State](docs/index.md#state) before relying on this for real data.
+Status: implemented and under hardening. Cross-node `fcntl`/`flock` advisory
+locks are the one accepted-but-unenforced POSIX surface — see
+[Consistency and durability](docs/architecture/consistency/consistency-and-durability-model.md)
+before relying on this for real data.
+
+## What that inversion buys
+
+Measured against GFS2, GlusterFS, self-hosted NFS and JuiceFS, each on its own
+isolated AWS cluster, all in one session. Full ledger — including every scenario
+EtcFS loses — in the
+[benchmark overview](docs/reports/benchmark-reports/overview.md).
+
+- **Recovery with no fence device and no journal replay.** A node is powered off
+  mid-write holding locks; a survivor takes over its file in **2.19 s** and never
+  stops serving its own I/O. **10.3x faster than GlusterFS** — and GFS2, NFS and
+  JuiceFS never recovered inside 180 s, GFS2's survivors stopping entirely until
+  an external STONITH device confirms the kill.
+- **Elastic membership, no stop-the-world.** A node leaving or joining under load
+  stalls the others **0.09–0.11 s** and costs them 7.2% / 11.3% of bandwidth —
+  about **half GFS2's cost**, which suspends its DLM lockspace on every
+  membership change. Three leave/rejoin cycles under load: 3.02%.
+- **A far tighter tail.** At the same random-write throughput as the kernel
+  filesystems, p99 write latency is **24x better than GFS2**, 16x better than
+  GlusterFS, 13.6x better than NFS; read p99 **21.9x better than GFS2**.
+- **Scales where the directory lock stops others.** Over a 2 → 6 node sweep
+  shared-directory metadata throughput climbs **+34%** while GFS2 **loses 47%**
+  of its own; disjoint-workload bandwidth climbs 253 → 282 MiB/s.
+- **Handoff at device speed.** A file written on one node reads back on another
+  at **255.95 MiB/s** against a 254.14 MiB/s raw-device ceiling, with
+  time-to-first-byte flat at 69–112 ms from 1 MiB to 8 GiB — only the extent map
+  crosses the network.
+- **A coherent page cache that is free to read through.** 600,852 IOPS on a
+  RAM-resident set with **zero reads reaching the daemon**, while the pages stay
+  under the inode's lock and are invalidated before it is yielded.
+- **Grow the volume under a running cluster.** New space allocatable in
+  **3.90 s**, no restart and no remount anywhere.
+- **Correctness checked by tools EtcFS did not write.** **8,787/8,787**
+  pjdfstest POSIX assertions pass; Porcupine finds every recorded history
+  linearizable against four models (**20/20** chaos assertions, 7/7 model runs);
+  the fencing protocol is TLA+ model-checked to **11.7 M states**, with four
+  deliberately broken variants producing counterexamples, and runs in CI.
 
 ## Quick start
 
@@ -48,54 +88,62 @@ Full flag reference and every config knob:
 
 ## How it measures up
 
-Five filesystems, each on its own isolated 3-node AWS cluster with a dedicated
-1000-IOPS io2 Multi-Attach volume — `scripts/bench/compare/`. Full method and
-caveats in [Reports](https://mhs-20.github.io/EtcFS/reports/benchmark-reports/negative-lookup/).
+Five filesystems, each on its own isolated AWS cluster with a dedicated
+1000-IOPS io2 Multi-Attach volume — `scripts/bench/compare/`. Every comparison
+below was measured in one session on 2026-08-24/25. Full method, caveats and the
+scenario-by-scenario ledger of wins and losses:
+[Benchmark overview](docs/reports/benchmark-reports/overview.md).
 
-**Where EtcFS wins — repeated negative lookups.** The pattern a compiler walking
-an include path or a build system checking timestamps generates. EtcFS answers a
-repeated probe for a missing name from the kernel's negative dentry cache with no
-upcall at all, at 2.10 us:
+**Where EtcFS wins — losing a node.** All five backends take one identical
+fault: the victim machine is powered off, nothing releases a lock, nothing runs
+an exit path. The number that matters is how long a survivor takes to write a
+file the dead node held the lock on.
 
-| vs. | their warm latency | EtcFS advantage |
+| Backend | takes over the dead node's file | survivor's own I/O |
 |---|---|---|
-| gfs2 | 5.40 us | **2.6x faster** |
-| nfs | 3.64 us | **1.7x faster** |
-| juicefs | 322.89 us | **154x faster** |
-| gluster | 693.36 us | **330x faster** |
+| **EtcFS** | **2.19 s** | never stopped (0.11 s worst gap) |
+| gluster | 22.64 s | continued, 78 s worst gap |
+| gfs2 | never, inside 180 s | **stopped and stayed stopped** |
+| nfs | never | client hung indefinitely |
+| juicefs | never | 3,356 errors, no recovery |
 
-Gluster and JuiceFS do not cache absences at all here — Gluster's warm pass is
-*slower* than its cold one.
+GFS2's DLM lockspace goes to `kern_stop` / "wait fencing" and stops granting
+locks to *anyone* on the surviving node until a fence device confirms the kill —
+this harness configures none, which is a caveat the
+[report](docs/reports/benchmark-reports/node-kill-recovery.md)
+states plainly.
 
-**Where EtcFS loses.**
+**Where EtcFS wins — the latency tail.** Per competitor, at effectively the same
+random-write throughput (934 IOPS against gluster's 1041 and gfs2's 973):
+
+| vs. | their p99 write | EtcFS advantage |
+|---|---|---|
+| gfs2 | 432.1 ms | **24x better** |
+| gluster | 288.8 ms | **16x better** |
+| nfs | 244.3 ms | **13.6x better** |
+| juicefs | 61.1 ms | 3.4x better, at 2.4x its throughput |
+
+**Where EtcFS loses.** Everything that costs a Raft commit:
 
 | Case | EtcFS | Best competitor | Deficit |
 |---|---|---|---|
-| Cold negative lookup | 1,073.50 us | 9.50 us (gfs2) | **113x slower** |
-| randwrite IOPS (`direct=1`) | 681 | 1,041 (gluster) | **35% lower** |
-| randread IOPS (`direct=1`) | 1,016 | 66,937 (juicefs) | see note |
+| 80k-file untar | 3327 s | 29.8 s (gfs2) | **112x slower** |
+| Shared-directory metadata, 3 nodes | 180 ops/s | 1515 ops/s (gfs2) | **8.4x slower** |
+| O_DSYNC 4 KiB writes | 155 IOPS | 989 (gfs2) | **6.4x slower** |
+| Cold negative lookup | 1474 us | 10.5 us (gfs2) | **140x slower** |
+| `du -s` over 80k files | 197 s | 0.41 s (nfs) | **480x slower** |
 
-Cold negative lookup is EtcFS's weakest measured result anywhere: every first
-probe is an etcd round trip, and the caching only pays when the same absent names
-are probed again inside the entry timeout. On writes, one Raft commit per
-structural mutation is the standing cost of putting durable truth in etcd. The
-randread column is not a like-for-like loss — JuiceFS/NFS/Gluster's large figures
-are client-cache artifacts under `direct=1`, which EtcFS honours strictly; see
-the [comparison report](https://mhs-20.github.io/EtcFS/reports/benchmark-reports/etcfs-vs-juicefs-gluster-gfs2-nfs/).
+One Raft commit per structural mutation is the standing cost of putting durable
+truth in etcd, and it is not a rounding error.
 
-**Where it makes no difference — a warm page cache.** All five converge on
-~600k IOPS on a RAM-resident working set (EtcFS 626k, gfs2 616k, gluster 609k,
-nfs 602k, juicefs 573k). That is the kernel page cache and every backend gets it.
-EtcFS reaches it while holding data pages only under the inode's lock and
-invalidating them before yielding it — the coherence obligation is free on this
-workload, but it is not an advantage, and the frequently-quoted "622x warm
-speedup" is an artifact of a device-bound cold baseline that gfs2 and gluster
-share.
-
-Not yet claimable: fencing and recovery against the other four. The
-[node-kill](https://mhs-20.github.io/EtcFS/reports/benchmark-reports/node-kill-recovery/)
-harness has two defects that invalidate three of its five columns, and it is
-being re-run.
+**Where it makes no difference.** A warm page cache: all five converge on
+530–620k IOPS on a RAM-resident working set, which is RAM, not a filesystem.
+EtcFS reaches it while holding data pages only under the inode's lock (zero
+reads reached the daemon across the warm pass), so the coherence obligation is
+free here — but it is not an advantage. Repeated *negative* lookups are the same
+story: EtcFS answers a cached absence in 8.81 us, the same order as gfs2
+(5.40 us) and nfs (3.68 us), and 31–57x faster than juicefs and gluster, which
+do not cache absences at all.
 
 ## Documentation
 
@@ -105,9 +153,9 @@ beyond this quick start:
 | | |
 |---|---|
 | **[Deployment](docs/deployment/index.md)** | Terraform module, binaries/containers, configuration, `etcfsctl`, Prometheus + Grafana |
-| **[Architecture](https://mhs-20.github.io/EtcFS/architecture/fuse/fuse-architecture/)** | FUSE layer, metadata model, storage substrate, consistency, fencing, reliability, cluster ops — one doc per subsystem |
-| **[Reports](https://mhs-20.github.io/EtcFS/reports/chaos-reports/fresh-cluster-per-scenario/)** | Chaos-testing and benchmark results, by date |
-| **[Background](https://mhs-20.github.io/EtcFS/background/etcd_raft_research/)** | Research behind the design decisions: etcd/Raft internals, cluster-FS survey, VFS/FUSE, userspace FS patterns |
+| **[Architecture](docs/architecture/fuse/fuse-architecture.md)** | FUSE layer, metadata model, storage substrate, consistency, fencing, reliability, cluster ops — one doc per subsystem |
+| **[Reports](docs/reports/chaos-reports/fresh-cluster-per-scenario.md)** | Chaos-testing and benchmark results, by date |
+| **[Background](docs/background/etcd_raft_research.md)** | Research behind the design decisions: etcd/Raft internals, cluster-FS survey, VFS/FUSE, userspace FS patterns |
 
 Read the relevant subsystem doc before making a design decision that touches
 fencing, the write path, or the metadata schema.

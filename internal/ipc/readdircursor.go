@@ -93,6 +93,12 @@ func (c *dirCursors) record(ino, offset uint64, name string) {
 }
 
 // forget drops a directory's cursor.
+//
+// Only the readdir benchmark calls this, to start a page cold and take the
+// fallback path deliberately. That test is behind the `integration` build tag,
+// which the lint run does not set, so `unused` sees no caller at all.
+//
+//nolint:unused // called by readdir_bench_integration_test.go (build tag: integration)
 func (c *dirCursors) forget(ino uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

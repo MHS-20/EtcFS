@@ -20,6 +20,10 @@ source "$SCRIPT_DIR/compare-lib.sh"
 
 FILES="${ETCFS_META_FILES:-500}"
 
+# The curve is only comparable across backends if every backend contributes the
+# same number of *mounted* nodes to it.
+compare_client_nodes "${ETCFS_META_NODES:-3}"
+
 compare_begin
 compare_mount
 
