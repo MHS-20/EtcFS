@@ -228,7 +228,7 @@ func TestCompactedWatchReportsTheGapAndRestartsFromCurrent(t *testing.T) {
 // create, which is the workload the longer timeout exists for.
 func TestAttrInvalidationSkipsInodesThisNodeHolds(t *testing.T) {
 	s := &Service{log: config.NewLogger(0), notifyServer: &notifyServer{}}
-	s.locks = newLockMap(func(*lockEntry, string) error { return nil })
+	s.locks = newLockMap(func(es []*lockEntry, _ string) []*lockEntry { return es })
 
 	client, daemon := net.Pipe()
 	defer func() { _ = client.Close() }()

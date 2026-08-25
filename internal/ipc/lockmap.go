@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -13,19 +14,20 @@ import (
 // published first, what a recall has to assert) stays on the Service in
 // lockcache.go: that is the protocol, and it is not a map operation.
 //
-// The eviction victim is dropped through the callback rather than here, because
-// dropping a lock publishes whatever the entry has buffered and can fail — and
-// a failure has to leave the entry in the set.
+// The eviction victims are dropped through the callback rather than here,
+// because dropping a lock publishes whatever the entry has buffered and can
+// fail — and a failure has to leave the entry in the set.
 type lockMap struct {
 	mu      sync.Mutex
 	entries map[uint64]*lockEntry
 
-	// drop publishes an entry's buffer and gives up its etcd key. It runs with
-	// the entry's write lock held and the set's mutex held.
-	drop func(e *lockEntry, trigger string) error
+	// drop publishes the entries' buffers and gives up their etcd keys, in one
+	// transaction, returning those whose keys are gone. It runs with each
+	// entry's write lock held and the set's mutex held.
+	drop func(es []*lockEntry, trigger string) []*lockEntry
 }
 
-func newLockMap(drop func(*lockEntry, string) error) *lockMap {
+func newLockMap(drop func([]*lockEntry, string) []*lockEntry) *lockMap {
 	return &lockMap{entries: make(map[uint64]*lockEntry), drop: drop}
 }
 
@@ -86,49 +88,68 @@ func (m *lockMap) drain() []*lockEntry {
 	return entries
 }
 
-// evictLocked drops cached locks until the set has room, oldest first.
+// evictLocked makes room in the set by giving up its least recently used
+// locks, a batch at a time.
+//
+// A batch rather than one victim, because giving a key up is a Raft commit and
+// one transaction of lockEvictBatch deletes costs what one delete costs.  A
+// workload with a far larger working set than the cache — an unpacking archive
+// touches 80,000 inodes against 4,096 entries — otherwise evicts one inode per
+// new one and pays that commit per file.  Between sweeps the set sits under its
+// bound by up to a batch, which is what the bound already tolerates in the
+// other direction.
+//
 // Only an entry no operation currently holds can go, so a full set of busy
 // inodes grows past the bound rather than blocking; the bound is a target, not
 // an invariant.
-//
-// ponytail: eviction is a linear sweep of the map, which is fine at this size
-// and against how rarely it runs.  An LRU list is the upgrade if the inode
-// fan-out of a real workload ever makes the sweep hot.
 func (m *lockMap) evictLocked() {
-	for len(m.entries) >= lockCacheMax {
-		var oldest uint64
-		var victim *lockEntry
-		for ino, e := range m.entries {
-			// TryLock rather than Lock: an entry with an operation in flight is
-			// skipped, never waited for.  Evicting it would let the next caller
-			// build a second entry for the same inode and run alongside the
-			// operation this one is excluding.
-			if !e.rw.TryLock() {
-				continue
-			}
-			if victim == nil || e.lastUsed.Before(victim.lastUsed) {
-				if victim != nil {
-					victim.rw.Unlock()
-				}
-				oldest, victim = ino, e
-				continue
-			}
-			e.rw.Unlock()
-		}
-		if victim == nil {
-			return
-		}
-		if err := m.drop(victim, "eviction"); err != nil {
-			// Its writes are not published, so its lock cannot be given up.
-			// Leaving it in the set keeps the buffer reachable by the flush
-			// interval; the set runs over its bound until then, which the bound
-			// already tolerates.
-			victim.rw.Unlock()
-			return
-		}
-		delete(m.entries, oldest)
-		victim.rw.Unlock()
+	if len(m.entries) < lockCacheMax {
+		return
 	}
+	victims := m.claimVictimsLocked(lockEvictBatch)
+	if len(victims) == 0 {
+		return
+	}
+	// Entries whose keys could not be given up — their writes are unpublished,
+	// or their pages are not invalidated — are not returned and stay in the set
+	// with their buffers reachable by the flush interval.
+	for _, e := range m.drop(victims, "eviction") {
+		delete(m.entries, e.ino)
+	}
+	for _, e := range victims {
+		e.rw.Unlock()
+	}
+}
+
+// claimVictimsLocked takes the write lock on up to n of the least recently used
+// entries and returns them, oldest first.
+//
+// The candidates are ordered before any of them is locked, so the sweep costs
+// one pass and one sort of the set rather than a pass per victim — which is
+// what a batch of evictions used to cost, one linear scan each.
+//
+// TryLock rather than Lock: an entry with an operation in flight is skipped,
+// never waited for.  Evicting it would let the next caller build a second entry
+// for the same inode and run alongside the operation this one is excluding.
+func (m *lockMap) claimVictimsLocked(n int) []*lockEntry {
+	candidates := make([]*lockEntry, 0, len(m.entries))
+	for _, e := range m.entries {
+		candidates = append(candidates, e)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].lastUsed.Before(candidates[j].lastUsed)
+	})
+
+	victims := make([]*lockEntry, 0, n)
+	for _, e := range candidates {
+		if len(victims) == n {
+			break
+		}
+		if e.rw.TryLock() {
+			victims = append(victims, e)
+		}
+	}
+	return victims
 }
 
 // recallSet names the inodes with a recall already in flight, so that a burst

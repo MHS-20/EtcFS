@@ -283,6 +283,53 @@ func (s *Store) PrepareLock(ino uint64, mode LockMode, ttl time.Duration) (strin
 		nil
 }
 
+// LockRelease names one holder's lock key, for the batched release below.
+type LockRelease struct {
+	Ino    uint64
+	Mode   LockMode
+	Holder string
+}
+
+// ReleaseLocks drops several holders' lock keys in one transaction, reporting
+// for each whether its key was still there to drop.
+//
+// One commit for the batch rather than one per key.  A cache eviction sweep is
+// what makes that worth having: the cache gives up many inodes at once and each
+// release used to be its own Raft commit, so a workload touching far more
+// inodes than the cache holds paid a commit per evicted inode.
+//
+// The per-key answers are what ReleaseLock's own return value is, and they
+// matter for the same reason: a key the lease had already dropped means this
+// node stopped holding the inode at an instant it never observed.  Nothing here
+// compares on the keys, exactly as the single release does not — a key this
+// node holds is one no peer can delete, and a key its lease dropped is one the
+// delete should find gone rather than refuse.
+func (s *Store) ReleaseLocks(ctx context.Context, batch []LockRelease) ([]bool, error) {
+	if len(batch) == 0 {
+		return nil, nil
+	}
+	ops := make([]clientv3.Op, len(batch))
+	for i, r := range batch {
+		ops[i] = clientv3.OpDelete(LockKey(r.Ino, r.Mode, r.Holder))
+	}
+
+	resp, err := s.TxnResponse(ctx, nil, ops, nil)
+	if err != nil {
+		return nil, fmt.Errorf("release %d locks: %w", len(batch), err)
+	}
+	// Nothing but the fencing guard can reject this transaction, and a rejected
+	// guard is reported as ErrFenced above.
+	if !resp.Succeeded {
+		return nil, fmt.Errorf("release %d locks: rejected", len(batch))
+	}
+
+	held := make([]bool, len(batch))
+	for i := range batch {
+		held[i] = resp.Responses[i].GetResponseDeleteRange().Deleted > 0
+	}
+	return held, nil
+}
+
 // ReleaseLock drops one holder's lock, reporting whether the key was still
 // there to drop.
 //

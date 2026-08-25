@@ -216,7 +216,7 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		readOnly:       opts.ReadOnly,
 		history:        opts.History,
 	}
-	s.locks = newLockMap(s.dropCachedLock)
+	s.locks = newLockMap(s.dropCachedLocks)
 	if opts.Device != nil {
 		s.setBlockDevice(opts.Device, opts.WriteBarriers)
 	}

@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -41,6 +42,15 @@ const (
 	// cache is not free to leave unbounded even ignoring memory.  What happens
 	// when it is reached is lockMap.evictLocked.
 	lockCacheMax = 4096
+
+	// lockEvictBatch is how many locks one eviction sweep gives up.
+	//
+	// The sweep costs one Raft commit whatever its size, so the batch is what
+	// turns a commit per evicted inode into a commit per lockEvictBatch of them.
+	// It is bounded above by etcd's own transaction op cap and below by wanting
+	// the sweep to be rare; 64 leaves the cache within 1.6% of its bound and the
+	// transaction at half of what one write may already carry.
+	lockEvictBatch = 64
 
 	// entryRetries bounds how many times an acquisition restarts because the
 	// cache entry was evicted from under it.  This is a race with the evictor
@@ -286,43 +296,36 @@ func covers(held, want metadata.LockMode) bool {
 	return held == metadata.LockExclusive || held == want
 }
 
-// dropCachedLock publishes anything this node has buffered for the inode and
+// errNotYielded reports that a cached lock could not be given up, because what
+// the key stands for has not been discharged: writes this node acknowledged are
+// still unpublished, or the kernel still holds the inode's pages.
+var errNotYielded = errors.New("cached lock not yielded")
+
+// dropCachedLock publishes anything this node has buffered for one inode and
 // then deletes its etcd key.  The caller must hold the entry's write lock, so
 // no operation is running under the lock being dropped.
 //
-// The flush comes first and its failure aborts the drop.  Yielding the key with
-// writes still buffered would let a peer read a file missing the writes this
-// node has already acknowledged, and the flush can never succeed afterwards —
-// its own comparison on the lock key would reject it.  Refusing to yield makes
-// the peer wait, which is the safe direction to fail in.
+// A batch of one: a recall and a shutdown give up exactly what an eviction
+// gives up, and the only thing a single release saves is a transaction it would
+// have been alone in anyway.
 func (s *Service) dropCachedLock(e *lockEntry, trigger string) error {
-	e.keyMu.Lock()
-	defer e.keyMu.Unlock()
-
-	if !e.pending.empty() {
-		// A context of its own, for the same reason the release below has one:
-		// this runs off whatever request last touched the inode, and may run
-		// with none at all.
-		ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
-		err := s.flushLocked(ctx, e, trigger)
-		cancel()
-		if err != nil && !e.pending.empty() {
-			return err
-		}
+	if len(s.dropCachedLocks([]*lockEntry{e}, trigger)) == 0 {
+		return errNotYielded
 	}
-	return s.releaseKeyLocked(e)
+	return nil
 }
 
 // releaseKeyLocked deletes an entry's etcd key with keyMu already held.
 //
 // Every cached copy of the inode goes with that key, and this is the single
-// place the obligation is discharged: recall, eviction, an upgrade from shared
-// to exclusive, a lost session and shutdown all release the key through here.
-// There are three such copies — the metadata snapshot, anything still buffered,
-// and the kernel's data pages — and the last of those is the only one this
-// process cannot simply drop, so it is done first and its failure aborts the
-// release.  Yielding the key with pages still cached would hide the next
-// holder's writes behind them for good, since a page cache has no timeout.
+// place the obligation is discharged: recall, an upgrade from shared to
+// exclusive, a lost session and shutdown all release the key through here, and
+// eviction through the batched form below.  There are three such copies — the
+// metadata snapshot, anything still buffered, and the kernel's data pages — and
+// the last of those is the only one this process cannot simply drop, so it is
+// done first and its failure aborts the release.  Yielding the key with pages
+// still cached would hide the next holder's writes behind them for good, since
+// a page cache has no timeout.
 func (s *Service) releaseKeyLocked(e *lockEntry) error {
 	if err := s.invalidatePages(e.ino); err != nil {
 		s.log.Error("kernel pages not invalidated, so this node's lock is not yielded",
@@ -330,7 +333,58 @@ func (s *Service) releaseKeyLocked(e *lockEntry) error {
 		return err
 	}
 
-	holder, mode := e.holder, e.mode
+	owed, owes := s.forgetKeyLocked(e)
+	if !owes {
+		return nil
+	}
+	s.deleteKeys([]metadata.LockRelease{owed}, []*lockEntry{e}, time.Now(), "release")
+	return nil
+}
+
+// deleteKeys deletes the keys a set of entries has given up, in one
+// transaction, and records the end of each hold.
+//
+// call is when the release began — after every page invalidation it depends on,
+// never before — and is shared by the batch, so a key's recorded hold ends no
+// earlier than the moment the whole batch was ready to give its keys up.  That
+// is later than the truth for every entry but the first, which is the safe
+// direction: a mutual-exclusion checker fed a hold that is too long can only
+// report overlaps that really happened.
+func (s *Service) deleteKeys(owed []metadata.LockRelease, owedBy []*lockEntry, call time.Time, trigger string) {
+	// A context of its own: a release has to happen even when the request that
+	// last used the lock has run out of time, or the keys stand until the node
+	// exits and every peer stalls on them.
+	ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
+	defer cancel()
+	var held []bool
+	err := retryEtcd(ctx, func(rctx context.Context) error {
+		var rerr error
+		held, rerr = s.store.ReleaseLocks(rctx, owed)
+		return rerr
+	})
+	ret := time.Now()
+	for i, e := range owedBy {
+		s.recordRelease(e, owed[i], err == nil && held[i], call, ret)
+	}
+	if err != nil {
+		// The entries are still forgotten: their local state was given up
+		// before this ran, and re-adopting a key whose caches are gone would be
+		// worse than leaking it.  The keys stand until the session ends, and a
+		// peer wanting one of those inodes stalls until then.
+		s.log.Error("cached inode locks not released, they will block peers until this node exits",
+			"inodes", len(owed), "trigger", trigger, "error", err)
+	}
+}
+
+// forgetKeyLocked drops everything an entry holds under its lock key and
+// reports the key etcd is now owed a delete for, if there was one.  keyMu must
+// be held.
+//
+// Separated from the delete because the delete is what batches: one release and
+// sixty-four give up exactly the same local state, and only the etcd half
+// differs.
+func (s *Service) forgetKeyLocked(e *lockEntry) (metadata.LockRelease, bool) {
+	owed := metadata.LockRelease{Ino: e.ino, Mode: e.mode, Holder: e.holder}
 	e.holder, e.lease = "", 0
 	e.meta, e.metaFor = nil, ""
 	// Every caller is expected to have published or discarded its buffer before
@@ -339,41 +393,108 @@ func (s *Service) releaseKeyLocked(e *lockEntry) error {
 	if !e.pending.empty() {
 		s.discardPending(e, "the lock key was released with writes still buffered")
 	}
-	if holder == "" {
-		return nil
-	}
+	return owed, owed.Holder != ""
+}
 
-	// A context of its own: a release has to happen even when the request that
-	// last used the lock has run out of time, or the key stands until the node
-	// exits and every peer stalls on it.
-	ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
-	defer cancel()
-	call := time.Now()
-	var wasHeld bool
-	err := retryEtcd(ctx, func(rctx context.Context) error {
-		var rerr error
-		wasHeld, rerr = s.store.ReleaseLock(rctx, e.ino, mode, holder)
-		return rerr
-	})
-	// A key that was already gone was dropped by the lease at an instant this
-	// node never saw, so the honest statement is that the hold ended somewhere
-	// between acquiring it and noticing — the same span keyLostLocked records,
-	// and for the same reason.  Timing the release from now instead would
-	// claim the inode right through the window a peer legitimately owned it,
-	// which is a mutual-exclusion violation in the history and not in the
-	// filesystem.  A lost response on a retry lands here too, and widening the
-	// interval is the safe direction to be wrong in: it weakens this node's
-	// claim rather than inventing one.
+// recordRelease appends the end of a key's hold to the history.
+//
+// A key that was already gone was dropped by the lease at an instant this node
+// never saw, so the honest statement is that the hold ended somewhere between
+// acquiring it and noticing — the same span keyLostLocked records, and for the
+// same reason.  Timing the release from the delete instead would claim the
+// inode right through the window a peer legitimately owned it, which is a
+// mutual-exclusion violation in the history and not in the filesystem.  A lost
+// response on a retry lands here too, and widening the interval is the safe
+// direction to be wrong in: it weakens this node's claim rather than inventing
+// one.
+func (s *Service) recordRelease(e *lockEntry, owed metadata.LockRelease, wasHeld bool, call, ret time.Time) {
 	widened := call
 	if !wasHeld {
 		widened = e.acquiredAt
 	}
-	s.recordKeyEvent(e.ino, mode, lockEventRelease, widened, time.Now(), call)
-	if err != nil {
-		s.log.Error("cached inode lock not released, it will block peers until this node exits",
-			"ino", e.ino, "mode", mode, "error", err)
+	s.recordKeyEvent(e.ino, owed.Mode, lockEventRelease, widened, ret, call)
+}
+
+// dropCachedLocks gives up a batch of cached locks at once, returning the
+// entries whose keys are gone and which the caller may therefore forget.
+//
+// One transaction for the whole batch is the point of it.  A release is a Raft
+// commit, and a workload touching far more inodes than the cache holds — an
+// unpacking archive is the example — evicts one inode per new one and used to
+// pay that commit per file.  Batching the deletes does not widen what any one
+// key stands for: each key is still deleted, still by exact holder token, and
+// the recorded hold merely ends later than it would have, which is the safe
+// direction for a mutual-exclusion checker.
+//
+// Everything that must happen before a key is yielded still happens per inode
+// and can still refuse: the buffer is published, and the kernel's pages are
+// invalidated.  An entry that fails either is left out of the batch with its
+// key intact, which leaves it in the cache — the bound is a target, not an
+// invariant.
+func (s *Service) dropCachedLocks(entries []*lockEntry, trigger string) []*lockEntry {
+	ready := make([]*lockEntry, 0, len(entries))
+	for _, e := range entries {
+		e.keyMu.Lock()
+		if s.prepareDropLocked(e, trigger) {
+			ready = append(ready, e)
+			continue
+		}
+		e.keyMu.Unlock()
 	}
-	return nil
+	defer func() {
+		for _, e := range ready {
+			e.keyMu.Unlock()
+		}
+	}()
+	if len(ready) == 0 {
+		return nil
+	}
+
+	// Taken after every invalidation, never before: the history has to show the
+	// pages going before the key does, and a release timed from the start of the
+	// batch would claim otherwise for every entry but the first.
+	call := time.Now()
+	owed := make([]metadata.LockRelease, 0, len(ready))
+	owedBy := make([]*lockEntry, 0, len(ready))
+	for _, e := range ready {
+		if r, owes := s.forgetKeyLocked(e); owes {
+			owed, owedBy = append(owed, r), append(owedBy, e)
+		}
+	}
+	if len(owed) == 0 {
+		return ready
+	}
+
+	s.deleteKeys(owed, owedBy, call, trigger)
+	return ready
+}
+
+// prepareDropLocked discharges what an entry owes before its key may be
+// yielded, reporting whether it may be.  keyMu must be held.
+//
+// The flush comes first and its failure refuses the drop.  Yielding the key
+// with writes still buffered would let a peer read a file missing the writes
+// this node has already acknowledged, and the flush can never succeed
+// afterwards — its own comparison on the lock key would reject it.  Refusing to
+// yield makes the peer wait, which is the safe direction to fail in.
+func (s *Service) prepareDropLocked(e *lockEntry, trigger string) bool {
+	if !e.pending.empty() {
+		// A context of its own, for the same reason the release has one: this
+		// runs off whatever request last touched the inode, and may run with
+		// none at all.
+		ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
+		err := s.flushLocked(ctx, e, trigger)
+		cancel()
+		if err != nil && !e.pending.empty() {
+			return false
+		}
+	}
+	if err := s.invalidatePages(e.ino); err != nil {
+		s.log.Error("kernel pages not invalidated, so this node's lock is not yielded",
+			"ino", e.ino, "error", err)
+		return false
+	}
+	return true
 }
 
 // keyLostLocked drops everything cached under a key etcd has already deleted:
