@@ -33,7 +33,11 @@ services:
       # Raft commit, and a commit is one WAL fsync.  The separation is only
       # worth what the storage underneath it is — point the volume at a
       # different device to get the benefit.
-      - --wal-dir=/etcd-wal
+      #
+      # A subdirectory of the mount, never the mount itself: etcd builds a fresh
+      # WAL as <dir>.tmp and renames it into place, and a rename onto a mount
+      # point fails with EBUSY — which panics the member on its first start.
+      - --wal-dir=/etcd-wal/wal
       - --listen-client-urls=http://0.0.0.0:2379
       - --advertise-client-urls=http://etcd1:2379
       - --listen-peer-urls=http://0.0.0.0:2380
@@ -72,7 +76,11 @@ services:
       # Raft commit, and a commit is one WAL fsync.  The separation is only
       # worth what the storage underneath it is — point the volume at a
       # different device to get the benefit.
-      - --wal-dir=/etcd-wal
+      #
+      # A subdirectory of the mount, never the mount itself: etcd builds a fresh
+      # WAL as <dir>.tmp and renames it into place, and a rename onto a mount
+      # point fails with EBUSY — which panics the member on its first start.
+      - --wal-dir=/etcd-wal/wal
       - --listen-client-urls=http://0.0.0.0:2379
       - --advertise-client-urls=http://etcd2:2379
       - --listen-peer-urls=http://0.0.0.0:2380
@@ -111,7 +119,11 @@ services:
       # Raft commit, and a commit is one WAL fsync.  The separation is only
       # worth what the storage underneath it is — point the volume at a
       # different device to get the benefit.
-      - --wal-dir=/etcd-wal
+      #
+      # A subdirectory of the mount, never the mount itself: etcd builds a fresh
+      # WAL as <dir>.tmp and renames it into place, and a rename onto a mount
+      # point fails with EBUSY — which panics the member on its first start.
+      - --wal-dir=/etcd-wal/wal
       - --listen-client-urls=http://0.0.0.0:2379
       - --advertise-client-urls=http://etcd3:2379
       - --listen-peer-urls=http://0.0.0.0:2380
