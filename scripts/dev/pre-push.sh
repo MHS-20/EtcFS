@@ -61,7 +61,13 @@ run_check "go vet (integration)" go vet -tags=integration ./...
 # with an older Go refuses go.mod's target outright, which is a green hook and
 # a red CI.
 pinned_lint="$(cat .golangci-version)"
-installed_lint="$(golangci-lint --version 2>/dev/null | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)"
+# `|| true`, because this whole assignment runs under `set -e` with `pipefail`:
+# with golangci-lint absent the grep matches nothing and exits 1, the pipeline
+# inherits that, and the hook dies here — before reaching the branch below that
+# exists precisely to report a missing linter. git surfaces that as a bare
+# "error: failed to push some refs", with every check above it printed OK, which
+# looks like the remote rejecting the push rather than the hook aborting it.
+installed_lint="$(golangci-lint --version 2>/dev/null | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || true)"
 if [[ "$installed_lint" != "$pinned_lint" ]]; then
     printf "  %-30s " "golangci-lint"
     echo -e "${RED}FAIL${NC}"

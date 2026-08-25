@@ -53,6 +53,18 @@ PREFIX="${2:-n}"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
 log() { echo "[$(date +%T)] $*"; }
 
+# Where each etcd member keeps its write-ahead log.  Separate from --data-dir so
+# the WAL's fsyncs — one per Raft commit, and every create, lock acquisition and
+# extent publication is a Raft commit — do not queue behind snapshot and
+# compaction I/O in the same directory.  This is etcd's own recommendation.
+#
+# The default is a second directory on the root volume, which separates the two
+# workloads but not the device they land on.  Point ETCD_WAL_DIR at a mount on a
+# different device — an instance store, or a second EBS volume — to get the
+# benefit the separation exists for.
+ETCD_WAL_DIR="${ETCD_WAL_DIR:-/var/lib/etcd-wal}"
+
+
 [[ -f "$STATE_FILE" ]] || { echo "ERROR: state file not found: $STATE_FILE (run create-infra.sh first)" >&2; exit 1; }
 
 wait_ssh() {
@@ -175,7 +187,8 @@ done
 for ip in "${PUB_IPS[@]}"; do
     ssh $SSH_OPTS "ec2-user@$ip" "
         sudo killall -9 etcd 2>/dev/null
-        sudo rm -rf /var/lib/etcd && sudo mkdir -p /var/lib/etcd
+        sudo rm -rf /var/lib/etcd $ETCD_WAL_DIR
+        sudo mkdir -p /var/lib/etcd $ETCD_WAL_DIR
     " 2>/dev/null
 done
 sleep 2
@@ -184,6 +197,7 @@ for i in "${!PUB_IPS[@]}"; do
     ip="${PUB_IPS[$i]}"; priv="${PRIV_IPS[$i]}"; ename="e${i}"
     ssh $SSH_OPTS "ec2-user@$ip" "
         sudo nohup /usr/local/bin/etcd --name $ename --data-dir /var/lib/etcd \
+            --wal-dir $ETCD_WAL_DIR \
             --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://$priv:2379 \
             --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://$priv:2380 \
             --initial-cluster $INITIAL_CLUSTER --initial-cluster-state new \

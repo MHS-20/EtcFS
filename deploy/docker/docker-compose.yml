@@ -26,6 +26,14 @@ services:
       - etcd
       - --name=etcd1
       - --data-dir=/etcd-data
+      # The WAL on its own volume, so its fsyncs do not queue behind snapshot
+      # and compaction I/O on the same directory.  etcd's own recommendation,
+      # and it lands under every commit-bound operation this filesystem makes:
+      # a create, a lock acquisition and an extent publication are each one
+      # Raft commit, and a commit is one WAL fsync.  The separation is only
+      # worth what the storage underneath it is — point the volume at a
+      # different device to get the benefit.
+      - --wal-dir=/etcd-wal
       - --listen-client-urls=http://0.0.0.0:2379
       - --advertise-client-urls=http://etcd1:2379
       - --listen-peer-urls=http://0.0.0.0:2380
@@ -41,6 +49,7 @@ services:
       - --initial-cluster-state=new
     volumes:
       - etcd1_data:/etcd-data
+      - etcd1_wal:/etcd-wal
     networks:
       - etcfuse-net
     healthcheck:
@@ -56,6 +65,14 @@ services:
       - etcd
       - --name=etcd2
       - --data-dir=/etcd-data
+      # The WAL on its own volume, so its fsyncs do not queue behind snapshot
+      # and compaction I/O on the same directory.  etcd's own recommendation,
+      # and it lands under every commit-bound operation this filesystem makes:
+      # a create, a lock acquisition and an extent publication are each one
+      # Raft commit, and a commit is one WAL fsync.  The separation is only
+      # worth what the storage underneath it is — point the volume at a
+      # different device to get the benefit.
+      - --wal-dir=/etcd-wal
       - --listen-client-urls=http://0.0.0.0:2379
       - --advertise-client-urls=http://etcd2:2379
       - --listen-peer-urls=http://0.0.0.0:2380
@@ -71,6 +88,7 @@ services:
       - --initial-cluster-state=new
     volumes:
       - etcd2_data:/etcd-data
+      - etcd2_wal:/etcd-wal
     networks:
       - etcfuse-net
     healthcheck:
@@ -86,6 +104,14 @@ services:
       - etcd
       - --name=etcd3
       - --data-dir=/etcd-data
+      # The WAL on its own volume, so its fsyncs do not queue behind snapshot
+      # and compaction I/O on the same directory.  etcd's own recommendation,
+      # and it lands under every commit-bound operation this filesystem makes:
+      # a create, a lock acquisition and an extent publication are each one
+      # Raft commit, and a commit is one WAL fsync.  The separation is only
+      # worth what the storage underneath it is — point the volume at a
+      # different device to get the benefit.
+      - --wal-dir=/etcd-wal
       - --listen-client-urls=http://0.0.0.0:2379
       - --advertise-client-urls=http://etcd3:2379
       - --listen-peer-urls=http://0.0.0.0:2380
@@ -101,6 +127,7 @@ services:
       - --initial-cluster-state=new
     volumes:
       - etcd3_data:/etcd-data
+      - etcd3_wal:/etcd-wal
     networks:
       - etcfuse-net
     healthcheck:
@@ -282,6 +309,11 @@ volumes:
   etcd1_data:
   etcd2_data:
   etcd3_data:
+  # Each member's write-ahead log, kept apart from its snapshots and compaction
+  # so the two do not contend for the same directory. See --wal-dir above.
+  etcd1_wal:
+  etcd2_wal:
+  etcd3_wal:
   block_data:
   meta1_sock:
   meta2_sock:

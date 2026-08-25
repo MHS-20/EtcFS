@@ -27,6 +27,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/state.sh"
 
+# Where each etcd member keeps its write-ahead log.  Separate from --data-dir so
+# the WAL's fsyncs — one per Raft commit, and every create, lock acquisition and
+# extent publication is a Raft commit — do not queue behind snapshot and
+# compaction I/O in the same directory.  This is etcd's own recommendation.
+#
+# The default is a second directory on the root volume, which separates the two
+# workloads but not the device they land on.  Point ETCD_WAL_DIR at a mount on a
+# different device — an instance store, or a second EBS volume — to get the
+# benefit the separation exists for.
+ETCD_WAL_DIR="${ETCD_WAL_DIR:-/var/lib/etcd-wal}"
+
 log "=== Adding EtcFS compute node ==="
 
 EXISTING_PUB_IP=$(state_get compute_public_ips | jq -r '.[0]')
@@ -127,8 +138,9 @@ done
 # ---- Start etcd as the joining member ----
 log "Starting etcd on new node..."
 ssh $SSH_OPTS "ec2-user@$PUB_IP" "
-    sudo mkdir -p /var/lib/etcd
+    sudo mkdir -p /var/lib/etcd $ETCD_WAL_DIR
     sudo nohup /usr/local/bin/etcd --name $ENAME --data-dir /var/lib/etcd \
+        --wal-dir $ETCD_WAL_DIR \
         --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://$PRIV_IP:2379 \
         --listen-peer-urls http://0.0.0.0:2380 --initial-advertise-peer-urls http://$PRIV_IP:2380 \
         --initial-cluster '$INITIAL_CLUSTER' --initial-cluster-state existing \
