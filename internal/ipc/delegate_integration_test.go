@@ -305,3 +305,94 @@ func TestIntegration_BufferedPayloadIsCappedAcrossInodes(t *testing.T) {
 		t.Errorf("%d operations still counted as buffered after every inode was fsynced", ops)
 	}
 }
+
+// closeInode drives the flush handler — what close() sends — and returns its
+// errno.
+func closeInode(t *testing.T, svc *Service, ino uint64) int32 {
+	t.Helper()
+	var b buf
+	b.w64(ino)
+	resp, err := svc.handleFlush(context.Background(), b.b)
+	if err != nil {
+		t.Fatalf("close ino %d: %v", ino, err)
+	}
+	return int32(binary.BigEndian.Uint32(resp))
+}
+
+// close() asks for an error report, not for durability, and answering it as
+// fsync is what cost a Raft commit per closed file.  What must not change is
+// that fsync still means fsync.
+func TestIntegration_CloseDefersPublicationAndFsyncDoesNot(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino = 9310
+	seedFile(t, store, ino, 0o100644)
+
+	writeAt(t, svc, ino, 0, make([]byte, 4096))
+	if e := closeInode(t, svc, ino); e != 0 {
+		t.Fatalf("close returned errno %d on a healthy inode", e)
+	}
+
+	if _, published, err := store.GetInodeAndExtents(ctx, ino); err != nil {
+		t.Fatalf("read extents: %v", err)
+	} else if len(published) != 0 {
+		t.Fatal("close published the extent; it is supposed to leave that to the flush interval")
+	}
+	if !svc.hasPending(ino) {
+		t.Fatal("close discarded the buffer instead of leaving it for the sweep")
+	}
+
+	if e := fsyncInode(t, svc, ino); e != 0 {
+		t.Fatalf("fsync returned errno %d", e)
+	}
+	if _, published, err := store.GetInodeAndExtents(ctx, ino); err != nil {
+		t.Fatalf("read extents: %v", err)
+	} else if len(published) == 0 {
+		t.Fatal("fsync did not publish the extent, so it no longer means what it promises")
+	}
+}
+
+// The interval sweep is where the deferred publications land, and it must put
+// several inodes in one transaction — that is the whole saving.  Every one of
+// them has to come out published and correct.
+func TestIntegration_TheIntervalSweepPublishesManyInodesAtOnce(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+
+	const files = 24
+	block := make([]byte, 4096)
+	for i := range block {
+		block[i] = byte(i)
+	}
+	inos := make([]uint64, 0, files)
+	for i := uint64(0); i < files; i++ {
+		ino := 9320 + i
+		if _, err := store.AtomicCreateFile(ctx, metadata.RootIno,
+			fmt.Sprintf("%s-%d", t.Name(), i), ino, 0o100644, 1000, 1000,
+			metadata.CreateExtra{}); err != nil {
+			t.Fatalf("seed inode %d: %v", ino, err)
+		}
+		writeAt(t, svc, ino, 0, block)
+		if e := closeInode(t, svc, ino); e != 0 {
+			t.Fatalf("close ino %d: errno %d", ino, e)
+		}
+		inos = append(inos, ino)
+	}
+
+	// Everything written above is older than the interval by the time this runs.
+	time.Sleep(2 * DefaultFlushInterval)
+	svc.flushExpired(ctx)
+
+	for _, ino := range inos {
+		rec, published, err := store.GetInodeAndExtents(ctx, ino)
+		if err != nil {
+			t.Fatalf("read ino %d: %v", ino, err)
+		}
+		if len(published) == 0 {
+			t.Fatalf("ino %d has no extents after the sweep", ino)
+		}
+		if rec.Size != 4096 {
+			t.Errorf("ino %d size = %d, want 4096", ino, rec.Size)
+		}
+	}
+}

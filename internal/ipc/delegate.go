@@ -95,6 +95,16 @@ const (
 	// being worth pipelining.
 	minBufferedWriteBytes = 64 << 10
 
+	// flushBatchInodes is how many inodes one pass of the interval sweep takes
+	// in hand at a time.
+	//
+	// The sweep holds an inode's local lock from the moment it claims it until
+	// the transaction it rides has committed, so an operation on a claimed inode
+	// waits for that commit.  Chunking bounds that wait at one commit however
+	// many inodes the sweep finds, and the transaction op cap already splits a
+	// chunk further when its inodes are carrying large buffers.
+	flushBatchInodes = 64
+
 	// oDSync is O_DSYNC as the kernel passes it in a write request's flags.
 	// O_SYNC carries this bit too, so one test covers both.
 	oDSync = 0o10000
@@ -350,24 +360,25 @@ func (s *Service) flushEntry(ctx context.Context, e *lockEntry, trigger string) 
 	return s.flushLocked(ctx, e, trigger)
 }
 
-// flushLocked publishes the buffer with keyMu already held.
+// proposeFlushLocked puts a buffer's data on the device and returns the
+// transaction that would publish it, with keyMu already held.
 //
-// Everything the buffered writes would have committed goes in one transaction,
-// with this node's own lock key added to the comparisons.  That last comparison
-// is by exact holder token rather than over the lock prefix: a prefix check is
-// satisfied by the key of the peer that took the inode from us, which is
-// precisely the case the comparison exists to reject.
-func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string) error {
-	if e.pending.empty() {
-		return nil
-	}
-
+// Nil comparisons and nil operations mean there is nothing left to publish: the
+// buffer was empty, or its lock key is gone and the buffer with it.  An error
+// means the device write failed, which keeps the buffer for a later attempt.
+//
+// Split out from flushLocked because it is the half a batch shares.  One
+// inode's proposal asserts only things about that inode — the keys it is
+// rewriting are where this node last saw them, and its own lock key still
+// exists — so several inodes' proposals concatenate into one transaction that
+// means exactly what the separate ones meant.
+func (s *Service) proposeFlushLocked(e *lockEntry) ([]clientv3.Cmp, []clientv3.Op, error) {
 	// The key is gone, so nothing buffered under it may be published.  The
 	// blocks were never referenced by anything in etcd, so giving them back is
 	// safe and is the only way they come back at all.
 	if e.holder == "" {
 		s.discardPending(e, "the lock key backing them is gone")
-		return nil
+		return nil, nil, nil
 	}
 
 	// Data before metadata, always.  Publishing an extent whose bytes are not
@@ -380,12 +391,36 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 		e.pending.err = err
 		s.log.Error("buffered write data not put on the device; it is kept and will be retried",
 			"ino", e.ino, "error", err)
-		return err
+		return nil, nil, err
 	}
 
 	cmps, ops := e.pending.txn()
+	// By exact holder token rather than over the lock prefix: a prefix check is
+	// satisfied by the key of the peer that took the inode from us, which is
+	// precisely the case the comparison exists to reject.
 	cmps = append(cmps, clientv3.Compare(
 		clientv3.CreateRevision(metadata.LockKey(e.ino, e.mode, e.holder)), "!=", 0))
+	return cmps, ops, nil
+}
+
+// flushLocked publishes the buffer with keyMu already held.
+//
+// Everything the buffered writes would have committed goes in one transaction,
+// with this node's own lock key added to the comparisons.  See
+// proposeFlushLocked, and flushEntries for the same transaction shared by
+// several inodes.
+func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string) error {
+	if e.pending.empty() {
+		return nil
+	}
+
+	cmps, ops, err := s.proposeFlushLocked(e)
+	if err != nil {
+		return err
+	}
+	if ops == nil {
+		return nil
+	}
 
 	committed, fenced, rev, err := s.commitGuarded(ctx, cmps, ops)
 	metrics.Flushes.WithLabelValues(trigger).Inc()
@@ -568,6 +603,141 @@ func (s *Service) flushCommitted(e *lockEntry, revs map[string]int64) {
 	e.meta = &inodeMeta{rec: e.meta.rec, extents: extents}
 }
 
+// flushEntries publishes several inodes' buffers in one transaction.
+//
+// One inode's proposal asserts only things about that inode, so their
+// comparison sets concatenate and the batch means precisely what the separate
+// flushes meant — for one Raft commit rather than N.  That is what an unpacking
+// archive needs: every file it closes leaves a buffer, and the sweep that
+// publishes them was paying a commit per file.
+//
+// The caller holds each entry's exclusive local lock, for the same reason a
+// single flush needs it: the transaction rewrites the very keys an in-flight
+// operation's comparisons were built against.
+//
+// A batch is all-or-nothing, which is the wrong shape for a rejection: one
+// inode whose lock key was lost would hold every other inode's writes
+// unpublished forever.  So a rejected batch is not diagnosed here.  Each member
+// is retried on its own through flushLocked, which has the per-inode handling a
+// rejection needs — a commit whose reply was lost, a key the lease dropped, a
+// key still held while a comparison failed anyway.  The batch is the fast path;
+// the single flush remains the one that decides what a failure meant.
+func (s *Service) flushEntries(ctx context.Context, entries []*lockEntry, trigger string) {
+	var batch flushBatch
+	for _, e := range entries {
+		e.keyMu.Lock()
+		if e.pending.empty() {
+			e.keyMu.Unlock()
+			continue
+		}
+		cmps, ops, err := s.proposeFlushLocked(e)
+		if err != nil || ops == nil {
+			// Either the device write failed and the buffer is kept for the next
+			// sweep, or there was nothing left to publish.  Both are already
+			// accounted for by proposeFlushLocked.
+			e.keyMu.Unlock()
+			continue
+		}
+		// etcd caps how many operations and comparisons one transaction may
+		// carry, and a single inode's proposal can approach that cap on its own.
+		if !batch.fits(cmps, ops) {
+			s.commitFlushBatch(ctx, &batch, trigger)
+		}
+		batch.add(e, cmps, ops)
+	}
+	s.commitFlushBatch(ctx, &batch, trigger)
+}
+
+// flushBatch is the transaction several inodes' buffers share, and the entries
+// riding it.  Each member's keyMu is held from the moment it joins until the
+// transaction has been accounted for.
+type flushBatch struct {
+	entries []*lockEntry
+	cmps    []clientv3.Cmp
+	ops     []clientv3.Op
+}
+
+// fits reports whether one more proposal stays inside etcd's transaction cap.
+// A batch of one always fits: a single write's proposal is capped at what a
+// transaction can carry (see bufferWrite), so an entry that does not fit an
+// empty batch cannot be made to fit any batch.
+func (b *flushBatch) fits(cmps []clientv3.Cmp, ops []clientv3.Op) bool {
+	return len(b.entries) == 0 ||
+		(len(b.ops)+len(ops) <= maxWriteTxnOps && len(b.cmps)+len(cmps) <= maxWriteTxnOps)
+}
+
+func (b *flushBatch) add(e *lockEntry, cmps []clientv3.Cmp, ops []clientv3.Op) {
+	b.entries = append(b.entries, e)
+	b.cmps = append(b.cmps, cmps...)
+	b.ops = append(b.ops, ops...)
+}
+
+// release drops every member's keyMu and empties the batch.
+func (b *flushBatch) release() {
+	for _, e := range b.entries {
+		e.keyMu.Unlock()
+	}
+	b.entries, b.cmps, b.ops = nil, nil, nil
+}
+
+// commitFlushBatch publishes a batch and accounts for what happened to each of
+// its members, then releases them.
+func (s *Service) commitFlushBatch(ctx context.Context, b *flushBatch, trigger string) {
+	if len(b.entries) == 0 {
+		return
+	}
+	defer b.release()
+
+	committed, fenced, rev, err := s.commitGuarded(ctx, b.cmps, b.ops)
+	for range b.entries {
+		metrics.Flushes.WithLabelValues(trigger).Inc()
+	}
+
+	switch {
+	case fenced:
+		// A fenced node must never publish, and never will: the guard rejects
+		// every later attempt too, so keeping the buffers only holds their
+		// blocks hostage until the process exits.
+		for _, e := range b.entries {
+			metrics.FlushFailures.WithLabelValues("fenced").Inc()
+			s.discardPending(e, "this node has been fenced")
+		}
+
+	case err != nil:
+		// Transient, and already retried to exhaustion by commitGuarded.  The
+		// buffers survive and every fsync on them keeps failing until a flush
+		// commits — discarding here is what makes a retried fsync succeed with
+		// the data gone.
+		for _, e := range b.entries {
+			metrics.FlushFailures.WithLabelValues("error").Inc()
+			e.pending.err = err
+		}
+		s.log.Error("deferred writes not published; they are kept and will be retried",
+			"inodes", len(b.entries), "error", err)
+
+	case !committed:
+		// Which inode's comparison failed is not knowable from here, so each is
+		// retried alone and told apart by the handling flushLocked already has.
+		for _, e := range b.entries {
+			if ferr := s.flushLocked(ctx, e, trigger); ferr != nil {
+				s.log.Warn("deferred writes not published after the batch they rode was rejected",
+					"ino", e.ino, "error", ferr)
+			}
+		}
+
+	default:
+		revs := make(map[string]int64, len(b.ops))
+		for _, op := range b.ops {
+			if op.IsPut() {
+				revs[string(op.KeyBytes())] = rev
+			}
+		}
+		for _, e := range b.entries {
+			s.flushCommitted(e, revs)
+		}
+	}
+}
+
 // flushAlreadyLanded reports whether the transaction a flush just had rejected
 // is in fact already in etcd, and the revisions its keys carry if so.
 //
@@ -661,16 +831,20 @@ func (s *Service) flushInode(ctx context.Context, ino uint64) error {
 // FlushAll publishes every buffer this node is holding.  Called before the
 // cached locks are given up on shutdown, so a peer that takes an inode next
 // sees the writes this node acknowledged.
+//
+// It waits for each inode rather than skipping a busy one: nothing here is on a
+// request's critical path, and a buffer left behind is acknowledged data lost.
 func (s *Service) FlushAll(ctx context.Context, trigger string) {
 	entries := s.locks.all()
-
 	for _, e := range entries {
 		e.rw.Lock()
-		if err := s.flushEntry(ctx, e, trigger); err != nil {
-			s.log.Warn("deferred writes not published", "ino", e.ino, "error", err)
-		}
-		e.rw.Unlock()
 	}
+	defer func() {
+		for _, e := range entries {
+			e.rw.Unlock()
+		}
+	}()
+	s.flushEntries(ctx, entries, trigger)
 }
 
 // StartFlusher publishes buffers that have been sitting longer than the flush
@@ -699,14 +873,14 @@ func (s *Service) StartFlusher(ctx context.Context) {
 }
 
 func (s *Service) flushExpired(ctx context.Context) {
-	entries := s.locks.all()
-
 	deadline := time.Now().Add(-s.flushInterval)
-	for _, e := range entries {
+
+	var due []*lockEntry
+	for _, e := range s.locks.all() {
 		e.keyMu.Lock()
-		due := !e.pending.empty() && e.pending.since.Before(deadline)
+		expired := !e.pending.empty() && e.pending.since.Before(deadline)
 		e.keyMu.Unlock()
-		if !due {
+		if !expired {
 			continue
 		}
 		// TryLock rather than Lock: an inode with an operation in flight is
@@ -716,18 +890,34 @@ func (s *Service) flushExpired(ctx context.Context) {
 		if !e.rw.TryLock() {
 			continue
 		}
-		if err := s.flushEntry(ctx, e, "interval"); err != nil {
-			s.log.Warn("deferred writes not published on the flush interval",
-				"ino", e.ino, "error", err)
+		due = append(due, e)
+		// A chunk at a time, rather than the whole sweep at once: the entries in
+		// hand have their local locks held across the commit, and an operation on
+		// one of them waits that long.  Publishing in transaction-sized chunks
+		// bounds that wait at one commit however many inodes the sweep finds.
+		if len(due) == flushBatchInodes {
+			s.flushDue(ctx, due)
+			due = due[:0]
 		}
+	}
+	s.flushDue(ctx, due)
+}
+
+// flushDue publishes a chunk of the sweep and gives the inodes back.
+func (s *Service) flushDue(ctx context.Context, due []*lockEntry) {
+	if len(due) == 0 {
+		return
+	}
+	s.flushEntries(ctx, due, "interval")
+	for _, e := range due {
 		e.rw.Unlock()
 	}
 }
 
-// FSYNC/FLUSH/FSYNCDIR payload: [u64:ino]
+// FSYNC/FSYNCDIR payload: [u64:ino]
 // Response: [i32:error]
 //
-// All three publish what this node is holding for the inode and block until it
+// Both publish what this node is holding for the inode and block until it
 // commits, which is what makes the acknowledgement mean what fsync promises.
 // A flush that failed for a transient reason keeps its buffer and keeps
 // returning EIO here until one commits.
@@ -762,4 +952,55 @@ func (s *Service) handleFsync(ctx context.Context, payload []byte) ([]byte, erro
 		}
 	}
 	return okResp(), nil
+}
+
+// FLUSH payload: [u64:ino]
+// Response: [i32:error]
+//
+// close() sends this, and it is not fsync.  It used to be answered as fsync:
+// the buffer was published and the caller waited for the commit, so every
+// closed file cost a Raft commit of its own — which for an unpacking archive is
+// a commit per file, on a path where nothing asked for durability.
+//
+// close() does not promise durability and never did; what it promises is that a
+// failure the descriptor already suffered is reported rather than swallowed,
+// and that is what is answered here.  The buffer stays buffered and is
+// published by the interval sweep, together with every other inode closed in
+// the same window (see flushEntries) — so the commit still happens, within the
+// flush interval, for one commit instead of N.
+//
+// What a peer sees is unchanged.  It cannot read this file without taking its
+// lock, and it cannot take its lock without recalling this node's, which
+// publishes the buffer before the key is yielded.  Coherence is the lock
+// protocol's, not this call's; only durability is deferred, by the same
+// interval and to the same bound that write delegation already deferred it by.
+// A caller that wants more calls fsync, which still commits before it answers.
+func (s *Service) handleFlush(_ context.Context, payload []byte) ([]byte, error) {
+	r := newReader(payload)
+	ino := r.u64()
+	if !r.ok {
+		return int32Resp(errInval), nil
+	}
+	if err := s.pendingError(ino); err != nil {
+		s.log.Warn("close: this inode's deferred writes have not been published",
+			"ino", ino, "error", err)
+		return int32Resp(errIO), nil
+	}
+	return okResp(), nil
+}
+
+// pendingError returns the failure a flush of this inode's buffer last hit and
+// has not yet recovered from, so that close() reports what the descriptor
+// already suffered.  Nil when the buffer is clean, empty, or absent.
+func (s *Service) pendingError(ino uint64) error {
+	e := s.locks.lookup(ino)
+	if e == nil {
+		return nil
+	}
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+	if e.pending == nil {
+		return nil
+	}
+	return e.pending.err
 }

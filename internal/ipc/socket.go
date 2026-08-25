@@ -110,10 +110,13 @@ var ops = map[uint16]op{
 	ipcOpOpendir:     {"opendir", ok},
 	ipcOpRelease:     {"release", (*Service).handleRelease},
 	ipcOpReleasedir:  {"releasedir", ok},
-	// Both publish this inode's deferred writes and block until they are in
-	// etcd.  flush arrives on every close(), fsync on the call of that name;
-	// neither can be answered locally once a write may be sitting in RAM.
-	ipcOpFlush: {"flush", (*Service).handleFsync},
+	// fsync — and fsyncdir, which the C daemon sends under the same opcode —
+	// publishes this inode's deferred writes and blocks until they are in etcd.
+	// flush arrives on every close(), which asks for no such thing: it reports a
+	// failure the descriptor already suffered and leaves the publication to the
+	// interval sweep, where it costs one commit shared with every other inode
+	// closed in the same window.
+	ipcOpFlush: {"flush", (*Service).handleFlush},
 	ipcOpFsync: {"fsync", (*Service).handleFsync},
 	// Block allocation happens inside the WRITE handler, not as a separate
 	// request; these opcodes are unused.
