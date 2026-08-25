@@ -242,6 +242,8 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 		FlushInterval: cfg.MetadataFlushInterval,
 		DataCache:     cfg.WriteDataCache && cfg.MetadataFlushInterval > 0,
 		PageCache:     cfg.PageCache,
+		EntryTimeout:  cfg.EntryTimeout,
+		AttrTimeout:   cfg.AttrTimeout,
 		ReadOnly:      cfg.ReadOnly,
 		Device:        dev,
 		WriteBarriers: cfg.WriteBarriers,
@@ -322,6 +324,10 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 
 	log.Info("binary IPC server starting")
 	svc.StartNotificationServer(ctx)
+	// The other half of what the kernel caches.  Names are invalidated by the
+	// dirent watch above; attributes had nothing at all watching them, which is
+	// why their timeout could not be raised past a second.
+	svc.StartAttrInvalidation(ctx)
 	svc.StartLockRevocation(ctx)
 	svc.StartSessionWatch(ctx)
 	svc.StartFlusher(ctx)

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MHS-20/EtcFS/internal/config"
 	"github.com/MHS-20/EtcFS/pkg/metadata"
 )
 
@@ -34,8 +35,18 @@ func TestAttrBlockMatchesCDaemonWidth(t *testing.T) {
 // GETXATTR) are not here: their length is carried in the frame, and the reader
 // that consumes them is bounded, so a mismatch is a short read rather than a
 // desync.
+// replyService is the least of a Service the reply builders need: the two cache
+// timeouts they stamp on every entry.
+func replyService() *Service {
+	return &Service{
+		entryTimeout: timeoutSecs(0, config.DefaultEntryTimeout),
+		attrTimeout:  timeoutSecs(0, config.DefaultAttrTimeout),
+	}
+}
+
 func TestFixedWidthRepliesMatchTheCDaemon(t *testing.T) {
 	rec := &metadata.InodeRecord{}
+	s := replyService()
 	cases := []struct {
 		op    string
 		reply []byte
@@ -44,17 +55,17 @@ func TestFixedWidthRepliesMatchTheCDaemon(t *testing.T) {
 		{"errno-only (unlink, rmdir, rename, fsync, flush)", okResp(), 4},
 		{"OPEN", openResp(true), 4 + 4},
 		{"WRITE", writtenResp(0), 4 + 4},
-		{"GETATTR/SETATTR", attrResp(rec), 4 + attrWireSize + 4},
-		{"LOOKUP/MKDIR/MKNOD/SYMLINK/LINK", entryResp(1, rec), 4 + 8 + attrWireSize + 4 + 4},
-		{"CREATE", createResp(1, rec, true), 4 + 8 + attrWireSize + 4 + 4 + 4},
+		{"GETATTR/SETATTR", s.attrResp(rec), 4 + attrWireSize + 4},
+		{"LOOKUP/MKDIR/MKNOD/SYMLINK/LINK", s.entryResp(1, rec), 4 + 8 + attrWireSize + 4 + 4},
+		{"CREATE", s.createResp(1, rec, true), 4 + 8 + attrWireSize + 4 + 4 + 4},
 		{"LSEEK", lseekResp(0), 4 + 8},
 		{"STATFS", statfsResp(0, 0, 0, 0), 4 + 5*8 + 3*4},
 		// The same totals test/c/test_ops.c pins from the reading side. Spelled
 		// out so the two files can be compared by eye without adding them up.
-		{"CREATE, as an absolute width", createResp(1, rec, true), 108},
-		{"LOOKUP, as an absolute width", entryResp(1, rec), 104},
-		{"LOOKUP negative entry", negativeEntryResp(), 4 + 8 + attrWireSize + 4 + 4},
-		{"GETATTR, as an absolute width", attrResp(rec), 92},
+		{"CREATE, as an absolute width", s.createResp(1, rec, true), 108},
+		{"LOOKUP, as an absolute width", s.entryResp(1, rec), 104},
+		{"LOOKUP negative entry", s.negativeEntryResp(), 4 + 8 + attrWireSize + 4 + 4},
+		{"GETATTR, as an absolute width", s.attrResp(rec), 92},
 		{"STATFS, as an absolute width", statfsResp(0, 0, 0, 0), 56},
 	}
 	for _, c := range cases {
@@ -70,7 +81,8 @@ func TestFixedWidthRepliesMatchTheCDaemon(t *testing.T) {
 // errno caches nothing, a non-zero inode invents a file, and a zero timeout
 // makes the reply cost a round trip without saving one.
 func TestNegativeEntryIsCacheableAbsence(t *testing.T) {
-	b := negativeEntryResp()
+	s := replyService()
+	b := s.negativeEntryResp()
 
 	if errno := int32(binary.BigEndian.Uint32(b[0:4])); errno != 0 {
 		t.Errorf("errno = %d, want 0: a negative entry is a successful reply", errno)
@@ -80,8 +92,8 @@ func TestNegativeEntryIsCacheableAbsence(t *testing.T) {
 	}
 
 	timeouts := b[len(b)-8:]
-	if entry := binary.BigEndian.Uint32(timeouts[0:4]); entry != entryTimeoutSecs {
-		t.Errorf("entry_timeout = %d, want %d", entry, entryTimeoutSecs)
+	if entry := binary.BigEndian.Uint32(timeouts[0:4]); entry != s.entryTimeout {
+		t.Errorf("entry_timeout = %d, want %d", entry, s.entryTimeout)
 	}
 	// There is no inode for an attr_timeout to describe, and the attr block
 	// carries nothing but zeroes.
@@ -92,10 +104,10 @@ func TestNegativeEntryIsCacheableAbsence(t *testing.T) {
 	// A cached absence may not outlive a cached presence: both are invalidated
 	// by the same dirent watch, so trusting one longer than the other would be
 	// arbitrary.
-	positive := entryResp(1, &metadata.InodeRecord{})
-	if got := binary.BigEndian.Uint32(positive[len(positive)-8 : len(positive)-4]); got != entryTimeoutSecs {
+	positive := s.entryResp(1, &metadata.InodeRecord{})
+	if got := binary.BigEndian.Uint32(positive[len(positive)-8 : len(positive)-4]); got != s.entryTimeout {
 		t.Errorf("a found name gets entry_timeout %d, a missing one %d: they must match",
-			got, entryTimeoutSecs)
+			got, s.entryTimeout)
 	}
 }
 
@@ -189,9 +201,10 @@ func TestDispatchTableCoversEveryOpcode(t *testing.T) {
 // keep_cache.  A create response that stops at the entry leaves that read past
 // the end of the buffer, and the C side turns a successful create into EIO.
 func TestCreateRespCarriesKeepCacheAfterTheEntry(t *testing.T) {
-	entry := len(entryResp(1, &metadata.InodeRecord{}))
+	s := replyService()
+	entry := len(s.entryResp(1, &metadata.InodeRecord{}))
 	for _, keep := range []bool{false, true} {
-		b := createResp(1, &metadata.InodeRecord{}, keep)
+		b := s.createResp(1, &metadata.InodeRecord{}, keep)
 		if len(b) != entry+4 {
 			t.Fatalf("createResp wrote %d bytes, want entry+4 = %d", len(b), entry+4)
 		}

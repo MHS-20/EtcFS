@@ -311,14 +311,6 @@ func (s *Store) ClearLockWant(ctx context.Context, ino uint64) error {
 	return nil
 }
 
-// WatchLockWants delivers every peer's request for a lock, cluster-wide.  One
-// watch covers every inode: a node holding no cached lock for the inode named
-// by an event simply ignores it, which is cheaper than maintaining a watch per
-// inode it happens to hold.
-func (s *Store) WatchLockWants(ctx context.Context) clientv3.WatchChan {
-	return s.Watch(ctx, PrefixLockWant, clientv3.WithPrefix())
-}
-
 // GetLockInfo returns the current lock state for an inode, or nil if it is
 // unlocked.  A single exclusive holder makes the whole lock exclusive.
 //

@@ -466,8 +466,8 @@ func dataResp(data []byte) []byte {
 // same answer an open would have got.
 //
 //	[i32:error][u64:ino][attr][u32:entry_timeout][u32:attr_timeout][u32:keep_cache]
-func createResp(ino uint64, rec *metadata.InodeRecord, keepCache bool) []byte {
-	b := entryResp(ino, rec)
+func (s *Service) createResp(ino uint64, rec *metadata.InodeRecord, keepCache bool) []byte {
+	b := s.entryResp(ino, rec)
 	if keepCache {
 		return append(b, 0, 0, 0, 1)
 	}
@@ -503,19 +503,23 @@ func statfsResp(blocks, bfree, files, ffree uint64) []byte {
 	return b.b
 }
 
-// How long the kernel may answer from its own caches before asking again.
+// How long the kernel may answer from its own caches before asking this daemon
+// again, in seconds, as the reply carries it.
 //
-// entryTimeoutSecs covers a name's existence, and is backed by the cluster-wide
-// watch on the dirent prefix: a change made anywhere reaches every node as an
-// INVAL_ENTRY, so the timeout is the fail-safe for a watch that is not
-// delivering rather than the mechanism coherence rests on.  attrTimeoutSecs
-// covers an inode's attributes, which nothing watches — a peer's write or chmod
-// changes them with no notification at all — so that one is the whole guarantee
-// and must stay short.
-const (
-	entryTimeoutSecs = 1
-	attrTimeoutSecs  = 1
-)
+// Both are backed by a cluster-wide watch, which is what makes a long value
+// defensible: a name changed anywhere reaches every node as an INVAL_ENTRY, and
+// an inode record changed anywhere reaches it as an INVAL_ATTR.  The watches
+// resume from where they stopped when etcd ends them (see watch.go), so a
+// timeout is the fail-safe for a watch that could not be resumed at all rather
+// than the mechanism coherence rests on.
+//
+// They used to be one second each, and the attribute one had to be: nothing
+// watched an inode's attributes, so that timeout was the whole guarantee.  One
+// second is also shorter than any walk of a real tree, which is why a warm
+// `find` or `du` over eighty thousand files cost exactly what a cold one did —
+// every name and every attribute had expired before the walk came back to it.
+//
+// The defaults are in internal/config, next to the flags that carry them.
 
 // entryResp answers every op that returns a directory entry — LOOKUP, MKDIR,
 // MKNOD, SYMLINK, LINK, and CREATE through createResp:
@@ -524,7 +528,7 @@ const (
 //
 // The attr block is fixed-width, so a missing inode record is sent as a zeroed
 // one rather than omitted; a short response would desynchronise the C parser.
-func entryResp(ino uint64, rec *metadata.InodeRecord) []byte {
+func (s *Service) entryResp(ino uint64, rec *metadata.InodeRecord) []byte {
 	if rec == nil {
 		rec = &metadata.InodeRecord{Ino: ino}
 	}
@@ -532,8 +536,8 @@ func entryResp(ino uint64, rec *metadata.InodeRecord) []byte {
 	b.w32(0) // success
 	b.w64(ino)
 	b.wAttr(rec)
-	b.w32(entryTimeoutSecs)
-	b.w32(attrTimeoutSecs)
+	b.w32(s.entryTimeout)
+	b.w32(s.attrTimeout)
 	return b.b
 }
 
@@ -557,21 +561,21 @@ func entryResp(ino uint64, rec *metadata.InodeRecord) []byte {
 // attr_timeout is zero because there is no inode for it to describe; the
 // zeroed attr block is there only to keep the reply the width the C parser
 // expects.
-func negativeEntryResp() []byte {
+func (s *Service) negativeEntryResp() []byte {
 	var b buf
 	b.w32(0) // the lookup was answered — the name simply is not there
 	b.w64(0) // ino 0: negative entry
 	b.wAttr(&metadata.InodeRecord{})
-	b.w32(entryTimeoutSecs)
+	b.w32(s.entryTimeout)
 	b.w32(0)
 	return b.b
 }
 
-func attrResp(rec *metadata.InodeRecord) []byte {
+func (s *Service) attrResp(rec *metadata.InodeRecord) []byte {
 	var b buf
 	b.w32(0) // error = success
 	b.wAttr(rec)
-	b.w32(attrTimeoutSecs)
+	b.w32(s.attrTimeout)
 	return b.b
 }
 

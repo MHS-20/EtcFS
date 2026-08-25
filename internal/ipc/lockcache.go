@@ -137,6 +137,24 @@ func (s *Service) hasPending(ino uint64) bool {
 	return !e.pending.empty()
 }
 
+// holdsLockKey reports whether this node currently holds an inode's lock key in
+// etcd, which is the only case in which a change to that inode's record cannot
+// have come from a peer.
+//
+// Distinct from Service.Holds, which asks the weaker question the scrubber
+// needs — whether an entry exists at all.  Here the entry existing is not
+// enough: a released or recalled entry stays in the cache, and an inode this
+// node no longer holds is exactly one a peer may be writing.
+func (s *Service) holdsLockKey(ino uint64) bool {
+	e := s.locks.lookup(ino)
+	if e == nil {
+		return false
+	}
+	e.keyMu.Lock()
+	defer e.keyMu.Unlock()
+	return e.holder != ""
+}
+
 // pendingSize returns an inode's size as this node's own unpublished writes
 // have left it.
 //
@@ -375,26 +393,29 @@ func (s *Service) keyLostLocked(e *lockEntry, why string) {
 // flight is what the peer is waiting for and starting a second would race it
 // for the same key.
 func (s *Service) StartLockRevocation(ctx context.Context) {
-	ch := s.store.WatchLockWants(ctx)
+	go s.runWatch(ctx, watcher{
+		what:   "lock request",
+		prefix: metadata.PrefixLockWant,
+		event:  s.lockWanted,
+	})
+}
+
+// lockWanted starts a recall for a peer's request, if one is not already
+// running for that inode.
+func (s *Service) lockWanted(ev *clientv3.Event) {
+	if ev.Type != mvccpb.PUT { // a withdrawn want recalls nothing
+		return
+	}
+	ino, node, ok := metadata.ParseLockWantKey(string(ev.Kv.Key))
+	if !ok || node == s.store.NodeID() {
+		return
+	}
+	if !s.recalls.begin(ino) {
+		return
+	}
 	go func() {
-		for resp := range ch {
-			for _, ev := range resp.Events {
-				if ev.Type != mvccpb.PUT { // a withdrawn want recalls nothing
-					continue
-				}
-				ino, node, ok := metadata.ParseLockWantKey(string(ev.Kv.Key))
-				if !ok || node == s.store.NodeID() {
-					continue
-				}
-				if !s.recalls.begin(ino) {
-					continue
-				}
-				go func(ino uint64) {
-					defer s.recalls.end(ino)
-					s.recallLock(ino)
-				}(ino)
-			}
-		}
+		defer s.recalls.end(ino)
+		s.recallLock(ino)
 	}()
 }
 

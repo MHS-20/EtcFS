@@ -100,6 +100,20 @@ type Config struct {
 	// definition.
 	PageCache bool
 
+	// EntryTimeout and AttrTimeout bound how long the kernel may answer a name's
+	// existence or absence, and an inode's attributes, from its own caches
+	// before asking this daemon again.
+	//
+	// Both are backed by a cluster-wide etcd watch that pushes an invalidation
+	// to every node — the dirent prefix for names, the inode prefix for
+	// attributes — and both watches resume from where they stopped when etcd
+	// ends them. So these bound the one case the watches cannot cover: a
+	// compaction past the resume point, which discards the changes that would
+	// have been replayed. Zero selects the defaults; a value below one second
+	// disables the cache, since FUSE carries whole seconds.
+	EntryTimeout time.Duration
+	AttrTimeout  time.Duration
+
 	// NotifyAddr is the socket the C daemon connects to for cache-invalidation
 	// notifications.  Configurable for the same reason ListenAddr is: two
 	// daemons on one host need two paths.
@@ -141,6 +155,25 @@ const (
 // cluster returns EIO during ordinary failover.
 const RequestTimeout = 10 * time.Second
 
+// DefaultEntryTimeout and DefaultAttrTimeout are how long the kernel may answer
+// a name's existence and an inode's attributes from its own caches before
+// asking the daemon again.
+//
+// They live here, next to the flags that carry them, for the same reason
+// RequestTimeout does: internal/ipc imports this package, so one definition can
+// be both the flag's printed default and the value the service runs with.
+//
+// Both are backed by a cluster-wide watch that pushes an invalidation on every
+// change, and both watches resume from where they stopped when etcd ends them —
+// so these bound the single case a watch cannot cover, a compaction past the
+// resume point. A minute is long enough that a walk of a large tree finds its
+// own names and attributes still cached on the way back, which one second never
+// was.
+const (
+	DefaultEntryTimeout = 60 * time.Second
+	DefaultAttrTimeout  = 60 * time.Second
+)
+
 // SelfFenceWindow is how long a node keeps serving after its membership lease
 // stops being renewed, before the watchdog declares it fenced and exits.  It
 // mirrors the watchdog's own 2x rule.
@@ -155,6 +188,7 @@ func Parse() *Config {
 	var etcdEndpoints string
 	var leaseTTL string
 	var flushInterval string
+	var entryTimeout, attrTimeout string
 
 	flag.StringVar(&cfg.NotifyAddr, "notify-socket", DefaultNotifySocket,
 		"Unix socket the C daemon connects to for cache-invalidation notifications")
@@ -199,6 +233,10 @@ func Parse() *Config {
 		"Flush the device cache, sync the range and read it back after every write; needed only on a device with a volatile write cache that does not publish an acknowledged O_DIRECT write to its other attachers (always on without O_DIRECT)")
 	flag.StringVar(&flushInterval, "metadata-flush-interval", "100ms",
 		"How long a write's extent may stay buffered in memory before it is published to etcd; 0 commits every write before acknowledging it (durable, one Raft commit per write)")
+	flag.StringVar(&entryTimeout, "entry-timeout", DefaultEntryTimeout.String(),
+		"How long the kernel may answer a name's existence or absence without asking; peers push an invalidation on every change, so this bounds only what an unresumable etcd watch would miss")
+	flag.StringVar(&attrTimeout, "attr-timeout", DefaultAttrTimeout.String(),
+		"How long the kernel may answer an inode's attributes without asking; peers push an invalidation on every inode change, so this bounds only what an unresumable etcd watch would miss")
 	flag.BoolVar(&cfg.PageCache, "page-cache", true,
 		"Let the kernel cache data pages for files this node holds a lock on; they are invalidated before the lock is yielded")
 	flag.BoolVar(&cfg.WriteDataCache, "write-data-cache", true,
@@ -241,6 +279,9 @@ func Parse() *Config {
 	}
 	cfg.MetadataFlushInterval = fi
 
+	cfg.EntryTimeout = parseCacheTimeout("entry-timeout", entryTimeout)
+	cfg.AttrTimeout = parseCacheTimeout("attr-timeout", attrTimeout)
+
 	d, err := time.ParseDuration(leaseTTL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid lease-ttl %q: %v\n", leaseTTL, err)
@@ -261,6 +302,20 @@ func Parse() *Config {
 	cfg.LeaseTTL = d
 
 	return cfg
+}
+
+// parseCacheTimeout reads a cache timeout flag, rejecting a negative value.
+//
+// Zero is accepted and means "do not cache", which is the value to reach for
+// when debugging a coherence complaint: it takes the kernel's caches out of the
+// picture entirely and sends every lookup and stat to the daemon.
+func parseCacheTimeout(name, value string) time.Duration {
+	d, err := time.ParseDuration(value)
+	if err != nil || d < 0 {
+		fmt.Fprintf(os.Stderr, "invalid %s %q: want a non-negative duration\n", name, value)
+		os.Exit(1)
+	}
+	return d
 }
 
 // EtcdTLSConfig returns a tls.Config from the configured cert files.

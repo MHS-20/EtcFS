@@ -26,9 +26,9 @@ func lookupReply(t *testing.T, svc *Service, parent uint64, name string) (errno 
 	if errno != 0 {
 		return errno, 0, 0
 	}
-	if len(resp) != len(entryResp(0, &metadata.InodeRecord{})) {
+	if len(resp) != len(svc.entryResp(0, &metadata.InodeRecord{})) {
 		t.Fatalf("lookup %d/%q: reply is %d bytes, the C parser reads %d",
-			parent, name, len(resp), len(entryResp(0, &metadata.InodeRecord{})))
+			parent, name, len(resp), len(svc.entryResp(0, &metadata.InodeRecord{})))
 	}
 	return errno, binary.BigEndian.Uint64(resp[4:12]),
 		binary.BigEndian.Uint32(resp[len(resp)-8 : len(resp)-4])

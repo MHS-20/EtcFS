@@ -68,7 +68,7 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errIO), nil
 	}
 	if ino == 0 {
-		return negativeEntryResp(), nil
+		return s.negativeEntryResp(), nil
 	}
 
 	rec, err := s.store.GetInode(ctx, ino)
@@ -77,7 +77,7 @@ func (s *Service) handleLookup(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errIO), nil
 	}
 
-	return entryResp(ino, s.withPending(rec)), nil
+	return s.entryResp(ino, s.withPending(rec)), nil
 }
 
 // withPending replaces the parts of a record that this node has changed and not
@@ -127,7 +127,7 @@ func (s *Service) handleGetattr(ctx context.Context, payload []byte) ([]byte, er
 		return int32Resp(errNoEnt), nil
 	}
 
-	return attrResp(s.withPending(rec)), nil
+	return s.attrResp(s.withPending(rec)), nil
 }
 
 // READDIR payload: [u64:ino][u64:offset][u32:size]
@@ -191,8 +191,8 @@ func (s *Service) readdirResp(ctx context.Context, payload []byte, plus bool) ([
 			rec = &metadata.InodeRecord{Ino: e.Ino}
 		}
 		b.wAttr(s.withPending(rec))
-		b.w32(entryTimeoutSecs)
-		b.w32(attrTimeoutSecs)
+		b.w32(s.entryTimeout)
+		b.w32(s.attrTimeout)
 	}
 
 	return b.b, nil
@@ -441,7 +441,7 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 	// only be filled by a read that reached the daemon under this inode's lock,
 	// and that lock's release invalidates it.  Nothing about a fresh inode
 	// changes either half of that.
-	return createResp(rec.Ino, rec, s.cacheableOpen(flags)), nil
+	return s.createResp(rec.Ino, rec, s.cacheableOpen(flags)), nil
 }
 
 // oTrunc is O_TRUNC as the kernel passes it in fuse_file_info.flags.
@@ -569,7 +569,7 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
 
-	return entryResp(rec.Ino, rec), nil
+	return s.entryResp(rec.Ino, rec), nil
 }
 
 // UNLINK payload: [u64:parent][u32:name_len][name]
@@ -784,7 +784,7 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 		return int32Resp(errAgain), nil // EAGAIN: the inode moved, let the kernel retry
 	}
 
-	return attrResp(rec), nil
+	return s.attrResp(rec), nil
 }
 
 // SYMLINK payload: [u64:parent][u32:name_len][name][u32:target_len][target][u32:uid][u32:gid]
@@ -807,7 +807,7 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
 
-	return entryResp(ino, rec), nil
+	return s.entryResp(ino, rec), nil
 }
 
 // LINK payload: [u64:ino][u64:new_parent][u32:new_name_len][new_name]
@@ -830,7 +830,7 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 	if err != nil {
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
-	return entryResp(ino, rec), nil
+	return s.entryResp(ino, rec), nil
 }
 
 // MKNOD payload: [u64:parent][u32:name_len][name][u32:mode][u32:rdev][u32:umask][u32:uid][u32:gid]
@@ -854,7 +854,7 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
 
-	return entryResp(ino, rec), nil
+	return s.entryResp(ino, rec), nil
 }
 
 // ---- lock handlers ----

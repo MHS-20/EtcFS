@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +24,7 @@ import (
 //
 //	1  INVAL_ENTRY  a dentry another node changed; ino is the parent
 //	2  INVAL_INODE  the data pages of one inode; name_len is 0
+//	3  INVAL_ATTR   the cached attributes of one inode; name_len is 0
 //
 // The length is not decoration.  This is a stream socket, so a reader that has
 // to recover the name as "whatever arrived with the header" gets it right only
@@ -34,10 +34,13 @@ import (
 // — the acknowledged messages below stop being recognised, the release waiting
 // on one times out, and the connection is dropped as unusable.
 //
-// INVAL_INODE is acknowledged and INVAL_ENTRY is not, because only the first
-// has a caller that must not proceed until it has happened: the pages of an
-// inode whose lock is being yielded have to be gone before the peer can take it,
-// or that peer's writes become invisible to every later read on this node.
+// INVAL_INODE is acknowledged and the other two are not, because only it has a
+// caller that must not proceed until it has happened: the pages of an inode
+// whose lock is being yielded have to be gone before the peer can take it, or
+// that peer's writes become invisible to every later read on this node.  An
+// invalidation of a name or of an attribute has no such caller — it makes a
+// cache colder, and the worst a lost one costs is the staleness its timeout
+// already bounds.
 //
 // ponytail: one socket and one thread in the C daemon, so a slow INVAL_INODE
 // delays the entry invalidations queued behind it.  A stale dentry is bounded by
@@ -46,6 +49,7 @@ import (
 const (
 	notifyInvalEntry = 1
 	notifyInvalInode = 2
+	notifyInvalAttr  = 3
 
 	// notifyHeaderLen is the fixed part of every message: type, inode and the
 	// length of the name that follows.
@@ -202,61 +206,78 @@ func (n *notifyServer) connected() bool {
 // StartNotificationServer watches every dirent in the cluster and tells the
 // kernel about each change, so a name created or removed on one node stops
 // being cached on the others.
+//
+// This is the whole of what a cached name rests on, which is why it is worth
+// making the watch resumable (see watch.go) rather than leaning on the entry
+// timeout: an ordinary reconnection now replays what it missed, and only an
+// etcd compaction past the resume point leaves the timeout doing the work
+// alone.
 func (s *Service) StartNotificationServer(ctx context.Context) {
-	go s.watchDirents(ctx, func() clientv3.WatchChan {
-		return s.store.Watch(ctx, metadata.PrefixDirent, clientv3.WithPrefix())
+	go s.runWatch(ctx, watcher{
+		what:   "dirent",
+		prefix: metadata.PrefixDirent,
+		event:  s.direntChanged,
+		gap:    s.direntWatchGap,
 	})
 }
 
-// rewatchDelay keeps a watch that fails immediately and repeatedly from
-// becoming a busy loop against etcd.  Short enough that the gap it adds stays
-// well inside the entry timeout that bounds the staleness anyway.
-const rewatchDelay = 100 * time.Millisecond
+// StartAttrInvalidation watches every inode record in the cluster and drops the
+// kernel's cached attributes for each one that changes.
+//
+// Without it nothing at all invalidates an attribute: a peer's write, chmod or
+// truncate changes an inode with no notification, and the only bound is the
+// attribute timeout — which is why that timeout had to stay at a second, and
+// why a walk that stats eighty thousand files got no benefit from a warm cache.
+// This is the dirent watch's counterpart for the other half of what the kernel
+// caches, and it is what makes a long attribute timeout defensible.
+//
+// The invalidation is attributes only.  Data pages are governed by the inode's
+// lock and are dropped before it is yielded (invalidatePages); dropping them
+// here as well would throw away a cache this node is entitled to keep.
+func (s *Service) StartAttrInvalidation(ctx context.Context) {
+	go s.runWatch(ctx, watcher{
+		what:   "inode attribute",
+		prefix: metadata.PrefixInode,
+		event:  s.inodeChanged,
+	})
+}
 
-// watchDirents turns every dirent change into an invalidation, re-opening the
-// watch each time it ends.
+// direntChanged turns one dirent change into an entry invalidation.
+func (s *Service) direntChanged(ev *clientv3.Event) {
+	parent, name, ok := metadata.ParseDirentKey(string(ev.Kv.Key))
+	if !ok {
+		return
+	}
+	s.sendInvalEntry(parent, name)
+}
+
+// direntWatchGap is what a missed run of dirent changes costs: every cached
+// name on this node may now describe a directory as it no longer is, and
+// nothing but the entry timeout will correct it.
+func (s *Service) direntWatchGap() {
+	s.log.Error("names changed elsewhere were missed; every cached name on this node " +
+		"is trusted only until it times out")
+}
+
+// inodeChanged drops the kernel's cached attributes for an inode a peer wrote.
 //
-// The re-opening matters more than it looks: this is the only thing that
-// invalidates a cached name, a cached absence of a name, and a cached directory
-// listing, and etcd ends a watch for reasons that have nothing to do with this
-// process stopping — a compaction past the watched revision is the usual one.
-// A single drain of the channel used to end the invalidations for the lifetime
-// of the daemon while it went on serving happily, with nothing in the logs to
-// say so.
-//
-// A re-opened watch starts from current, so changes during the gap are missed
-// rather than replayed.  That is what the entry and attribute timeouts are for:
-// they bound how long any of those caches can outlive a notification that never
-// came, which is why they stay short whether the watch is healthy or not.
-func (s *Service) watchDirents(ctx context.Context, open func() clientv3.WatchChan) {
-	prefix := metadata.PrefixDirent
-	for ctx.Err() == nil {
-		for resp := range open() {
-			for _, ev := range resp.Events {
-				key := string(ev.Kv.Key)
-				parts := strings.SplitN(key[len(prefix):], "/", 2)
-				if len(parts) != 2 {
-					continue
-				}
-				s.sendInvalEntry(parts[0], parts[1])
-			}
-		}
-		if ctx.Err() != nil {
-			return
-		}
-		s.log.Warn("the dirent watch ended; re-establishing it. Names changed " +
-			"elsewhere in the gap stay cached on this node until they time out")
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(rewatchDelay):
-		}
+// An inode whose lock key this node holds cannot have been written by a peer,
+// so the change is this node's own and the kernel's copy of it came from the
+// reply to the very operation that made it.  Skipping those is what keeps a
+// stream of creates from invalidating each new file's attributes immediately
+// after handing them to the kernel.
+func (s *Service) inodeChanged(ev *clientv3.Event) {
+	ino, ok := metadata.ParseInodeKey(string(ev.Kv.Key))
+	if !ok || s.holdsLockKey(ino) {
+		return
+	}
+	if err := s.notifyServer.send(notifyMsg(notifyInvalAttr, ino, ""), false); err != nil &&
+		!errors.Is(err, errNoNotifyClient) {
+		s.log.Warn("notify: inval_attr not delivered", "ino", ino, "error", err)
 	}
 }
 
-func (s *Service) sendInvalEntry(parent, name string) {
-	var parentIno uint64
-	_, _ = fmt.Sscanf(parent, "%d", &parentIno)
+func (s *Service) sendInvalEntry(parentIno uint64, name string) {
 	if parentIno == 0 {
 		return
 	}
@@ -265,7 +286,7 @@ func (s *Service) sendInvalEntry(parent, name string) {
 			"parent", parentIno, "len", len(name))
 		return
 	}
-	s.log.Info("notify: inval_entry", "parent", parentIno, "name", name)
+	s.log.Debug("notify: inval_entry", "parent", parentIno, "name", name)
 
 	if err := s.notifyServer.send(notifyMsg(notifyInvalEntry, parentIno, name), false); err != nil &&
 		!errors.Is(err, errNoNotifyClient) {

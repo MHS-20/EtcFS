@@ -63,6 +63,14 @@ type Service struct {
 	// write a lost write rather than a read of garbage.
 	dataCache bool
 
+	// entryTimeout and attrTimeout are how many seconds the kernel may answer a
+	// name's existence and an inode's attributes from its own caches before
+	// asking again.  Both are backed by a cluster-wide watch that invalidates
+	// them, so they bound how long a watch that could not be resumed leaves this
+	// node answering from a cache nothing has corrected.  See socket.go.
+	entryTimeout uint32
+	attrTimeout  uint32
+
 	// pageCache lets the kernel keep an inode's data pages across reads while
 	// this node holds its lock, so a re-read costs nothing at all.  What makes
 	// it sound is that the pages are invalidated before the lock is yielded;
@@ -155,6 +163,13 @@ type Options struct {
 	// its lock. Off sends every read through to the daemon.
 	PageCache bool
 
+	// EntryTimeout and AttrTimeout bound how long the kernel may answer a name's
+	// existence and an inode's attributes without asking. Zero selects
+	// config.DefaultEntryTimeout and config.DefaultAttrTimeout; sub-second
+	// values are rounded down to whole seconds, which is what FUSE carries.
+	EntryTimeout time.Duration
+	AttrTimeout  time.Duration
+
 	// ReadOnly rejects every mutating opcode with EROFS, for mounting a
 	// filesystem for backup or inspection while another node writes.
 	ReadOnly bool
@@ -190,6 +205,8 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		flushMaxBytes:  defaultFlushMaxBytes,
 		bufferMaxBytes: defaultBufferMaxBytes,
 		dataCache:      opts.DataCache,
+		entryTimeout:   timeoutSecs(opts.EntryTimeout, config.DefaultEntryTimeout),
+		attrTimeout:    timeoutSecs(opts.AttrTimeout, config.DefaultAttrTimeout),
 		pageCache:      opts.PageCache,
 		readOnly:       opts.ReadOnly,
 		history:        opts.History,
@@ -199,6 +216,21 @@ func NewService(store *metadata.Store, membership *metadata.Membership,
 		s.setBlockDevice(opts.Device, opts.WriteBarriers)
 	}
 	return s
+}
+
+// timeoutSecs converts a cache timeout to the whole seconds the FUSE reply
+// carries, substituting the default for an unset one.  A value below a second
+// but above zero becomes zero, which is "do not cache" — the caller asked for
+// less than the wire can express, and rounding *up* would hand out a longer
+// timeout than was asked for.
+func timeoutSecs(d, fallback time.Duration) uint32 {
+	if d == 0 {
+		d = fallback
+	}
+	if d < 0 {
+		return 0
+	}
+	return uint32(d / time.Second)
 }
 
 // pagesCacheable reports whether an invalidation could have anything to do.

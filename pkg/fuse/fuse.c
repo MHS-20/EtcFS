@@ -41,6 +41,7 @@
 #define NOTIFY_HDR_LEN     16
 #define NOTIFY_INVAL_ENTRY 1
 #define NOTIFY_INVAL_INODE 2
+#define NOTIFY_INVAL_ATTR  3
 
 /* Reconnection backoff, in milliseconds: fast enough that losing the race with
  * a daemon still binding its socket costs nothing, slow enough that a daemon
@@ -178,6 +179,17 @@ static void notify_serve(struct etcfs_context *ctx, int fd)
             uint8_t ack = (rc == 0 || rc == -ENOENT) ? 0 : 1;
             if (write(fd, &ack, 1) != 1)
                 return;
+        } else if (typ == NOTIFY_INVAL_ATTR) {
+            /* Drop the kernel's cached attributes for one inode, leaving its
+             * data pages alone: a negative offset is how the kernel is asked
+             * for attributes only.  The pages belong to whoever holds the
+             * inode's lock and are dropped separately, before that lock is
+             * yielded — throwing them away here would discard a cache this
+             * node is entitled to keep.
+             *
+             * Not acknowledged, because nothing waits on it.  A lost one costs
+             * the staleness the attribute timeout already bounds. */
+            fuse_lowlevel_notify_inval_inode(ctx->notify_se, ino, -1, 0);
         } else {
             etcfs_log(ETCFS_LOG_ERROR, "unknown cache-invalidation message type %u; reconnecting",
                       typ);

@@ -163,6 +163,19 @@ func InodeKey(ino uint64) string {
 	return fmt.Sprintf("%s%d", PrefixInode, ino)
 }
 
+// ParseInodeKey returns the inode number an inode key names.
+func ParseInodeKey(key string) (ino uint64, ok bool) {
+	rest, found := strings.CutPrefix(key, PrefixInode)
+	if !found {
+		return 0, false
+	}
+	ino, err := strconv.ParseUint(rest, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return ino, true
+}
+
 func InodeSymlinkKey(ino uint64) string {
 	return fmt.Sprintf("symlink:%d", ino)
 }

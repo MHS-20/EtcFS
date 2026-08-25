@@ -28,10 +28,14 @@
  * their buffers by it. */
 #define MAX_NAME_LEN 255
 
-/* Default cache timeouts (seconds) */
-#define ETCFS_ENTRY_TIMEOUT    1.0
-#define ETCFS_ATTR_TIMEOUT     1.0
-#define ETCFS_NEGATIVE_TIMEOUT 0.0
+/* Cache timeouts for the replies this daemon answers by itself, which is only
+ * the root directory: its inode number, mode and link count are fixed, and its
+ * attributes are synthesised here rather than read from etcd.  Every other
+ * reply carries the timeout the backend sends with it — see
+ * DefaultEntryTimeout in internal/config, and --entry-timeout/--attr-timeout to
+ * change them. */
+#define ETCFS_ROOT_ENTRY_TIMEOUT 1.0
+#define ETCFS_ROOT_ATTR_TIMEOUT  1.0
 
 /* EtcFS internal attribute structure.
  * Matches kernel struct fuse_attr in layout but uses host byte order. */

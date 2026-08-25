@@ -376,8 +376,8 @@ static void ec_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
         struct fuse_entry_param e;
         memset(&e, 0, sizeof(e));
         e.ino = FUSE_ROOT_ID;
-        e.attr_timeout = ETCFS_ATTR_TIMEOUT;
-        e.entry_timeout = ETCFS_ENTRY_TIMEOUT;
+        e.attr_timeout = ETCFS_ROOT_ATTR_TIMEOUT;
+        e.entry_timeout = ETCFS_ROOT_ENTRY_TIMEOUT;
         e.attr.st_ino = FUSE_ROOT_ID;
         e.attr.st_mode = S_IFDIR | 0755;
         e.attr.st_nlink = 2;
@@ -436,7 +436,7 @@ static void ec_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
         st.st_gid = getgid();
         st.st_size = 4096;
         st.st_blksize = 4096;
-        fuse_reply_attr(req, &st, ETCFS_ATTR_TIMEOUT);
+        fuse_reply_attr(req, &st, ETCFS_ROOT_ATTR_TIMEOUT);
         return;
     }
     uint8_t payload[8];
