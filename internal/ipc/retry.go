@@ -115,9 +115,15 @@ func permanent(err error) bool {
 // retryEtcd runs fn against a fresh bounded context on every attempt.  Each
 // attempt gets its own context so that one timed-out call does not poison the
 // retries that follow it.
+//
+// The attempt context keeps the caller's values and drops only its
+// cancellation, which is what the detachment was ever for: built from
+// Background instead, it also threw away the transaction origin the caller had
+// labelled the work with, and every commit taking this path — the extent
+// publication behind close(), among others — was counted as "other".
 func retryEtcd(ctx context.Context, fn func(context.Context) error) error {
 	return retry(ctx, etcdAttempts, func() error {
-		actx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
+		actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), etcdOpTimeout)
 		defer cancel()
 		return fn(actx)
 	})
