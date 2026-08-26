@@ -46,6 +46,16 @@ var (
 		Buckets: prometheus.ExponentialBuckets(0.0001, 3, 10),
 	}, []string{"op"})
 
+	// Setattr counts SETATTR calls by what the request named and whether it
+	// reached etcd.  A timestamp is deferrable and a permission change is not,
+	// so the split says how much of a workload's setattr traffic can ever be
+	// taken off the request path — and, when a deferral is expected and does
+	// not happen, which field is the reason.
+	Setattr = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_setattr_total",
+		Help: "SETATTR calls, by the fields named and whether they were deferred.",
+	}, []string{"fields", "outcome"})
+
 	// LockHandoverHold observes how long a cached inode lock is held before a
 	// peer's recall is honoured, in seconds.
 	//

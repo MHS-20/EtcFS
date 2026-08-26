@@ -751,6 +751,33 @@ func applySetattr(rec *metadata.InodeRecord, valid uint32, f setattrFields, now 
 	}
 }
 
+// setattrFieldLabel names what a setattr request asked for, for the metric that
+// counts how much of a workload's setattr traffic is deferrable.  Bounded in
+// cardinality by construction: four groups, always in the same order.
+func setattrFieldLabel(valid uint32) string {
+	label := ""
+	for _, group := range []struct {
+		mask uint32
+		name string
+	}{
+		{fattrMode, "mode"},
+		{fattrUID | fattrGID, "owner"},
+		{fattrSize, "size"},
+		{fattrAtime | fattrMtime | fattrCtime | fattrAtimeNow | fattrMtimeNow, "times"},
+	} {
+		if valid&group.mask != 0 {
+			if label != "" {
+				label += "+"
+			}
+			label += group.name
+		}
+	}
+	if label == "" {
+		return "none"
+	}
+	return label
+}
+
 // setattrEnforces reports whether a setattr changes anything a peer's access
 // check depends on, given the record as it stands.
 //
@@ -828,11 +855,14 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	// then its times after writing it, so this is most of what an unpacking
 	// archive asks of setattr, and none of it needs consensus before the call
 	// returns.
+	fields := setattrFieldLabel(valid)
 	if !setattrEnforces(rec, valid, f) {
 		if resp, deferred := s.deferSetattrTimes(rec, valid, f); deferred {
+			metrics.Setattr.WithLabelValues(fields, "deferred").Inc()
 			return resp, nil
 		}
 	}
+	metrics.Setattr.WithLabelValues(fields, "committed").Inc()
 
 	// Committing synchronously: anything queued for this inode is older than
 	// what is about to be written and would otherwise be published on top of
