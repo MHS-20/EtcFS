@@ -405,6 +405,7 @@ func (s *Service) deleteKeys(owed []metadata.LockRelease, owedBy []*lockEntry, c
 	// exits and every peer stalls on them.
 	ctx, cancel := context.WithTimeout(context.Background(), etcdOpTimeout)
 	defer cancel()
+	ctx = metadata.WithTxnOrigin(ctx, "lock_release")
 	var held []bool
 	err := retryEtcd(ctx, func(rctx context.Context) error {
 		var rerr error

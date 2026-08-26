@@ -265,6 +265,7 @@ func (s *Service) bufferWriteOp(ctx context.Context, lk *heldLock, w *writeOp,
 // commitWriteOp puts the payload on the device and publishes this write's
 // metadata in one guarded transaction, then reclaims what it buried.
 func (s *Service) commitWriteOp(ctx context.Context, lk *heldLock, w *writeOp) ([]byte, error) {
+	ctx = metadata.WithTxnOrigin(ctx, "write_commit")
 	cmps, ops := w.proposal()
 
 	// This write is committing after all, and the proposal above may have been
@@ -839,7 +840,8 @@ func (s *Service) reclaimCovered(ctx context.Context, old metadata.Extent,
 		return nil
 	}
 
-	ok, err := s.store.Txn(ctx, []clientv3.Cmp{p.cmp}, p.ops, nil)
+	ok, err := s.store.Txn(metadata.WithTxnOrigin(ctx, "reclaim"),
+		[]clientv3.Cmp{p.cmp}, p.ops, nil)
 	if err != nil {
 		return fmt.Errorf("reclaim covered extent %s: %w", old.Key, err)
 	}

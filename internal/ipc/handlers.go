@@ -465,7 +465,8 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 	}
 
 	call := time.Now()
-	rec, err := s.store.AtomicCreateFile(ctx, parent, name, ino, applyUmask(mode, umask), uid, gid, extra)
+	rec, err := s.store.AtomicCreateFile(metadata.WithTxnOrigin(ctx, "create"), parent, name, ino,
+		applyUmask(mode, umask), uid, gid, extra)
 	if err != nil {
 		if holder != "" {
 			s.discardCreatedLock(ino, holder)
@@ -932,7 +933,7 @@ func (s *Service) commitSetattr(ctx context.Context, ino uint64, rec *metadata.I
 
 	// Pinned to the revision the record was read at, so a concurrent update to
 	// a different field is not silently overwritten by this one.
-	ok, err := s.store.Txn(ctx,
+	ok, err := s.store.Txn(metadata.WithTxnOrigin(ctx, "setattr"),
 		[]clientv3.Cmp{metadata.InodeUnchanged(ino, rev)},
 		[]clientv3.Op{clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(rec)))}, nil)
 	if err != nil {

@@ -424,6 +424,7 @@ func (s *Service) flushLocked(ctx context.Context, e *lockEntry, trigger string)
 	if e.pending.empty() {
 		return nil
 	}
+	ctx = metadata.WithTxnOrigin(ctx, "extent_flush")
 
 	cmps, ops, err := s.proposeFlushLocked(e)
 	if err != nil {

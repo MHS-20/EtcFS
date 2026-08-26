@@ -197,6 +197,27 @@ func (s *Store) TxnResponse(ctx context.Context, ifs []clientv3.Cmp, thens, else
 	return resp, nil
 }
 
+// Transaction origins.  A commit is the unit of cost in this filesystem, so
+// which operation asked for one is worth carrying: a context tag rather than a
+// parameter, because the callers that matter are several layers above the
+// transaction and threading it by hand would touch every one of them.
+type txnOriginKey struct{}
+
+// WithTxnOrigin labels every transaction committed under ctx.
+func WithTxnOrigin(ctx context.Context, origin string) context.Context {
+	return context.WithValue(ctx, txnOriginKey{}, origin)
+}
+
+// TxnOrigin returns the label ctx carries, or "other" for a path that has not
+// been tagged.  A large "other" is a sign this instrumentation has fallen
+// behind the code, not that the commits came from nowhere.
+func TxnOrigin(ctx context.Context) string {
+	if origin, ok := ctx.Value(txnOriginKey{}).(string); ok {
+		return origin
+	}
+	return "other"
+}
+
 // txnRaw executes a transaction without the fencing guard.
 //
 // Only for control-plane paths that cannot be guarded: creating the generation
@@ -222,6 +243,7 @@ func (s *Store) txnRawResponse(ctx context.Context, ifs []clientv3.Cmp, thens, e
 	}
 	if resp.Succeeded {
 		metrics.EtcdTxns.WithLabelValues("committed").Inc()
+		metrics.EtcdTxnOrigin.WithLabelValues(TxnOrigin(ctx)).Inc()
 	} else {
 		metrics.EtcdTxns.WithLabelValues("rejected").Inc()
 	}

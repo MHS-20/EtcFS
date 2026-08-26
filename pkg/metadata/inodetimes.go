@@ -342,7 +342,7 @@ func (s *Store) commitInodeTimesBatch(ctx context.Context, due map[uint64]timeUp
 		return failed
 	}
 
-	ok, err := s.Txn(ctx, cmps, ops, nil)
+	ok, err := s.Txn(WithTxnOrigin(ctx, "times_batch"), cmps, ops, nil)
 	if err == nil && ok {
 		return failed
 	}
@@ -369,6 +369,7 @@ func (s *Store) commitInodeTimesBatch(ctx context.Context, due map[uint64]timeUp
 // here may be overwritten.  An inode that has since been deleted takes the
 // update to the grave, which is what it is for.
 func (s *Store) commitInodeTimes(ctx context.Context, ino uint64, u timeUpdate) error {
+	ctx = WithTxnOrigin(ctx, "times_single")
 	return retryCAS(ctx, "publish inode times", func() (bool, error) {
 		rec, rev, err := s.GetInodeRev(ctx, ino)
 		if err != nil {

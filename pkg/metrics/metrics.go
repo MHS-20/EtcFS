@@ -56,6 +56,15 @@ var (
 		Help: "SETATTR calls, by the fields named and whether they were deferred.",
 	}, []string{"fields", "outcome"})
 
+	// EtcdTxnOrigin counts committed transactions by the operation that asked
+	// for them.  The total alone says how much consensus a workload costs; this
+	// says which part of the filesystem is spending it, which is the difference
+	// between knowing a number and being able to act on it.
+	EtcdTxnOrigin = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "etcfuse_etcd_txn_origin_total",
+		Help: "Committed etcd transactions, by the operation that issued them.",
+	}, []string{"origin"})
+
 	// LockHandoverHold observes how long a cached inode lock is held before a
 	// peer's recall is honoured, in seconds.
 	//

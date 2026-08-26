@@ -418,7 +418,8 @@ func (s *Service) acquireLockKey(ctx context.Context, ino uint64, mode metadata.
 		}
 
 		var aerr error
-		holder, aerr = s.store.AcquireLock(actx, ino, mode, inodeLockTTL)
+		holder, aerr = s.store.AcquireLock(metadata.WithTxnOrigin(actx, "lock_acquire"),
+			ino, mode, inodeLockTTL)
 		if holder != "" {
 			attempted = append(attempted, holder)
 		}
