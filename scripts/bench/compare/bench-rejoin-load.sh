@@ -5,7 +5,10 @@
 # arena, so there should be none), and whether arena reclaim keeps up — the
 # leaver's arenas must come back, or every cycle leaks capacity.
 #
-# ETCFS_REJOIN_CYCLES (default 3), ETCFS_BENCH_RUNTIME (per-cycle load, 30).
+# ETCFS_REJOIN_CYCLES (default 3), ETCFS_BENCH_RUNTIME (per-cycle load, 30),
+# ETCFS_REJOIN_SETTLE (default 120) — how long to wait before re-sampling the
+# arena count, so a reclaim still in flight when the last cycle ended is told
+# apart from capacity the cycles leaked.
 #
 # Usage:
 #   ./bench-rejoin-load.sh
@@ -17,6 +20,7 @@ source "$SCRIPT_DIR/compare-lib.sh"
 
 CYCLES="${ETCFS_REJOIN_CYCLES:-3}"
 RUNTIME="${ETCFS_BENCH_RUNTIME:-30}"
+SETTLE="${ETCFS_REJOIN_SETTLE:-120}"
 
 # etcfuse_arenas_owned, summed over the whole cluster: the leaver's arenas
 # should come back to the pool rather than staying charged to a node that is
@@ -78,3 +82,11 @@ compare_headline leave-rejoin worst_survivor_mibps "$worst" MiB/s
 compare_headline leave-rejoin worst_survivor_dip_pct \
     "$(awk -v b="$baseline" -v w="$worst" 'BEGIN{ if (b+0 == 0) print "0"; else printf "%.2f", (b-w)/b*100 }')" %
 compare_headline leave-rejoin arenas_owned_after "$(arenas_owned_total)" arenas
+
+# Sampled twice, because the first sample is taken the moment the last cycle
+# ends and a reclaim started during that cycle may still be in flight. A count
+# that comes back down over the settle window is a reclaim that had not
+# finished; one that stays up is capacity the cycles genuinely leaked.
+sleep "$SETTLE"
+compare_headline leave-rejoin settle_seconds "$SETTLE" s
+compare_headline leave-rejoin arenas_owned_settled "$(arenas_owned_total)" arenas
