@@ -34,3 +34,4 @@ dist/
 specs/.tools/
 specs/states/
 *.toolbox
+.compare-run.lock

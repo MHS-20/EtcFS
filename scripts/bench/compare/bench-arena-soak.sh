@@ -63,10 +63,31 @@ done
 # The headline is the drift: allocatable space lost per byte of live data
 # still there at the end. 1.0 means the allocator gave back exactly what the
 # churn stopped using; well above 1.0 is fragmentation.
-read -r first_avail first_live < <(head -1 "$SAMPLES" | awk '{print $2, $3}')
+#
+# Baselined on the first sample after live bytes plateau, not on the first
+# sample of the run. The churn starts on an empty filesystem and spends its
+# first minutes filling it for the first time, and space consumed by data that
+# is still there is not fragmentation — measured from sample zero the ratio is
+# dominated by that fill (19.4 over six hours, 27.4 over ten minutes, neither
+# of them a statement about the allocator). "Plateau" is the first sample
+# holding at least 90% of the run's peak live bytes, which is where each
+# node's fixed window of files is fully populated and the churn is only
+# replacing them.
+read -r base_ts base_avail base_live < <(
+    awk '{ts[NR]=$1; a[NR]=$2; l[NR]=$3; if ($3 > max) max = $3}
+         END { for (i = 1; i <= NR; i++) if (l[i] >= 0.9 * max) { print ts[i], a[i], l[i]; exit } }' "$SAMPLES")
 read -r last_avail last_live last_arenas < <(tail -1 "$SAMPLES" | awk '{print $2, $3, $4}')
 compare_headline arena-soak soak_seconds "$SECONDS_TOTAL" s
 compare_headline arena-soak arenas_owned_end "$last_arenas" arenas
+compare_headline arena-soak baseline_offset_s \
+    "$(( base_ts - $(head -1 "$SAMPLES" | awk '{print $1}') ))" s
+# With live bytes flat after the plateau, the ratio's denominator is near
+# zero and the ratio itself stops being readable, so the two quantities it is
+# built from are published alongside it: allocatable space lost over the
+# plateau window against how much live data actually changed in it. Space
+# falling while live data holds steady is the fragmentation signal.
+compare_headline arena-soak avail_lost_since_plateau "$(( base_avail - last_avail ))" bytes
+compare_headline arena-soak live_delta_since_plateau "$(( last_live - base_live ))" bytes
 compare_headline arena-soak avail_lost_per_live_byte \
-    "$(awk -v fa="$first_avail" -v la="$last_avail" -v fl="$first_live" -v ll="$last_live" \
+    "$(awk -v fa="$base_avail" -v la="$last_avail" -v fl="$base_live" -v ll="$last_live" \
         'BEGIN{ d = ll - fl; if (d <= 0) { print "0" } else { printf "%.3f", (fa - la) / d } }')" ratio
