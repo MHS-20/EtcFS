@@ -144,6 +144,20 @@ var (
 		Help: "Publications of deferred metadata, by trigger.",
 	}, []string{"trigger"})
 
+	// FlushBatches counts transactions that published several inodes' buffers
+	// at once, and FlushBatchInodes the inodes they carried.  The ratio of the
+	// two is the only measurement of what batching the interval sweep is worth:
+	// one means the batch was a single flush wearing a different name.
+	FlushBatches = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "etcfuse_metadata_flush_batch_total",
+		Help: "Transactions that published one or more inodes' deferred metadata together.",
+	})
+
+	FlushBatchInodes = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "etcfuse_metadata_flush_batch_inodes_total",
+		Help: "Inodes published by batched metadata flush transactions.",
+	})
+
 	// FlushFailures counts flushes that did not publish, by why (error,
 	// rejected, fenced).  Anything but zero is worth an alert: "error" means
 	// acknowledged writes are sitting unpublished, and the other two mean they

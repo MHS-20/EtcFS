@@ -701,6 +701,8 @@ func (s *Service) commitFlushBatch(ctx context.Context, b *flushBatch, trigger s
 	defer b.release()
 
 	committed, fenced, rev, err := s.commitGuarded(ctx, b.cmps, b.ops)
+	metrics.FlushBatches.Inc()
+	metrics.FlushBatchInodes.Add(float64(len(b.entries)))
 	for range b.entries {
 		metrics.Flushes.WithLabelValues(trigger).Inc()
 	}
