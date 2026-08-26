@@ -43,10 +43,10 @@ import (
 // cache colder, and the worst a lost one costs is the staleness its timeout
 // already bounds.
 //
-// ponytail: one socket and one thread in the C daemon, so a slow INVAL_INODE
-// delays the entry invalidations queued behind it.  A stale dentry is bounded by
-// entry_timeout anyway, and the delay is bounded by the same recall the peer is
-// already waiting on.  A second connection is the upgrade if that stops holding.
+// One socket carries all three, but the client does not serve them on one
+// thread: it enqueues the unacknowledged kinds and makes their kernel calls
+// elsewhere, so an acknowledged INVAL_INODE never waits behind a flood of entry
+// invalidations from an unpacking archive.  See the queue in pkg/fuse/fuse.h.
 const (
 	notifyInvalEntry = 1
 	notifyInvalInode = 2
@@ -73,7 +73,7 @@ const (
 	// before the client is treated as unresponsive.  A client that is wedged but
 	// still connected answers nothing while keeping the socket open, so without
 	// this every lock release pays the full ack timeout, one after another,
-	// through a path that is one socket and one thread.
+	// since one socket carries them all.
 	notifyBreakerTrips = 3
 
 	// notifyBreakerCooldown is how long acknowledged messages fail immediately

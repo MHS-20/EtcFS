@@ -312,6 +312,93 @@ static void test_a_negative_entry_parses_as_a_cacheable_absence(void)
     assert(r.off == sizeof(reply));
 }
 
+/* ---- the fire-and-forget invalidation queue ---- */
+
+static void test_the_queue_is_first_in_first_out(void)
+{
+    struct etcfs_inval_queue q;
+    etcfs_inval_queue_init(&q);
+
+    for (unsigned i = 0; i < 3; i++) {
+        struct etcfs_inval_msg m = {.type = 1, .ino = i, .nlen = 1};
+        m.name[0] = (char) ('a' + i);
+        assert(etcfs_inval_queue_push(&q, &m) == 0);
+    }
+
+    struct etcfs_inval_msg out;
+    for (unsigned i = 0; i < 3; i++) {
+        assert(etcfs_inval_queue_pop(&q, &out) == 1);
+        assert(out.ino == i);
+        assert(out.name[0] == (char) ('a' + i));
+    }
+
+    /* Closing an empty queue is what ends the draining thread's loop. */
+    etcfs_inval_queue_close(&q);
+    assert(etcfs_inval_queue_pop(&q, &out) == 0);
+}
+
+static void test_a_full_queue_drops_its_oldest_message(void)
+{
+    struct etcfs_inval_queue q;
+    etcfs_inval_queue_init(&q);
+
+    /* One past capacity: the first message is the one that goes. */
+    for (unsigned i = 0; i < ETCFS_INVAL_QUEUE_CAP + 1; i++) {
+        struct etcfs_inval_msg m = {.type = 1, .ino = i};
+        assert(etcfs_inval_queue_push(&q, &m) == (i == ETCFS_INVAL_QUEUE_CAP));
+    }
+
+    struct etcfs_inval_msg out;
+    assert(etcfs_inval_queue_pop(&q, &out) == 1);
+    assert(out.ino == 1);
+
+    etcfs_inval_queue_close(&q);
+}
+
+static void *queue_pop_once(void *arg)
+{
+    struct etcfs_inval_queue *q = (struct etcfs_inval_queue *) arg;
+    static struct etcfs_inval_msg out;
+    return etcfs_inval_queue_pop(q, &out) ? &out : NULL;
+}
+
+static void test_a_waiting_pop_is_woken_by_a_push(void)
+{
+    struct etcfs_inval_queue q;
+    etcfs_inval_queue_init(&q);
+
+    pthread_t tid;
+    assert(pthread_create(&tid, NULL, queue_pop_once, &q) == 0);
+
+    struct etcfs_inval_msg m = {.type = 1, .ino = 42};
+    /* The pop is parked on the condition variable at some point in here; either
+     * order it observes is a wake-up rather than a missed one. */
+    etcfs_inval_queue_push(&q, &m);
+
+    void *got = NULL;
+    assert(pthread_join(tid, &got) == 0);
+    assert(got != NULL);
+    assert(((struct etcfs_inval_msg *) got)->ino == 42);
+
+    etcfs_inval_queue_close(&q);
+}
+
+/* A close with a pop already waiting has to wake it, or teardown would join a
+ * thread that never returns. */
+static void test_a_waiting_pop_is_woken_by_a_close(void)
+{
+    struct etcfs_inval_queue q;
+    etcfs_inval_queue_init(&q);
+
+    pthread_t tid;
+    assert(pthread_create(&tid, NULL, queue_pop_once, &q) == 0);
+    etcfs_inval_queue_close(&q);
+
+    void *got = &q;
+    assert(pthread_join(tid, &got) == 0);
+    assert(got == NULL);
+}
+
 int main(void)
 {
     test_rb_reads_big_endian();
@@ -326,6 +413,10 @@ int main(void)
     test_a_failed_exchange_reconnects_on_the_next_request();
     test_fixed_reply_widths_match_the_daemon();
     test_a_negative_entry_parses_as_a_cacheable_absence();
+    test_the_queue_is_first_in_first_out();
+    test_a_full_queue_drops_its_oldest_message();
+    test_a_waiting_pop_is_woken_by_a_push();
+    test_a_waiting_pop_is_woken_by_a_close();
 
     printf("test/c: all checks passed\n");
     return 0;

@@ -116,6 +116,86 @@ static void notify_sleep_ms(unsigned ms)
     }
 }
 
+/* ---- the fire-and-forget invalidation queue ---- */
+
+void etcfs_inval_queue_init(struct etcfs_inval_queue *q)
+{
+    pthread_mutex_init(&q->mu, NULL);
+    pthread_cond_init(&q->cv, NULL);
+    q->head = 0;
+    q->len = 0;
+    q->closed = 0;
+}
+
+int etcfs_inval_queue_push(struct etcfs_inval_queue *q, const struct etcfs_inval_msg *msg)
+{
+    int dropped = 0;
+
+    pthread_mutex_lock(&q->mu);
+    if (q->closed) {
+        pthread_mutex_unlock(&q->mu);
+        return 0;
+    }
+    if (q->len == ETCFS_INVAL_QUEUE_CAP) {
+        q->head = (q->head + 1) % ETCFS_INVAL_QUEUE_CAP;
+        q->len--;
+        dropped = 1;
+    }
+    q->slot[(q->head + q->len) % ETCFS_INVAL_QUEUE_CAP] = *msg;
+    q->len++;
+    pthread_cond_signal(&q->cv);
+    pthread_mutex_unlock(&q->mu);
+    return dropped;
+}
+
+int etcfs_inval_queue_pop(struct etcfs_inval_queue *q, struct etcfs_inval_msg *out)
+{
+    pthread_mutex_lock(&q->mu);
+    while (q->len == 0 && !q->closed)
+        pthread_cond_wait(&q->cv, &q->mu);
+    if (q->len == 0) {
+        pthread_mutex_unlock(&q->mu);
+        return 0;
+    }
+    *out = q->slot[q->head];
+    q->head = (q->head + 1) % ETCFS_INVAL_QUEUE_CAP;
+    q->len--;
+    pthread_mutex_unlock(&q->mu);
+    return 1;
+}
+
+void etcfs_inval_queue_close(struct etcfs_inval_queue *q)
+{
+    pthread_mutex_lock(&q->mu);
+    q->closed = 1;
+    pthread_cond_broadcast(&q->cv);
+    pthread_mutex_unlock(&q->mu);
+}
+
+static struct etcfs_inval_queue inval_queue;
+
+/* Makes the kernel calls for the queued invalidations.  Its own thread so that
+ * a slow one delays nothing the backend is waiting on; see the queue's comment
+ * in fuse.h.  Not a request thread either, which is what keeps
+ * fuse_lowlevel_notify_inval_inode clear of the kernel's writeback of the inode
+ * it is invalidating. */
+static void *inval_thread(void *arg)
+{
+    struct etcfs_context *ctx = (struct etcfs_context *) arg;
+    struct etcfs_inval_msg msg;
+
+    while (etcfs_inval_queue_pop(&inval_queue, &msg)) {
+        if (msg.type == NOTIFY_INVAL_ENTRY)
+            fuse_lowlevel_notify_inval_entry(ctx->notify_se, msg.ino, msg.name, msg.nlen);
+        else
+            /* A negative offset asks for the attributes only: the data pages
+             * belong to whoever holds the inode's lock and are dropped
+             * separately, before that lock is yielded. */
+            fuse_lowlevel_notify_inval_inode(ctx->notify_se, msg.ino, -1, 0);
+    }
+    return NULL;
+}
+
 static int notify_connect(const char *path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -139,6 +219,7 @@ static int notify_connect(const char *path)
 static void notify_serve(struct etcfs_context *ctx, int fd)
 {
     uint8_t hdr[NOTIFY_HDR_LEN];
+    int complained = 0;
 
     while (!notify_stop && read_full(fd, hdr, sizeof(hdr)) == 0) {
         uint32_t typ = notify_u32(hdr);
@@ -161,8 +242,19 @@ static void notify_serve(struct etcfs_context *ctx, int fd)
             return;
         name[nlen] = '\0';
 
-        if (typ == NOTIFY_INVAL_ENTRY) {
-            fuse_lowlevel_notify_inval_entry(ctx->notify_se, ino, name, nlen);
+        if (typ == NOTIFY_INVAL_ENTRY || typ == NOTIFY_INVAL_ATTR) {
+            /* Queued rather than carried out here.  Nothing waits on either,
+             * and the acknowledged message below must not queue behind them —
+             * that is the whole reason the queue exists. */
+            struct etcfs_inval_msg msg = {.type = typ, .ino = ino, .nlen = nlen};
+            memcpy(msg.name, name, nlen + 1);
+            if (etcfs_inval_queue_push(&inval_queue, &msg) && !complained) {
+                etcfs_log(ETCFS_LOG_WARN,
+                          "cache invalidations are arriving faster than the kernel accepts "
+                          "them; the oldest are being dropped and the names or attributes "
+                          "they covered stay cached on this node until they time out");
+                complained = 1;
+            }
         } else if (typ == NOTIFY_INVAL_INODE) {
             /* Drop the kernel's data pages for one inode, then acknowledge.
              * The backend is holding that inode's lock open until this reply
@@ -179,17 +271,6 @@ static void notify_serve(struct etcfs_context *ctx, int fd)
             uint8_t ack = (rc == 0 || rc == -ENOENT) ? 0 : 1;
             if (write(fd, &ack, 1) != 1)
                 return;
-        } else if (typ == NOTIFY_INVAL_ATTR) {
-            /* Drop the kernel's cached attributes for one inode, leaving its
-             * data pages alone: a negative offset is how the kernel is asked
-             * for attributes only.  The pages belong to whoever holds the
-             * inode's lock and are dropped separately, before that lock is
-             * yielded — throwing them away here would discard a cache this
-             * node is entitled to keep.
-             *
-             * Not acknowledged, because nothing waits on it.  A lost one costs
-             * the staleness the attribute timeout already bounds. */
-            fuse_lowlevel_notify_inval_inode(ctx->notify_se, ino, -1, 0);
         } else {
             etcfs_log(ETCFS_LOG_ERROR, "unknown cache-invalidation message type %u; reconnecting",
                       typ);
@@ -566,8 +647,10 @@ after_cleanup:
     etcfs_log(ETCFS_LOG_INFO, "EtcFS mounted at %s", mountpoint);
 
     ctx->notify_se = se;
-    pthread_t ntid;
+    etcfs_inval_queue_init(&inval_queue);
+    pthread_t ntid, itid;
     pthread_create(&ntid, NULL, notify_thread, ctx);
+    pthread_create(&itid, NULL, inval_thread, ctx);
 
     /*
      * Multi-threaded: each worker takes its own IPC connection from
@@ -595,6 +678,10 @@ after_cleanup:
     notify_stop = 1;
     notify_fd_shutdown();
     pthread_join(ntid, NULL);
+    /* The reader is gone, so nothing can enqueue past this point; what is still
+     * queued is for caches the session about to be destroyed owns anyway. */
+    etcfs_inval_queue_close(&inval_queue);
+    pthread_join(itid, NULL);
 
     fuse_session_unmount(se);
     fuse_session_destroy(se);

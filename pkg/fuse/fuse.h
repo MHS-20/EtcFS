@@ -15,6 +15,7 @@
  * It defines EtcFS's own wrapper types for the metadata IPC layer.
  */
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/types.h>
@@ -97,6 +98,55 @@ struct etcfs_context {
     char *volume_id;
     char *node_id;
 };
+
+/* Queue of invalidations nobody is waiting on.
+ *
+ * The notification socket carries two kinds of traffic: entry and attribute
+ * invalidations, which are fire-and-forget, and inode invalidations, which the
+ * backend blocks on because it may not yield an inode's lock until the kernel's
+ * pages for that inode are gone.  Calling into the kernel for the first kind on
+ * the thread that reads the socket puts the second kind behind however many of
+ * them are outstanding — an unpacking archive produces one per created file —
+ * until the backend's acknowledgement deadline expires and the connection is
+ * dropped.  The reader therefore only parses and enqueues the fire-and-forget
+ * messages, and a separate thread makes their kernel calls.
+ *
+ * Bounded, because the producer is a peer's create rate and the consumer is the
+ * kernel: an unbounded queue would trade the stall for unbounded memory.  A full
+ * queue drops its oldest message, which is the one whose loss costs least —
+ * invalidation is idempotent, so the newest message for a name subsumes the
+ * older ones, and what is lost stays cached only until its entry or attribute
+ * timeout. */
+#define ETCFS_INVAL_QUEUE_CAP 512
+
+struct etcfs_inval_msg {
+    uint32_t type;
+    uint64_t ino;
+    uint32_t nlen;
+    char name[MAX_NAME_LEN + 1];
+};
+
+struct etcfs_inval_queue {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    struct etcfs_inval_msg slot[ETCFS_INVAL_QUEUE_CAP];
+    unsigned head;
+    unsigned len;
+    int closed;
+};
+
+void etcfs_inval_queue_init(struct etcfs_inval_queue *q);
+
+/* Appends one message, and reports whether an older one was dropped to make
+ * room. */
+int etcfs_inval_queue_push(struct etcfs_inval_queue *q, const struct etcfs_inval_msg *msg);
+
+/* Waits for the next message and returns 1, or returns 0 once the queue has
+ * been closed and emptied. */
+int etcfs_inval_queue_pop(struct etcfs_inval_queue *q, struct etcfs_inval_msg *out);
+
+/* Wakes every waiter and stops the queue accepting anything further. */
+void etcfs_inval_queue_close(struct etcfs_inval_queue *q);
 
 /* Log levels */
 #define ETCFS_LOG_ERROR 0
