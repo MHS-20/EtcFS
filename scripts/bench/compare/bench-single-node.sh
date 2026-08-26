@@ -8,6 +8,13 @@
 # Sequential 1 MiB and random 4 KiB, both one job deep: the first says how much
 # bandwidth survives, the second how much of the device's IOPS does.
 #
+# The raw device is measured at both depths.  A queued baseline says what the
+# volume can be driven to and is the right ceiling for bandwidth; a depth-1 one
+# is the only fair comparison for the random-write percentage, since the
+# filesystem leg is psync and one request deep by construction, and dividing by
+# the queued number reports the filesystem's missing queue depth as if it were
+# the filesystem's overhead.
+#
 # Usage:
 #   COMPARE_BACKEND=etcfs ./bench-single-node.sh
 set -euo pipefail
@@ -50,6 +57,17 @@ rw=randwrite
 bs=4k
 iodepth=4
 ")
+raw_rand_d1=$(compare_run_job "raw-rand-d1" "$RAW_NODE" "$RUNTIME" "
+[global]
+ioengine=psync
+direct=1
+filename=$RAW_DEV
+runtime=$RUNTIME
+time_based=1
+[randwrite-4k]
+rw=randwrite
+bs=4k
+")
 
 compare_mount 0
 
@@ -65,6 +83,11 @@ time_based=1
 rw=write
 bs=1M
 ")
+# Bracketing the random-write leg only: it is the one whose cost is unexplained,
+# and the counters worth reading — how many of its metadata lookups the lock's
+# cache answered, and how long the daemon itself spent per write — are deltas
+# rather than levels.
+compare_etcfs_snapshot_metrics "$N0" "before-fs-rand"
 fs_rand=$(compare_run_job "fs-rand-$COMPARE_BACKEND" "$N0" "$RUNTIME" "
 [global]
 ioengine=psync
@@ -78,12 +101,17 @@ rw=randwrite
 bs=4k
 ")
 
+compare_etcfs_snapshot_metrics "$N0" "after-fs-rand"
+
 raw_bw=$(compare_fio_bw_mibps "$raw_seq" write)
 fs_bw=$(compare_fio_bw_mibps "$fs_seq" write)
 raw_iops=$(compare_fio_iops "$raw_rand" write)
+raw_iops_d1=$(compare_fio_iops "$raw_rand_d1" write)
 fs_iops=$(compare_fio_iops "$fs_rand" write)
 
 compare_headline single-node raw_write_mibps "$raw_bw" MiB/s
 compare_headline single-node fs_write_mibps "$fs_bw" MiB/s
 compare_headline single-node pct_of_raw_bandwidth "$(compare_div "$(compare_div "$fs_bw" "$raw_bw" 4)" 0.01)" %
+compare_headline single-node raw_iops_depth1 "$raw_iops_d1" IOPS
 compare_headline single-node pct_of_raw_iops "$(compare_div "$(compare_div "$fs_iops" "$raw_iops" 4)" 0.01)" %
+compare_headline single-node pct_of_raw_iops_depth1 "$(compare_div "$(compare_div "$fs_iops" "$raw_iops_d1" 4)" 0.01)" %

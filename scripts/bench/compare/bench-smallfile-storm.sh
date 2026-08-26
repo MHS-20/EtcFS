@@ -25,3 +25,10 @@ compare_build_tree "$N0" "$FILES" >/dev/null
 read -r elapsed rate < <(compare_untar_tree "$N0" "$MOUNT_PATH/storm" "$FILES")
 compare_headline smallfile-storm untar_s "$elapsed" s
 compare_headline smallfile-storm creates_per_sec "$rate" files/s
+
+# The create rate is only half of what this scenario says about etcfs.  The
+# other half is whether the invalidation path kept up with it: a run that is
+# fast because it stopped yielding locks is not a faster run.
+notify_failures=$(compare_etcfs_notify_failures "$N0")
+[[ -z "$notify_failures" ]] || compare_headline smallfile-storm notify_failures "$notify_failures" locks
+compare_etcfs_snapshot_metrics "$N0" "after-storm"

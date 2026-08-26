@@ -336,6 +336,16 @@ compare_etcfs_read_ops() {
         "curl -s --max-time 5 http://127.0.0.1:9090/metrics | awk '/^etcfuse_fuse_ops_total\{op=\"read\"\}/ {printf \"%d\", \$2}'" 2>/dev/null
 }
 
+# compare_etcfs_snapshot_metrics <pub_ip> <label> — save the daemon's whole
+# Prometheus page to the results directory, so a scenario can take one before a
+# leg and one after and read any counter's delta afterwards without deciding in
+# advance which counter mattered. Nothing for a non-etcfs backend.
+compare_etcfs_snapshot_metrics() {
+    [[ "$COMPARE_BACKEND_BASE" == "etcfs" ]] || return 0
+    $SSH_CMD "ec2-user@$1" "curl -s --max-time 5 http://127.0.0.1:9090/metrics" \
+        > "$RESULTS_DIR/metrics-$2.txt" 2>/dev/null || true
+}
+
 # compare_etcfs_page_cache <pub_ip> — whether the daemon is currently answering
 # opens as cacheable: "up", "down", or "never" if it has had no client at all.
 #
@@ -349,6 +359,17 @@ compare_etcfs_page_cache() {
         /notify: client connected/ { s = \"up\" }
         /no cache-invalidation client is connected/ { s = \"down\" }
         END { print (s == \"\" ? \"never\" : s) }' /tmp/meta.log" 2>/dev/null
+}
+
+# compare_etcfs_notify_failures <pub_ip> — how many times a lock could not be
+# yielded because the kernel's pages for it were not invalidated. Zero is the
+# only acceptable number: each one is a lock this node keeps holding against the
+# cluster, and a run full of them is the invalidation path failing under load
+# rather than the filesystem being slow.
+compare_etcfs_notify_failures() {
+    [[ "$COMPARE_BACKEND_BASE" == "etcfs" ]] || return 0
+    $SSH_CMD "ec2-user@$1" \
+        "sudo grep -c 'kernel pages not invalidated' /tmp/meta.log || true" 2>/dev/null
 }
 
 # compare_drop_caches <pub_ip>... — empty the kernel's page, dentry and inode
