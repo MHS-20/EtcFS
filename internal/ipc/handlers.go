@@ -132,6 +132,18 @@ func (s *Service) handleGetattr(ctx context.Context, payload []byte) ([]byte, er
 		return int32Resp(errInval), nil
 	}
 
+	// Read from etcd, not from the snapshot cached under this node's lock, even
+	// when it holds one.  That snapshot is authoritative for what the lock
+	// protects — the extent list and the size — and not for the rest of the
+	// record: setattr changes mode, ownership and times under a compare-and-set
+	// and takes no lock at all, so a peer may rewrite those fields of an inode
+	// this node holds exclusively.  Answering a stat from the snapshot would
+	// serve that peer's permission change as the old one until the lock was
+	// given up, which is unbounded rather than merely late.
+	//
+	// Making this cacheable means first bringing mode and ownership under the
+	// inode lock, which is a change to how chmod behaves cluster-wide, not an
+	// optimisation of this handler.
 	rec, err := s.store.GetInode(ctx, ino)
 	if err != nil || rec == nil {
 		return int32Resp(errNoEnt), nil

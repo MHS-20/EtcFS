@@ -137,3 +137,48 @@ func TestIntegration_DirTouchWritesThroughWithoutBatching(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, rec.Mtime.After(old), "the timestamp should have been committed inline")
 }
+
+// The sweep publishes many inodes in one transaction — a commit per inode is
+// what the queue exists to avoid — and an inode whose record moved underneath
+// the batch is settled on its own rather than taking the others down with it.
+func TestBatchedSweepPublishesEveryInodeDespiteOneThatMoved(t *testing.T) {
+	store := testStore(t, "node-1")
+	ctx := context.Background()
+	store.StartDirTouchBatching(ctx, time.Hour, nil)
+
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	want := time.Now().Add(-time.Minute).Truncate(time.Second)
+
+	const first = uint64(700)
+	const count = 5
+	for i := uint64(0); i < count; i++ {
+		seedDir(t, store, ctx, first+i, old)
+		require.True(t, store.QueueInodeTimes(first+i, time.Time{}, want, time.Time{}, false, true, false))
+	}
+
+	// One record moves after it was queued, so the batch's comparison on it
+	// cannot hold and the transaction is refused as a whole.
+	moved, rev, err := store.GetInodeRev(ctx, first+2)
+	require.NoError(t, err)
+	require.NotNil(t, moved)
+	moved.UID = 4242
+	ok, err := store.Txn(ctx,
+		[]clientv3.Cmp{InodeUnchanged(first+2, rev)},
+		[]clientv3.Op{clientv3.OpPut(InodeKey(first+2), string(EncodeInode(moved)))}, nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	store.FlushInodeTimes(ctx, 0)
+
+	for i := uint64(0); i < count; i++ {
+		rec, err := store.GetInode(ctx, first+i)
+		require.NoError(t, err)
+		assert.True(t, rec.Mtime.Equal(want),
+			"ino %d has mtime %v, want %v", first+i, rec.Mtime, want)
+	}
+	// The field the racing write set is still there: the fallback rewrites only
+	// the timestamps it queued, over whatever the record says now.
+	rec, err := store.GetInode(ctx, first+2)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(4242), rec.UID)
+}

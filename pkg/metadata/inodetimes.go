@@ -237,11 +237,10 @@ func (t *dirTouch) flush(ctx context.Context, only uint64) {
 	}
 	t.mu.Unlock()
 
-	for ino, u := range due {
-		if err := t.store.commitInodeTimes(ctx, ino, u); err != nil {
+	for _, chunk := range chunkUpdates(due, timeBatchInodes) {
+		for ino, u := range t.store.commitInodeTimesBatch(ctx, chunk) {
 			if t.log != nil {
-				t.log.Error("inode timestamps not published; they will be retried",
-					"ino", ino, "error", err)
+				t.log.Error("inode timestamps not published; they will be retried", "ino", ino)
 			}
 			// Requeued rather than dropped: the next sweep retries it, and a
 			// clock that is merely late is better than one stuck in the past.
@@ -249,6 +248,31 @@ func (t *dirTouch) flush(ctx context.Context, only uint64) {
 			t.requeue(ino, u)
 		}
 	}
+}
+
+// timeBatchInodes is how many inodes one transaction carries.
+//
+// Each costs a comparison and a put, against etcd's --max-txn-ops of 128 by
+// default, and the margin is deliberate: a batch that is refused for being too
+// large is refused whole, and this queue's whole purpose is to stop paying a
+// commit per inode.
+const timeBatchInodes = 60
+
+// chunkUpdates splits the due set into transaction-sized pieces.
+func chunkUpdates(due map[uint64]timeUpdate, size int) []map[uint64]timeUpdate {
+	var chunks []map[uint64]timeUpdate
+	current := map[uint64]timeUpdate{}
+	for ino, u := range due {
+		current[ino] = u
+		if len(current) == size {
+			chunks = append(chunks, current)
+			current = map[uint64]timeUpdate{}
+		}
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks
 }
 
 // requeue puts a failed update back underneath whatever has arrived since.
@@ -277,6 +301,64 @@ func (t *dirTouch) queue(ino uint64, at time.Time) {
 		queued.bump = at
 	}
 	t.dirty[ino] = queued
+}
+
+// commitInodeTimesBatch publishes several inodes' timestamps in one
+// transaction, and returns those it could not.
+//
+// A commit per inode is what this queue exists to avoid, and an unpacking
+// archive queues one update per file — so the sweep's own commits become the
+// cost the deferral was meant to remove unless they are batched.  Each inode
+// keeps its own comparison and its own put, so what a shared transaction adds
+// is atomicity between inodes, which nothing here depends on either way.
+//
+// A rejected batch is retried per inode rather than as a batch.  One inode
+// whose record moved would otherwise take every other inode's timestamps down
+// with it on every sweep, for as long as it kept moving — a batch is an
+// efficiency, and it must not become a way for one busy inode to starve the
+// rest.
+func (s *Store) commitInodeTimesBatch(ctx context.Context, due map[uint64]timeUpdate) map[uint64]timeUpdate {
+	failed := map[uint64]timeUpdate{}
+	if len(due) == 0 {
+		return failed
+	}
+
+	cmps := make([]clientv3.Cmp, 0, len(due))
+	ops := make([]clientv3.Op, 0, len(due))
+	for ino, u := range due {
+		rec, rev, err := s.GetInodeRev(ctx, ino)
+		if err != nil {
+			failed[ino] = u
+			continue
+		}
+		// Gone, or already carrying these times: nothing owed either way.
+		if rec == nil || !u.apply(rec) {
+			continue
+		}
+		cmps = append(cmps, InodeUnchanged(ino, rev))
+		ops = append(ops, clientv3.OpPut(InodeKey(ino), string(EncodeInode(rec))))
+	}
+	if len(ops) == 0 {
+		return failed
+	}
+
+	ok, err := s.Txn(ctx, cmps, ops, nil)
+	if err == nil && ok {
+		return failed
+	}
+
+	// Whatever the batch could not settle is settled one inode at a time, each
+	// against its own revision, which is where a record that moved underneath
+	// the read above is picked up.
+	for ino, u := range due {
+		if _, isFailed := failed[ino]; isFailed {
+			continue
+		}
+		if cerr := s.commitInodeTimes(ctx, ino, u); cerr != nil {
+			failed[ino] = u
+		}
+	}
+	return failed
 }
 
 // commitInodeTimes writes an inode's queued timestamps.

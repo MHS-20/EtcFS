@@ -64,3 +64,34 @@ func TestQueuedTimesAnswerALocalStat(t *testing.T) {
 		t.Error("an inode with nothing queued should report no change")
 	}
 }
+
+// A batch is split at the transaction limit, and every inode ends up in exactly
+// one piece — a queue that dropped or duplicated one would lose a timestamp or
+// publish it twice.
+func TestChunkUpdatesCoversEveryInodeOnce(t *testing.T) {
+	due := map[uint64]timeUpdate{}
+	for i := uint64(0); i < timeBatchInodes*2+7; i++ {
+		due[i] = timeUpdate{mtime: time.Unix(int64(i), 0), set: setMtime}
+	}
+
+	seen := map[uint64]int{}
+	for _, chunk := range chunkUpdates(due, timeBatchInodes) {
+		if len(chunk) > timeBatchInodes {
+			t.Fatalf("chunk of %d exceeds the transaction limit", len(chunk))
+		}
+		for ino, u := range chunk {
+			seen[ino]++
+			if !u.mtime.Equal(due[ino].mtime) {
+				t.Errorf("ino %d carries the wrong update", ino)
+			}
+		}
+	}
+	if len(seen) != len(due) {
+		t.Errorf("chunks covered %d inodes, want %d", len(seen), len(due))
+	}
+	for ino, n := range seen {
+		if n != 1 {
+			t.Errorf("ino %d appeared in %d chunks", ino, n)
+		}
+	}
+}
