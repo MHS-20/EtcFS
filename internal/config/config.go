@@ -43,8 +43,13 @@ type Config struct {
 	// serial on every start.
 	VolumeID    string
 	MetricsAddr string
-	RunFsck     bool
-	RunInfo     bool
+	// Pprof adds Go's profiling endpoints to the metrics listener.  Off by
+	// default: that listener is reachable by anything that can route to the
+	// node, and a profile is both expensive to produce and a description of
+	// what the process is doing.
+	Pprof   bool
+	RunFsck bool
+	RunInfo bool
 
 	// External fencing (AWS). When EBSVolumeID is set the fencing controller
 	// detaches the shared volume from an expired node and waits for the
@@ -219,6 +224,8 @@ func Parse() *Config {
 		"Cloud volume ID of the shared data volume (e.g., vol-0abcdef1234567890); its device path is resolved at every start and overrides --block-device")
 	flag.StringVar(&cfg.MetricsAddr, "metrics-addr", "",
 		"Prometheus metrics HTTP listen address (e.g., :9090)")
+	flag.BoolVar(&cfg.Pprof, "pprof", false,
+		"Serve Go profiling endpoints under /debug/pprof on the metrics listener")
 	flag.BoolVar(&cfg.RunFsck, "fsck", false,
 		"Run offline filesystem check and exit")
 	flag.BoolVar(&cfg.RunInfo, "info", false,

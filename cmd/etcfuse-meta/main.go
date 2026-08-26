@@ -316,7 +316,7 @@ func run(ctx context.Context, cfg *config.Config, log *config.Logger) error {
 	go svc.Allocator().ReapEmptyArenas(ctx, time.Minute)
 
 	if cfg.MetricsAddr != "" {
-		go func() { _ = metrics.StartServer(cfg.MetricsAddr, readiness(svc, membership)) }()
+		go func() { _ = metrics.StartServer(cfg.MetricsAddr, readiness(svc, membership), cfg.Pprof) }()
 		log.Info("metrics server listening", "addr", cfg.MetricsAddr)
 	}
 

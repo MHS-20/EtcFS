@@ -13,6 +13,7 @@ package metrics
 import (
 	"io"
 	"net/http"
+	"net/http/pprof"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -215,13 +216,13 @@ var (
 // restarted, /readyz says work sent here will be served rather than answered
 // with EIO.  A node whose lease has lapsed or that has fenced itself is
 // healthy — it is running, and killing it fixes nothing — but not ready.
-func StartServer(addr string, ready func() error) error {
+func StartServer(addr string, ready func() error, pprof bool) error {
 	// Timeouts, because this listener is reachable by anything that can route
 	// to the node: without them a client that opens a connection and never
 	// finishes its request holds a goroutine and an fd for as long as it likes.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           Handler(ready),
+		Handler:           Handler(ready, pprof),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -230,11 +231,41 @@ func StartServer(addr string, ready func() error) error {
 	return srv.ListenAndServe()
 }
 
+// profileWriteTimeout is how long a profiling response may take to produce.
+// The server's own write timeout is meant for clients that stall; a CPU profile
+// legitimately writes nothing until its sampling window closes, and the caller
+// chooses that window.  Generous enough for the minute-long profiles a
+// benchmark takes, and applied to these routes alone.
+const profileWriteTimeout = 10 * time.Minute
+
+// registerPprof adds Go's profiling endpoints, each with a write deadline of
+// its own so a long profile is not cut off mid-response.
+func registerPprof(mux *http.ServeMux) {
+	routes := map[string]http.HandlerFunc{
+		"/debug/pprof/":        pprof.Index,
+		"/debug/pprof/cmdline": pprof.Cmdline,
+		"/debug/pprof/profile": pprof.Profile,
+		"/debug/pprof/symbol":  pprof.Symbol,
+		"/debug/pprof/trace":   pprof.Trace,
+	}
+	for path, h := range routes {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			// Best effort: a ResponseWriter that cannot take a deadline still
+			// serves the shorter profiles, which is better than refusing.
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(profileWriteTimeout))
+			h(w, r)
+		})
+	}
+}
+
 // Handler builds the served routes.  Separate from StartServer so the
 // endpoints can be exercised without binding a port.
-func Handler(ready func() error) http.Handler {
+func Handler(ready func() error, enablePprof bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	if enablePprof {
+		registerPprof(mux)
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 	})

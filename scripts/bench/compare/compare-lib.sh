@@ -361,6 +361,21 @@ compare_etcfs_page_cache() {
         END { print (s == \"\" ? \"never\" : s) }' /tmp/meta.log" 2>/dev/null
 }
 
+# compare_etcfs_cpu_profile <pub_ip> <label> <delay_s> <seconds> — take a CPU
+# profile of the daemon while a workload is running, and leave it in the results
+# directory. Backgrounded by the caller: the delay is what places the sampling
+# window inside the run rather than at its start, where a warm-up is all there
+# is to see. Needs --pprof on the daemon (ETCFS_META_EXTRA_ARGS).
+compare_etcfs_cpu_profile() {
+    [[ "$COMPARE_BACKEND_BASE" == "etcfs" ]] || return 0
+    local ip="$1" label="$2" delay="$3" seconds="$4"
+    sleep "$delay"
+    $SSH_CMD "ec2-user@$ip" \
+        "curl -s --max-time $((seconds + 60)) -o /tmp/cpu-$label.pprof \
+             http://127.0.0.1:9090/debug/pprof/profile?seconds=$seconds" 2>/dev/null || return 0
+    scp $SSH_OPTS "ec2-user@$ip:/tmp/cpu-$label.pprof" "$RESULTS_DIR/cpu-$label.pprof" >/dev/null 2>&1 || true
+}
+
 # compare_etcfs_notify_failures <pub_ip> — how many times a lock could not be
 # yielded because the kernel's pages for it were not invalidated. Zero is the
 # only acceptable number: each one is a lock this node keeps holding against the
