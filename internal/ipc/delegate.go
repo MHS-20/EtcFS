@@ -301,6 +301,9 @@ func (s *Service) bufferWrite(ctx context.Context, e *lockEntry, replay *txnRepl
 	// every return above, so a write that did not join the buffer leaves the
 	// snapshot exactly as it found it.
 	if e.holder != "" && e.meta != nil {
+		// The snapshot is edited in place, which is safe only while no reader
+		// can be looking at it.
+		e.mustHoldExclusive(s, "bufferWrite")
 		e.meta, e.metaFor = replay.apply(e.meta, 0), e.holder
 	}
 
@@ -348,14 +351,14 @@ func (s *Service) drainBuffers(ctx context.Context, skip *lockEntry) {
 		// several entries at once — each end up waiting for what the other
 		// holds.  Skipping a busy entry costs a buffer that stays until the
 		// next sweep.
-		if !e.rw.TryLock() {
+		if !e.tryLockExclusive() {
 			continue
 		}
 		if err := s.flushEntry(ctx, e, "memory_pressure"); err != nil {
 			s.log.Warn("deferred writes not published under memory pressure",
 				"ino", e.ino, "error", err)
 		}
-		e.rw.Unlock()
+		e.unlockExclusive()
 	}
 }
 
@@ -847,7 +850,7 @@ func (s *Service) flushInode(ctx context.Context, ino uint64) error {
 func (s *Service) FlushAll(ctx context.Context, trigger string) {
 	held := make([]*lockEntry, 0, flushBatchInodes)
 	for _, e := range s.locks.all() {
-		e.rw.Lock()
+		e.lockExclusive()
 		held = append(held, e)
 		if len(held) == flushBatchInodes {
 			s.flushHeld(ctx, held, trigger)
@@ -865,7 +868,7 @@ func (s *Service) flushHeld(ctx context.Context, held []*lockEntry, trigger stri
 	}
 	s.flushEntries(ctx, held, trigger)
 	for _, e := range held {
-		e.rw.Unlock()
+		e.unlockExclusive()
 	}
 }
 
@@ -909,7 +912,7 @@ func (s *Service) flushExpired(ctx context.Context) {
 		// skipped and picked up on the next tick.  Waiting would hold the
 		// sweeper behind one slow request, and the flush must not run alongside
 		// an operation whose comparisons it would invalidate.
-		if !e.rw.TryLock() {
+		if !e.tryLockExclusive() {
 			continue
 		}
 		due = append(due, e)

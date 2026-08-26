@@ -837,11 +837,41 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	// Committing synchronously: anything queued for this inode is older than
 	// what is about to be written and would otherwise be published on top of
 	// it, taking the record's clock backwards.
-	s.store.FlushInodeTimes(ctx, ino)
-	rec, rev, err := s.store.GetInodeRev(ctx, ino)
-	if err != nil || rec == nil {
-		return int32Resp(errNoEnt), nil
+	//
+	// Retried rather than refused, because this node's own timestamp sweep is
+	// now one of the writers this comparison can lose to.  A caller that asked
+	// for a mode it is entitled to should not be handed EAGAIN because a
+	// queued ctime happened to publish in between; only a genuine race with
+	// another operation is worth reporting, and that one still ends in EAGAIN
+	// once the attempts are spent.
+	var rev int64
+	for attempt := 0; ; attempt++ {
+		s.store.FlushInodeTimes(ctx, ino)
+		rec, rev, err = s.store.GetInodeRev(ctx, ino)
+		if err != nil || rec == nil {
+			return int32Resp(errNoEnt), nil
+		}
+
+		resp, done := s.commitSetattr(ctx, ino, rec, rev, valid, f)
+		if done {
+			return resp, nil
+		}
+		if attempt == setattrRetries {
+			return int32Resp(errAgain), nil
+		}
 	}
+}
+
+// setattrRetries is how many times a synchronous setattr rebuilds its change
+// against a record that moved underneath it before giving up.
+const setattrRetries = 3
+
+// commitSetattr applies one attempt of a synchronous setattr, reporting whether
+// it settled the call.  Not settled means the record moved between the read and
+// the transaction, and the caller should build the change again from what
+// replaced it.
+func (s *Service) commitSetattr(ctx context.Context, ino uint64, rec *metadata.InodeRecord,
+	rev int64, valid uint32, f setattrFields) ([]byte, bool) {
 
 	// Shrinking releases the extents past the new end, and that runs before the
 	// size is published: metadata-then-data, so no reader can still resolve a
@@ -852,7 +882,7 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 			// while every extent past the new end was still readable — which is
 			// what a fenced node did, since the guard rejects its writes.
 			s.log.Error("truncate failed, size not changed", "ino", ino, "error", terr)
-			return int32Resp(errnoFor(terr, errIO)), nil
+			return int32Resp(errnoFor(terr, errIO)), true
 		}
 	}
 
@@ -864,13 +894,13 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 		[]clientv3.Cmp{metadata.InodeUnchanged(ino, rev)},
 		[]clientv3.Op{clientv3.OpPut(metadata.InodeKey(ino), string(metadata.EncodeInode(rec)))}, nil)
 	if err != nil {
-		return int32Resp(errnoFor(err, errIO)), nil
+		return int32Resp(errnoFor(err, errIO)), true
 	}
 	if !ok {
-		return int32Resp(errAgain), nil // EAGAIN: the inode moved, let the kernel retry
+		return nil, false
 	}
 
-	return s.attrResp(rec), nil
+	return s.attrResp(rec), true
 }
 
 // deferSetattrTimes queues the timestamps a setattr assigns and answers it from
@@ -880,13 +910,22 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 func (s *Service) deferSetattrTimes(rec *metadata.InodeRecord, valid uint32,
 	f setattrFields) ([]byte, bool) {
 
+	// Built on what this node believes rather than on what etcd holds: a
+	// previous setattr's times may still be queued, and this call may leave
+	// them alone — utimensat with UTIME_OMIT does exactly that.  Answering from
+	// the stored record would hand the kernel a reply in which the earlier
+	// change had never happened, and the kernel would cache it.
+	base, _ := s.store.PendingInodeTimes(rec)
 	now := time.Now()
-	updated := *rec
+	updated := base
 	applySetattr(&updated, valid, f, now)
 
+	// Only the fields this call moved are queued.  One it left alone is either
+	// already queued or equal to what etcd holds, and in both cases saying so
+	// again would change nothing.
 	if !s.store.QueueInodeTimes(updated.Ino, updated.Atime, updated.Mtime, updated.Ctime,
-		!updated.Atime.Equal(rec.Atime), !updated.Mtime.Equal(rec.Mtime),
-		!updated.Ctime.Equal(rec.Ctime)) {
+		!updated.Atime.Equal(base.Atime), !updated.Mtime.Equal(base.Mtime),
+		!updated.Ctime.Equal(base.Ctime)) {
 		return nil, false
 	}
 	return s.attrResp(&updated), true

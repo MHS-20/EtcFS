@@ -147,7 +147,7 @@ func (m *lockMap) evictLocked() {
 
 	released := m.drop(victims, "eviction")
 	for _, e := range victims {
-		e.rw.Unlock()
+		e.unlockExclusive()
 	}
 
 	m.mu.Lock()
@@ -184,7 +184,7 @@ func (m *lockMap) claimVictimsLocked(n int) []*lockEntry {
 		if len(victims) == n {
 			break
 		}
-		if e.rw.TryLock() {
+		if e.tryLockExclusive() {
 			victims = append(victims, e)
 		}
 	}

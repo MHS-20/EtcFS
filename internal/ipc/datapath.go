@@ -330,6 +330,9 @@ func (s *Service) commitWriteOp(ctx context.Context, lk *heldLock, w *writeOp) (
 	// for publishes nothing and the cache is dropped on release instead.
 	if len(w.deferredReclaim) == 0 {
 		if replay := replayTxn(w.ino, w.rec, ops); replay != nil {
+			// In place over the list this write planned against, which is the
+			// entry's own snapshot: only the holder of its write lock may.
+			lk.e.mustHoldExclusive(s, "commitWriteOp")
 			lk.publishMeta(replay.apply(&inodeMeta{rec: w.rec, extents: w.existing}, rev))
 		}
 	}

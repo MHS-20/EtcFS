@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mvccpb "go.etcd.io/etcd/api/v3/mvccpb"
@@ -110,6 +111,12 @@ const (
 type lockEntry struct {
 	ino uint64
 	rw  sync.RWMutex
+
+	// exclusive records that rw is held for writing, so the two places that
+	// depend on that can check rather than trust it.  Written under rw itself
+	// and read without it, which is why it is atomic; it is a debugging aid,
+	// never a lock.
+	exclusive atomic.Bool
 
 	keyMu      sync.Mutex
 	mode       metadata.LockMode // meaningful only while holder is set
@@ -296,6 +303,48 @@ func covers(held, want metadata.LockMode) bool {
 	return held == metadata.LockExclusive || held == want
 }
 
+// lockExclusive, tryLockExclusive and unlockExclusive keep `exclusive` in step
+// with rw.  Every exclusive acquisition goes through them, so the checks below
+// can tell whether the caller holds what it is required to hold.
+func (e *lockEntry) lockExclusive() {
+	e.rw.Lock()
+	e.exclusive.Store(true)
+}
+
+func (e *lockEntry) tryLockExclusive() bool {
+	if !e.rw.TryLock() {
+		return false
+	}
+	e.exclusive.Store(true)
+	return true
+}
+
+func (e *lockEntry) unlockExclusive() {
+	e.exclusive.Store(false)
+	e.rw.Unlock()
+}
+
+// mustHoldExclusive reports whether this entry's write lock is held, and
+// complains when it is not.
+//
+// Two invariants rest on that lock and neither is visible at the call site.
+// The cached snapshot is edited in place rather than rebuilt, which is safe
+// only while no reader can be looking at it; and a batch of releases holds
+// several entries' keyMu at once, which cannot deadlock only because every
+// caller that reaches for a second entry has taken its rw with TryLock first.
+// Both are the kind of rule a later change breaks silently — the first by
+// handing an application a torn extent list, the second by wedging the node —
+// so they are checked on every run instead of being left to the comments.
+func (e *lockEntry) mustHoldExclusive(s *Service, where string) bool {
+	if e.exclusive.Load() {
+		return true
+	}
+	s.log.Error("BUG: an inode's exclusive local lock is not held where it must be; "+
+		"the cached snapshot and the batched release both depend on it",
+		"ino", e.ino, "where", where)
+	return false
+}
+
 // errNotYielded reports that a cached lock could not be given up, because what
 // the key stands for has not been discharged: writes this node acknowledged are
 // still unpublished, or the kernel still holds the inode's pages.
@@ -443,6 +492,9 @@ func (s *Service) recordRelease(e *lockEntry, owed metadata.LockRelease, wasHeld
 func (s *Service) dropCachedLocks(entries []*lockEntry, trigger string) []*lockEntry {
 	ready := make([]*lockEntry, 0, len(entries))
 	for _, e := range entries {
+		// Every entry here arrived with its rw held by the caller, which is
+		// what makes holding several keyMu at once safe.
+		e.mustHoldExclusive(s, "dropCachedLocks")
 		e.keyMu.Lock()
 		if s.prepareDropLocked(e, trigger) {
 			ready = append(ready, e)
@@ -644,8 +696,8 @@ func (s *Service) yieldCachedLock(ino uint64, trigger string) error {
 	if e == nil {
 		return nil
 	}
-	e.rw.Lock()
-	defer e.rw.Unlock()
+	e.lockExclusive()
+	defer e.unlockExclusive()
 	return s.dropCachedLock(e, trigger)
 }
 
@@ -721,7 +773,7 @@ func (s *Service) ReleaseCachedLocks() {
 	entries := s.locks.drain()
 
 	for _, e := range entries {
-		e.rw.Lock()
+		e.lockExclusive()
 		if err := s.dropCachedLock(e, "shutdown"); err != nil {
 			// Last chance: the process is exiting, so a buffer kept here dies
 			// with it either way, and the blocks are better returned to the
@@ -736,7 +788,7 @@ func (s *Service) ReleaseCachedLocks() {
 			}
 			e.keyMu.Unlock()
 		}
-		e.rw.Unlock()
+		e.unlockExclusive()
 	}
 }
 

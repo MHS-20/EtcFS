@@ -256,7 +256,7 @@ func (l *heldLock) Release() {
 	}
 	call := time.Now()
 	if l.mode == metadata.LockExclusive {
-		l.e.rw.Unlock()
+		l.e.unlockExclusive()
 	} else {
 		l.e.rw.RUnlock()
 	}
@@ -311,7 +311,8 @@ func (s *Service) lockInode(ctx context.Context, ino uint64, mode metadata.LockM
 func lockLocal(ctx context.Context, e *lockEntry, mode metadata.LockMode) error {
 	return retry(ctx, contendedAttempts, func() error {
 		if mode == metadata.LockExclusive {
-			if e.rw.TryLock() {
+			if e.tryLockExclusive() {
+				e.exclusive.Store(true)
 				return nil
 			}
 		} else if e.rw.TryRLock() {
@@ -323,7 +324,8 @@ func lockLocal(ctx context.Context, e *lockEntry, mode metadata.LockMode) error 
 
 func unlockLocal(e *lockEntry, mode metadata.LockMode) {
 	if mode == metadata.LockExclusive {
-		e.rw.Unlock()
+		e.exclusive.Store(false)
+		e.unlockExclusive()
 	} else {
 		e.rw.RUnlock()
 	}
