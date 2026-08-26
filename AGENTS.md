@@ -14,6 +14,48 @@ The two daemons talk over a hand-rolled length-prefixed binary protocol on a Uni
 
 Every mutation is generation-guarded: the guard is installed on the store itself (`Store.SetGuard`), so namespace transactions carry it as well as extent commits. `docs/design-decisions.md` records the choices behind the non-obvious ones.
 
+## Measurement traps
+
+Written down because each of these cost real time and produced a wrong
+conclusion at least once. Read before benchmarking anything.
+
+- **Measure commits, not seconds, on the small-file storm.** Each run
+  provisions its own cluster, so wall clock carries host-to-host variance:
+  five runs spanned 1159–1440 s with *four of them the same build*. Anything
+  below ~20% is invisible at n=1. `etcfuse_etcd_txn_origin_total` barely
+  varies and attributes every commit to the operation that asked for it. If a
+  wall-clock number is genuinely needed, run both builds on one cluster,
+  alternating, rather than averaging separate clusters.
+- **Never compare across dates or instance classes.** A 1.24x speed-up was
+  published and had to be retracted because the two runs came from different
+  days; the competitor tables are `t3.medium` and today's runs are
+  `m7i.large`, and mixing them proves nothing.
+- **Burstable instances lie.** `t3.medium` exhausts CPU credits minutes into a
+  sustained untar, which once manufactured a 1.54x "regression". Use
+  `m7i.large` (or `m5.large`) for long runs, one at a time, and check
+  `CPUCreditBalance` afterwards.
+- **Instrument before predicting.** Estimating a change's saving from the
+  design was wrong four times in a row on the same workload — 2.05, 4.0, 7.2
+  and "batching removes one commit" all failed, while the counter got it right
+  on the first run each time. Add the counter, then predict.
+- **A deferral only pays if nothing else drains the queue.** Deferring
+  timestamps was worth exactly nothing until two unwatched paths stopped
+  publishing them one inode at a time: the synchronous `setattr` that follows
+  (which flushed before writing its own change — fold it into that
+  transaction instead) and `close()` (which published for durability nobody
+  asked for). Check what else touches the queue before measuring.
+- **Only enforcement-free fields can be deferred.** Timestamps can; mode and
+  ownership cannot, because a peer checks access against what etcd holds, and
+  a deferred tightening leaves that peer granting permission already taken
+  away. The same rule blocks answering `getattr` from the lock's snapshot:
+  `setattr` takes no lock, so a peer can rewrite those fields of an inode this
+  node holds exclusively.
+- **Run pjdfstest before believing a metadata change is safe.** It caught two
+  regressions in one afternoon that reasoning and the unit suites did not: a
+  `utimensat` reply built from etcd rather than from this node's queue, and
+  `chown` returning `EAGAIN` once the timestamp sweep became a second writer of
+  the inode record. The documented baseline is 0 failures.
+
 ## Document map
 
 | Document | Purpose |

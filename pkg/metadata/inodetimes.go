@@ -209,6 +209,49 @@ func (s *Store) PendingInodeTimes(rec *InodeRecord) (InodeRecord, bool) {
 	return out, queued.apply(&out)
 }
 
+// PendingTimes is an inode's queued timestamp update, taken out of the queue by
+// a caller that is about to write the record itself.
+type PendingTimes struct {
+	ino uint64
+	u   timeUpdate
+}
+
+// TakeInodeTimes removes what an inode has queued and hands it to the caller,
+// for an operation that is going to rewrite the record anyway.
+//
+// The alternative is to publish the queue first, which is a commit — and for an
+// archive, which sets a file's times and then its mode, that is a commit per
+// file for timestamps that were deferred precisely to avoid one.  Folding them
+// into the transaction the caller was already making costs nothing.
+//
+// The caller must either commit them or give them back with RequeueInodeTimes;
+// dropping them loses a timestamp the kernel was told had been set.
+func (s *Store) TakeInodeTimes(ino uint64) (PendingTimes, bool) {
+	t := s.dirTouches()
+	if t == nil {
+		return PendingTimes{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	u, found := t.dirty[ino]
+	if !found {
+		return PendingTimes{}, false
+	}
+	delete(t.dirty, ino)
+	return PendingTimes{ino: ino, u: u}, true
+}
+
+// ApplyTo writes the taken update into a record, reporting whether anything
+// moved.  Apply it before the caller's own change, which is newer.
+func (p PendingTimes) ApplyTo(rec *InodeRecord) bool { return p.u.apply(rec) }
+
+// RequeueInodeTimes puts a taken update back, underneath anything queued since.
+func (s *Store) RequeueInodeTimes(p PendingTimes) {
+	if t := s.dirTouches(); t != nil {
+		t.requeue(p.ino, p.u)
+	}
+}
+
 // FlushInodeTimes publishes queued timestamps: one inode when ino is non-zero,
 // every queued one when it is zero.
 //

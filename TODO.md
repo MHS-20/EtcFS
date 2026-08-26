@@ -6,52 +6,36 @@ work is not kept here — it lives in the docs and in the reports under
 `docs/reports/`, with `benchmark-reports/overview.md` as the ledger of where
 EtcFS wins and loses.
 
-## Ideas to improve the worst cases
-
-A measured loss from `overview.md` with no decision recorded against it yet.
-The rest have one — see `docs/design-decisions.md`.
-
-**Single-node random writes — 21.7% of the raw device's IOPS.**
-
-- *Profile before proposing anything.* 78% of the device's IOPS is going
-  somewhere between the FUSE upcall, the IPC round trip and the O_DIRECT write,
-  and nothing here says which. The sequential number retains 65.6%, so the loss
-  is per-operation rather than per-byte, which points at the round trip. io_uring
-  on the data path and a larger `max_write` are the candidates once there is a
-  profile to justify one.
-
 ## Next steps, ranked
 
-**1. Split the cache-invalidation channel.** `pkg/fuse/fuse.c`'s `notify_thread`
-serves two kinds of traffic on one serial loop: `NOTIFY_INVAL_ENTRY`, which is
-fire-and-forget and arrives once per create from the dirent watch, and
-`NOTIFY_INVAL_INODE`, which the backend *blocks on* because it may not yield an
-inode's lock until the kernel's pages for it are gone. An unpacking archive
-floods the thread with the first, the second queues behind thousands of them,
-the backend's read deadline expires, and the connection is dropped as out of
-step — which disables page caching for the whole mount until the next open
-re-enables it, and then it happens again.
+**1. Label the last unattributed commit.** `etcfuse_etcd_txn_origin_total` puts
+1.026 commits per file under `other`, which is the extent publication at
+`close()` — the tag on `flushLocked` does not reach whatever path actually
+commits it. Small, and it is the only part of the storm's cost still unnamed.
 
-This is head-of-line blocking between acknowledged and unacknowledged traffic
-sharing one channel, not slowness, so the fix is to separate them: their own
-socket and thread, or an entry-invalidation queue the notify thread drains
-without holding up acks. It is what blocks putting the inode's lock in the
-create transaction — one Raft commit per created-and-written file — and it is a
-fragility that will bite any future change touching invalidation concurrency.
-See `docs/design-decisions.md#the-create-time-lock-key-was-reverted`.
+**2. Decide whether mode and ownership belong under the inode lock.** `getattr`
+costs ~1.5 ms per file reading etcd for a record the lock's own snapshot already
+holds, and it cannot use that snapshot today: `setattr` changes mode and
+ownership under a bare compare-and-set and takes no lock, so a peer can rewrite
+those fields of an inode this node holds exclusively. Bringing them under the
+lock would make the snapshot authoritative for the whole record — and would make
+a `chmod` on a file another node holds force a handover. That is a change to how
+`chmod` behaves cluster-wide, not an optimisation, and it is the prerequisite
+for the `getattr` saving rather than a separate idea. `getxattr` (~1.5 ms more)
+needs the same question answered for xattr keys.
 
-**2. Guardrails on the comparison harness.** Refuse to start a run while another
+**3. Guardrails on the comparison harness.** Refuse to start a run while another
 is in flight, and check `CPUCreditBalance` after any burstable-instance run. The
 combination of the two cost most of a day and manufactured a 1.54x "regression"
 that did not exist.
 
-**3. Decide about the batched cross-inode flush.** `Service.flushEntries` is in
+**4. Decide about the batched cross-inode flush.** `Service.flushEntries` is in
 the tree, is correct, and is unmeasured — and it cannot help the small-file
 storm by construction, since `close()` publishes each file before the interval
 sweep ever sees it. Either measure it where it applies (concurrent writers
 across many inodes) or take it out. Unmeasured performance code is debt.
 
-**4. `bench-node-scaling.sh` at 8 and 16 nodes.** The one measurement that would
+**5. `bench-node-scaling.sh` at 8 and 16 nodes.** The one measurement that would
 support the central claim. Over 2/4/6 nodes GFS2 loses 47% of its
 shared-directory metadata throughput while EtcFS gains 34%, but GFS2 is still 4x
 faster in absolute terms at six, so "more scalable" is not claimable yet.
@@ -82,11 +66,53 @@ faster in absolute terms at six, so "more scalable" is not claimable yet.
       ended three leave/rejoin cycles owning one more arena than it started with
       (3 → 4). An in-flight reclaim explains it, but that is a guess — sample
       again after a settle period, or over more cycles.
+- [ ] **Re-measure the five-way comparison on current code.** Every competitor
+      row in the storm and metadata reports is `t3.medium` against an etcfs build
+      that predates the 2026-08-26 commit reductions (~6.2 per file to 4.18).
+      The published multiples are therefore against an older etcfs than the one
+      in the tree.
+- [ ] **A real-infrastructure device-fencing chaos run.** The bulk of the chaos
+      suite runs against Docker, which cannot exercise device-enforced fencing at
+      all — there are no NVMe reservations on a loopback device. The provisioned
+      run is owed, and its cost is the reason it has not happened.
+- [ ] **Multi-hour fuzzing.** One hour-scale run (279k operations, 158 injected
+      faults) looks clean on memory, file descriptors and store size. That earns
+      "stable for an hour", not "no slow-leak class of bug exists".
+- [ ] **Paired A/B for any storm wall-clock claim.** Five runs that day spanned
+      1159–1440 s with four of them the same build, because each run provisions
+      its own cluster. Wall clock at n=1 cannot resolve anything smaller than
+      ~20%; run both builds on one cluster, alternating, or quote commits.
 - [ ] **Cross-node handoff on a larger instance class.** At 255.95 MiB/s the
       8 GiB handoff is pinned to the t3.medium's own EBS ceiling (254.14 MiB/s
       measured on the same instance), so the scenario currently measures the
       hardware rather than any backend.
 
 
-# Future Extension
+# Future Extensions
+
+Sized by effort and by how far the change reaches.
+
+**Backup and restore. Large; allocator, metadata, new tool.** Nothing today could
+restore this filesystem's data if the shared device were lost. The path is clean
+— two etcd revisions diff to exactly the changed extents — but a backup that
+reads a block already reused reads another file's bytes into itself, so it needs
+the same pinning machinery snapshots do. That pinning is the work.
+
+**Snapshots. Large; same pinning, plus a namespace clone.** Shares all of its
+hard part with backup, so the two are one project rather than two.
+
+**Cross-node `fcntl`/`flock`. Medium; a key namespace and two handlers.** Today
+`SETLK` always succeeds and `GETLK` always reports the range free, so an
+application coordinating through file locks silently gets nothing. `SETLKW`
+needs blocking semantics against a lease, which is the design cost. Unrelated to
+the per-inode lease lock the data path uses, which works.
+
+**A production caller for arena rebalancing. Small; contained.** The mechanism
+exists and nothing invokes it, so an imbalanced cluster has no remedy.
+
+**Shard the inode counter. Small to medium; `inodealloc.go` and one key.**
+Contention grows with node count by design; named as the structure most likely
+to need reworking first if metadata-creation throughput becomes a target.
+
+**Cross-file / cross-directory atomicity. Structural; not planned.**
 Cross-file / cross-directory atomicity does not exist. Each inode is independently consistent; there is no multi-inode transaction, no snapshot spanning several files. An application that needs "these three files change together, atomically, cluster-wide" gets nothing from the filesystem for that — it has to build it itself.

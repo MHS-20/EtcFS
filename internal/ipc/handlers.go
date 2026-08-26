@@ -878,8 +878,11 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	metrics.Setattr.WithLabelValues(fields, "committed").Inc()
 
 	// Committing synchronously: anything queued for this inode is older than
-	// what is about to be written and would otherwise be published on top of
-	// it, taking the record's clock backwards.
+	// what is about to be written, so it is folded into the same transaction
+	// rather than published ahead of it.  Publishing it first would be a commit
+	// of its own, and an archive reaches here twice per file — for the mode and
+	// for the owner — which was enough to hand back every commit the deferral
+	// had removed.
 	//
 	// Retried rather than refused, because this node's own timestamp sweep is
 	// now one of the writers this comparison can lose to.  A caller that asked
@@ -889,15 +892,27 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	// once the attempts are spent.
 	var rev int64
 	for attempt := 0; ; attempt++ {
-		s.store.FlushInodeTimes(ctx, ino)
+		queued, hadQueued := s.store.TakeInodeTimes(ino)
 		rec, rev, err = s.store.GetInodeRev(ctx, ino)
 		if err != nil || rec == nil {
+			if hadQueued {
+				s.store.RequeueInodeTimes(queued)
+			}
 			return int32Resp(errNoEnt), nil
+		}
+		// The queued times go on first: they happened before this call, and
+		// applySetattr overwrites whichever of them this call names itself.
+		if hadQueued {
+			queued.ApplyTo(rec)
 		}
 
 		resp, done := s.commitSetattr(ctx, ino, rec, rev, valid, f)
 		if done {
 			return resp, nil
+		}
+		// The transaction did not commit, so those timestamps are still owed.
+		if hadQueued {
+			s.store.RequeueInodeTimes(queued)
 		}
 		if attempt == setattrRetries {
 			return int32Resp(errAgain), nil
