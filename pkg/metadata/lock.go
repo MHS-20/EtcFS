@@ -262,6 +262,12 @@ func (s *Store) AcquireLock(ctx context.Context, ino uint64, mode LockMode, ttl 
 // The caller owns what it mints: a transaction that does not commit leaves no
 // key, and one whose reply is lost leaves a key only this holder token names.
 // See internal/ipc.handleCreate for how that second case is settled.
+//
+// One coupling to know about before changing inode allocation: the comparison
+// fails if *any* lock key already names this inode, so a create folding it in
+// fails when one does.  That is unreachable only because inode numbers are
+// never reused (see internal/ipc/inodealloc.go); a scheme that recycled them
+// could fail a create over a lock key left by the number's previous life.
 func (s *Store) PrepareLock(ino uint64, mode LockMode, ttl time.Duration) (string, clientv3.Cmp, clientv3.Op, error) {
 	if mode != LockShared && mode != LockExclusive {
 		return "", clientv3.Cmp{}, clientv3.Op{},

@@ -266,7 +266,7 @@ func (s *Store) adjustDirNlink(ctx context.Context, ino uint64, delta int) (nlin
 // operation that fails under concurrency, which is also why a failure here is
 // reported to the caller's log and not to the caller.
 //
-// With batching started (see dirtouch.go) the commit is queued rather than made
+// With batching started (see inodetimes.go) the commit is queued rather than made
 // here, so a stream of entries into one directory costs one timestamp commit
 // per interval instead of one per entry.
 func (s *Store) touchDir(ctx context.Context, ino uint64) {
@@ -275,7 +275,7 @@ func (s *Store) touchDir(ctx context.Context, ino uint64) {
 		t.queue(ino, now)
 		return
 	}
-	_ = s.commitDirTime(ctx, ino, now)
+	_ = s.commitInodeTimes(ctx, ino, timeUpdate{bump: now})
 }
 
 // AtomicCreateFile creates a regular file and its directory entry in a single

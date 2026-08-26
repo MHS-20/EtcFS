@@ -476,7 +476,7 @@ func leaveCluster(cfg *config.Config, svc *ipc.Service, store *metadata.Store,
 	// Directory timestamps this node queued rather than committed.  They go
 	// before the locks, because after the locks are gone a peer may already be
 	// changing the same directories and the queue would be writing over them.
-	store.FlushDirTimes(ctx, 0)
+	store.FlushInodeTimes(ctx, 0)
 
 	// Cached inode locks first: their keys outlive the operations that took
 	// them, so nothing else has dropped them, and a peer blocked on one should

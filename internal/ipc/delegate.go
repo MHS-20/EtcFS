@@ -945,7 +945,7 @@ func (s *Service) handleFsync(ctx context.Context, payload []byte) ([]byte, erro
 		return int32Resp(errInval), nil
 	}
 
-	s.store.FlushDirTimes(ctx, ino)
+	s.store.FlushInodeTimes(ctx, ino)
 
 	if err := s.flushInode(ctx, ino); err != nil {
 		s.log.Warn("fsync: cannot publish deferred writes", "ino", ino, "error", err)

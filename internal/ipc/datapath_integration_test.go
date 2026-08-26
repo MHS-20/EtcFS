@@ -762,3 +762,51 @@ func TestIntegration_SynchronousConfigurationPublishesBeforeAcknowledging(t *tes
 		t.Error("an open was told the kernel may cache pages with page caching switched off")
 	}
 }
+
+// A setattr that names mode or ownership without moving either is timestamps
+// only, and timestamps are queued rather than committed. This is most of what
+// an unpacking archive asks of setattr: `tar` restores the mode a file was
+// created with on every file it extracts.
+func TestIntegration_SetattrThatChangesNoPermissionCommitsNothing(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino = 7101
+	seedFile(t, store, ino, metadata.ModeFile|0644)
+	store.StartDirTouchBatching(ctx, time.Hour, nil) // never sweeps on its own
+
+	before, err := store.GetInode(ctx, ino)
+	if err != nil || before == nil {
+		t.Fatalf("read back inode: %v", err)
+	}
+
+	// The same mode the file already has, which is what tar sends.
+	mustSetattr(t, svc, setattrPayload(ino, fattrMode, 0, metadata.ModeFile|0644, 0, 0, 0, 0, 0))
+
+	unchanged, err := store.GetInode(ctx, ino)
+	if err != nil || unchanged == nil {
+		t.Fatalf("read back inode: %v", err)
+	}
+	if !unchanged.Ctime.Equal(before.Ctime) {
+		t.Errorf("etcd was written for a setattr that changed no permission bits")
+	}
+
+	// POSIX still owes the caller a status change, so this node reports one
+	// from the queue while etcd has yet to hear about it.
+	pending, moved := store.PendingInodeTimes(unchanged)
+	if !moved || !pending.Ctime.After(before.Ctime) {
+		t.Errorf("ctime should have been queued: moved=%v ctime=%v", moved, pending.Ctime)
+	}
+
+	// A mode that does move commits, and publishes the queued ctime with it.
+	mustSetattr(t, svc, setattrPayload(ino, fattrMode, 0, metadata.ModeFile|0600, 0, 0, 0, 0, 0))
+	after, err := store.GetInode(ctx, ino)
+	if err != nil || after == nil {
+		t.Fatalf("read back inode: %v", err)
+	}
+	if got := after.Mode & ^metadata.S_IFMT; got != 0600 {
+		t.Errorf("mode = %#o, want 0600", got)
+	}
+	if !after.Ctime.After(before.Ctime) {
+		t.Errorf("ctime did not move on a real chmod: %v", after.Ctime)
+	}
+}

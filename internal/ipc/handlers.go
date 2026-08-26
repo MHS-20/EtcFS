@@ -112,12 +112,8 @@ func (s *Service) withPending(rec *metadata.InodeRecord) *metadata.InodeRecord {
 		updated.Size = size
 		changed = true
 	}
-	// Only forward: a queued timestamp older than the record's own has already
-	// been superseded by something that committed its own — a mkdir folds the
-	// parent's new mtime into its transaction — and reporting it would take the
-	// directory's clock backwards.
-	if at, queued := s.store.PendingDirTime(rec.Ino); queued && rec.Mtime.Before(at) {
-		updated.Mtime, updated.Ctime = at, at
+	if withTimes, moved := s.store.PendingInodeTimes(&updated); moved {
+		updated = withTimes
 		changed = true
 	}
 
@@ -755,6 +751,30 @@ func applySetattr(rec *metadata.InodeRecord, valid uint32, f setattrFields, now 
 	}
 }
 
+// setattrEnforces reports whether a setattr changes anything a peer's access
+// check depends on, given the record as it stands.
+//
+// The distinction is what may be deferred.  A timestamp has no enforcement
+// meaning, so a peer seeing it late costs nothing; mode and ownership decide
+// who may open the file, and a peer checks them against what etcd holds — so a
+// change that takes permission away has to be there before the call returns,
+// or that peer goes on granting it.  A setattr that names those fields without
+// moving them is not such a change: `tar` restores the mode a file was created
+// with on every file it extracts, and the record already says so.
+func setattrEnforces(rec *metadata.InodeRecord, valid uint32, f setattrFields) bool {
+	if valid&fattrMode != 0 &&
+		(rec.Mode&metadata.S_IFMT)|(f.mode&^metadata.S_IFMT) != rec.Mode {
+		return true
+	}
+	if valid&fattrUID != 0 && f.uid != rec.UID {
+		return true
+	}
+	if valid&fattrGID != 0 && f.gid != rec.GID {
+		return true
+	}
+	return valid&fattrSize != 0
+}
+
 func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, error) {
 	r := newReader(payload)
 	ino := r.u64()
@@ -795,6 +815,29 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 		}
 	}
 
+	// Read without a revision: this copy only decides which way the call goes,
+	// and the committing path re-reads once anything queued is out of the way.
+	rec, err := s.store.GetInode(ctx, ino)
+	if err != nil || rec == nil {
+		return int32Resp(errNoEnt), nil
+	}
+
+	// A setattr that moves nothing a peer enforces against is timestamps only —
+	// the ones it names, plus the status change POSIX owes any attribute call —
+	// and those are queued rather than committed.  `tar` sets a file's mode and
+	// then its times after writing it, so this is most of what an unpacking
+	// archive asks of setattr, and none of it needs consensus before the call
+	// returns.
+	if !setattrEnforces(rec, valid, f) {
+		if resp, deferred := s.deferSetattrTimes(rec, valid, f); deferred {
+			return resp, nil
+		}
+	}
+
+	// Committing synchronously: anything queued for this inode is older than
+	// what is about to be written and would otherwise be published on top of
+	// it, taking the record's clock backwards.
+	s.store.FlushInodeTimes(ctx, ino)
 	rec, rev, err := s.store.GetInodeRev(ctx, ino)
 	if err != nil || rec == nil {
 		return int32Resp(errNoEnt), nil
@@ -828,6 +871,25 @@ func (s *Service) handleSetattr(ctx context.Context, payload []byte) ([]byte, er
 	}
 
 	return s.attrResp(rec), nil
+}
+
+// deferSetattrTimes queues the timestamps a setattr assigns and answers it from
+// the record they would produce, reporting whether it did.
+//
+// False when write-behind is off, which leaves the caller to commit as before.
+func (s *Service) deferSetattrTimes(rec *metadata.InodeRecord, valid uint32,
+	f setattrFields) ([]byte, bool) {
+
+	now := time.Now()
+	updated := *rec
+	applySetattr(&updated, valid, f, now)
+
+	if !s.store.QueueInodeTimes(updated.Ino, updated.Atime, updated.Mtime, updated.Ctime,
+		!updated.Atime.Equal(rec.Atime), !updated.Mtime.Equal(rec.Mtime),
+		!updated.Ctime.Equal(rec.Ctime)) {
+		return nil, false
+	}
+	return s.attrResp(&updated), true
 }
 
 // SYMLINK payload: [u64:parent][u32:name_len][name][u32:target_len][target][u32:uid][u32:gid]

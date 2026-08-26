@@ -59,17 +59,18 @@ func TestIntegration_DirTouchIsQueuedThenPublished(t *testing.T) {
 
 	// Queued, so etcd still holds the old timestamp and this node answers with
 	// the new one.
-	at, queued := store.PendingDirTime(dir)
+	seeded := &InodeRecord{Ino: dir, Mtime: old, Ctime: old}
+	pending, queued := store.PendingInodeTimes(seeded)
 	require.True(t, queued, "the touch should be queued rather than committed")
-	assert.True(t, at.After(old))
+	assert.True(t, pending.Mtime.After(old))
 
 	rec, err := store.GetInode(ctx, dir)
 	require.NoError(t, err)
 	assert.True(t, rec.Mtime.Equal(old), "etcd should not have been written yet")
 
-	store.FlushDirTimes(ctx, dir)
+	store.FlushInodeTimes(ctx, dir)
 
-	_, queued = store.PendingDirTime(dir)
+	_, queued = store.PendingInodeTimes(seeded)
 	assert.False(t, queued, "the queue should be empty after a flush")
 	rec, err = store.GetInode(ctx, dir)
 	require.NoError(t, err)
@@ -89,7 +90,7 @@ func TestIntegration_DirTouchCoalescesManyEntries(t *testing.T) {
 	assert.Equal(t, before, dirRev(t, store, ctx, dir),
 		"fifty entries should not have written the record fifty times")
 
-	store.FlushDirTimes(ctx, 0)
+	store.FlushInodeTimes(ctx, 0)
 	assert.Greater(t, dirRev(t, store, ctx, dir), before,
 		"the flush should have written it exactly once")
 }
@@ -113,7 +114,7 @@ func TestIntegration_DirTouchNeverMovesTheClockBackwards(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	store.FlushDirTimes(ctx, dir)
+	store.FlushInodeTimes(ctx, dir)
 
 	got, err := store.GetInode(ctx, dir)
 	require.NoError(t, err)
@@ -130,7 +131,7 @@ func TestIntegration_DirTouchWritesThroughWithoutBatching(t *testing.T) {
 
 	store.touchDir(ctx, dir)
 
-	_, queued := store.PendingDirTime(dir)
+	_, queued := store.PendingInodeTimes(&InodeRecord{Ino: dir, Mtime: old, Ctime: old})
 	assert.False(t, queued, "nothing should be queued when batching was never started")
 	rec, err := store.GetInode(ctx, dir)
 	require.NoError(t, err)
