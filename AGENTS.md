@@ -33,7 +33,11 @@ conclusion at least once. Read before benchmarking anything.
 - **Burstable instances lie.** `t3.medium` exhausts CPU credits minutes into a
   sustained untar, which once manufactured a 1.54x "regression". Use
   `m7i.large` (or `m5.large`) for long runs, one at a time, and check
-  `CPUCreditBalance` afterwards.
+  `CPUCreditBalance` afterwards. The comparison harness now enforces both
+  halves: a second run refuses to start while one is in flight
+  (`COMPARE_ALLOW_CONCURRENT=1` overrides), and a run on a `t*` instance
+  reports the lowest credit balance CloudWatch saw before it tears the
+  cluster down.
 - **Instrument before predicting.** Estimating a change's saving from the
   design was wrong four times in a row on the same workload — 2.05, 4.0, 7.2
   and "batching removes one commit" all failed, while the counter got it right
