@@ -37,8 +37,8 @@ if [[ ! -f "$JAR" ]]; then
 fi
 
 # module:config:expected — "pass" means TLC must find no error, "fail" means it
-# must produce a counterexample, and the named invariant is the one it must
-# break.
+# must produce a counterexample, and the named invariant or temporal property is
+# the one it must break.
 CHECKS=(
     "Fencing:Fencing:pass:"
     "Fencing:FencingNoFencer:pass:"
@@ -55,6 +55,8 @@ CHECKS=(
     "CachedLock:CachedLockNoInvalidate:fail:NoStalePages"
     "CachedLock:CachedLockStaleSnapshot:fail:ViewMatchesTruth"
     "CachedLock:CachedLockKeepsCacheOnKeyLoss:fail:NoStalePages"
+    "CachedLock:CachedLockOrphanedKey:pass:"
+    "CachedLock:CachedLockNoOrphanDiscard:fail:OrphanFreed"
 )
 [[ "${DEEP:-0}" == "1" ]] && CHECKS+=("Fencing:Fencing3Nodes:pass:")
 
@@ -75,6 +77,12 @@ for check in "${CHECKS[@]}"; do
 
     states=$(echo "$out" | grep -oE '[0-9]+ distinct states found' | tail -1 | grep -oE '^[0-9]+')
     broke=$(echo "$out" | grep -oE 'Invariant [A-Za-z]+ is violated' | head -1 | awk '{print $2}')
+    # A temporal property violation does not name the property it broke, so the
+    # configuration is asked instead: TLC checked what the cfg declares, and a
+    # cfg declaring one property leaves nothing to attribute wrongly.
+    if [[ -z "$broke" ]] && echo "$out" | grep -q 'Temporal properties were violated'; then
+        grep -q "^ *$wanted\$" "$cfg.cfg" && broke="$wanted"
+    fi
 
     if echo "$out" | grep -q "No error has been found"; then
         if [[ "$expected" == "pass" ]]; then

@@ -342,6 +342,12 @@ func (s *Service) drainBuffers(ctx context.Context, skip *lockEntry) {
 		if s.bufferedBytes.Load() <= s.bufferMaxBytes {
 			return
 		}
+		// TryLock, never Lock: the caller reached here holding another entry's
+		// keyMu, and flushEntry below takes this one's.  Waiting for the lock
+		// would let this and an eviction sweep — the other path that holds
+		// several entries at once — each end up waiting for what the other
+		// holds.  Skipping a busy entry costs a buffer that stays until the
+		// next sweep.
 		if !e.rw.TryLock() {
 			continue
 		}

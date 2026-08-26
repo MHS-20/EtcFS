@@ -429,3 +429,98 @@ func TestIntegration_ReaddirDecodesWhatTheHandlerEncoded(t *testing.T) {
 		t.Fatalf("a history containing real listings was rejected (%v)", res)
 	}
 }
+
+// The two events caching a lock made unobservable — when the etcd key is taken
+// and when it is given up — are what the mutual-exclusion and page-cache
+// checkers actually run over, so both new ways of moving that key have to show
+// up in them: a key taken by the transaction that creates a file, and a batch
+// of keys given up by one eviction sweep.
+//
+// A create that recorded no acquisition would leave the eviction's release
+// dangling, which reads as a lock released twice; a batched release timed from
+// before its invalidations would read as a key yielded with the kernel's pages
+// still cached. Neither is visible without decoding the recorded history, which
+// is what this does.
+func TestIntegration_CreatedAndBatchReleasedLockKeysAreCheckable(t *testing.T) {
+	cli := etcdtest.Client(t)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+
+	store := metadata.NewStore(cli, "n1")
+	if _, err := store.CreateInode(ctx, metadata.RootIno, metadata.ModeDir|0755, 0, 0); err != nil {
+		t.Fatalf("seed root: %v", err)
+	}
+
+	membership := metadata.NewMembership(cli, "n1", "verify", 10*time.Second)
+	svc := NewService(store, membership, fencing.NewWatchdog(membership, 10*time.Second),
+		config.NewLogger(0), Options{FlushInterval: DefaultFlushInterval})
+	if err := svc.InitGeneration(ctx); err != nil {
+		t.Fatalf("init generation: %v", err)
+	}
+	svc.InstallStoreGuard()
+	rec, err := history.NewRecorder(path, "n1")
+	if err != nil {
+		t.Fatalf("recorder: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+	svc.history = rec
+
+	const files = 40
+	for i := 0; i < files; i++ {
+		_, _ = svc.observedDispatch(ipcOpCreate,
+			createPayload(metadata.RootIno, fmt.Sprintf("created-%d", i), 0))
+	}
+
+	entries := svc.locks.all()
+	if len(entries) < files {
+		t.Fatalf("%d lock entries cached after %d creates; the create did not take the lock",
+			len(entries), files)
+	}
+	held := 0
+	for _, e := range entries {
+		if e.holder != "" {
+			held++
+		}
+	}
+	if held < files {
+		t.Fatalf("%d of %d created inodes hold a lock key", held, files)
+	}
+
+	// The eviction sweep's own path: every victim's key given up by one
+	// transaction, with the release recorded per inode.
+	for _, e := range entries {
+		e.rw.Lock()
+	}
+	released := svc.dropCachedLocks(entries, "eviction")
+	for _, e := range entries {
+		e.rw.Unlock()
+	}
+	if len(released) != len(entries) {
+		t.Fatalf("%d of %d locks yielded by the batch", len(released), len(entries))
+	}
+
+	recorded, err := history.Load(path)
+	if err != nil {
+		t.Fatalf("load history: %v", err)
+	}
+	keys, err := verify.DecodeLockKeys(recorded)
+	if err != nil {
+		t.Fatalf("decode lock keys: %v", err)
+	}
+	if len(keys) < 2*files {
+		t.Fatalf("%d lock-key events for %d creates and their releases, want at least %d",
+			len(keys), files, 2*files)
+	}
+	if res := verify.CheckLocks(keys, verify.DecodeStarts(recorded),
+		verify.DefaultLockLeaseTTL, 60*time.Second); res != porcupine.Ok {
+		t.Fatalf("the cached lock keys admit a mutual-exclusion violation (%v)", res)
+	}
+
+	invals, err := verify.DecodePageInvals(recorded)
+	if err != nil {
+		t.Fatalf("decode page invalidations: %v", err)
+	}
+	if violations := verify.CheckPageCache(keys, invals); len(violations) > 0 {
+		t.Fatalf("a lock key was yielded without its inode's pages going first: %v", violations[0])
+	}
+}
