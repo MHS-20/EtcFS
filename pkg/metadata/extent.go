@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -187,15 +188,30 @@ func DecodeExtents(kvs []*mvccpb.KeyValue) []Extent {
 // that came out of DecodeExtents. Two orderings that could drift apart would be
 // two different answers to what a byte of the file contains.
 func SortExtents(extents []Extent) {
-	slices.SortFunc(extents, func(a, b Extent) int {
-		if a.LogOff != b.LogOff {
-			return cmp.Compare(a.LogOff, b.LogOff)
-		}
-		if a.Seq != b.Seq {
-			return cmp.Compare(b.Seq, a.Seq)
-		}
-		return cmp.Compare(b.Chunk, a.Chunk)
-	})
+	slices.SortFunc(extents, extentOrder)
+}
+
+// InsertExtent puts one extent into an already-ordered list at its place, and
+// returns the list.  For a list maintained incrementally this is what replaces
+// appending and sorting again: a write appends an extent whose logical offset
+// falls in the middle of the file, so the append alone leaves the list unsorted
+// every single time.
+func InsertExtent(extents []Extent, e Extent) []Extent {
+	i := sort.Search(len(extents), func(i int) bool { return extentOrder(extents[i], e) >= 0 })
+	extents = append(extents, Extent{})
+	copy(extents[i+1:], extents[i:])
+	extents[i] = e
+	return extents
+}
+
+func extentOrder(a, b Extent) int {
+	if a.LogOff != b.LogOff {
+		return cmp.Compare(a.LogOff, b.LogOff)
+	}
+	if a.Seq != b.Seq {
+		return cmp.Compare(b.Seq, a.Seq)
+	}
+	return cmp.Compare(b.Chunk, a.Chunk)
 }
 
 // Supersedes reports whether e covers every logical byte of other and was

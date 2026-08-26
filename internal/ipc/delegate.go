@@ -258,7 +258,7 @@ var errBufferPublished = errors.New("the buffer was published to make room")
 // data and runs are non-empty only when the payload is buffered too: the bytes
 // this write would otherwise have put on the device, and the blocks reserved to
 // hold them.  Both are empty when the write has already been written through.
-func (s *Service) bufferWrite(ctx context.Context, e *lockEntry, m *inodeMeta,
+func (s *Service) bufferWrite(ctx context.Context, e *lockEntry, replay *txnReplay,
 	cmps []clientv3.Cmp, ops []clientv3.Op, plans []*reclaimPlan, bytes uint64,
 	data []bufferedRun, runs []arena.Run) error {
 
@@ -296,10 +296,12 @@ func (s *Service) bufferWrite(ctx context.Context, e *lockEntry, m *inodeMeta,
 	s.bufferAccounted(len(e.pending.order)-before, int64(bytes))
 	e.pending.data = append(e.pending.data, data...)
 	e.pending.runs = append(e.pending.runs, runs...)
-	// The snapshot is republished under the same mutex the buffer is, so the
-	// two can never disagree about what this node has written.
-	if e.holder != "" {
-		e.meta, e.metaFor = m, e.holder
+	// The snapshot is updated under the same mutex the buffer is, so the two can
+	// never disagree about what this node has written — and only here, past
+	// every return above, so a write that did not join the buffer leaves the
+	// snapshot exactly as it found it.
+	if e.holder != "" && e.meta != nil {
+		e.meta, e.metaFor = replay.apply(e.meta, 0), e.holder
 	}
 
 	return nil

@@ -66,17 +66,21 @@ func BenchmarkWriteProposal(b *testing.B) {
 	}
 }
 
-func BenchmarkAfterCommit(b *testing.B) {
+// The cost of folding one write's transaction back into the cached snapshot,
+// which is what lets the next operation on the file skip etcd.
+func BenchmarkReplayApply(b *testing.B) {
 	for _, n := range benchExtentCounts {
 		b.Run(fmt.Sprintf("extents=%d", n), func(b *testing.B) {
-			existing := benchExtents(n)
-			w := benchWriteOp(existing)
+			w := benchWriteOp(benchExtents(n))
 			_, ops := w.proposal()
+			m := &inodeMeta{rec: w.rec, extents: w.existing}
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if afterCommit(1, existing, w.rec, ops, 0) == nil {
+				replay := replayTxn(1, w.rec, ops)
+				if replay == nil {
 					b.Fatal("the transaction was not replayable into the cache")
 				}
+				m = replay.apply(m, 0)
 			}
 		})
 	}
