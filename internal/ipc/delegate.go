@@ -943,13 +943,31 @@ func (s *Service) flushExpired(ctx context.Context) {
 // clock is queued (see the directory write-behind in pkg/metadata) and a caller
 // that asked for the directory to be durable is asking for that too.
 func (s *Service) handleFsync(ctx context.Context, payload []byte) ([]byte, error) {
+	return s.fsyncInode(ctx, payload, true)
+}
+
+// FLUSH is close(), which promises nothing about durability — POSIX asks it to
+// surface an error the descriptor already suffered, and nothing more.  It still
+// publishes the extents, because a peer that opens the file next has to see the
+// data (see close-to-open in the design decisions), but not the timestamps: an
+// archive sets a file's times on the descriptor and then closes it, so
+// publishing them here is a commit per file for a change nobody asked to be
+// durable, which is exactly the commit deferring them was meant to remove.
+// They are late by at most one sweep, which is the bound already documented.
+func (s *Service) handleFlush(ctx context.Context, payload []byte) ([]byte, error) {
+	return s.fsyncInode(ctx, payload, false)
+}
+
+func (s *Service) fsyncInode(ctx context.Context, payload []byte, durable bool) ([]byte, error) {
 	r := newReader(payload)
 	ino := r.u64()
 	if !r.ok {
 		return int32Resp(errInval), nil
 	}
 
-	s.store.FlushInodeTimes(ctx, ino)
+	if durable {
+		s.store.FlushInodeTimes(ctx, ino)
+	}
 
 	if err := s.flushInode(ctx, ino); err != nil {
 		s.log.Warn("fsync: cannot publish deferred writes", "ino", ino, "error", err)

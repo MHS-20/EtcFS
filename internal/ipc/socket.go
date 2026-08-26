@@ -113,7 +113,7 @@ var ops = map[uint16]op{
 	// Both publish this inode's deferred writes and block until they are in
 	// etcd.  flush arrives on every close(), fsync on the call of that name;
 	// neither can be answered locally once a write may be sitting in RAM.
-	ipcOpFlush: {"flush", (*Service).handleFsync},
+	ipcOpFlush: {"flush", (*Service).handleFlush},
 	ipcOpFsync: {"fsync", (*Service).handleFsync},
 	// Block allocation happens inside the WRITE handler, not as a separate
 	// request; these opcodes are unused.
