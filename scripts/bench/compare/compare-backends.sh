@@ -209,9 +209,15 @@ compare_mount_gfs2_fenced() {
     for ip in "${COMPARE_PUB_IPS[@]}"; do
         $SSH_CMD "ec2-user@$ip" "set -e
             sudo amazon-linux-extras install python3.8 -y >/dev/null
-            sudo yum install -y fence-agents-aws >/dev/null
+            # python38-devel, libcurl-devel and openssl-devel are pycurl's
+            # build dependencies: the agent's own fencing.py imports pycurl
+            # before it imports anything AWS, so a missing one fails the agent
+            # in a way that says nothing about AWS at all.
+            sudo yum install -y fence-agents-aws python38-devel libcurl-devel \
+                openssl-devel gcc >/dev/null
             sudo /usr/bin/python3.8 -m ensurepip --upgrade >/dev/null
-            sudo /usr/bin/python3.8 -m pip install --quiet 'urllib3<2.0' boto3 botocore requests --upgrade
+            sudo /usr/bin/python3.8 -m pip install --quiet 'urllib3<2.0' \
+                boto3 botocore requests pexpect pycurl certifi --upgrade
             sudo sed -i 's|^#!/usr/bin/python.*|#!/usr/bin/python3.8|' /usr/sbin/fence_aws
             sudo sed -i \"s/conn = boto3.resource('ec2')/conn = boto3.resource('ec2', region_name=options.get('--region'))/\" /usr/sbin/fence_aws"
     done
