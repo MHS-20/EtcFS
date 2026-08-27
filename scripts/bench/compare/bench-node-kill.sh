@@ -112,6 +112,23 @@ case "$COMPARE_BACKEND_BASE" in
         $SSH_CMD "ec2-user@$SURVIVOR" \
             "sudo dlm_tool ls 2>&1; echo ---; sudo corosync-quorumtool -s 2>&1; echo ---; sudo dmesg | tail -40" \
             > "$RESULTS_DIR/survivor-cluster-state.txt" 2>&1 || true
+        # Under pacemaker the recovery time only means anything if the fence
+        # actually completed: a lockspace that recovered without one has not
+        # been made safe, and a fence that failed leaves a number that is an
+        # outage rather than a recovery. The history says which happened.
+        if [[ "$COMPARE_BACKEND" == "gfs2-fenced" ]]; then
+            $SSH_CMD "ec2-user@$SURVIVOR" \
+                "sudo pcs status 2>&1; echo ---; sudo pcs stonith history 2>&1 || sudo stonith_admin --history '*' 2>&1" \
+                > "$RESULTS_DIR/survivor-fencing-state.txt" 2>&1 || true
+            if grep -qiE 'reboot|off' "$RESULTS_DIR/survivor-fencing-state.txt" 2>/dev/null &&
+               grep -qi 'successful' "$RESULTS_DIR/survivor-fencing-state.txt" 2>/dev/null; then
+                compare_headline node-kill fence_confirmed 1 bool
+            else
+                compare_headline node-kill fence_confirmed 0 bool
+                log "WARNING no successful fence is recorded on the survivor — the recovery"
+                log "        number below is not a fenced recovery, whatever it says"
+            fi
+        fi
         ;;
     etcfs)
         $SSH_CMD "ec2-user@$SURVIVOR" "sudo tail -60 /tmp/meta.log 2>&1" \

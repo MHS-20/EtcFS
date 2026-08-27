@@ -76,7 +76,18 @@ compare_mount_nfs() {
     BENCH_NODES=("${COMPARE_PUB_IPS[@]:1}" "${COMPARE_PUB_IPS[0]}")
 }
 
+# compare_mount_gfs2 brings up the bare corosync + dlm stack every GFS2 run
+# has used: no cluster resource manager, and so no fencing. That is honest for
+# throughput scenarios and wrong for the node-kill one, where a survivor's
+# lockspace waits for a fence that never comes and there is no recovery time to
+# quote. COMPARE_BACKEND=gfs2-fenced selects the pacemaker-managed variant
+# below instead, which is the like-for-like comparison against EtcFS's own
+# recovery.
 compare_mount_gfs2() {
+    if [[ "$COMPARE_BACKEND" == "gfs2-fenced" ]]; then
+        compare_mount_gfs2_fenced
+        return
+    fi
     local ip i dev
     compare_open_port_udp 5404 5405  # corosync totem
     compare_open_port 21064          # dlm_controld
@@ -130,6 +141,129 @@ logging {
     done
     MOUNT_PATH=/mnt/compare-gfs2
     COMPARE_REMOTE_MOUNT_CMD="sudo mount -t gfs2 -o noatime $dev /mnt/compare-gfs2"
+    BENCH_NODES=("${COMPARE_PUB_IPS[@]}")
+}
+
+# compare_mount_gfs2_fenced — GFS2 under pacemaker with real STONITH, so that a
+# node-kill run measures recovery rather than a lockspace that stopped for good.
+#
+# The difference from the bare stack is the whole point of the variant. There,
+# corosync and dlm are started by hand and nothing is configured to fence, so
+# when a node dies DLM moves its lockspace to "wait fencing" and stays there:
+# survivors keep the locks they already hold and can never take the dead node's.
+# Here pacemaker owns DLM and the mount as cloned resources, and a fence_aws
+# STONITH device stops the dead instance through the EC2 API. DLM releases the
+# lockspace only once pacemaker reports that stop confirmed, which is the
+# sequence GFS2 was designed around and the one EtcFS's 2.19 s should be read
+# against.
+#
+# Needs the STONITH policy from scripts/infra/fencing-iam.sh on the instance
+# role (ec2:StopInstances on this harness's own instances) and fence_aws, which
+# is a boto3 script — without either, the device fails to probe and pacemaker
+# refuses to start the filesystem clone rather than running unfenced.
+compare_mount_gfs2_fenced() {
+    local ip i dev cluster=comparegfs2 pw=etcfsbench
+    # Checked before a cluster is provisioned rather than after: without the
+    # STONITH policy the fence device cannot start, the filesystem clone never
+    # comes up, and the run costs a full provision to tell you so.
+    aws iam get-role-policy --role-name etcfs-nodes \
+        --policy-name gfs2-stonith-permissions >/dev/null 2>&1 \
+        || die "gfs2-fenced needs the STONITH policy on the etcfs-nodes role: run scripts/infra/fencing-iam.sh create" 
+    compare_open_port_udp 5404 5405  # corosync totem
+    compare_open_port 21064          # dlm_controld
+    compare_open_port 2224           # pcsd
+    compare_open_port 3121           # pacemaker remote/crmd
+
+    for ip in "${COMPARE_PUB_IPS[@]}"; do
+        $SSH_CMD "ec2-user@$ip" "set -e
+            sudo yum install -y pacemaker pcs fence-agents-aws dlm gfs2-utils python3-pip
+            # fence_aws is a boto3 script and the packaged dependency is not
+            # always pulled in on AL2; installing it directly is cheaper than
+            # discovering at fence time that the device cannot probe.
+            sudo python3 -m pip install --quiet boto3 2>/dev/null || true
+            echo '$pw' | sudo passwd --stdin hacluster
+            sudo systemctl enable --now pcsd"
+    done
+    sleep 5
+
+    local nodes="${COMPARE_PRIV_IPS[*]}"
+    local n0="${COMPARE_PUB_IPS[0]}"
+    # pcs 0.9 (AL2) and 0.10 spell authentication and setup differently, and
+    # the harness spans both. Try the newer form, fall back to the older.
+    $SSH_CMD "ec2-user@$n0" "
+        sudo pcs host auth $nodes -u hacluster -p $pw 2>/dev/null ||
+        sudo pcs cluster auth $nodes -u hacluster -p $pw --force" \
+        || die "gfs2-fenced: pcs authentication failed across the cluster"
+    $SSH_CMD "ec2-user@$n0" "
+        sudo pcs cluster setup --force $cluster $nodes 2>/dev/null ||
+        sudo pcs cluster setup --force --name $cluster $nodes" \
+        || die "gfs2-fenced: pcs cluster setup failed"
+    $SSH_CMD "ec2-user@$n0" "sudo pcs cluster start --all" || die "gfs2-fenced: cluster did not start"
+
+    log "Waiting for pacemaker quorum..."
+    for _ in $(seq 1 40); do
+        $SSH_CMD "ec2-user@$n0" "sudo pcs status 2>/dev/null | grep -q 'partition with quorum'" && break
+        sleep 3
+    done
+
+    # A GFS2 cluster must freeze rather than keep serving when it loses quorum:
+    # continuing would let a minority write to the same device the majority is
+    # recovering.
+    $SSH_CMD "ec2-user@$n0" "
+        sudo pcs property set stonith-enabled=true
+        sudo pcs property set no-quorum-policy=freeze"
+
+    # Each pacemaker node name is its private IP here, because that is what the
+    # cluster was set up with; the map turns those into the instance ids the
+    # fence agent stops.
+    local map="" inst
+    for i in "${!COMPARE_PRIV_IPS[@]}"; do
+        inst=$(state_get compute_instance_ids | jq -r ".[$i]")
+        map+="${COMPARE_PRIV_IPS[$i]}:$inst;"
+    done
+    # action=off, not reboot: a fenced node that comes back before its journal
+    # has been replayed is the failure mode fencing exists to prevent.
+    $SSH_CMD "ec2-user@$n0" "sudo pcs stonith create aws-fence fence_aws \
+        region=$AWS_DEFAULT_REGION pcmk_host_map='$map' pcmk_reboot_action=off \
+        power_timeout=120 op monitor interval=120s" \
+        || die "gfs2-fenced: STONITH device not created"
+
+    log "Waiting for the STONITH device to start..."
+    for _ in $(seq 1 30); do
+        $SSH_CMD "ec2-user@$n0" "sudo pcs status 2>/dev/null | grep -q 'aws-fence.*Started'" && break
+        sleep 4
+    done
+    $SSH_CMD "ec2-user@$n0" "sudo pcs status 2>/dev/null | grep -q 'aws-fence.*Started'" \
+        || die "gfs2-fenced: the fence device never started — check the instance role's ec2:StopInstances permission and that boto3 is installed"
+
+    dev=$(compare_shared_device "$n0")
+    $SSH_CMD "ec2-user@$n0" \
+        "sudo mkfs.gfs2 -O -p lock_dlm -t $cluster:vol1 -j ${#COMPARE_PUB_IPS[@]} $dev" \
+        || die "gfs2-fenced: mkfs.gfs2 failed"
+
+    # DLM and the mount as clones, ordered: the filesystem may not start on a
+    # node whose DLM is not up, and pacemaker fences a node where either fails
+    # rather than leaving it half-joined.
+    $SSH_CMD "ec2-user@$n0" "
+        sudo pcs resource create dlm ocf:pacemaker:controld op monitor interval=30s on-fail=fence clone interleave=true ordered=true
+        sudo pcs resource create gfs2fs Filesystem device=$dev directory=/mnt/compare-gfs2 fstype=gfs2 options=noatime op monitor interval=10s on-fail=fence clone interleave=true
+        sudo pcs constraint order start dlm-clone then gfs2fs-clone
+        sudo pcs constraint colocation add gfs2fs-clone with dlm-clone" \
+        || die "gfs2-fenced: cluster resources not created"
+
+    log "Waiting for the filesystem clone on every node..."
+    for ip in "${COMPARE_PUB_IPS[@]}"; do
+        for _ in $(seq 1 45); do
+            $SSH_CMD "ec2-user@$ip" "mountpoint -q /mnt/compare-gfs2" && break
+            sleep 4
+        done
+        $SSH_CMD "ec2-user@$ip" "mountpoint -q /mnt/compare-gfs2" \
+            || die "gfs2-fenced: $ip never mounted the clustered filesystem"
+    done
+
+    MOUNT_PATH=/mnt/compare-gfs2
+    # Pacemaker owns this mount: a bare mount command here would fight it.
+    COMPARE_REMOTE_MOUNT_CMD=""
     BENCH_NODES=("${COMPARE_PUB_IPS[@]}")
 }
 

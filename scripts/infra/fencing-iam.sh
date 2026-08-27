@@ -70,6 +70,37 @@ read -r -d '' POLICY <<'EOF'
 }
 EOF
 
+# What a pacemaker-managed GFS2 cluster needs to fence a peer for real.
+# fence_aws stops the dead node's instance through the EC2 API, which is the
+# confirmation DLM waits for before it releases that node's lockspace and
+# replays its journal — without it the survivors' lockspace stops for good and
+# there is no recovery time to measure. Only the comparison suite's GFS2 runs
+# use this; an EtcFS node fences by detaching the volume and never calls it.
+#
+# Deliberately narrower than the fence agent would accept: StopInstances and
+# StartInstances only, and only on instances carrying this harness's own
+# ClusterName tag, so a misconfigured pcmk_host_map cannot reach an instance
+# the benchmark did not create. RebootInstances is not granted — the STONITH
+# resource is configured with the "off" action, which is the correct one for
+# fencing anyway, since a rebooted node may come back before its journal has
+# been replayed.
+read -r -d '' STONITH_POLICY <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Gfs2StonithPowerControl",
+      "Effect": "Allow",
+      "Action": ["ec2:StopInstances", "ec2:StartInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": {
+        "StringLike": {"aws:ResourceTag/ClusterName": "compare-*"}
+      }
+    }
+  ]
+}
+EOF
+
 if aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
     log "role $ROLE already exists"
 else
@@ -90,6 +121,10 @@ aws iam put-role-policy --role-name "$ROLE" \
 # AWS-managed policy, not hand-rolled, since it also covers the SSM agent's
 # own connectivity requirements (ssmmessages:*, ec2messages:*) which change
 # across agent versions.
+log "putting the GFS2 STONITH policy on $ROLE (idempotent)..."
+aws iam put-role-policy --role-name "$ROLE" \
+    --policy-name gfs2-stonith-permissions --policy-document "$STONITH_POLICY" || exit 1
+
 log "attaching AmazonSSMManagedInstanceCore to $ROLE..."
 aws iam attach-role-policy --role-name "$ROLE" \
     --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore || exit 1
