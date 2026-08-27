@@ -176,15 +176,29 @@ compare_mount_gfs2_fenced() {
 
     for ip in "${COMPARE_PUB_IPS[@]}"; do
         $SSH_CMD "ec2-user@$ip" "set -e
-            sudo yum install -y pacemaker pcs fence-agents-aws dlm gfs2-utils python3-pip
-            # fence_aws is a boto3 script and the packaged dependency is not
-            # always pulled in on AL2; installing it directly is cheaper than
-            # discovering at fence time that the device cannot probe.
+            sudo yum install -y pacemaker pcs dlm gfs2-utils python3-pip
+            # fence-agents-aws is not in AL2's default repositories — it lives
+            # in EPEL, which amazon-linux-extras provides. Installed separately
+            # from the packages above so that a missing agent is a distinct
+            # failure rather than one line of a yum transaction.
+            sudo amazon-linux-extras install -y epel >/dev/null 2>&1 || true
+            sudo yum install -y fence-agents-aws >/dev/null 2>&1 || true
+            # fence_aws is a boto3 script and the dependency is not always
+            # pulled in; installing it directly is cheaper than discovering at
+            # fence time that the device cannot probe.
             sudo python3 -m pip install --quiet boto3 2>/dev/null || true
             echo '$pw' | sudo passwd --stdin hacluster
             sudo systemctl enable --now pcsd"
     done
     sleep 5
+
+    # Checked on every node before the cluster is built: pacemaker will happily
+    # form a cluster it cannot fence, and the failure would otherwise surface
+    # as a filesystem clone that never starts.
+    for ip in "${COMPARE_PUB_IPS[@]}"; do
+        $SSH_CMD "ec2-user@$ip" "test -x /usr/sbin/fence_aws" \
+            || die "gfs2-fenced: fence_aws is not installed on $ip — EPEL's fence-agents-aws did not install, and without the agent this run would measure an unfenced cluster again"
+    done
 
     local nodes="${COMPARE_PRIV_IPS[*]}"
     local n0="${COMPARE_PUB_IPS[0]}"
