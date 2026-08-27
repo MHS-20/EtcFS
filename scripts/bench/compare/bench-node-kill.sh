@@ -169,7 +169,11 @@ T_ORIGIN="$T_DOWN"
 # The takeover probe's own log, kept whatever it reported: -1 means the survivor
 # never wrote the dead node's file inside the window, and a probe that failed to
 # start looks exactly the same from the outside.
-$SSH_CMD "ec2-user@$SURVIVOR" "sudo tail -40 /tmp/takeover.log 2>&1; echo ---; ls -la $OWNED 2>&1" \
+# Wrapped in a timeout, and it does not touch the file itself: a stat on an
+# inode whose lock holder is gone blocks for as long as the recovery being
+# measured — which, on a GFS2 cluster whose lockspace has not released that
+# inode, is indefinitely. One unguarded `ls` here hung a whole run.
+timeout 30 $SSH_CMD "ec2-user@$SURVIVOR" "sudo tail -40 /tmp/takeover.log 2>&1" \
     > "$RESULTS_DIR/takeover-probe.txt" 2>&1 || true
 
 read -r takeover stall_t errs_t < <(compare_probe_recovery "$SURVIVOR" "$T_ORIGIN" takeover)
