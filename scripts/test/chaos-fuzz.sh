@@ -146,6 +146,23 @@ inject_fault() {
                 docker start "$M1" "$M2" "$M3" >/dev/null 2>&1
                 sleep 3
                 docker start "$N1" "$N2" "$N3" >/dev/null 2>&1
+                # etcfuse exits immediately if the metadata socket is not there
+                # yet, so a start that raced the metadata daemon leaves the
+                # container stopped and every later operation on that node
+                # blocked on a mount nothing serves. Confirmed and retried
+                # rather than assumed: one run lost its whole remaining
+                # duration to a FUSE container that had exited(0) at restart.
+                for _ in 1 2 3; do
+                    sleep 3
+                    down=""
+                    for c in "$N1" "$N2" "$N3"; do
+                        [[ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" == "true" ]] || down="$down $c"
+                    done
+                    [[ -z "$down" ]] && break
+                    logerr "  restart: FUSE container(s) not running, retrying:$down"
+                    # shellcheck disable=SC2086
+                    docker start $down >/dev/null 2>&1
+                done
             else
                 # shellcheck disable=SC2154
                 for i in 1 2 3; do eval "ip=\$N$i"; runcmd "$ip" "sudo pkill -9 etcfuse-meta etcfuse 2>/dev/null; sudo umount -l /mnt/etcfuse 2>/dev/null; true"; done
@@ -281,7 +298,25 @@ resource_sampler & SAMPLEPID=$!
 
 sleep "$DURATION"
 touch "$STOP_FILE"
-wait "$W1" "$W2" "$W3" "$CHAOSPID" "$LIVEPID" "$SAMPLEPID" 2>/dev/null
+
+# Bounded, because a worker blocked in write(2) on a mount whose FUSE daemon
+# never came back does not observe the stop file and never returns: an
+# unbounded wait here left one run hung for twelve hours with every result it
+# had already collected unreported. Whatever has not stopped within the grace
+# window is killed, and the run reports what it has.
+STOP_GRACE="${FUZZ_STOP_GRACE:-120}"
+stop_deadline=$((SECONDS + STOP_GRACE))
+for pid in "$W1" "$W2" "$W3" "$CHAOSPID" "$LIVEPID" "$SAMPLEPID"; do
+    while kill -0 "$pid" 2>/dev/null && [[ $SECONDS -lt $stop_deadline ]]; do sleep 1; done
+done
+STUCK=""
+for pid in "$W1" "$W2" "$W3" "$CHAOSPID" "$LIVEPID" "$SAMPLEPID"; do
+    if kill -0 "$pid" 2>/dev/null; then
+        STUCK="$STUCK $pid"
+        kill -9 "$pid" 2>/dev/null
+    fi
+done
+[[ -z "$STUCK" ]] || logerr "  STOP TIMEOUT: killed processes still running ${STOP_GRACE}s after the stop file:$STUCK"
 
 log "Fuzz run complete. Final liveness check on all 3 nodes..."
 FINAL_OK=0
