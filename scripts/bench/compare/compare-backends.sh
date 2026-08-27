@@ -182,13 +182,18 @@ compare_mount_gfs2_fenced() {
             # from the packages above so that a missing agent is a distinct
             # failure rather than one line of a yum transaction.
             sudo amazon-linux-extras install -y epel >/dev/null 2>&1 || true
-            sudo yum install -y fence-agents-aws python3-boto3 >/dev/null 2>&1 || true
+            sudo yum install -y fence-agents-aws >/dev/null 2>&1 || true
             # fence_aws imports boto3 at metadata time, so a missing dependency
             # does not look like a missing dependency — pacemaker reports the
-            # agent as providing no valid metadata. Installed through pip as
-            # well because the packaged boto3 is not always present for the
-            # interpreter in the agent's shebang.
-            sudo python3 -m pip install --quiet boto3 2>/dev/null || true
+            # agent as providing no valid metadata. EPEL's build on AL2 runs
+            # under python2, whatever the system's own python3 has, so boto3 is
+            # installed for the interpreter named in the agent's shebang rather
+            # than for the one that happens to be default.
+            agent_py=\$(head -1 /usr/sbin/fence_aws 2>/dev/null | sed 's|^#!||; s| .*||')
+            [ -x \"\$agent_py\" ] || agent_py=/usr/bin/python3
+            sudo yum install -y python2-boto3 python3-boto3 >/dev/null 2>&1 || true
+            sudo \"\$agent_py\" -m pip install --quiet boto3 2>/dev/null ||
+                sudo \"\$agent_py\" -m easy_install boto3 2>/dev/null || true
             echo '$pw' | sudo passwd --stdin hacluster
             sudo systemctl enable --now pcsd"
     done
