@@ -286,6 +286,26 @@ func (s *Service) inodeChanged(ev *clientv3.Event) {
 	}
 }
 
+// parentTimesChanged drops the kernel's cached attributes for a directory this
+// node has just added an entry to or removed one from.
+//
+// The bump those mutations owe the directory is deferred to the timestamp
+// sweep, so no etcd write happens at the moment of the change and the watch
+// that normally invalidates a peer's cached attributes never fires for it.
+// Without this the kernel keeps answering the directory's mtime and ctime from
+// a copy taken before the change, for as long as the attribute timeout — a
+// minute by default — and a stat that follows an unlink on the same node reads
+// the state from before it.
+func (s *Service) parentTimesChanged(parentIno uint64) {
+	if parentIno == 0 {
+		return
+	}
+	if err := s.notifyServer.send(notifyMsg(notifyInvalAttr, parentIno, ""), false); err != nil &&
+		!errors.Is(err, errNoNotifyClient) {
+		s.log.Warn("notify: parent inval_attr not delivered", "parent", parentIno, "error", err)
+	}
+}
+
 func (s *Service) sendInvalEntry(parentIno uint64, name string) {
 	if parentIno == 0 {
 		return

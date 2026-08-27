@@ -479,6 +479,7 @@ func (s *Service) handleCreate(ctx context.Context, payload []byte) ([]byte, err
 		s.discardCreatedLock(ino, holder)
 	}
 	s.dirents.created(parent, name)
+	s.parentTimesChanged(parent)
 
 	// A create hands back an open descriptor, and the release that closes it
 	// arrives like any other, so it has to be counted like any other.
@@ -616,6 +617,7 @@ func (s *Service) handleMkdir(ctx context.Context, payload []byte) ([]byte, erro
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
 	s.dirents.created(parent, name)
+	s.parentTimesChanged(parent)
 
 	return s.entryResp(rec.Ino, rec), nil
 }
@@ -634,6 +636,7 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errnoFor(err, errNoEnt)), nil // ENOENT unless fenced
 	}
 	s.dirents.deleted(parent, name)
+	s.parentTimesChanged(parent)
 	return okResp(), nil
 }
 
@@ -650,6 +653,7 @@ func (s *Service) handleRmdir(ctx context.Context, payload []byte) ([]byte, erro
 		return int32Resp(errnoFor(err, errNoEnt)), nil
 	}
 	s.dirents.deleted(parent, name)
+	s.parentTimesChanged(parent)
 	return okResp(), nil
 }
 
@@ -685,6 +689,10 @@ func (s *Service) handleRename(ctx context.Context, payload []byte) ([]byte, err
 	}
 	s.dirents.deleted(oldParent, oldName)
 	s.dirents.created(newParent, newName)
+	s.parentTimesChanged(oldParent)
+	if newParent != oldParent {
+		s.parentTimesChanged(newParent)
+	}
 	return okResp(), nil
 }
 
@@ -1009,6 +1017,7 @@ func (s *Service) handleSymlink(ctx context.Context, payload []byte) ([]byte, er
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
 	s.dirents.created(parent, name)
+	s.parentTimesChanged(parent)
 
 	return s.entryResp(ino, rec), nil
 }
@@ -1034,6 +1043,7 @@ func (s *Service) handleLink(ctx context.Context, payload []byte) ([]byte, error
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
 	s.dirents.created(newParent, name)
+	s.parentTimesChanged(newParent)
 	return s.entryResp(ino, rec), nil
 }
 
@@ -1058,6 +1068,7 @@ func (s *Service) handleMknod(ctx context.Context, payload []byte) ([]byte, erro
 		return int32Resp(errnoFor(err, errExist)), nil
 	}
 	s.dirents.created(parent, name)
+	s.parentTimesChanged(parent)
 
 	return s.entryResp(ino, rec), nil
 }
