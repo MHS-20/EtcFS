@@ -96,6 +96,12 @@ read -r -d '' STONITH_POLICY <<'EOF'
       "Condition": {
         "StringLike": {"aws:ResourceTag/ClusterName": "compare-*"}
       }
+    },
+    {
+      "Sid": "Gfs2StonithStatus",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstanceStatus"],
+      "Resource": "*"
     }
   ]
 }

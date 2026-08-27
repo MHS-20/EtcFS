@@ -168,40 +168,54 @@ compare_mount_gfs2_fenced() {
     # comes up, and the run costs a full provision to tell you so.
     aws iam get-role-policy --role-name etcfs-nodes \
         --policy-name gfs2-stonith-permissions >/dev/null 2>&1 \
-        || die "gfs2-fenced needs the STONITH policy on the etcfs-nodes role: run scripts/infra/fencing-iam.sh create" 
+        || die "gfs2-fenced needs the STONITH policy on the etcfs-nodes role: run scripts/infra/fencing-iam.sh create"
+
     compare_open_port_udp 5404 5405  # corosync totem
     compare_open_port 21064          # dlm_controld
     compare_open_port 2224           # pcsd
-    compare_open_port 3121           # pacemaker remote/crmd
+    compare_open_port 3121           # pacemaker crmd
 
+    # Cluster node names, resolvable everywhere. Pacemaker identifies a node by
+    # the name corosync was given, and the fence map has to use the same
+    # strings, so the names are assigned here rather than inherited from
+    # whatever hostname EC2 handed out.
+    local names=() hosts=""
+    for i in "${!COMPARE_PRIV_IPS[@]}"; do
+        names+=("cmp-n$((i+1))")
+        hosts+="${COMPARE_PRIV_IPS[$i]} cmp-n$((i+1))"$'\n'
+    done
+
+    for i in "${!COMPARE_PUB_IPS[@]}"; do
+        ip="${COMPARE_PUB_IPS[$i]}"
+        $SSH_CMD "ec2-user@$ip" "set -e
+            sudo yum install -y pcs pacemaker dlm gfs2-utils >/dev/null
+            sudo hostnamectl set-hostname ${names[$i]}
+            echo '$hosts' | sudo tee -a /etc/hosts >/dev/null
+            echo 'hacluster:$pw' | sudo chpasswd
+            sudo systemctl enable --now pcsd
+            sudo systemctl enable corosync pacemaker >/dev/null 2>&1 || true"
+    done
+
+    # fence_aws on AL2 ships with a python2 shebang and imports boto3, which
+    # python2 no longer has a supported build of — the agent then answers a
+    # metadata query with an ImportError, and pacemaker reports it as an agent
+    # that "does not provide valid metadata", which points at the wrong thing
+    # entirely. Python 3.8 comes from amazon-linux-extras, boto3 is installed
+    # for that interpreter specifically, and the agent is pointed at it.
+    #
+    # The second patch fixes the agent itself: 4.2's fence_aws builds its EC2
+    # resource with no region, so every call fails on an instance whose region
+    # is not in the environment pacemaker runs it under.
     for ip in "${COMPARE_PUB_IPS[@]}"; do
         $SSH_CMD "ec2-user@$ip" "set -e
-            sudo yum install -y pacemaker pcs dlm gfs2-utils python3-pip
-            # fence-agents-aws is not in AL2's default repositories — it lives
-            # in EPEL, which amazon-linux-extras provides. Installed separately
-            # from the packages above so that a missing agent is a distinct
-            # failure rather than one line of a yum transaction.
-            sudo amazon-linux-extras install -y epel >/dev/null 2>&1 || true
-            sudo yum install -y fence-agents-aws >/dev/null 2>&1 || true
-            # fence_aws imports boto3 at metadata time, so a missing dependency
-            # does not look like a missing dependency — pacemaker reports the
-            # agent as providing no valid metadata. EPEL's build on AL2 runs
-            # under python2, whatever the system's own python3 has, so boto3 is
-            # installed for the interpreter named in the agent's shebang rather
-            # than for the one that happens to be default.
-            agent_py=\$(head -1 /usr/sbin/fence_aws 2>/dev/null | sed 's|^#!||; s| .*||')
-            [ -x \"\$agent_py\" ] || agent_py=/usr/bin/python3
-            sudo yum install -y python2-boto3 python3-boto3 >/dev/null 2>&1 || true
-            sudo \"\$agent_py\" -m pip install --quiet boto3 2>/dev/null ||
-                sudo \"\$agent_py\" -m easy_install boto3 2>/dev/null || true
-            echo '$pw' | sudo passwd --stdin hacluster
-            sudo systemctl enable --now pcsd"
+            sudo amazon-linux-extras install python3.8 -y >/dev/null
+            sudo yum install -y fence-agents-aws >/dev/null
+            sudo /usr/bin/python3.8 -m ensurepip --upgrade >/dev/null
+            sudo /usr/bin/python3.8 -m pip install --quiet 'urllib3<2.0' boto3 botocore requests --upgrade
+            sudo sed -i 's|^#!/usr/bin/python.*|#!/usr/bin/python3.8|' /usr/sbin/fence_aws
+            sudo sed -i \"s/conn = boto3.resource('ec2')/conn = boto3.resource('ec2', region_name=options.get('--region'))/\" /usr/sbin/fence_aws"
     done
-    sleep 5
 
-    # Checked on every node before the cluster is built: pacemaker will happily
-    # form a cluster it cannot fence, and the failure would otherwise surface
-    # as a filesystem clone that never starts.
     # The agent is run, not merely looked for: an installed fence_aws whose
     # boto3 import fails answers a metadata query with an error, and pacemaker
     # reports that as "not installed or does not provide valid metadata", which
@@ -216,17 +230,17 @@ $probe" ;;
         esac
     done
 
-    local nodes="${COMPARE_PRIV_IPS[*]}"
     local n0="${COMPARE_PUB_IPS[0]}"
     # pcs 0.9 (AL2) and 0.10 spell authentication and setup differently, and
-    # the harness spans both. Try the newer form, fall back to the older.
+    # the harness spans both. The older form is tried first here because AL2 is
+    # what this backend is pinned to.
     $SSH_CMD "ec2-user@$n0" "
-        sudo pcs host auth $nodes -u hacluster -p $pw 2>/dev/null ||
-        sudo pcs cluster auth $nodes -u hacluster -p $pw --force" \
+        sudo pcs cluster auth ${names[*]} -u hacluster -p $pw --force 2>/dev/null ||
+        sudo pcs host auth ${names[*]} -u hacluster -p $pw" \
         || die "gfs2-fenced: pcs authentication failed across the cluster"
     $SSH_CMD "ec2-user@$n0" "
-        sudo pcs cluster setup --force $cluster $nodes 2>/dev/null ||
-        sudo pcs cluster setup --force --name $cluster $nodes" \
+        sudo pcs cluster setup --force --name $cluster ${names[*]} 2>/dev/null ||
+        sudo pcs cluster setup --force $cluster ${names[*]}" \
         || die "gfs2-fenced: pcs cluster setup failed"
     $SSH_CMD "ec2-user@$n0" "sudo pcs cluster start --all" || die "gfs2-fenced: cluster did not start"
 
@@ -236,50 +250,58 @@ $probe" ;;
         sleep 3
     done
 
-    # A GFS2 cluster must freeze rather than keep serving when it loses quorum:
-    # continuing would let a minority write to the same device the majority is
-    # recovering.
+    # startup-fencing and a long stonith-timeout matter here: stopping an EC2
+    # instance through the API is slow enough that pacemaker's default gives up
+    # while the fence is still succeeding, and a fence that is reported failed
+    # leaves the lockspace stopped exactly as an unfenced cluster does.
     $SSH_CMD "ec2-user@$n0" "
         sudo pcs property set stonith-enabled=true
-        sudo pcs property set no-quorum-policy=freeze"
+        sudo pcs property set stonith-action=off
+        sudo pcs property set startup-fencing=true
+        sudo pcs property set no-quorum-policy=stop
+        sudo pcs property set stonith-timeout=600s"
 
-    # Each pacemaker node name is its private IP here, because that is what the
-    # cluster was set up with; the map turns those into the instance ids the
-    # fence agent stops.
     local map="" inst
-    for i in "${!COMPARE_PRIV_IPS[@]}"; do
+    for i in "${!names[@]}"; do
         inst=$(state_get compute_instance_ids | jq -r ".[$i]")
-        map+="${COMPARE_PRIV_IPS[$i]}:$inst;"
+        map+="${names[$i]}:$inst;"
     done
-    # action=off, not reboot: a fenced node that comes back before its journal
-    # has been replayed is the failure mode fencing exists to prevent.
-    $SSH_CMD "ec2-user@$n0" "sudo pcs stonith create aws-fence fence_aws \
-        region=$AWS_DEFAULT_REGION pcmk_host_map='$map' pcmk_reboot_action=off \
-        power_timeout=120 op monitor interval=120s" \
+    $SSH_CMD "ec2-user@$n0" "sudo pcs stonith create clusterfence fence_aws \
+        region=$AWS_DEFAULT_REGION pcmk_host_map='$map' \
+        power_timeout=600 pcmk_off_timeout=600 pcmk_reboot_timeout=480 \
+        pcmk_reboot_retries=4 power_wait=5" \
         || die "gfs2-fenced: STONITH device not created"
 
     log "Waiting for the STONITH device to start..."
     for _ in $(seq 1 30); do
-        $SSH_CMD "ec2-user@$n0" "sudo pcs status 2>/dev/null | grep -q 'aws-fence.*Started'" && break
+        $SSH_CMD "ec2-user@$n0" "sudo pcs status 2>/dev/null | grep -q 'clusterfence.*Started'" && break
         sleep 4
     done
-    $SSH_CMD "ec2-user@$n0" "sudo pcs status 2>/dev/null | grep -q 'aws-fence.*Started'" \
-        || die "gfs2-fenced: the fence device never started — check the instance role's ec2:StopInstances permission and that boto3 is installed"
+    if ! $SSH_CMD "ec2-user@$n0" "sudo pcs status 2>/dev/null | grep -q 'clusterfence.*Started'"; then
+        $SSH_CMD "ec2-user@$n0" "sudo pcs status 2>&1 | tail -30; sudo journalctl -u pacemaker --no-pager 2>&1 | grep -i fence | tail -20" \
+            > "$RESULTS_DIR/stonith-start-failure.txt" 2>&1 || true
+        die "gfs2-fenced: the fence device never started — see $RESULTS_DIR/stonith-start-failure.txt"
+    fi
 
     dev=$(compare_shared_device "$n0")
+    # GFS2 straight on the shared device, not on a clustered LVM volume: that
+    # is what every other GFS2 run in this suite measures, and the fenced
+    # variant exists to change one thing — whether a dead node is fenced — not
+    # the storage stack underneath it.
     $SSH_CMD "ec2-user@$n0" \
         "sudo mkfs.gfs2 -O -p lock_dlm -t $cluster:vol1 -j ${#COMPARE_PUB_IPS[@]} $dev" \
         || die "gfs2-fenced: mkfs.gfs2 failed"
 
-    # DLM and the mount as clones, ordered: the filesystem may not start on a
-    # node whose DLM is not up, and pacemaker fences a node where either fails
-    # rather than leaving it half-joined.
     $SSH_CMD "ec2-user@$n0" "
         sudo pcs resource create dlm ocf:pacemaker:controld op monitor interval=30s on-fail=fence clone interleave=true ordered=true
-        sudo pcs resource create gfs2fs Filesystem device=$dev directory=/mnt/compare-gfs2 fstype=gfs2 options=noatime op monitor interval=10s on-fail=fence clone interleave=true
-        sudo pcs constraint order start dlm-clone then gfs2fs-clone
-        sudo pcs constraint colocation add gfs2fs-clone with dlm-clone" \
+        sudo pcs resource create clusterfs Filesystem device=$dev directory=/mnt/compare-gfs2 fstype=gfs2 options=noatime op monitor interval=10s on-fail=fence clone interleave=true
+        sudo pcs constraint order start dlm-clone then clusterfs-clone
+        sudo pcs constraint colocation add clusterfs-clone with dlm-clone" \
         || die "gfs2-fenced: cluster resources not created"
+
+    for ip in "${COMPARE_PUB_IPS[@]}"; do
+        $SSH_CMD "ec2-user@$ip" "sudo mkdir -p /mnt/compare-gfs2"
+    done
 
     log "Waiting for the filesystem clone on every node..."
     for ip in "${COMPARE_PUB_IPS[@]}"; do
@@ -287,8 +309,11 @@ $probe" ;;
             $SSH_CMD "ec2-user@$ip" "mountpoint -q /mnt/compare-gfs2" && break
             sleep 4
         done
-        $SSH_CMD "ec2-user@$ip" "mountpoint -q /mnt/compare-gfs2" \
-            || die "gfs2-fenced: $ip never mounted the clustered filesystem"
+        if ! $SSH_CMD "ec2-user@$ip" "mountpoint -q /mnt/compare-gfs2"; then
+            $SSH_CMD "ec2-user@$n0" "sudo pcs status 2>&1 | tail -40" \
+                > "$RESULTS_DIR/clone-start-failure.txt" 2>&1 || true
+            die "gfs2-fenced: $ip never mounted the clustered filesystem — see $RESULTS_DIR/clone-start-failure.txt"
+        fi
     done
 
     MOUNT_PATH=/mnt/compare-gfs2
