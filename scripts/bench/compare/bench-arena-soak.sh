@@ -88,6 +88,26 @@ compare_headline arena-soak baseline_offset_s \
 # falling while live data holds steady is the fragmentation signal.
 compare_headline arena-soak avail_lost_since_plateau "$(( base_avail - last_avail ))" bytes
 compare_headline arena-soak live_delta_since_plateau "$(( last_live - base_live ))" bytes
+
+# Endpoints alone misread this filesystem: allocatable space swings by tens of
+# gigabytes within a run as arenas are claimed and their free lists consumed
+# and returned, so a single last sample can land anywhere in that range. The
+# spread and the least-squares slope over the plateau window are what a
+# fragmentation trend would actually show up in — a slope near zero with live
+# bytes flat is the allocator giving back what the churn stops using.
+read -r avail_min avail_max slope < <(
+    awk -v base="$base_ts" '$1 >= base {
+        n++; x = $1 - base; y = $2
+        if (n == 1 || y < mn) mn = y
+        if (n == 1 || y > mx) mx = y
+        sx += x; sy += y; sxx += x*x; sxy += x*y
+    } END {
+        d = n*sxx - sx*sx
+        printf "%d %d %.0f", mn, mx, (d == 0 ? 0 : (n*sxy - sx*sy) / d * 3600)
+    }' "$SAMPLES")
+compare_headline arena-soak avail_min "$avail_min" bytes
+compare_headline arena-soak avail_max "$avail_max" bytes
+compare_headline arena-soak avail_trend_per_hour "$slope" bytes/h
 compare_headline arena-soak avail_lost_per_live_byte \
     "$(awk -v fa="$base_avail" -v la="$last_avail" -v fl="$base_live" -v ll="$last_live" \
         'BEGIN{ d = ll - fl; if (d <= 0) { print "0" } else { printf "%.3f", (fa - la) / d } }')" ratio
