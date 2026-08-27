@@ -810,3 +810,65 @@ func TestIntegration_SetattrThatChangesNoPermissionCommitsNothing(t *testing.T) 
 		t.Errorf("ctime did not move on a real chmod: %v", after.Ctime)
 	}
 }
+
+// A file that is unlinked while nothing holds it open leaves its extents behind
+// as orphans, and only the node owning their arena may give the blocks back.
+// The scrubber refuses to reclaim an orphan while anything is cached for its
+// inode's lock, so an entry left in this node's cache pins those blocks until
+// the cache evicts it — under churn that deletes as fast as it writes, that is
+// a filesystem which walks to ENOSPC with nothing live in it.
+func TestIntegration_UnlinkGivesUpTheInodesCachedLock(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	const ino = 7009
+	name := t.Name()
+	seedFile(t, store, ino, metadata.ModeFile|0644)
+
+	// A write is what puts the entry in this node's lock cache, and the cache
+	// keeps it long after the write is done — which is the state the scrubber
+	// trips over.
+	if _, err := svc.handleWrite(ctx, writePayload(ino, 0, []byte("doomed"), 0)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// close() publishes an inode's buffered extents, and the churn this test
+	// stands in for closes each file before deleting it — so the buffer is
+	// empty by the time the unlink arrives, and the lock entry is all that is
+	// left behind.
+	if err := svc.flushInode(ctx, ino); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if !svc.Holds(ino) {
+		t.Skip("nothing was cached for this inode's lock, so there is nothing to give up")
+	}
+
+	var uq buf
+	uq.w64(metadata.RootIno)
+	uq.w32(uint32(len(name)))
+	uq.b = append(uq.b, name...)
+	uresp, err := svc.handleUnlink(ctx, uq.b)
+	if err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+	if code := respCode(uresp); code != 0 {
+		t.Fatalf("unlink returned errno %d", code)
+	}
+
+	// The write left a descriptor open, so the unlink orphans the record rather
+	// than deleting it; the release that follows is where it goes. Both orders
+	// end with an inode nothing can reach and extents only the scrubber can
+	// give back, and both must therefore give up the cached lock.
+	var rq buf
+	rq.w64(ino)
+	if _, err := svc.handleRelease(ctx, rq.b); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	if rec, err := store.GetInode(ctx, ino); err != nil {
+		t.Fatalf("read back inode: %v", err)
+	} else if rec != nil {
+		t.Fatalf("inode %d survived an unlink with nothing holding it open", ino)
+	}
+	if svc.Holds(ino) {
+		t.Error("the unlinked inode's lock is still cached here, so the scrubber will skip its orphaned extents and never give the blocks back")
+	}
+}

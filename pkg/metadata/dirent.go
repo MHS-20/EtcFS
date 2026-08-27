@@ -382,7 +382,8 @@ func (s *Store) AtomicLink(ctx context.Context, ino, parent uint64, name string)
 // freed. Losing either comparison is contention, so the work is redone against
 // fresh state rather than reported as a failure.
 func (s *Store) AtomicUnlink(ctx context.Context, parent uint64, name string) error {
-	return s.AtomicUnlinkKeepingOpen(ctx, parent, name, nil)
+	_, err := s.AtomicUnlinkKeepingOpen(ctx, parent, name, nil)
+	return err
 }
 
 // AtomicUnlinkKeepingOpen is AtomicUnlink with a say in what happens to an
@@ -395,10 +396,17 @@ func (s *Store) AtomicUnlink(ctx context.Context, parent uint64, name string) er
 // unlinking a file this node holds open still takes it away, which is the
 // limitation an open-count in etcd would close at the cost of a round trip on
 // every open.
+//
+// The inode number is reported back when the unlink removed the record
+// outright, and zero when it did not — a link that remains, or a file this node
+// still holds open.  The caller needs to know: an inode that is gone leaves its
+// extents behind as orphans for the scrubber, and the scrubber will not touch
+// them while this node still has anything cached for that inode's lock.
 func (s *Store) AtomicUnlinkKeepingOpen(ctx context.Context, parent uint64, name string,
-	heldOpen func(ino uint64) bool) error {
+	heldOpen func(ino uint64) bool) (uint64, error) {
 
-	return retryCAS(ctx, fmt.Sprintf("atomic unlink %d/%q", parent, name), func() (bool, error) {
+	var removed uint64
+	err := retryCAS(ctx, fmt.Sprintf("atomic unlink %d/%q", parent, name), func() (bool, error) {
 		fail := func(format string, args ...any) (bool, error) {
 			prefix := fmt.Sprintf("atomic unlink %d/%q: ", parent, name)
 			return false, fmt.Errorf(prefix+format, args...)
@@ -427,6 +435,7 @@ func (s *Store) AtomicUnlinkKeepingOpen(ctx context.Context, parent uint64, name
 			InodeUnchanged(ino, rev),
 		}
 		var tail []clientv3.Op
+		removed = 0
 		if rec.Nlink <= 1 && rec.Mode&S_IFMT != ModeDir && heldOpen != nil && heldOpen(ino) {
 			orphaned := *rec
 			orphaned.Nlink = 0
@@ -437,14 +446,21 @@ func (s *Store) AtomicUnlinkKeepingOpen(ctx context.Context, parent uint64, name
 			}
 		} else {
 			tail = s.unlinkInodeOps(rec)
+			if rec.Nlink <= 1 {
+				removed = ino
+			}
 		}
 		ops := append([]clientv3.Op{DeleteDirent(parent, name)}, tail...)
 		ok, err := s.Txn(ctx, cmps, ops, nil)
 		if ok && err == nil {
 			s.touchDir(ctx, parent)
 		}
+		if !ok || err != nil {
+			removed = 0
+		}
 		return ok, err
 	})
+	return removed, err
 }
 
 // AtomicRmdir removes an empty directory and its entry in one transaction.

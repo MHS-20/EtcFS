@@ -593,6 +593,14 @@ func (s *Service) handleRelease(ctx context.Context, payload []byte) ([]byte, er
 		if err := s.store.DeleteOrphan(ctx, ino); err != nil {
 			s.log.Warn("release: cannot delete orphaned inode", "ino", ino, "error", err)
 		}
+		// And the inode's cached lock goes with it, so the scrubber stops
+		// skipping the extents this inode has just orphaned. Only when nothing
+		// is buffered under it — see yieldQuietCachedLock for why a drop that
+		// publishes would put the deleted record back.
+		if err := s.yieldQuietCachedLock(ino, "unlinked"); err != nil {
+			s.log.Warn("released orphan's cached lock not given up; its blocks wait for the cache to evict it",
+				"ino", ino, "error", err)
+		}
 	}
 	return okResp(), nil
 }
@@ -631,12 +639,28 @@ func (s *Service) handleUnlink(ctx context.Context, payload []byte) ([]byte, err
 		return int32Resp(errInval), nil
 	}
 
-	err := s.store.AtomicUnlinkKeepingOpen(ctx, parent, name, s.open.heldOpen)
+	removed, err := s.store.AtomicUnlinkKeepingOpen(ctx, parent, name, s.open.heldOpen)
 	if err != nil {
 		return int32Resp(errnoFor(err, errNoEnt)), nil // ENOENT unless fenced
 	}
 	s.dirents.deleted(parent, name)
 	s.parentTimesChanged(parent)
+	// The file is gone and its extents are now orphans, which only the node
+	// owning their arena may reclaim — this one.  The scrubber refuses to
+	// reclaim an orphan while anything is cached for its inode's lock, and this
+	// node's cache keeps that entry until it is evicted, so an inode nobody can
+	// reach again would otherwise pin its blocks for as long as the entry
+	// lives.  Under churn that deletes as fast as it writes, nothing comes back
+	// at all and the filesystem reaches ENOSPC with almost nothing live in it.
+	if removed != 0 {
+		if yerr := s.yieldQuietCachedLock(removed, "unlinked"); yerr != nil {
+			// The blocks are not lost, only late: the entry stays, and the
+			// eviction that eventually takes it lets the next scrub pass
+			// reclaim them.
+			s.log.Warn("unlinked inode's cached lock not given up; its blocks wait for the cache to evict it",
+				"ino", removed, "error", yerr)
+		}
+	}
 	return okResp(), nil
 }
 

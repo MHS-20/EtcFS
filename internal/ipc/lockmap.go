@@ -130,6 +130,26 @@ func (m *lockMap) drain() []*lockEntry {
 // Only an entry no operation currently holds can go, so a full set of busy
 // inodes grows past the bound rather than blocking; the bound is a target, not
 // an invariant.
+// forget removes an entry from the set, for an inode that can never be reached
+// again — one whose last name and last descriptor are both gone.
+//
+// Eviction is the only other way an entry leaves, and it is driven by pressure
+// rather than by liveness, so without this a deleted inode's entry can sit in
+// the set for as long as the set has room. That is not free: the scrubber
+// declines to reclaim the extents such an inode orphaned while an entry for it
+// is here, so the blocks stay out of the free list for exactly as long.
+//
+// Only the entry the caller was working with is removed: a lookup that raced
+// this and built a fresh one is a different object, and deleting it would leave
+// that caller running under an entry nothing else can find.
+func (m *lockMap) forget(e *lockEntry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.entries[e.ino] == e {
+		delete(m.entries, e.ino)
+	}
+}
+
 func (m *lockMap) evictLocked() {
 	if len(m.entries) < lockCacheMax || m.evicting {
 		return

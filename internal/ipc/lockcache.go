@@ -702,6 +702,38 @@ func (s *Service) yieldCachedLock(ino uint64, trigger string) error {
 	return s.dropCachedLock(e, trigger)
 }
 
+// yieldQuietCachedLock gives up an inode's cached lock only when nothing is
+// buffered under it.
+//
+// The distinction matters for an inode that has just been removed. Dropping a
+// lock publishes whatever the buffer holds, and a buffered write's proposal
+// carries a put of the inode's own record — so a drop that flushes after the
+// record was deleted writes it back, resurrecting an inode nothing has a name
+// for. When there is something to publish, the entry is left for eviction,
+// which takes the same path at a moment when it cannot do that damage.
+func (s *Service) yieldQuietCachedLock(ino uint64, trigger string) error {
+	e := s.locks.lookup(ino)
+	if e == nil {
+		return nil
+	}
+	e.lockExclusive()
+	defer e.unlockExclusive()
+	e.keyMu.Lock()
+	quiet := e.pending.empty()
+	e.keyMu.Unlock()
+	if !quiet {
+		return nil
+	}
+	if err := s.dropCachedLock(e, trigger); err != nil {
+		return err
+	}
+	// The key is gone and so is the entry: an entry left behind still answers
+	// Holds, and the scrubber reads that as a reason to leave this inode's
+	// orphaned blocks alone.
+	s.locks.forget(e)
+	return nil
+}
+
 // sessionPollInterval is how often the session watcher looks for a session to
 // watch when this node has taken no lock yet.  Nothing is at stake while there
 // is no session — there are no keys and no caches under one — so this only has
