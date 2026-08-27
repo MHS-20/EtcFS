@@ -82,8 +82,13 @@ compare_provision() {
 # just moves the wait off the critical path, it doesn't skip it.
 compare_destroy() {
     log "=== [$COMPARE_BACKEND] tearing down (async) ==="
+    # The lock descriptor is explicitly closed in the child: teardown outlives
+    # this script by design, and a copy of the descriptor keeps the run lock
+    # held, so the next run in a serial queue is refused by a cluster that is
+    # already being deleted.
     nohup bash "$INFRA_DIR/destroy-infra.sh" --force \
-        > "$COMPARE_PROJECT_ROOT/teardown-${COMPARE_BACKEND}.log" 2>&1 &
+        > "$COMPARE_PROJECT_ROOT/teardown-${COMPARE_BACKEND}.log" 2>&1 \
+        {COMPARE_LOCK_FD}>&- &
     disown
 }
 
@@ -98,6 +103,9 @@ compare_destroy() {
 # are checked here rather than remembered.
 
 COMPARE_RUN_LOCK="${COMPARE_RUN_LOCK:-$COMPARE_PROJECT_ROOT/.compare-run.lock}"
+# Defined even when the lock is never taken (COMPARE_ALLOW_CONCURRENT=1), because
+# compare_destroy closes this descriptor in the teardown child unconditionally.
+COMPARE_LOCK_FD=9
 
 # compare_take_run_lock — refuse to start while another comparison run holds
 # the lock. Set COMPARE_ALLOW_CONCURRENT=1 to run two on purpose (they will
@@ -105,12 +113,16 @@ COMPARE_RUN_LOCK="${COMPARE_RUN_LOCK:-$COMPARE_PROJECT_ROOT/.compare-run.lock}"
 # result is comparable with a run that had the account to itself).
 compare_take_run_lock() {
     [[ "${COMPARE_ALLOW_CONCURRENT:-0}" == "1" ]] && return 0
-    exec {COMPARE_LOCK_FD}>"$COMPARE_RUN_LOCK"
+    # Appended, not truncated: opening for write would erase the holder line of
+    # the run this one is about to be refused by, and the refusal would then
+    # name nobody.
+    exec {COMPARE_LOCK_FD}>>"$COMPARE_RUN_LOCK"
     if ! flock -n "$COMPARE_LOCK_FD"; then
         die "another comparison run is in flight (holder: $(cat "$COMPARE_RUN_LOCK" 2>/dev/null)).
      Runs must be serial: concurrent clusters on one account distort every
      number. Wait for it, or set COMPARE_ALLOW_CONCURRENT=1 to override."
     fi
+    : > "$COMPARE_RUN_LOCK"
     printf '%s pid=%s started=%s\n' "$COMPARE_BACKEND" "$$" "$(date -Is)" >&"$COMPARE_LOCK_FD"
 }
 
