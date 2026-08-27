@@ -182,10 +182,12 @@ compare_mount_gfs2_fenced() {
             # from the packages above so that a missing agent is a distinct
             # failure rather than one line of a yum transaction.
             sudo amazon-linux-extras install -y epel >/dev/null 2>&1 || true
-            sudo yum install -y fence-agents-aws >/dev/null 2>&1 || true
-            # fence_aws is a boto3 script and the dependency is not always
-            # pulled in; installing it directly is cheaper than discovering at
-            # fence time that the device cannot probe.
+            sudo yum install -y fence-agents-aws python3-boto3 >/dev/null 2>&1 || true
+            # fence_aws imports boto3 at metadata time, so a missing dependency
+            # does not look like a missing dependency — pacemaker reports the
+            # agent as providing no valid metadata. Installed through pip as
+            # well because the packaged boto3 is not always present for the
+            # interpreter in the agent's shebang.
             sudo python3 -m pip install --quiet boto3 2>/dev/null || true
             echo '$pw' | sudo passwd --stdin hacluster
             sudo systemctl enable --now pcsd"
@@ -195,9 +197,18 @@ compare_mount_gfs2_fenced() {
     # Checked on every node before the cluster is built: pacemaker will happily
     # form a cluster it cannot fence, and the failure would otherwise surface
     # as a filesystem clone that never starts.
+    # The agent is run, not merely looked for: an installed fence_aws whose
+    # boto3 import fails answers a metadata query with an error, and pacemaker
+    # reports that as "not installed or does not provide valid metadata", which
+    # sends the reader looking for a package that is already there.
     for ip in "${COMPARE_PUB_IPS[@]}"; do
-        $SSH_CMD "ec2-user@$ip" "test -x /usr/sbin/fence_aws" \
-            || die "gfs2-fenced: fence_aws is not installed on $ip — EPEL's fence-agents-aws did not install, and without the agent this run would measure an unfenced cluster again"
+        local probe
+        probe=$($SSH_CMD "ec2-user@$ip" "sudo /usr/sbin/fence_aws -o metadata 2>&1 | head -20" 2>&1)
+        case "$probe" in
+            *"<resource-agent"*) ;;
+            *) die "gfs2-fenced: fence_aws cannot run on $ip, so this run would measure an unfenced cluster again. The agent said:
+$probe" ;;
+        esac
     done
 
     local nodes="${COMPARE_PRIV_IPS[*]}"
