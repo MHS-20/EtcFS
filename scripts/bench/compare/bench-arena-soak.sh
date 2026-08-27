@@ -103,7 +103,7 @@ read -r avail_min avail_max slope < <(
         sx += x; sy += y; sxx += x*x; sxy += x*y
     } END {
         d = n*sxx - sx*sx
-        printf "%d %d %.0f", mn, mx, (d == 0 ? 0 : (n*sxy - sx*sy) / d * 3600)
+        printf "%d %d %.0f\n", mn, mx, (d == 0 ? 0 : (n*sxy - sx*sy) / d * 3600)
     }' "$SAMPLES")
 compare_headline arena-soak avail_min "$avail_min" bytes
 compare_headline arena-soak avail_max "$avail_max" bytes
