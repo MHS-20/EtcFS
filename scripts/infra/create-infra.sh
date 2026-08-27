@@ -143,11 +143,19 @@ VOL_ID=$(state_get volume_id 2>/dev/null || echo "")
 if [[ -n "$VOL_ID" && "$VOL_ID" != "null" && "$VOL_ID" != "" ]]; then
     VOL_STATE=$(aws ec2 describe-volumes --volume-ids "$VOL_ID" \
         --query 'Volumes[0].State' --output text 2>/dev/null || echo "deleted")
-    if [[ "$VOL_STATE" != "deleted" && "$VOL_STATE" != "None" && "$VOL_STATE" != "null" ]]; then
-        log "EBS volume already exists: $VOL_ID ($VOL_STATE)"
-    else
-        VOL_ID=""
-    fi
+    # "deleting" counts as gone, not as present: the previous run's teardown is
+    # asynchronous, so a state file can name a volume that is on its way out
+    # and still answers describe-volumes. Reusing it means every attachment
+    # fails a minute later with InvalidVolume.NotFound, which reads as a
+    # provisioning bug rather than as the race it is.
+    case "$VOL_STATE" in
+        deleted|deleting|None|null|"")
+            VOL_ID=""
+            ;;
+        *)
+            log "EBS volume already exists: $VOL_ID ($VOL_STATE)"
+            ;;
+    esac
 fi
 
 if [[ -z "$VOL_ID" ]]; then
