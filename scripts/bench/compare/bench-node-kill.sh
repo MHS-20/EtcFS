@@ -120,8 +120,14 @@ case "$COMPARE_BACKEND_BASE" in
             $SSH_CMD "ec2-user@$SURVIVOR" \
                 "sudo pcs status 2>&1; echo ---; sudo pcs stonith history 2>&1 || sudo stonith_admin --history '*' 2>&1" \
                 > "$RESULTS_DIR/survivor-fencing-state.txt" 2>&1 || true
-            if grep -qiE 'reboot|off' "$RESULTS_DIR/survivor-fencing-state.txt" 2>/dev/null &&
-               grep -qi 'successful' "$RESULTS_DIR/survivor-fencing-state.txt" 2>/dev/null; then
+            # Pacemaker's own phrasing, not a word this script invented:
+            # `pcs stonith history` reports a completed fence as "<node> was
+            # able to turn off node <victim>", and stonith_admin as
+            # "Node <victim> last fenced at". Grepping for "successful" found
+            # neither, and reported a fence that had plainly worked as one that
+            # had not.
+            if grep -qiE 'was able to turn (off|on) node|last fenced at' \
+                   "$RESULTS_DIR/survivor-fencing-state.txt" 2>/dev/null; then
                 compare_headline node-kill fence_confirmed 1 bool
             else
                 compare_headline node-kill fence_confirmed 0 bool
@@ -160,6 +166,12 @@ fi
 # harness does not configure is the honest answer rather than a missing number.
 T_ORIGIN="$T_DOWN"
 [[ "$T_ORIGIN" == "-1" ]] && T_ORIGIN="$T0"
+# The takeover probe's own log, kept whatever it reported: -1 means the survivor
+# never wrote the dead node's file inside the window, and a probe that failed to
+# start looks exactly the same from the outside.
+$SSH_CMD "ec2-user@$SURVIVOR" "sudo tail -40 /tmp/takeover.log 2>&1; echo ---; ls -la $OWNED 2>&1" \
+    > "$RESULTS_DIR/takeover-probe.txt" 2>&1 || true
+
 read -r takeover stall_t errs_t < <(compare_probe_recovery "$SURVIVOR" "$T_ORIGIN" takeover)
 compare_headline node-kill takeover_s "$takeover" s
 compare_headline node-kill takeover_max_stall_s "$stall_t" s
