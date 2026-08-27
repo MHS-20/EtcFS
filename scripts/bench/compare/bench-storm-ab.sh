@@ -54,6 +54,15 @@ compare_begin
 compare_mount
 compare_build_tree "$N0" "$FILES" >/dev/null
 
+# The daemons' own command lines, captured while they are still running:
+# compare_etcfs_start relaunches from /tmp/meta.cmd and /tmp/fuse.cmd, and
+# nothing writes those files until something asks for them. Without this the
+# first build swap kills the daemons and then has no command to bring them
+# back with.
+for ip in "${COMPARE_PUB_IPS[@]}"; do
+    compare_etcfs_snapshot_cmdline "$ip"
+done
+
 # deploy_and_restart <binary> — put this build on every node and bring the
 # daemons back on it. The mount has to come back everywhere, not just on the
 # node the untar runs on, because a node left without one is a peer that
